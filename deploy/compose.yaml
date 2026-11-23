@@ -11,9 +11,17 @@
 # settings for Atlassian, Slack OAuth and GitHub come from deploy/live.env.
 #
 # Network: the services talk on the `pmos` network under their *.pmos.internal names, the same
-# names the bots' OpenShell sandbox policies allow. Ports are published on 127.0.0.1 only: the
-# sandboxes reach the tool server, gateway and runtime there (see /etc/hosts in the install
-# runbook), and the OAuth callback reaches the tool server through the reverse proxy.
+# names the bots' OpenShell sandbox policies allow. Ports are published on 127.0.0.1 only, for
+# deploy/pmos-admin and the reverse proxy (the OAuth callback reaches the tool server through it).
+# The sandboxes reach the tool server, gateway and runtime at their own fixed addresses on the
+# `pmos` network instead (slice H2; docs/openshell-any-host-spec.md §3.3): 10.201.77.10, .11
+# and .12 (`ipv4_address` below; the two model servers have .13 and .14), which the host's
+# names resolve to through the block `sudo deploy/pmos-admin host-names apply` writes in
+# /etc/hosts. Loopback is never an allowed destination for a sandbox. These addresses are
+# reviewed code, not settings: deploy/pmos-admin holds the same literals (scripts/
+# test-pmos-admin.sh checks they are equal), and changing them is a code change under POL-2
+# review. Verify on a real host (the acceptance run): that a sandbox resolves the names through
+# the host's /etc/hosts and reaches these addresses.
 
 name: pmos
 
@@ -86,7 +94,8 @@ services:
     <<: *service
     command: ["pmos-toolserver"]
     networks:
-      pmos: { aliases: [toolserver.pmos.internal] }
+      # Pinned (slice H2): a reviewed literal, never a setting.
+      pmos: { aliases: [toolserver.pmos.internal], ipv4_address: 10.201.77.10 }
     ports: ["127.0.0.1:${PMOS_TOOLSERVER_PORT:-8710}:8710"]
     env_file:
       - path: ./live.env
@@ -147,7 +156,8 @@ services:
     <<: *service
     command: ["pmos-gateway"]
     networks:
-      pmos: { aliases: [gateway.pmos.internal] }
+      # Pinned (slice H2): a reviewed literal, never a setting.
+      pmos: { aliases: [gateway.pmos.internal], ipv4_address: 10.201.77.11 }
     ports: ["127.0.0.1:${PMOS_GATEWAY_PORT:-8740}:8740"]
     environment:
       PMOS_GATEWAY_BIND: 0.0.0.0:8740
@@ -167,7 +177,8 @@ services:
     <<: *service
     command: ["pmos-bots"]
     networks:
-      pmos: { aliases: [bots.pmos.internal] }
+      # Pinned (slice H2): a reviewed literal, never a setting.
+      pmos: { aliases: [bots.pmos.internal], ipv4_address: 10.201.77.12 }
     ports: ["127.0.0.1:${PMOS_BOTS_PORT:-8750}:8750"]
     environment:
       PMOS_BOTS_BIND: 0.0.0.0:8750
@@ -400,8 +411,10 @@ services:
     restart: unless-stopped
     # deploy/gateway.yaml (`class: production`) names each model server
     # `<service>.pmos.internal`, the only form a production gateway accepts (docs/gateway.md).
+    # Pinned (slice H2), so no other container can hold the address the gateway checks its
+    # name against (slice H4) after this one restarts.
     networks:
-      pmos: { aliases: [vllm-default.pmos.internal] }
+      pmos: { aliases: [vllm-default.pmos.internal], ipv4_address: 10.201.77.13 }
     ipc: host
     environment:
       HF_TOKEN: ${HF_TOKEN:-}
@@ -429,7 +442,7 @@ services:
   vllm-extraction:
     <<: *vllm
     networks:
-      pmos: { aliases: [vllm-extraction.pmos.internal] }
+      pmos: { aliases: [vllm-extraction.pmos.internal], ipv4_address: 10.201.77.14 }
     command:
       - vllm
       - serve
@@ -443,14 +456,28 @@ networks:
   # on this host reaches the web app from (the gateway) never moves when the network is made
   # again, and PMOS_WEB_TRUSTED_PROXIES stays right. 10.201.77.0/24 is outside Docker's own
   # default pools (172.17-172.31.0.0/16, 192.168.0.0/16), so Docker never gives it to another
-  # network; a site that already routes it sets both in deploy/.env (deploy/env.example).
+  # network. A site that already routes it can't simply set another subnet in deploy/.env since
+  # slice H2: the pinned addresses below must stay inside it, so that is a reviewed code change.
   # `deploy/pmos-admin up --web` checks the real gateway against these and against
   # PMOS_WEB_TRUSTED_PROXIES, and refuses on a mismatch.
+  #
+  # Slice H2 (docs/openshell-any-host-spec.md §3.3): the tool server, gateway and runtime, and the
+  # two model servers, have fixed addresses (.10 to .14), so the subnet must be a /24 or longer
+  # that holds them. Docker hands every other container (the eval stack's, a `docker run
+  # --network pmos_pmos`) an address from `ip_range` only (.128 to .254 by default), so none can
+  # take a pinned one; .2 to .127 are for pinned addresses (a reverse-proxy container pinned
+  # under PMOS_WEB_TRUST_PROXY_IN_NETWORK takes one outside .10 to .14). The bridge is named
+  # pmos0, so host firewall rules can match it by name however often the network is made again.
+  # `deploy/pmos-admin up` refuses settings that break any of this, and a network that exists
+  # with other settings (Compose doesn't change one that exists): down, then up, re-creates it.
   pmos:
+    driver_opts:
+      com.docker.network.bridge.name: pmos0
     ipam:
       config:
         - subnet: ${PMOS_NETWORK_SUBNET:-10.201.77.0/24}
           gateway: ${PMOS_NETWORK_GATEWAY:-10.201.77.1}
+          ip_range: ${PMOS_NETWORK_IP_RANGE:-10.201.77.128/25}
 
 volumes:
   pgdata: {}

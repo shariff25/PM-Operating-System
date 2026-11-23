@@ -33,7 +33,7 @@ Run them as the user OpenShell runs as, not with `sudo`. A bot name is lowercase
 and single hyphens, at most 32 characters; `pmos-admin` refuses anything else before it writes a
 token or creates a sandbox. The worker runs as that user's systemd unit, which restarts it if it
 fails (at most five times in ten minutes, then it stays failed until `resume`) and starts it
-again after a reboot, as long as lingering is on (`install.md`, Stage 4 step 1).
+again after a reboot, as long as lingering is on (`install.md`, Stage 4 step 2).
 
 Until you do, their bot's tasks wait in the queue. Their `setup` checklist shows the bot as
 "being set up".

@@ -172,18 +172,38 @@ If another stack on the host already listens on 127.0.0.1:8710 to 8770, set
 
 The bring-up worker isn't isolated. Replace it with the Docs bot's real sandbox.
 
-> **Stop here until slice H2 is built.** Sandboxes can't reach the three services yet, on the
-> Spark or any other host. This step used to map `toolserver.pmos.internal`,
-> `gateway.pmos.internal` and `bots.pmos.internal` to `127.0.0.1` in `/etc/hosts`, which can't
-> work: OpenShell's network rules never allow a loopback destination, and inside a sandbox
-> `127.0.0.1` is the sandbox itself. The services publish their ports on `127.0.0.1` only, so no
-> other address on the host serves them today. Slice H2 pins each service to its own address on
-> the `pmos` network and writes the names with `pmos-admin host-names apply`
-> (`docs/openshell-any-host-spec.md`, §3.3). Don't add a hosts line by hand. If you have the old
-> `127.0.0.1` line, remove it. Until H2, keep using the bring-up worker (Stage 2) with fake data
-> only. Steps 2 to 5 below are written for when H2 is in.
+> **Not yet seen on a real OpenShell host.** Step 1 is how sandboxes find the three services
+> (`docs/openshell-any-host-spec.md`, §3.3). That OpenShell resolves names through this host's
+> `/etc/hosts`, and that a sandbox reaches an address on the `pmos` network, are checked in the
+> acceptance run (§6, step 4: O-REACH, and H-1 from the Docs bot's sandbox). If a sandbox can't
+> reach the services by name, stop and report: don't work around it (§3.3, step 6).
 
-1. **Turn on lingering** for the user OpenShell runs as (once). OpenShell's gateway and each
+1. **Write the service names** (once, and again whenever `host-names check` fails). The tool
+   server, gateway and runtime have fixed addresses on the `pmos` network, `10.201.77.10`, `.11`
+   and `.12` (`deploy/compose.yaml`; the two model servers have `.13` and `.14`). A sandbox can't
+   reach them on `127.0.0.1`: OpenShell never allows a loopback destination, and inside a sandbox
+   `127.0.0.1` is the sandbox itself. So the host resolves the three names to those addresses,
+   through a block `pmos-admin` keeps in `/etc/hosts`:
+   ```sh
+   sudo deploy/pmos-admin host-names apply   # writes or replaces only its own block
+   deploy/pmos-admin host-names check        # each name resolves to its own address
+   ```
+   The block sits between `# BEGIN pmos (managed by pmos-admin)` and `# END pmos`; every other
+   line of `/etc/hosts` is kept. It always holds the same three lines on every host, and takes no
+   argument or setting. Don't edit it, and don't add a line for these names anywhere else:
+   `check` fails on a missing, stale or doubled block, on any other line that names one of them
+   (the old `127.0.0.1 toolserver.pmos.internal …` line included: remove it), and when the host's
+   resolver answers anything else. `apply` keeps lines that aren't its own, so it exits 1 and
+   names any such line for you to remove. `deploy/pmos-admin sandbox` refuses to start a sandbox
+   while `check` fails, and `deploy/pmos-admin status` shows it every time.
+
+   The addresses are reviewed code, not settings: `deploy/pmos-admin up` refuses a
+   `PMOS_NETWORK_SUBNET` that is shorter than a `/24` or doesn't hold `10.201.77.10` to `.14`, and
+   a `PMOS_NETWORK_IP_RANGE` (the addresses Docker hands every other container,
+   `10.201.77.128/25` by default) that holds any of them. It also refuses a `pmos` network that
+   was made with other settings, such as one made before these addresses existed; re-create it
+   with `deploy/pmos-admin down && deploy/pmos-admin up` (no eval stack may be running).
+2. **Turn on lingering** for the user OpenShell runs as (once). OpenShell's gateway and each
    bot's worker are that user's systemd services, and without lingering they stop when you log
    out and don't start after a reboot. Run it as that user (not root):
    ```sh
@@ -192,12 +212,12 @@ The bring-up worker isn't isolated. Replace it with the Docs bot's real sandbox.
    ```
    `deploy/pmos-admin sandbox` and `resume` refuse to start a worker until this says `yes`.
    Run every `pmos-admin sandbox`, `pause` and `resume` as this same user, never with `sudo`.
-2. **Load the provider profiles** (once). Each command is from `docs/sandbox-policies.md`:
+3. **Load the provider profiles** (once). Each command is from `docs/sandbox-policies.md`:
    ```sh
    openshell provider profile import -f /srv/pmos/content-repo/policies/providers/pmos-gateway.yaml --global
    openshell provider profile import -f /srv/pmos/content-repo/policies/providers/pmos-worker.yaml --global
    ```
-3. **Start the Docs bot's sandbox, without the bring-up worker:**
+4. **Start the Docs bot's sandbox, without the bring-up worker:**
    ```sh
    deploy/pmos-admin down && deploy/pmos-admin up --models
    deploy/pmos-admin sandbox docs --dry-run    # what it will run; no tokens are printed
@@ -214,12 +234,12 @@ The bring-up worker isn't isolated. Replace it with the Docs bot's real sandbox.
    Not yet seen on a real OpenShell: whether `--from` takes the local image tag, and whether
    `sandbox exec` stays in the foreground for as long as the worker runs. Note in the record what
    you saw (`docs/openshell-any-host-spec.md` §6, step 2).
-4. **Create each platform owner's personal bot sandbox:**
+5. **Create each platform owner's personal bot sandbox:**
    ```sh
    deploy/pmos-admin add-bot pm-<handle>
    deploy/pmos-admin sandbox pm-<handle>
    ```
-5. **Run the red-team checklist** in `policies/redteam/checklist.md`. Run it on the Spark only,
+6. **Run the red-team checklist** in `policies/redteam/checklist.md`. Run it on the Spark only,
    never on a shared machine. Work through the "Verify on the Spark" table in
    `docs/sandbox-policies.md` as you go, and note anything that differed.
 
