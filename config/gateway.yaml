@@ -32,9 +32,10 @@ limits:
 # in flight (docs/gateway.md). Unlisted clients: not trusted, `personal`, `per-user` slots.
 clients:
   runtime: {trusted: true, max-in-flight: 2}
-  # A PM's own bot (bot-pm-<handle>) may name only that PM; a team bot (bot-docs) anyone. A
-  # client that may name anyone (runtime, bot-*) holds at most one of a PM's two running slots
-  # (`per-user-share`, default 1 for such a client), so the PM's own bot always has one.
+  # A PM's own bot (bot-pm-<handle>) may name only that PM; a team bot (bot-docs) anyone.
+  # Because a `from-name` client is listed, the clients that may name anyone (runtime, bot-*)
+  # hold at most one of a PM's two running slots together, so the other is only ever taken
+  # by the PM's own bot (docs/gateway.md, "A person's own bot's slot").
   bot-pm-*: {trusted: true, max-in-flight: 3, user: from-name}
   bot-*: {trusted: true, max-in-flight: 3}
   evals: {max-in-flight: 1, priority: personal}

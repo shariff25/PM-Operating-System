@@ -532,6 +532,11 @@ pub async fn run(args: &[String], io: Io<'_>) -> i32 {
                     if u.identity(super::IdentityKind::Slack).is_some() {
                         flags.push("slack".into());
                     }
+                    // U3 (review at c78b5fb): spelled as another user's handle.
+                    let clash = dir.spelling_clash_of(&u.handle);
+                    if !clash.is_empty() {
+                        flags.push(format!("spelling_clash:{}", clash.join(",")));
+                    }
                     say!(
                         out,
                         "{:<24} {:<12} {:<26} {}",
@@ -547,6 +552,9 @@ pub async fn run(args: &[String], io: Io<'_>) -> i32 {
                     dir.users.len(),
                     dir.version
                 );
+                for w in dir.spelling_clash_warnings() {
+                    say!(err, "warning: {w}");
+                }
                 DONE
             }
             Err(e) => {

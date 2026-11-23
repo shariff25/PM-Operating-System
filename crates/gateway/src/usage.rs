@@ -67,6 +67,12 @@ pub struct UsageEvent {
     /// of the held refusals named someone not in it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refused_users_more: Option<u64>,
+    /// On a `403` line only: the person key of the handle in `user` (its spelled form,
+    /// `config::person_key`), the form every other line's `user` has, so a refusal can be
+    /// matched to that person's calls (`ana.k` is `ana-k`; the Low on 403 lines, review at
+    /// c78b5fb). On a summary line, the last refusal's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_key: Option<String>,
 }
 
 /// How long a client's refusals of one status are counted into one summary line, after the
@@ -273,6 +279,7 @@ mod tests {
             refused_count: None,
             refused_users: Vec::new(),
             refused_users_more: None,
+            user_key: None,
         }
     }
 

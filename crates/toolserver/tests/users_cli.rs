@@ -279,3 +279,51 @@ async fn the_host_issues_a_password_setup_code() {
     assert!(!stored[0].contains(&code) && stored[0].len() == 64);
     pg.drop_schema().await;
 }
+
+/// U3 (review at c78b5fb): `users list` flags users whose handles spell the same, made before
+/// PM OS refused such handles (here with the trigger off, as an older database holds them),
+/// and warns about each group on stderr; with none, it says nothing more.
+#[tokio::test]
+async fn the_user_list_warns_about_handles_that_spell_the_same() {
+    let Some(pg) = TestPg::new().await else {
+        return;
+    };
+    let url = pg.schema_url();
+    let env = [
+        ("PMOS_HOST_USER", "opsuser"),
+        ("PMOS_DATABASE_URL", url.as_str()),
+    ];
+    let o = users(&BOOTSTRAP, &env);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o).1);
+    let o = users(&["list"], &env);
+    let (out, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{err}");
+    assert!(
+        !out.contains("spelling_clash") && !err.contains("warning"),
+        "{out}{err}"
+    );
+    for sql in [
+        "ALTER TABLE users DISABLE TRIGGER users_invariants",
+        "INSERT INTO users (handle, status, created_at, created_by, created_client)
+         VALUES ('raj.', 'active', now(), 'host', 'host')",
+        "ALTER TABLE users ENABLE TRIGGER users_invariants",
+    ] {
+        sqlx::query(sql).execute(pg.store.pool()).await.unwrap();
+    }
+    let o = users(&["list"], &env);
+    let (out, err) = text(&o);
+    assert_eq!(o.status.code(), Some(0), "{err}");
+    let line = |h: &str| {
+        out.lines()
+            .find(|l| l.split_whitespace().next() == Some(h))
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert!(line("raj").contains("spelling_clash:raj."), "{out}");
+    assert!(line("raj.").contains("spelling_clash:raj"), "{out}");
+    assert!(
+        err.contains("warning: handles `raj`, `raj.` are all spelled `raj`"),
+        "{err}"
+    );
+    pg.drop_schema().await;
+}

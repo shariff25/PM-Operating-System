@@ -1346,6 +1346,11 @@ and one person's model slots. Creating a user whose handle is spelled as an exis
 every client (`users.create` in the web app and on the host, `bootstrap-admin`, a Slack join's
 approval); `users import` reports such a member as a `conflict` and creates the rest. Users
 that already clash are left as they are (no migration), and share their caps at the gateway.
+Since finding U3 of the review at c78b5fb they are reported: `users list` on the host flags
+each with `spelling_clash:<the others>` and prints a `warning:` line per group on stderr, and
+the web API's user list (`GET /internal/admin/users`) gives each user a `spelling_clash` array
+(the others' handles) and the list a `warnings` array (one line per group). The database
+refuses such a handle too (below), so raw SQL can't add one.
 
 **The database is the guarantee.** A deferred constraint trigger, `users_invariants()`, runs
 at commit for any change to `users`, `user_roles`, `user_identities` or `pilot_exceptions`.
@@ -1357,7 +1362,11 @@ COMMITTED (so the checks read a fresh snapshot after the lock), and then refuses
   `expires_at` (`dual_role`); checked for the people the change touched, so a lapsed exception
   blocks other changes to such a person but never the ones that resolve it (revoking either
   role, deactivating them, `off --revoke-auditor`);
-- the `evals` account holding any role but `pm`, or any identity (`evals_account`).
+- the `evals` account holding any role but `pm`, or any identity (`evals_account`);
+- a user inserted, or a handle changed, so that its spelled form (`spelled_handle()`, the same
+  rule as the Rust one) is another user's, active or deactivated (`exists`; migration 0028,
+  finding U3 of the review at c78b5fb). Only the new or renamed row is checked, so users that
+  already clash can still be changed.
 
 `role_changes` is append-only by its own trigger, which never reads the audit purge's
 `pmos.audit_purge` setting: `UPDATE` and `TRUNCATE` are always refused, and `DELETE` only from

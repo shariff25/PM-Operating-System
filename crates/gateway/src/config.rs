@@ -139,8 +139,9 @@ struct ClientSpec {
     user: Option<String>,
     /// How many of one person's `limits.per-user` running slots this client may hold at once
     /// (finding G3 of the review at 6bb806f). `None`: 1 for a trusted `user: any` client (a
-    /// team bot, or the runtime), so it can never hold all of a PM's slots; `per-user` for a
-    /// `from-name` client, which names only its own PM.
+    /// team bot, or the runtime); `per-user` for a `from-name` client, which names only its
+    /// own PM. When `clients:` lists a `from-name` client, a `user: any` client's share is at
+    /// most `per-user - 1` ([`Models::shared_person_cap`], finding U1).
     #[serde(default)]
     per_user_share: Option<usize>,
 }
@@ -173,9 +174,13 @@ pub struct ClientPolicy {
     /// Which people it may name, when trusted.
     pub user: UserRule,
     /// The most of one believed person's `per-user` running slots this client may hold
-    /// (G3, review at 6bb806f): 1 by default for a trusted `user: any` client, so a team
-    /// bot's token naming a PM leaves that PM a slot for their own calls.
+    /// (G3, review at 6bb806f): 1 by default for a trusted `user: any` client.
     pub per_user_share: usize,
+    /// For a trusted `user: any` client: the most of one person's running slots that all
+    /// such clients together may hold ([`Models::shared_person_cap`], finding U1). `None`
+    /// for a `from-name` client (it names only its own PM) and an untrusted one (it names
+    /// no one).
+    pub shared_person_cap: Option<usize>,
 }
 
 impl ClientPolicy {
@@ -386,6 +391,22 @@ impl Models {
                     .into(),
             );
         }
+        // U1: when a PM's own bot (`from-name`) is configured, one of each person's slots is
+        // kept for it, so the clients that may name anyone (the runtime and every team bot)
+        // together hold at most `per-user - 1` of them.
+        let reserve = usize::from(
+            file.clients
+                .values()
+                .any(|c| c.user.as_deref() == Some("from-name")),
+        );
+        if reserve > 0 && limits.per_user < 2 {
+            return Err(
+                "gateway config: a `user: from-name` client keeps one of each person's running \
+                 slots for that person's own bot, so limits.per-user must be at least 2"
+                    .into(),
+            );
+        }
+        let shared_cap = limits.per_user - reserve;
         let mut clients = BTreeMap::new();
         for (name, spec) in file.clients {
             let pattern = name.strip_suffix('*');
@@ -437,7 +458,10 @@ impl Models {
                 }
             };
             // G3 (review at 6bb806f): a client that may name anyone holds at most this many of
-            // one person's running slots, 1 unless it says otherwise.
+            // one person's running slots, 1 unless it says otherwise; with a `from-name` client
+            // listed, never more than all such clients together may hold (U1).
+            let shared = spec.trusted && user == UserRule::Any;
+            let most = if shared { shared_cap } else { limits.per_user };
             let per_user_share = match spec.per_user_share {
                 Some(n) if !spec.trusted => {
                     return Err(format!(
@@ -445,7 +469,15 @@ impl Models {
                          `trusted: true` (an untrusted client names no one)"
                     ))
                 }
-                Some(n) if n == 0 || n > limits.per_user => {
+                Some(n) if (n == 0 || n > most) && most < limits.per_user => {
+                    return Err(format!(
+                        "gateway config: client `{name}`: per-user-share must be 1 to {most}, \
+                         not {n}: limits.per-user ({}) less the one slot of each person's kept \
+                         for their own bot (a `user: from-name` client is listed)",
+                        limits.per_user
+                    ))
+                }
+                Some(n) if n == 0 || n > most => {
                     return Err(format!(
                         "gateway config: client `{name}`: per-user-share must be 1 to \
                          limits.per-user ({}), not {n}",
@@ -478,6 +510,7 @@ impl Models {
                         .unwrap_or_else(|| max_in_flight.saturating_mul(2)),
                     user,
                     per_user_share,
+                    shared_person_cap: shared.then_some(shared_cap),
                 },
             );
         }
@@ -621,6 +654,7 @@ impl Models {
             user: UserRule::Any,
             // Untrusted: it names no one, so no person's slots are counted for it.
             per_user_share: self.limits.per_user,
+            shared_person_cap: None,
         };
         if let Some(p) = self.clients.get(client) {
             return *p;
@@ -675,6 +709,20 @@ impl Models {
                 ))
             })
             .collect()
+    }
+
+    /// The most of one person's `per-user` running slots that the trusted `user: any`
+    /// clients (the runtime, every team bot) may hold **together** (finding U1 of the review
+    /// at c78b5fb): `per-user - 1` when `clients:` lists a `user: from-name` client, so the
+    /// last slot is only ever taken by that person's own bot; `per-user` when none is listed
+    /// (the test stack's configs), as there is no own bot to keep it for. Each such client
+    /// also holds at most its own `per-user-share`.
+    pub fn shared_person_cap(&self) -> usize {
+        let reserve = self
+            .clients
+            .values()
+            .any(|p| matches!(p.user, UserRule::FromName { .. }));
+        self.limits.per_user - usize::from(reserve)
     }
 
     /// The role a request's `model` names: `pmos/<role>`. A concrete model name is refused,

@@ -65,7 +65,7 @@ async fn main() -> Result<()> {
         tracing::info!(
             client = %client.name, trusted = p.trusted, max_in_flight = p.max_in_flight,
             max_queue = p.max_queue, priority = ?p.priority, user = ?p.user,
-            per_user_share = p.per_user_share, "client"
+            per_user_share = p.per_user_share, shared_person_cap = ?p.shared_person_cap, "client"
         );
     }
     let app = router(GatewayConfig {

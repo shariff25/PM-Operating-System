@@ -457,6 +457,57 @@ impl Directory {
             .collect()
     }
 
+    /// Groups of two or more users (active or deactivated) whose handles a personal bot's
+    /// name and the model gateway spell the same (`ana.k`, `ana_k`; finding U3 of the review
+    /// at c78b5fb): each group's handles in order, the groups in order of their first handle.
+    /// Such users share one bot name and one person's model slots. PM OS refuses to create
+    /// one beside another (`rules::Builder::spelling_clash`, and the database since migration
+    /// 0028), so a group here was made before that check; it is reported, never changed.
+    pub fn spelling_clashes(&self) -> Vec<Vec<&str>> {
+        let mut by_spelling: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+        for handle in self.users.keys() {
+            by_spelling
+                .entry(pmos_contract::onboarding::spelled_handle(handle))
+                .or_default()
+                .push(handle);
+        }
+        let mut groups: Vec<Vec<&str>> =
+            by_spelling.into_values().filter(|g| g.len() > 1).collect();
+        groups.sort();
+        groups
+    }
+
+    /// The other users whose handles spell as `handle`'s does ([`Directory::spelling_clashes`]).
+    pub fn spelling_clash_of(&self, handle: &str) -> Vec<&str> {
+        let spelled = pmos_contract::onboarding::spelled_handle(handle);
+        self.users
+            .keys()
+            .filter(|h| {
+                h.as_str() != handle && pmos_contract::onboarding::spelled_handle(h) == spelled
+            })
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// The user list's warning for each group in [`Directory::spelling_clashes`].
+    pub fn spelling_clash_warnings(&self) -> Vec<String> {
+        self.spelling_clashes()
+            .into_iter()
+            .map(|g| {
+                format!(
+                    "handles {} are all spelled `{}` in a personal bot's name and by the model \
+                     gateway, so they share one bot name and one person's model slots; they were \
+                     made before PM OS refused such handles and are left as they are",
+                    g.iter()
+                        .map(|h| format!("`{h}`"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    pmos_contract::onboarding::spelled_handle(g[0])
+                )
+            })
+            .collect()
+    }
+
     /// Active people holding both Admin and Auditor.
     pub fn dual_role_holders(&self) -> Vec<&User> {
         self.users

@@ -719,7 +719,11 @@ impl<'a> Builder<'a> {
     /// is ([`pmos_contract::onboarding::spelling_clash`]): `ana.k` for a new `ana_k`. The model
     /// gateway keeps each person's calls under that spelling, and a personal bot is named by
     /// it, so two such users would share both (the Low on colliding handles, review at
-    /// 6bb806f). Existing rows that already clash are left as they are.
+    /// 6bb806f). Existing rows that already clash are left as they are, and the user list
+    /// warns about them ([`Directory::spelling_clashes`]). The database refuses such a row
+    /// too, from raw SQL (`users_invariants()`, migration 0028; finding U3 of the review at
+    /// c78b5fb); the in-memory store's writes all come through here, so its invariant check
+    /// (`check_invariants`) needs no copy of that rule.
     pub(crate) fn spelling_clash(&self, handle: &str) -> Option<String> {
         let pending = self.writes.iter().filter_map(|w| match w {
             Write::InsertUser(u) => Some(u.handle.as_str()),
