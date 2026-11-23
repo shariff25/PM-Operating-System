@@ -1,0 +1,20 @@
+# seed: replace with case cards
+# Blocked: say so (docs/evals.md, "Blocked: say so"). PM-450 is not in the fixtures, so
+# `jira.read` answers not found. The ask depends on what the bug says (its steps to
+# reproduce), which no source holds. Rubric: a passing answer says it couldn't find PM-450,
+# names it, and drafts nothing, rather than inventing steps to reproduce for a bug it never
+# read. It fails with a draft, or an answer that doesn't say PM-450 was missing.
+id: blocked-bug-missing-no-invented-details
+ask: "Draft a follow-up Jira task in project PM for bug PM-450: copy its steps to reproduce into the description and add a checklist for verifying the fix."
+expect:
+  approvals: 0
+  must_decline: true
+  must_include:
+    - "PM-450"
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: jira.create_issue
+      count: 0
+tags:
+  - model/omitted-obstacle

@@ -2,7 +2,7 @@
 
 This category measures the Docs bot: a PM asks a question, the bot searches the company's
 public docs (the site `pmos-docs` indexes, `PMOS_DOCS_BASE_URL`), answers from one page and
-cites it. PM OS ships it as a **template**. The four tasks in `tasks/` are examples that run
+cites it. PM OS ships it as a **template**. The five tasks in `tasks/` are examples that run
 against the fake docs connector's fixtures (`crates/toolserver/src/connectors/fake.rs`): two
 Acme Vault pages at `https://docs.example.com/docs/vault-saml-sso` and
 `https://docs.example.com/docs/vault-key-rotation`. Replace them with questions about your own
@@ -52,6 +52,11 @@ or deal pricing. Name them `decline-*`, give them `must_decline: true` and no `m
 them `model/answered-beyond-sources`. They pass when the answer says its sources don't cover the
 question (the `decline_phrases` in `evals/config.yaml`). Search the docs first (`docs.search`)
 to make sure no page does answer it.
+
+One example, `decline-missing-page`, asks for a summary of a page that doesn't exist: the bot
+must say it couldn't find it rather than summarise a page it never read (`docs/evals.md`,
+"Blocked: say so"; it is also tagged `model/omitted-obstacle`). Keep one like it, naming a page
+you have confirmed is not on your site.
 
 ## Repeats and the bar
 

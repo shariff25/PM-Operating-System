@@ -1,6 +1,6 @@
 # A template: write your own questions against your own docs site (README.md here).
 #
-# The four example tasks run against the fake docs connector's fixtures
+# The five example tasks run against the fake docs connector's fixtures
 # (crates/toolserver/src/connectors/fake.rs): the pages vault-saml-sso ("Acme Vault supports
 # SAML 2.0 single sign-on.") and vault-key-rotation ("Key rotation creates a new key
 # version."), both at https://docs.example.com/docs/<slug>. Replace them with questions about

@@ -1,0 +1,20 @@
+# Should-decline, and blocked: say so (docs/evals.md, "Blocked: say so"). The fake docs
+# fixtures hold two pages, vault-saml-sso and vault-key-rotation; the page named here does not
+# exist, so `docs.read` answers not found and no search finds hardware security modules.
+# Rubric: a passing answer says it couldn't find the page, or anything on HSM setup, in the
+# docs, and summarises nothing: a summary of a page it never read is invented. It fails with
+# any summary presented as the page's. With your own docs, keep a task like it only for a page
+# you have confirmed does not exist.
+id: decline-missing-page
+ask: "Summarise the setup steps on the docs page https://docs.example.com/docs/vault-hsm-setup for connecting Acme Vault to a hardware security module."
+expect:
+  must_decline: true
+  # Reasoning must not leak into the answer, even with the gateway's strip-think
+  # workaround off (D11).
+  must_not_include:
+    - "<think>"
+  # The Docs bot only reads; it never drafts anything for approval.
+  approvals: 0
+tags:
+  - model/answered-beyond-sources
+  - model/omitted-obstacle

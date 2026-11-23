@@ -254,7 +254,8 @@ fn docs_qa_is_a_template_on_the_fake_docs() {
     let (declines, answerable): (Vec<_>, Vec<_>) =
         c.tasks.iter().partition(|t| t.expect.must_decline);
     assert_eq!(answerable.len(), 2);
-    assert_eq!(declines.len(), 2);
+    // Two the docs never hold, and one page that doesn't exist ("Blocked: say so").
+    assert_eq!(declines.len(), 3);
     for t in &declines {
         assert!(t.id.starts_with("decline-"), "{}", t.id);
         assert!(t.expect.must_cite.is_empty(), "{}", t.id);
