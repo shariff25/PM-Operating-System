@@ -1350,6 +1350,9 @@ both!(reviewers_are_assigned_pms, Assert::Require, |s, _| {
     );
     let list = s.list("aud").await;
     assert_eq!(Server::user(&list, "p1")["reviewed_by"], json!(["rev"]));
+    // U3 (review at c78b5fb): no handles here spell the same, so no warning and no clash.
+    assert_eq!(list["warnings"], json!([]), "{list}");
+    assert_eq!(Server::user(&list, "p1")["spelling_clash"], json!([]));
     // The whole set: p2 goes, p3 comes.
     let v = s.version().await;
     let (st, b) = s

@@ -68,20 +68,34 @@ pub struct GatewayConfig {
 /// harness makes, and every call to the Claude test upstream) sends nothing until it's
 /// whole, so it gets `whole_answer` from the request to its last byte: with only the silence
 /// limit, every generation longer than it was cut off as a `502`.
+///
+/// `ready_cache`: how long `GET /readyz` reuses its last probe of the model servers (the Low
+/// on unauthenticated probes, review at c78b5fb). The route needs no token, so before, every
+/// request to it sent a request to each upstream; now a flood of them sends at most one
+/// round of probes per `ready_cache`. [`READY_CACHE`] by default; zero probes every time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timeouts {
     pub stream_silence: Duration,
     pub whole_answer: Duration,
+    pub ready_cache: Duration,
 }
+
+/// How long `GET /readyz` reuses a probe of the model servers, by default.
+pub const READY_CACHE: Duration = Duration::from_secs(5);
 
 impl Default for Timeouts {
     fn default() -> Self {
         Self {
             stream_silence: Duration::from_secs(120),
             whole_answer: Duration::from_secs(600),
+            ready_cache: READY_CACHE,
         }
     }
 }
+
+/// The last probe of the model servers for `GET /readyz`: when it was made, and whether each
+/// upstream base answered.
+type Probe = (Instant, std::collections::HashMap<String, bool>);
 
 struct Inner {
     retry: RetryPolicy,
@@ -100,6 +114,11 @@ struct Inner {
     remote_key: String,
     /// Remote test upstreams only: tool-call `extra_content` to give back (`remote.rs`).
     extras: Arc<ToolCallExtras>,
+    /// [`Timeouts::ready_cache`].
+    ready_cache: Duration,
+    /// `GET /readyz`'s last probe. Held across a probe, so callers that arrive while one
+    /// runs wait for it and use its result rather than probing again.
+    probe: tokio::sync::Mutex<Option<Probe>>,
 }
 
 #[derive(Clone)]
@@ -171,6 +190,8 @@ pub fn router(mut cfg: GatewayConfig) -> Router {
         remote_key: cfg.remote_key,
         retry: cfg.retry,
         extras: Arc::default(),
+        ready_cache: cfg.timeouts.ready_cache,
+        probe: tokio::sync::Mutex::new(None),
     }));
     let v1 = Router::new()
         .route("/models", get(models))
@@ -306,6 +327,10 @@ fn upstream_label(kind: UpstreamKind) -> &'static str {
 /// label and `ok` or `down`: labels only, never an address, host name, URL or key. The route
 /// needs no token, and before the review at 6bb806f its keys were the model servers' base
 /// URLs, so it named their hosts (and a remote test upstream's provider).
+///
+/// The probe of the model servers is reused for [`Timeouts::ready_cache`] (5 s by default),
+/// so unauthenticated callers can't make the gateway probe every upstream on each request;
+/// `running` and `waiting` are always read afresh.
 async fn readyz(State(state): State<AppState>) -> Response {
     let (running, waiting) = state.0.sched.snapshot();
     let class = state.0.models.class.as_str();
@@ -314,48 +339,14 @@ async fn readyz(State(state): State<AppState>) -> Response {
                            "running": running, "waiting": waiting}))
         .into_response();
     }
-    let mut upstreams: Vec<String> = state
-        .0
-        .models
-        .roles
-        .values()
-        .map(|r| r.upstream.clone())
-        .collect();
-    upstreams.sort();
-    upstreams.dedup();
     let cloud_test = state
         .0
         .models
         .roles
         .values()
         .any(|r| r.kind.is_cloud_test());
-    let mut up_by_base = std::collections::HashMap::new();
-    let mut ok = true;
-    for base in upstreams {
-        let remote = state
-            .0
-            .models
-            .roles
-            .values()
-            .any(|r| r.upstream == base && r.kind == UpstreamKind::RemoteOpenAi);
-        let probe = if remote {
-            state
-                .0
-                .http
-                .get(format!("{base}/models"))
-                .bearer_auth(&state.0.remote_key)
-        } else {
-            state.0.http.get(format!("{base}/models"))
-        };
-        let up = tokio::time::timeout(
-            Duration::from_secs(if remote { 5 } else { 2 }),
-            probe.send(),
-        )
-        .await
-        .is_ok_and(|r| r.is_ok_and(|r| r.status().is_success()));
-        ok &= up;
-        up_by_base.insert(base, up);
-    }
+    let up_by_base = probe_upstreams(&state.0).await;
+    let ok = up_by_base.values().all(|up| *up);
     // By role, with labels only (no address, host, URL or key).
     let checks: serde_json::Map<String, Value> = state
         .0
@@ -384,6 +375,51 @@ async fn readyz(State(state): State<AppState>) -> Response {
         ),
     )
         .into_response()
+}
+
+/// Whether each upstream base answers `GET <base>/models`: the cached probe while it is
+/// younger than [`Timeouts::ready_cache`], else a new one.
+async fn probe_upstreams(inner: &Inner) -> std::collections::HashMap<String, bool> {
+    let mut cached = inner.probe.lock().await;
+    if let Some((at, result)) = cached.as_ref() {
+        if at.elapsed() < inner.ready_cache {
+            return result.clone();
+        }
+    }
+    let mut upstreams: Vec<String> = inner
+        .models
+        .roles
+        .values()
+        .map(|r| r.upstream.clone())
+        .collect();
+    upstreams.sort();
+    upstreams.dedup();
+    let mut up_by_base = std::collections::HashMap::new();
+    for base in upstreams {
+        let remote = inner
+            .models
+            .roles
+            .values()
+            .any(|r| r.upstream == base && r.kind == UpstreamKind::RemoteOpenAi);
+        let probe = if remote {
+            inner
+                .http
+                .get(format!("{base}/models"))
+                .bearer_auth(&inner.remote_key)
+        } else {
+            inner.http.get(format!("{base}/models"))
+        };
+        let up = tokio::time::timeout(
+            Duration::from_secs(if remote { 5 } else { 2 }),
+            probe.send(),
+        )
+        .await
+        .is_ok_and(|r| r.is_ok_and(|r| r.status().is_success()));
+        up_by_base.insert(base, up);
+    }
+    // Timed from the end of the probe, so a slow one is still reused for the full period.
+    *cached = Some((Instant::now(), up_by_base.clone()));
+    up_by_base
 }
 
 async fn chat(
@@ -728,6 +764,7 @@ async fn forward(
         refused_count: None,
         refused_users: Vec::new(),
         refused_users_more: None,
+        user_key: None,
     };
     let who = match caller(&headers, &client, &policy) {
         Ok(c) => c,
@@ -738,15 +775,22 @@ async fn forward(
             // R1: the client's token is believed only for its own PM. The line names whom it
             // tried to name, so an operator sees a worker token used for someone else. A
             // looping token gets its first refusal recorded and then a count a minute.
-            let line = refused_line(
+            // `user_key` is the person key every other line uses for that handle (its
+            // spelled form, `config::person_key`), so the refusal can be matched to them.
+            let user_key = crate::config::person_key(&named);
+            let mut line = refused_line(
                 403,
                 Some(named.clone()),
                 None,
                 policy.priority,
                 "names a person this client may not name",
             );
+            line.user_key = Some(user_key.clone());
             if inner.usage.record_refusal(line) {
-                tracing::warn!(client = %client, named = %named, "a client named a person it may not name");
+                tracing::warn!(
+                    client = %client, named = %named, user_key = %user_key,
+                    "a client named a person it may not name"
+                );
             }
             return error(
                 StatusCode::FORBIDDEN,
@@ -761,9 +805,12 @@ async fn forward(
     // `X-Pmos-User`); the client's own cap always applies. Without a believed person, the
     // client's cap alone bounds its calls. The same holds for calls waiting (R2).
     // A client may hold only its share of the person's running slots (G3).
+    // Clients that may name anyone hold at most their shared cap of the person's running
+    // slots together, so with a PM's own bot configured, its calls never wait on theirs (U1).
     let owner = Owner::new(who.user.as_deref(), &client, policy.max_in_flight)
         .with_queue(policy.max_queue)
-        .with_person_share(policy.per_user_share);
+        .with_person_share(policy.per_user_share)
+        .with_shared_cap(policy.shared_person_cap);
     let permit = match slot(inner, &owner, who.priority).await {
         Ok(p) => p,
         Err(why) => {
@@ -804,6 +851,7 @@ async fn forward(
         refused_count: None,
         refused_users: Vec::new(),
         refused_users_more: None,
+        user_key: None,
     };
     let model_header = HeaderValue::from_str(&role.model).ok();
     let finish = |mut res: Response| {

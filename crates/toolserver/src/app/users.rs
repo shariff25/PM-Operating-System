@@ -345,6 +345,9 @@ pub fn user_json(
         "team_bots": team_bots,
         "reviews": dir.reviews(&u.handle),
         "reviewed_by": dir.reviewers_of(&u.handle),
+        // U3 (review at c78b5fb): other users whose handles spell as this one's, which
+        // share its bot name and its model slots (made before PM OS refused such handles).
+        "spelling_clash": dir.spelling_clash_of(&u.handle),
     });
     if addresses {
         v["sign_in_name"] = json!(u.sign_in_name);
@@ -457,6 +460,8 @@ async fn list(
             "deactivations": limits(&state, &dir),
             "pilot_exception": exception_json(&dir, now),
             "linking": state.oauth.is_some(),
+            // U3: one line per group of handles that spell the same (`spelling_clash`).
+            "warnings": dir.spelling_clash_warnings(),
         }))
         .into_response(),
     )

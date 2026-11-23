@@ -68,11 +68,28 @@ it can be deleted.
 - **A client's share of one person** (`clients.<name>.per-user-share`, finding G3 of the review
   at 6bb806f): a trusted client that may name anyone (`user: any`: a team bot such as
   `bot-docs`, or the runtime) holds at most this many of one person's `per-user` running slots,
-  **1 by default**; a `from-name` client (the PM's own bot) may hold all of them. Dispatch is
-  oldest-first within a priority, so before, a team bot's token whose calls for a PM came
-  first could hold both of that PM's slots and the PM's own bot waited behind it; now the PM's
-  own client always finds a slot. The share is 1 to `per-user`, and only for a trusted client.
-  The test stack's configs raise it for their shared `runtime` and `worker` tokens (below).
+  **1 by default**; a `from-name` client (the PM's own bot) may hold all of them. The share is
+  1 to `per-user` (1 to `per-user - 1` for a `user: any` client when a `from-name` client is
+  listed, below), and only for a trusted client. The test stack's configs raise it for their
+  shared `runtime` and `worker` tokens (below).
+- **A person's own bot's slot** (finding U1 of the review at c78b5fb): when `clients:` lists a
+  `user: from-name` client, the trusted `user: any` clients (the runtime and every team bot)
+  hold at most `per-user - 1` of one person's running slots **together**
+  (`Models::shared_person_cap`), so the last of them is only ever taken by that person's own
+  bot. What is guaranteed: a call from a PM's own bot for that PM never waits on the runtime's
+  or a team bot's calls for them; it starts as soon as the PM has fewer than `per-user` calls
+  running and a GPU slot (`max-in-flight`) and its own client's cap allow. It can still wait
+  behind its own bot's other calls, and behind other people's calls when every GPU slot is
+  taken. Before, each client's share counted on its own, so two `user: any` clients (the
+  runtime and `bot-docs`, or two team bots), each within its share of 1, held both of a PM's
+  2 slots between them and the PM's own bot waited; the earlier claim here that the own bot
+  "always finds a slot" was not true. A config that lists a `from-name` client needs
+  `per-user` of at least 2, and is refused at start-up otherwise, as is a `user: any` client's
+  `per-user-share` above `per-user - 1`. A config with no `from-name` client (the test
+  stack's) keeps no slot back: its `user: any` clients may hold all of `per-user` together.
+  Tested in `scheduler.rs`,
+  `clients_that_may_name_anyone_together_leave_a_pm_their_own_bots_slot`, and with the shipped
+  config in `limits.rs`, `two_shared_clients_cant_fill_a_pms_slots_and_her_own_bot_still_runs`.
 - **Per client:** each client token has its own cap, `clients.<name>.max-in-flight` (default
   `limits.per-client`, itself defaulting to `per-user`), whoever its calls name. So one token
   can't hold every slot (review finding N3); in `deploy/gateway.yaml` the `evals` token, which
@@ -130,9 +147,12 @@ it can be deleted.
     count together. The trade-off: a PM whose handle has `.` or `_` (`ana.k`) appears as
     `ana-k` on every usage line. Handles that spell the same (`ana.k`, `ana_k`) would share a
     key, so PM OS refuses to create a handle spelled as an existing user's
-    (`docs/toolserver.md`, "Handles that spell the same"); rows that already clash share
-    their caps. A `403` line's `user` is still the handle as the client sent it (the evidence
-    of whom it tried to name).
+    (`docs/toolserver.md`, "Handles that spell the same"; since U3 the database refuses it
+    too, migration 0028); rows that already clash share their caps, and the user list warns
+    about them. A `403` line's `user` is still the handle as the client sent it (the evidence
+    of whom it tried to name), and its `user_key` the spelled form, as every other line's
+    `user` (the Low on 403 lines, review at c78b5fb), so a refusal can be matched to that
+    person's calls; the start-up warning for it carries both too.
   - **Names that only look like it** (the Low on `bot-pm` names): a client named `bot-pm` or
     `bot-pmana` (no hyphen) would fall under `bot-*` and may name anyone. A name that starts
     with a `from-name` pattern's prefix without its trailing hyphen, but not with the whole
@@ -145,9 +165,14 @@ it can be deleted.
   `bot-pm-*` with `user: from-name` (each PM's own bot's worker; cap 3 of 4) and `bot-*` (a
   team bot's worker, such as `bot-docs`, naming the PM whose task it runs; cap 3 of 4), and
   caps `evals` at 1, `personal`. `runtime` and `bot-*` keep the default `per-user-share` of 1,
-  so neither holds both of a PM's 2 running slots; `bot-pm-*` may. **Known residual (S8):** a
-  team bot's token can still name any PM, since it serves them all; it holds at most 3 slots,
-  one of any one PM's, and 6 waiting places. The test stack (`scripts/claude-test-stack.sh`)
+  and together hold at most 1 of a PM's 2 running slots (U1, above); `bot-pm-*` may hold
+  both. **The runtime runs one call per PM at a time** (finding U2 of the review at c78b5fb):
+  a PM's second routine (or a routine beside a team bot's call for them) waits for the shared
+  slot, up to `queue-wait-secs` (300 s), and then gets `503` with `Retry-After: 5`. A share of
+  2 for the runtime would need `per-user` 3 (a PM could then hold 3 of the 4 GPU slots), a
+  capacity decision this config does not make. **Known residual (S8):** a team bot's token
+  can still name any PM, since it serves them all; it holds at most 3 slots, one of any one
+  PM's, and 6 waiting places. The test stack (`scripts/claude-test-stack.sh`)
   gives all its workers one `worker` token, trusted to name anyone, as before, with
   `per-user-share` equal to `per-user` for `worker` and `runtime` (in the config it writes for
   another provider and in `config/gateway.claude-test.yaml`): its eval mode runs every attempt
@@ -158,6 +183,14 @@ it can be deleted.
 - **Queue deadline:** a call that has waited `limits.queue-wait-secs` (default 300) for a slot
   gives up with the same `503` and leaves the queue. A retry waiting for a slot again gives up
   the same way and returns the upstream's last answer.
+- **Readiness** (`GET /readyz`, no token): the probe of the model servers is reused for 5
+  seconds (`Timeouts::ready_cache`, `READY_CACHE`), so a flood of unauthenticated requests
+  sends at most one round of probes to the upstreams every 5 seconds (the Low on
+  unauthenticated probes, review at c78b5fb); callers that arrive while a probe runs wait for
+  it. `running` and `waiting` are read afresh on every request. A model server that goes down
+  therefore shows as `down` up to 5 seconds late (plus the probe's own timeout). Tested in
+  `gateway.rs`, `readiness_reuses_its_probe_for_a_while`; every shipped config's role-and-label
+  answer, stub off, in `limits.rs`, `readiness_of_every_shipped_config_reports_roles_by_label`.
 - **Hang-ups:** a caller that hangs up while waiting gives its place back. One that hangs up
   while its call runs (streamed or not) cancels it: the gateway drops the upstream request,
   which closes its connection to the model server, and frees the slot at once (tested in
@@ -294,11 +327,12 @@ bound every client, wait, stream and answer):
 | `clients.<…>.max-in-flight` | `limits.per-client` | This client's cap |
 | `clients.<…>.max-queue` | twice its `max-in-flight` | Calls this client may have waiting |
 | `clients.<…>.user` | `any` | `from-name` (a pattern, trusted only): it may name only the person its name spells |
-| `clients.<…>.per-user-share` | `1` for a trusted `user: any` client, else `per-user` | How many of one person's `per-user` running slots this client may hold (1 to `per-user`; trusted only) |
+| `clients.<…>.per-user-share` | `1` for a trusted `user: any` client, else `per-user` | How many of one person's `per-user` running slots this client may hold (1 to `per-user`; trusted only). With a `from-name` client listed, the `user: any` clients hold at most `per-user - 1` of them together, and each one's share is at most that (U1) |
 | `clients.<…>.priority` | `interactive` if trusted, else `personal` | An untrusted client's every call; a trusted one's calls without the header |
 
 At start-up the gateway logs its class (as served: `test` with the stub on), and each client's
-name, trust, caps, priority, `user` rule and `per-user-share` (never a token).
+name, trust, caps, priority, `user` rule, `per-user-share` and `shared_person_cap` (the U1
+cap a `user: any` client shares with the others; never a token).
 
 **Upstream forms:**
 - `http://<local host>/<base>`: an OpenAI-compatible local model server (vLLM). The only form

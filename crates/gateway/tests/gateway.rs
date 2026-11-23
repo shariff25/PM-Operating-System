@@ -140,7 +140,12 @@ async fn start_gateway(upstream: &str, limits: Limits, stub: bool, workarounds_o
         anthropic_key: "test-key".into(),
         remote_key: String::new(),
         retry: Default::default(),
-        timeouts: Default::default(),
+        // Readiness probes afresh each time here, so a test sees a model server go away at
+        // once; the probe cache has its own test (`readiness_reuses_its_probe_for_a_while`).
+        timeouts: pmos_gateway::Timeouts {
+            ready_cache: Duration::ZERO,
+            ..Default::default()
+        },
     });
     let (base, stop) = serve(app).await;
     Gw { base, usage, stop }
@@ -1128,7 +1133,11 @@ async fn readiness_names_no_upstream_host_url_model_or_key() {
             anthropic_key: ANTHROPIC_KEY.into(),
             remote_key: REMOTE_KEY.into(),
             retry: Default::default(),
-            timeouts: Default::default(),
+            // Fresh probes, so the remote upstream going away shows at once.
+            timeouts: pmos_gateway::Timeouts {
+                ready_cache: Duration::ZERO,
+                ..Default::default()
+            },
         }))
         .await
     };
@@ -1246,6 +1255,90 @@ async fn readiness_of_the_shipped_config_names_none_of_its_hosts() {
     }
     let v: Value = serde_json::from_str(&body).unwrap();
     assert_eq!((&v["class"], &v["stub"]), (&json!("test"), &json!(true)));
+    stop_gw.cancel();
+}
+
+/// The Low on unauthenticated probes (review at c78b5fb): `/readyz` needs no token, so it
+/// reuses its probe of the model servers for `ready_cache` (5 s by default) instead of
+/// probing every upstream on each request; `running` and `waiting` are still read afresh.
+/// A short cache here, so the test needn't wait 5 s.
+#[tokio::test]
+async fn readiness_reuses_its_probe_for_a_while() {
+    assert_eq!(pmos_gateway::READY_CACHE, Duration::from_secs(5));
+    assert_eq!(
+        pmos_gateway::Timeouts::default().ready_cache,
+        pmos_gateway::READY_CACHE
+    );
+    let (up, seen, stop_up) = start_recorder("/v1").await;
+    let probes = || {
+        seen.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _, _)| path == "models")
+            .count()
+    };
+    let cache = Duration::from_secs(1);
+    let yaml = format!(
+        "upstreams: {{a: '{up}'}}\nroles: {{default: {{upstream: a, model: m}}}}\n\
+         clients: {{runtime: {{trusted: true}}}}\n"
+    );
+    let (gw, stop_gw) = serve(router(GatewayConfig {
+        models: Models::from_yaml(&yaml).unwrap(),
+        clients: vec![Client {
+            name: "runtime".into(),
+            token: TOKEN.into(),
+        }],
+        usage: Arc::new(UsageLog::new(None).unwrap()),
+        stub: false,
+        workarounds_on: true,
+        anthropic_key: String::new(),
+        remote_key: String::new(),
+        retry: Default::default(),
+        timeouts: pmos_gateway::Timeouts {
+            ready_cache: cache,
+            ..Default::default()
+        },
+    }))
+    .await;
+    let ready = async || {
+        let res = reqwest::get(format!("{gw}/readyz")).await.unwrap();
+        let status = res.status().as_u16();
+        let v: Value = res.json().await.unwrap();
+        (status, v)
+    };
+    // Twenty requests at once, and more after: one probe.
+    let burst: Vec<_> = (0..20)
+        .map(|_| {
+            let gw = gw.clone();
+            tokio::spawn(
+                async move { reqwest::get(format!("{gw}/readyz")).await.unwrap().status() },
+            )
+        })
+        .collect();
+    for h in burst {
+        assert_eq!(h.await.unwrap(), 200);
+    }
+    for _ in 0..5 {
+        assert_eq!(ready().await.0, 200);
+    }
+    assert_eq!(
+        probes(),
+        1,
+        "one probe for every request within the cache's life"
+    );
+    // The model server goes away: still the cached answer until the cache runs out...
+    stop_up.cancel();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (status, v) = ready().await;
+    assert_eq!(status, 200, "{v}");
+    // ...while the load is always live.
+    assert_eq!((&v["running"], &v["waiting"]), (&json!(0), &json!(0)));
+    // ...and then a new probe, which finds it down.
+    tokio::time::sleep(cache).await;
+    let (status, v) = ready().await;
+    assert_eq!(status, 503, "{v}");
+    assert_eq!(v["upstreams"]["default"]["status"], "down");
     stop_gw.cancel();
 }
 
@@ -1681,6 +1774,7 @@ async fn a_whole_answer_may_take_longer_than_a_stream_may_stay_silent() {
     let (gw, stop) = serve(start(pmos_gateway::Timeouts {
         stream_silence: Duration::from_millis(500),
         whole_answer: Duration::from_secs(10),
+        ..Default::default()
     }))
     .await;
     let whole = ask(&gw, false).await.unwrap();
@@ -1693,6 +1787,7 @@ async fn a_whole_answer_may_take_longer_than_a_stream_may_stay_silent() {
     let (gw, stop) = serve(start(pmos_gateway::Timeouts {
         stream_silence: Duration::from_secs(10),
         whole_answer: Duration::from_millis(500),
+        ..Default::default()
     }))
     .await;
     assert_eq!(ask(&gw, false).await.unwrap().status(), 502);

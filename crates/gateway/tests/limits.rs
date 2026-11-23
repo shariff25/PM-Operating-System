@@ -198,13 +198,31 @@ async fn gateway(limits: &str, clients: &str) -> Gw {
 /// A gateway whose whole config `yaml` makes from the mock's address (`http://127.0.0.1:…`,
 /// no `/v1`), parsed with `cloud_test` as given; clients as [`gateway`]'s, plus `worker`.
 async fn gateway_from(yaml: impl FnOnce(&str) -> String, cloud_test: bool) -> Gw {
+    gateway_models(|upstream| Models::parse(&yaml(upstream), cloud_test).unwrap()).await
+}
+
+/// A shipped config (`deploy/gateway.yaml`, `config/*.yaml`) as parsed, its limits, clients
+/// and class as they are, with every role's upstream moved to the mock at `upstream` (the
+/// shipped hosts don't resolve here, and nothing may leave the machine in a test).
+fn shipped(path: &str, upstream: &str) -> Models {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let text = std::fs::read_to_string(root.join(path)).unwrap();
+    let mut m = Models::parse(&text, path.contains("claude-test")).unwrap();
+    for role in m.roles.values_mut() {
+        role.upstream = format!("{upstream}/v1");
+    }
+    m
+}
+
+/// [`gateway_from`], with the config made by `models` from the mock's address.
+async fn gateway_models(models: impl FnOnce(&str) -> Models) -> Gw {
     let up = Arc::new(Upstream::default());
     let app = Router::new()
         .route("/v1/models", get(|| async { Json(json!({"data": []})) }))
         .route("/v1/chat/completions", post(mock))
         .with_state(up.clone());
     let (upstream, stop_up) = serve(app).await;
-    let models = Models::parse(&yaml(&upstream), cloud_test).unwrap();
+    let models = models(&upstream);
     let usage = Arc::new(UsageLog::new(None).unwrap());
     let client = |name: &str, token: &str| Client {
         name: name.into(),
@@ -663,6 +681,178 @@ fn the_deploy_config_caps_evals_at_one_slot() {
         m.limits.per_user >= 2,
         "a PM keeps a slot beside a team bot"
     );
+    // U1 (review at c78b5fb): the runtime and the team bots hold one of a PM's two slots
+    // *together*, so the other is only ever her own bot's. U2: so the runtime, too, runs one
+    // call per PM at a time; a PM's second routine waits for the first (docs/gateway.md).
+    assert_eq!(m.shared_person_cap(), m.limits.per_user - 1);
+    for c in ["runtime", "bot-docs"] {
+        assert_eq!(m.client_policy(c).shared_person_cap, Some(1), "{c}");
+    }
+    assert_eq!(own.shared_person_cap, None);
+    assert_eq!(evals.shared_person_cap, None);
+}
+
+/// U1 (review at c78b5fb), with the shipped `deploy/gateway.yaml` (its limits and clients;
+/// its model servers moved to a mock): two clients that may name anyone, the runtime and a
+/// team bot, each within its share of one, can't fill both of Ana's running slots between
+/// them; her own bot's call starts at once. Before, each client's share was counted on its
+/// own, so `runtime` and `bot-docs` held both and `bot-pm-ana` waited.
+#[tokio::test]
+async fn two_shared_clients_cant_fill_a_pms_slots_and_her_own_bot_still_runs() {
+    let gw = Arc::new(gateway_models(|up| shipped("deploy/gateway.yaml", up)).await);
+    let send = |token: &'static str, text: &'static str| {
+        let gw = gw.clone();
+        tokio::spawn(async move {
+            ask(&gw, token, text, false)
+                .header("x-pmos-user", "ana")
+                .header("x-pmos-priority", "interactive")
+                .send()
+                .await
+                .unwrap()
+                .status()
+        })
+    };
+    let r = send(RUNTIME, "slow 600");
+    eventually("the runtime's call runs", async || {
+        load(&gw).await == (1, 0)
+    })
+    .await;
+    // The team bot's call for her waits, though she has a slot free and bot-docs holds none.
+    let d = send(BOT_DOCS, "slow 600");
+    let r2 = send(RUNTIME, "slow 600");
+    eventually("the shared calls wait", async || load(&gw).await == (1, 2)).await;
+    // Her own bot's call starts at once, ahead of both.
+    let t = std::time::Instant::now();
+    assert_eq!(send(BOT_ANA, "now").await.unwrap(), 200);
+    assert!(
+        t.elapsed() < Duration::from_millis(400),
+        "her own bot waited"
+    );
+    // Someone else, through the same shared clients, isn't held up by her.
+    let bo = ask(&gw, BOT_DOCS, "now", false)
+        .header("x-pmos-user", "bo")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bo.status(), 200);
+    for h in [r, d, r2] {
+        assert_eq!(h.await.unwrap(), 200);
+    }
+    assert_eq!(load(&gw).await, (0, 0));
+}
+
+/// The Low on the shipped configs' readiness (review at c78b5fb): each shipped config, stub
+/// off, with its model servers moved to mocks (no network): `/readyz` reports each role by
+/// its label, `ok` or `down`, and its class, and names none of the config's hosts, server
+/// names or model ids. Before, only `deploy/gateway.yaml` with the stub on was checked.
+#[tokio::test]
+async fn readiness_of_every_shipped_config_reports_roles_by_label() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for (path, class, label) in [
+        ("deploy/gateway.yaml", "production", "local"),
+        ("config/gateway.yaml", "test", "local"),
+        ("config/gateway.claude-test.yaml", "test", "claude-test"),
+    ] {
+        let text = std::fs::read_to_string(root.join(path)).unwrap();
+        // What the body must never carry: the config's hosts, server names and model ids.
+        let original = Models::parse(&text, path.contains("claude-test")).unwrap();
+        let mut forbidden: Vec<String> = vec!["http".into(), "://".into(), "127.0.0.1".into()];
+        for role in original.roles.values() {
+            forbidden.push(role.upstream_host());
+            forbidden.push(role.model.clone());
+        }
+        // Each upstream the config names gets its own mock, so one can go away alone.
+        let mut bases: Vec<&str> = original
+            .roles
+            .values()
+            .map(|r| r.upstream.as_str())
+            .collect();
+        bases.sort();
+        bases.dedup();
+        let mut mocks = Vec::new();
+        for _ in &bases {
+            let app =
+                Router::new().route("/v1/models", get(|| async { Json(json!({"data": []})) }));
+            mocks.push(serve(app).await);
+        }
+        let mut models = shipped(path, "unused");
+        for role in models.roles.values_mut() {
+            let i = bases
+                .iter()
+                .position(|b| *b == original.roles[&role.name].upstream)
+                .unwrap();
+            role.upstream = format!("{}/v1", mocks[i].0);
+        }
+        assert_eq!(models.class.as_str(), class, "{path}");
+        let (base, stop) = serve(router(GatewayConfig {
+            models,
+            clients: vec![Client {
+                name: "runtime".into(),
+                token: RUNTIME.into(),
+            }],
+            usage: Arc::new(UsageLog::new(None).unwrap()),
+            stub: false,
+            workarounds_on: true,
+            anthropic_key: "limits-test-anthropic-key".into(),
+            remote_key: String::new(),
+            retry: Default::default(),
+            timeouts: pmos_gateway::Timeouts {
+                ready_cache: Duration::ZERO,
+                ..Default::default()
+            },
+        }))
+        .await;
+        let ready = async || {
+            let res = reqwest::get(format!("{base}/readyz")).await.unwrap();
+            let status = res.status().as_u16();
+            let text = res.text().await.unwrap();
+            for f in &forbidden {
+                assert!(
+                    !text.contains(f.as_str()),
+                    "{path}: /readyz carries `{f}`: {text}"
+                );
+            }
+            for (mock, _) in &mocks {
+                let port = mock.rsplit(':').next().unwrap();
+                assert!(
+                    !text.contains(port),
+                    "{path}: /readyz carries a port: {text}"
+                );
+            }
+            (status, serde_json::from_str::<Value>(&text).unwrap())
+        };
+        let (status, v) = ready().await;
+        assert_eq!(status, 200, "{path}: {v}");
+        assert_eq!(
+            (&v["class"], &v["stub"]),
+            (&json!(class), &json!(false)),
+            "{path}"
+        );
+        let want: serde_json::Map<String, Value> = original
+            .roles
+            .keys()
+            .map(|r| (r.clone(), json!({"upstream": label, "status": "ok"})))
+            .collect();
+        assert_eq!(v["upstreams"], Value::Object(want), "{path}");
+        assert_eq!(v["cloud_test"], label != "local", "{path}");
+        // The first model server goes away: its roles are down, the others still ok.
+        mocks[0].1.cancel();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (status, v) = ready().await;
+        assert_eq!(status, 503, "{path}: {v}");
+        for (name, role) in &original.roles {
+            let want = if role.upstream == bases[0] {
+                "down"
+            } else {
+                "ok"
+            };
+            assert_eq!(v["upstreams"][name]["status"], want, "{path}: {name}");
+        }
+        stop.cancel();
+        for (_, s) in &mocks {
+            s.cancel();
+        }
+    }
 }
 
 /// R1: a client `bot-pm-<handle>` (pattern `bot-pm-*`, `user: from-name`) may name only that
@@ -699,6 +889,7 @@ async fn a_pms_own_bot_names_only_that_pm() {
     let line = refused[0];
     assert_eq!(line.client, "bot-pm-ana");
     assert_eq!(line.user.as_deref(), Some("bo"), "whom it tried to name");
+    assert_eq!(line.user_key.as_deref(), Some("bo"), "its person key");
     assert_eq!(line.attempts, 0);
     assert!(line.refused.is_some());
     let ok_for_ana = events
@@ -706,6 +897,24 @@ async fn a_pms_own_bot_names_only_that_pm() {
         .filter(|e| e.client == "bot-pm-ana" && e.status == 200)
         .count();
     assert_eq!(ok_for_ana, 2);
+    // The Low on 403 lines (review at c78b5fb): a refusal naming a dotted handle keeps the
+    // handle as sent in `user`, and gives its person key, the form every other line uses,
+    // in `user_key`. Only a 403 line has the field. (Another client: bot-pm-ana's next
+    // refusal within the minute is only counted, `UsageLog::record_refusal`.)
+    let res = send(BOT_ANA_K, Some("bo.k")).await.unwrap();
+    assert_eq!(res.status(), 403);
+    let events = gw.usage.recent();
+    let line = events.last().unwrap();
+    assert_eq!(
+        (line.status, line.user.as_deref(), line.user_key.as_deref()),
+        (403, Some("bo.k"), Some("bo-k"))
+    );
+    let text = serde_json::to_string(line).unwrap();
+    assert!(text.contains("\"user_key\":\"bo-k\""), "{text}");
+    for e in events.iter().filter(|e| e.status != 403) {
+        assert_eq!(e.user_key, None, "{e:?}");
+        assert!(!serde_json::to_string(e).unwrap().contains("user_key"));
+    }
 }
 
 /// R1: every valid handle gives a personal bot whose gateway client name (`bot-pm-<handle>`
@@ -1216,9 +1425,12 @@ async fn a_persons_running_cap_holds_across_clients_for_a_dotted_handle() {
     let gw = Arc::new(
         gateway(
             "{max-in-flight: 8, per-user: 2}",
-            "{runtime: {trusted: true, max-in-flight: 8, per-user-share: 2}, \
+            // No `per-user-share: 2` for runtime and bot-* (it was here before U1): beside a
+            // `from-name` client they may hold only `per-user - 1` of her slots together, and
+            // the config is refused otherwise. The cap across spellings is what's tested.
+            "{runtime: {trusted: true, max-in-flight: 8}, \
               bot-pm-*: {trusted: true, max-in-flight: 8, user: from-name}, \
-              bot-*: {trusted: true, max-in-flight: 8, per-user-share: 2}}",
+              bot-*: {trusted: true, max-in-flight: 8}}",
         )
         .await,
     );
@@ -1258,9 +1470,10 @@ async fn a_persons_running_cap_holds_across_clients_for_a_dotted_handle() {
 }
 
 /// G3 (review at 6bb806f): a client that may name anyone (`user: any`, such as a team bot's
-/// token) holds at most its `per-user-share` of one person's running slots, 1 by default, so
-/// that person's own calls always find one; dispatch is oldest-first, so before, two of the
-/// team bot's calls could take both.
+/// token) holds at most its `per-user-share` of one person's running slots, 1 by default;
+/// dispatch is oldest-first, so before, two of the team bot's calls could take both. (Two
+/// *different* such clients are U1's test,
+/// `two_shared_clients_cant_fill_a_pms_slots_and_her_own_bot_still_runs`.)
 #[tokio::test]
 async fn a_team_bot_holds_at_most_its_share_of_a_pms_slots() {
     let gw = Arc::new(
@@ -1307,18 +1520,44 @@ async fn a_team_bot_holds_at_most_its_share_of_a_pms_slots() {
              limits: {{per-user: 2}}\nclients: {clients}\n"
         ))
     };
-    let ok = m("{bot-*: {trusted: true, per-user-share: 2}, bot-pm-*: {trusted: true, user: from-name}, runtime: {trusted: true}}").unwrap();
+    // Without a `from-name` client, a `user: any` client may hold all of `per-user`.
+    let ok = m("{bot-*: {trusted: true, per-user-share: 2}, runtime: {trusted: true}}").unwrap();
     assert_eq!(ok.client_policy("bot-docs").per_user_share, 2);
-    assert_eq!(
-        ok.client_policy("bot-pm-ana").per_user_share,
-        2,
-        "from-name: its own PM"
-    );
+    assert_eq!(ok.shared_person_cap(), 2);
     assert_eq!(
         ok.client_policy("runtime").per_user_share,
         1,
         "user: any: 1 by default"
     );
+    // U1: beside a `from-name` client, one slot of each person's is kept for their own bot,
+    // so a `user: any` share of all of `per-user` is refused (it was accepted before U1)...
+    let err = m("{bot-*: {trusted: true, per-user-share: 2}, bot-pm-*: {trusted: true, user: from-name}, runtime: {trusted: true}}").unwrap_err();
+    assert!(err.contains("per-user-share must be 1 to 1"), "{err}");
+    assert!(err.contains("own bot"), "{err}");
+    // ...and with `per-user` 3, a share of 2 is fine; the clients that may name anyone hold
+    // 2 of a person's slots together, and her own bot may hold all 3.
+    let ok = Models::from_yaml(
+        "upstreams: {a: 'http://vllm/v1'}\nroles: {default: {upstream: a, model: m}}\n\
+         limits: {per-user: 3}\nclients: {bot-*: {trusted: true, per-user-share: 2}, \
+         bot-pm-*: {trusted: true, user: from-name}, runtime: {trusted: true}}\n",
+    )
+    .unwrap();
+    assert_eq!(ok.shared_person_cap(), 2);
+    assert_eq!(ok.client_policy("bot-docs").per_user_share, 2);
+    assert_eq!(ok.client_policy("bot-docs").shared_person_cap, Some(2));
+    assert_eq!(
+        ok.client_policy("bot-pm-ana").per_user_share,
+        3,
+        "from-name: its own PM"
+    );
+    assert_eq!(ok.client_policy("bot-pm-ana").shared_person_cap, None);
+    // A `from-name` client needs a slot to keep: `per-user` 1 is refused beside one.
+    let err = Models::from_yaml(
+        "upstreams: {a: 'http://vllm/v1'}\nroles: {default: {upstream: a, model: m}}\n\
+         limits: {per-user: 1}\nclients: {bot-pm-*: {trusted: true, user: from-name}}\n",
+    )
+    .unwrap_err();
+    assert!(err.contains("at least 2"), "{err}");
     for (clients, want) in [
         (
             "{bot-*: {trusted: true, per-user-share: 0}}",

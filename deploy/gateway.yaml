@@ -52,10 +52,16 @@ limits:
 # not listed here is not trusted: its calls are keyed by its own name, run as `personal`, and
 # hold at most `per-user` (2) slots.
 clients:
-  # A client that may name any PM (runtime, bot-*) holds at most one of a PM's per-user (2)
-  # running slots (`per-user-share`, default 1 for such a client; review at 6bb806f, G3), so a
-  # PM's own bot always finds one. bot-pm-* (user: from-name) may hold both.
-  # The bot runtime: it parses routines for the PM its caller verified.
+  # What is guaranteed (review at 6bb806f, G3, and at c78b5fb, U1): the clients that may name
+  # any PM (runtime and every bot-* team bot) hold at most one of a PM's per-user (2) running
+  # slots *together*, because bot-pm-* (user: from-name) is listed: the other slot is only
+  # ever taken by that PM's own bot, so their own bot's call starts as soon as a GPU slot
+  # (max-in-flight) is free, whatever the runtime and team bots are doing for them. The PM's
+  # own bot may hold both of their slots. Each client's `per-user-share` (default 1 for a
+  # client that may name anyone) is at most per-user - 1 here (docs/gateway.md).
+  # The bot runtime: it parses routines for the PM its caller verified. Within the shared
+  # slot, it runs one call per PM at a time (U2): a PM's second routine waits for the first,
+  # up to queue-wait-secs (300), then gets 503 with Retry-After (docs/gateway.md, U2).
   runtime: {trusted: true, max-in-flight: 2}
   # Each PM's own bot's worker (bot-pm-<handle>): it may name only the PM its name spells
   # (`user: from-name`; naming anyone else is 403, in the usage log; review finding R1).

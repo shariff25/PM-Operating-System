@@ -10,6 +10,13 @@
 //! else away. The person's cap counts per client (finding F1 of the review at 2544d01): before,
 //! a team bot's token naming one PM (`bot-docs`, `user: any`) could fill that PM's places and
 //! the PM's own calls through the runtime got an immediate `429`.
+//!
+//! Running, a person's slots are shared out by client (U1, review at c78b5fb): each client
+//! holds at most its `person_share` of them, and the clients that may name anyone (the
+//! runtime, the team bots; [`Owner::with_shared_cap`]) at most `shared_cap` of them
+//! **together**, so with `per-user` 2 and a PM's own bot configured, one slot is only ever
+//! taken by that bot. Before, the share was per client only, so two such clients (`bot-docs`
+//! and `runtime`) could hold both of a PM's slots and the PM's own bot waited.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -61,6 +68,10 @@ pub struct Owner {
     /// The most of this person's running slots this client may hold (G3, review at
     /// 6bb806f): `ClientPolicy::per_user_share`.
     pub person_share: usize,
+    /// For a client that may name anyone: the most of this person's running slots that all
+    /// such clients together may hold (U1): `ClientPolicy::shared_person_cap`. `None` for a
+    /// PM's own bot's client and for a call that names no one.
+    pub shared_cap: Option<usize>,
 }
 
 impl Owner {
@@ -73,7 +84,20 @@ impl Owner {
             client_cap,
             client_queue: client_cap.saturating_mul(2),
             person_share: usize::MAX,
+            shared_cap: None,
         }
+    }
+
+    /// The same, from a client that may name anyone: such clients together hold at most
+    /// `cap` of the person's running slots (U1). `None` leaves the call out of that count.
+    pub fn with_shared_cap(mut self, cap: Option<usize>) -> Self {
+        self.shared_cap = cap;
+        self
+    }
+
+    /// Counted among the calls of clients that may name anyone, for its person.
+    fn shared(&self) -> bool {
+        self.person.is_some() && self.shared_cap.is_some()
     }
 
     /// The same, with this client allowed at most `share` of the person's running slots.
@@ -103,6 +127,8 @@ struct State {
     per_client: HashMap<String, usize>,
     /// Running calls by (client, person): each client's share of a person's slots (G3).
     per_client_person: HashMap<(String, String), usize>,
+    /// Running calls by person, of clients that may name anyone, together (U1).
+    per_user_shared: HashMap<String, usize>,
     waiting: Vec<Waiter>,
     /// Started but not yet picked up by their caller.
     granted: HashSet<u64>,
@@ -254,14 +280,18 @@ impl Scheduler {
                 &mut st.per_client_person,
                 &(owner.client.clone(), p.clone()),
             );
+            if owner.shared() {
+                decrement(&mut st.per_user_shared, p);
+            }
         }
         decrement(&mut st.per_client, &owner.client);
         self.dispatch(&mut st);
     }
 
     /// Start waiters while there is room: the highest priority whose person and client are
-    /// both under their caps, and whose client is under its share of that person's slots
-    /// (G3), oldest first.
+    /// both under their caps, whose client is under its share of that person's slots (G3),
+    /// and, for a client that may name anyone, whose person's calls from all such clients
+    /// are under their shared cap (U1); oldest first.
     fn dispatch(&self, st: &mut State) {
         while st.in_flight < self.limits.max_in_flight {
             let pick = st
@@ -277,6 +307,9 @@ impl Scheduler {
                                 .copied()
                                 .unwrap_or(0)
                                 < w.owner.person_share
+                            && w.owner.shared_cap.is_none_or(|cap| {
+                                st.per_user_shared.get(p).copied().unwrap_or(0) < cap
+                            })
                     });
                     let client_ok = st.per_client.get(&w.owner.client).copied().unwrap_or(0)
                         < w.owner.client_cap;
@@ -288,6 +321,9 @@ impl Scheduler {
             let w = st.waiting.remove(i);
             if w.tx.send(()).is_ok() {
                 st.in_flight += 1;
+                if let Some(p) = w.owner.person.as_ref().filter(|_| w.owner.shared()) {
+                    *st.per_user_shared.entry(p.clone()).or_default() += 1;
+                }
                 if let Some(p) = w.owner.person {
                     *st.per_client_person
                         .entry((w.owner.client.clone(), p.clone()))
@@ -599,6 +635,73 @@ mod tests {
         let d2 = d2.await.unwrap().unwrap();
         settle(&s, (3, 0)).await;
         drop((d2, bo, o1));
+        assert_eq!(s.snapshot(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn clients_that_may_name_anyone_together_leave_a_pm_their_own_bots_slot() {
+        // U1 (review at c78b5fb): Ana has two slots. `runtime` and `bot-docs` may each hold
+        // one (their share), and together hold at most one (the shared cap, `per-user - 1`
+        // with a PM's own bot configured). Before, each client's share was counted alone, so
+        // the two of them filled both slots and her own bot waited behind them.
+        let s = sched(4, 2, 16);
+        let any = |client: &str| {
+            Owner::new(Some("ana"), client, 8)
+                .with_person_share(1)
+                .with_shared_cap(Some(1))
+        };
+        let r1 = s
+            .acquire(&any("runtime"), Priority::Interactive)
+            .await
+            .unwrap();
+        // Each waiter keeps its permit (in its task's output) until it is awaited.
+        let mut waiting = Vec::new();
+        for client in ["bot-docs", "runtime", "bot-docs"] {
+            let (s2, o) = (s.clone(), any(client));
+            waiting.push(tokio::spawn(async move {
+                s2.acquire(&o, Priority::Interactive).await
+            }));
+            settle(&s, (1, waiting.len())).await;
+        }
+        // The saturated shared cap holds no one else up: Bo, through the same clients.
+        let bo = s
+            .acquire(
+                &Owner::new(Some("bo"), "bot-docs", 8)
+                    .with_person_share(1)
+                    .with_shared_cap(Some(1)),
+                Priority::Personal,
+            )
+            .await
+            .unwrap();
+        // Her own bot's call starts at once, at a lower priority than those waiting.
+        let own = Owner::new(Some("ana"), "bot-pm-ana", 8).with_person_share(2);
+        let o1 = tokio::time::timeout(
+            Duration::from_millis(200),
+            s.acquire(&own, Priority::Personal),
+        )
+        .await
+        .expect("her own bot's call starts without waiting")
+        .unwrap();
+        assert_eq!(s.snapshot(), (3, 3));
+        // She is at her two: her own bot's second call waits like everyone else's.
+        let (s2, o) = (s.clone(), own.clone());
+        let o2 = tokio::spawn(async move { s2.acquire(&o, Priority::Personal).await });
+        settle(&s, (3, 4)).await;
+        // Freeing the runtime's slot lets one shared call in (the oldest of the highest
+        // priority, bot-docs'), never two: the shared cap is still 1.
+        drop(r1);
+        assert_eq!(s.snapshot(), (3, 3));
+        // Freeing Bo's and her own bot's slots: her own bot's second call starts, and the
+        // shared calls still wait for the one shared slot.
+        drop((bo, o1));
+        assert_eq!(s.snapshot(), (2, 2));
+        let o2 = o2.await.unwrap().unwrap();
+        for w in waiting {
+            // Each in turn, as the one before gives the shared slot back.
+            drop(w.await.unwrap().unwrap());
+        }
+        assert_eq!(s.snapshot(), (1, 0));
+        drop(o2);
         assert_eq!(s.snapshot(), (0, 0));
     }
 

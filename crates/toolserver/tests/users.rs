@@ -1879,6 +1879,139 @@ async fn trigger_last_admin_and_no_deletes() {
     pg.drop_schema().await;
 }
 
+/// U3 (review at c78b5fb): the database refuses a handle spelled as another user's (`ana.`,
+/// `ana_k` beside `ana.k`), from raw SQL with no application check (migration 0028), as the
+/// application already did; users that already clash are reported in the user list and can
+/// still be changed.
+#[tokio::test]
+async fn trigger_handles_that_spell_the_same() {
+    let Some(pg) = pg().await else { return };
+    two_admins(&pg).await;
+    let insert = |h: &str| {
+        format!(
+            "INSERT INTO users (handle, status, created_at, created_by, created_client)
+             VALUES ('{h}', 'active', now(), 'host', 'host')"
+        )
+    };
+    // The spelled form, as the gateway and a personal bot's name write it.
+    for (h, want) in [
+        ("ana.k", "ana-k"),
+        ("ana__k", "ana-k"),
+        ("-ana-.k-", "ana-k"),
+        ("ana", "ana"),
+        ("ana..", "ana"),
+        ("a.b_c-d", "a-b-c-d"),
+    ] {
+        let got: String = sqlx::query_scalar("SELECT spelled_handle($1)")
+            .bind(h)
+            .fetch_one(pg.store.pool())
+            .await
+            .unwrap();
+        assert_eq!(got, want, "{h}");
+        assert_eq!(pmos_contract::onboarding::spelled_handle(h), want, "{h}");
+    }
+    // Beside `ana` (active) and a deactivated user alike.
+    raw(&pg, &insert("zed.k")).await.unwrap();
+    raw(
+        &pg,
+        "UPDATE users SET status = 'deactivated', deactivated_at = now(), deactivated_by = 'x'
+         WHERE handle = 'zed.k'",
+    )
+    .await
+    .unwrap();
+    for (h, other) in [
+        ("ana.", "ana"),
+        ("ana_", "ana"),
+        ("ana..", "ana"),
+        ("zed_k", "zed.k"),
+    ] {
+        let err = raw(&pg, &insert(h)).await.unwrap_err();
+        assert!(err.contains("exists: "), "{h}: {err}");
+        assert!(
+            err.contains(&format!("as `{other}` already is")),
+            "{h}: {err}"
+        );
+    }
+    // Two that clash, inserted in one transaction: refused at commit.
+    let mut tx = pg.store.pool().begin().await.unwrap();
+    for h in ["bo.k", "bo_k"] {
+        sqlx::query(sqlx::AssertSqlSafe(insert(h)))
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+    }
+    let err = tx.commit().await.unwrap_err().to_string();
+    assert!(err.contains("exists: "), "{err}");
+    // A handle changed to clash, too.
+    raw(&pg, &insert("cy")).await.unwrap();
+    let err = raw(&pg, "UPDATE users SET handle = 'ana.' WHERE handle = 'cy'")
+        .await
+        .unwrap_err();
+    assert!(err.contains("exists: "), "{err}");
+    // A handle that doesn't clash is fine.
+    raw(&pg, &insert("ana-kim")).await.unwrap();
+    let store: &dyn UserStore = &pg.store;
+    assert!(store
+        .directory(Utc::now())
+        .await
+        .unwrap()
+        .spelling_clashes()
+        .is_empty());
+
+    // Rows that clashed before migration 0028 (made here with the trigger off, as a database
+    // that predates it holds them) are left as they are: reported, and still changeable.
+    raw(&pg, "ALTER TABLE users DISABLE TRIGGER users_invariants")
+        .await
+        .unwrap();
+    raw(&pg, &insert("raj.")).await.unwrap();
+    raw(&pg, "ALTER TABLE users ENABLE TRIGGER users_invariants")
+        .await
+        .unwrap();
+    let dir = store.directory(Utc::now()).await.unwrap();
+    assert_eq!(dir.spelling_clashes(), vec![vec!["raj", "raj."]]);
+    assert_eq!(dir.spelling_clash_of("raj."), ["raj"]);
+    assert_eq!(dir.spelling_clash_of("ana"), Vec::<&str>::new());
+    let warnings = dir.spelling_clash_warnings();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0].contains("`raj`, `raj.`") && warnings[0].contains("spelled `raj`"),
+        "{warnings:?}"
+    );
+    raw(
+        &pg,
+        "UPDATE users SET status = 'deactivated', deactivated_at = now(), deactivated_by = 'x'
+         WHERE handle = 'raj.'",
+    )
+    .await
+    .unwrap();
+    for h in ["raj.", "raj"] {
+        raw(
+            &pg,
+            &format!("UPDATE users SET display_name = 'Renamed' WHERE handle = '{h}'"),
+        )
+        .await
+        .unwrap();
+    }
+    // The trigger keeps its fixed search_path (CREATE OR REPLACE would have dropped it).
+    let config: Vec<String> = sqlx::query_scalar(
+        "SELECT unnest(proconfig) FROM pg_proc
+         WHERE proname IN ('users_invariants', 'spelled_handle')
+           AND pronamespace = current_schema()::regnamespace",
+    )
+    .fetch_all(pg.store.pool())
+    .await
+    .unwrap();
+    assert_eq!(config.len(), 2, "{config:?}");
+    assert!(
+        config.iter().all(|c| c.starts_with("search_path=")),
+        "{config:?}"
+    );
+    // A third spelling of it is still refused.
+    let err = raw(&pg, &insert("raj_")).await.unwrap_err();
+    assert!(err.contains("as `raj, raj.` already is"), "{err}");
+    pg.drop_schema().await;
+}
+
 #[tokio::test]
 async fn trigger_admin_and_auditor_and_the_pilot_exception() {
     let Some(pg) = pg().await else { return };
