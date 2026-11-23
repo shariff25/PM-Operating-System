@@ -197,7 +197,7 @@ chmod +x "$WORK/bin/docker"
 # A stand-in `curl`: every /readyz and /healthz answers FAKE_READYZ with 200 (for `status`), the
 # gateway's /readyz FAKE_GW_READYZ when the test gives one; the runtime's task routes answer as for a finished task (for `smoke`). It records its arguments
 # (CURL_LOG, one call per line), what it read with `--config -` (CURL_CONFIG_LOG) and a `-d`
-# body (CURL_BODY_LOG).
+# body (CURL_BODY_LOG). The ledger summary answers FAKE_LEDGER_SUMMARY (for `ledger`).
 cat >"$WORK/bin/curl" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"${CURL_LOG:-/dev/null}"
@@ -215,6 +215,7 @@ case "$*" in
   *"-X POST http://127.0.0.1:"*"/v1/tasks "*) echo '{"id":"tsk_0abc12","status":"queued"}' ;;
   *750/v1/tasks/*/events*) echo '[{"kind":"answer","text":"see the getting started page"}]' ;;
   *750/v1/tasks/*) echo '{"id":"tsk_0abc12","status":"done"}' ;;
+  */internal/ledger/summary*) printf '%s\n' "${FAKE_LEDGER_SUMMARY:-{\}}" ;;
   *) echo '{}' ;;
 esac
 EOF
@@ -1325,6 +1326,27 @@ no_secret_in_args reindex
 run_stack revoke ana slack >/dev/null || fail "revoke ana slack failed"
 grep -q -- '-X DELETE http://127.0.0.1:8710/internal/credentials/ana/slack ' "$CURL_LOG" || fail "revoke didn't call the route: $(cat "$CURL_LOG")"
 no_secret_in_args revoke
+# `ledger` prints the summary, with the decision-time tripwire: the median time to a decision
+# and the fast-approval share with the count it is over; `-` where there is none.
+export FAKE_LEDGER_SUMMARY='{"since":"2026-11-16T00:00:00Z","rows":7,"label_coverage":0.857,"fast_approval_seconds":5,"groups":[
+ {"bot":"docs","skill":null,"tool":"jira.create_issue","rows":5,"counts":{"pending":1,"approved":3,"edited":1,"rejected":0,"failed":0,"expired":0},"label_coverage":0.8,"median_edit_distance":0.0,"reasons":{},"median_decision_seconds":4.0,"decision_time_rows":4,"fast_approvals":2,"fast_approval_rows":3,"fast_approval_share":0.6667},
+ {"bot":"growth","skill":null,"tool":"slack.post_message","rows":2,"counts":{"pending":0,"approved":0,"edited":0,"rejected":2,"failed":0,"expired":0},"label_coverage":1.0,"median_edit_distance":null,"reasons":{"tone":2},"median_decision_seconds":150.0,"decision_time_rows":2,"fast_approvals":0,"fast_approval_rows":0,"fast_approval_share":null}]}'
+: >"$CURL_LOG"
+out=$(run_stack ledger --since 7d 2>&1) || fail "ledger failed: $out"
+grep -q -- '-X GET http://127.0.0.1:8710/internal/ledger/summary?since=' "$CURL_LOG" || fail "ledger didn't call the summary: $(cat "$CURL_LOG")"
+[[ "$out" == *"drafts since 2026-11-16T00:00:00Z: 7, labelled 86%"* ]] || fail "ledger's first line: $out"
+[[ "$out" == *"approved unchanged within 5s"*"a tripwire, never a target"* ]] || fail "ledger doesn't explain the fast column: $out"
+[[ "$out" == *"med dec"*"fast"* ]] || fail "ledger has no decision-time columns: $out"
+line=$(grep -- ' docs ' <<<"$out") || fail "no docs row: $out"
+[[ "$line" == *" 4.0s "*"67% of 3"* ]] || fail "docs row lacks the decision time and fast share: $line"
+line=$(grep -- ' growth ' <<<"$out") || fail "no growth row: $out"
+[[ "$line" == *" 2m "*" - "*"tone 2"* ]] || fail "growth row: $line"
+# A summary from a tool server without the figures still prints, with `-`.
+export FAKE_LEDGER_SUMMARY='{"rows":1,"label_coverage":0.0,"groups":[{"bot":"docs","tool":"jira.create_issue","rows":1,"counts":{"pending":1},"median_edit_distance":null,"reasons":{}}]}'
+out=$(run_stack ledger 2>&1) || fail "ledger on an older summary failed: $out"
+[[ "$(grep -- ' docs ' <<<"$out")" == *" - "*" - "* ]] || fail "ledger on an older summary: $out"
+unset FAKE_LEDGER_SUMMARY
+no_secret_in_args ledger
 out=$(run_stack smoke ana.b 2>&1) || fail "smoke failed: $out"
 [[ "$out" == *"smoke test passed"* ]] || fail "smoke didn't pass: $out"
 [ "$(grep -c '^header = "Authorization: Bearer slk0SECRET0123456789abcdef0123456789abcdef"$' "$CURL_CONFIG_LOG")" = 3 ] ||

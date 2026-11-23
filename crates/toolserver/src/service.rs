@@ -49,7 +49,9 @@ use crate::audit::{source_title, AuditEvent, Client, Outcome, TITLED_SYSTEMS};
 use crate::catalog::{Catalog, Roster, ToolSpec};
 use crate::connectors::{untrusted, Audience, Caller, Connector, ConnectorError, Item, TeamBot};
 use crate::context::{load_docs, ContextDoc, ReindexReport};
-use crate::ledger::{summarize, LedgerQuery, LedgerRow, Summary, DEFAULT_EXPIRE_DAYS};
+use crate::ledger::{
+    summarize, LedgerQuery, LedgerRow, Summary, DEFAULT_EXPIRE_DAYS, DEFAULT_FAST_APPROVAL_SECONDS,
+};
 use crate::memory::{valid_key, MemoryError};
 use crate::schemas::{changed_target, check_args};
 use crate::session::{bot_identity, token_hash, valid_handle, Session};
@@ -489,6 +491,8 @@ pub struct ToolService {
     content_sha: RwLock<Option<String>>,
     /// Pending ledger rows older than this many days are reported as expired.
     ledger_expire_days: i64,
+    /// An approved-unchanged draft decided within this many seconds is a fast approval.
+    ledger_fast_approval_seconds: i64,
     /// Refusals for invalid arguments, by session (token hash) and write tool, with when the
     /// session expires. In memory: a restart starts every session's count again.
     invalid_drafts: Mutex<HashMap<DraftKey, (u32, DateTime<Utc>)>>,
@@ -565,6 +569,7 @@ impl ToolService {
             connectors,
             stale_after_days: pmos_contract::lint::DEFAULT_STALE_AFTER_DAYS,
             ledger_expire_days: DEFAULT_EXPIRE_DAYS,
+            ledger_fast_approval_seconds: DEFAULT_FAST_APPROVAL_SECONDS,
             invalid_drafts: Mutex::default(),
             slack_draft_ttl: Duration::hours(DEFAULT_SLACK_DRAFT_TTL_HOURS),
             audiences: Mutex::default(),
@@ -703,6 +708,13 @@ impl ToolService {
     /// Report pending ledger rows older than `days` as expired (`PMOS_LEDGER_EXPIRE_DAYS`).
     pub fn with_ledger_expire_days(mut self, days: i64) -> Self {
         self.ledger_expire_days = days.max(1);
+        self
+    }
+
+    /// Count an approved-unchanged draft decided within `secs` of its creation as a fast
+    /// approval in the ledger summary (`PMOS_LEDGER_FAST_APPROVAL_SECONDS`).
+    pub fn with_ledger_fast_approval_seconds(mut self, secs: i64) -> Self {
+        self.ledger_fast_approval_seconds = secs.max(1);
         self
     }
 
@@ -2337,8 +2349,8 @@ impl ToolService {
         self.stores.approvals.ledger(&query).await
     }
 
-    /// Outcomes, label coverage, median edit distance and rejection reasons per bot (or
-    /// skill) and tool, over the rows since `since`.
+    /// Outcomes, label coverage, median edit distance, rejection reasons, median decision
+    /// time and fast-approval share per bot (or skill) and tool, over the rows since `since`.
     pub async fn ledger_summary(
         &self,
         since: Option<DateTime<Utc>>,
@@ -2351,7 +2363,7 @@ impl ToolService {
             ..LedgerQuery::all(self.ledger_expire_before(now))
         };
         let rows = self.ledger(query, now).await?;
-        Ok(summarize(since, &rows))
+        Ok(summarize(since, &rows, self.ledger_fast_approval_seconds))
     }
 
     /// Decide an inbox item as `decided_by`, for the orchestrator. See

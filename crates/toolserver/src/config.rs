@@ -171,6 +171,10 @@ pub struct Config {
     /// `PMOS_LEDGER_EXPIRE_DAYS`: a draft still pending after this many days is reported as
     /// `expired` in the feedback ledger. Default 7.
     pub ledger_expire_days: i64,
+    /// `PMOS_LEDGER_FAST_APPROVAL_SECONDS`: an approved-unchanged draft decided within this
+    /// many seconds counts as a fast approval in the ledger summary. Default 5. A tripwire,
+    /// never a target.
+    pub ledger_fast_approval_seconds: i64,
     /// `PMOS_SLACK_DRAFT_TTL_HOURS`: an undecided Slack draft expires after this many hours,
     /// and a decided one loses its text this long after its decision. 1 to 24; default 24.
     pub slack_draft_ttl_hours: i64,
@@ -427,6 +431,18 @@ impl Config {
                 })?,
             None => crate::ledger::DEFAULT_EXPIRE_DAYS,
         };
+        let ledger_fast_approval_seconds =
+            match get("PMOS_LEDGER_FAST_APPROVAL_SECONDS").filter(|s| !s.is_empty()) {
+                Some(s) => s
+                    .trim()
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|d| *d >= 1)
+                    .ok_or_else(|| {
+                        format!("PMOS_LEDGER_FAST_APPROVAL_SECONDS must be a whole number of seconds (1 or more), not `{s}`")
+                    })?,
+                None => crate::ledger::DEFAULT_FAST_APPROVAL_SECONDS,
+            };
         let max_ttl = crate::service::DEFAULT_SLACK_DRAFT_TTL_HOURS;
         let slack_draft_ttl_hours = match get("PMOS_SLACK_DRAFT_TTL_HOURS").filter(|s| !s.is_empty()) {
             Some(s) => s
@@ -525,6 +541,7 @@ impl Config {
             memory,
             content_sync_secs,
             ledger_expire_days,
+            ledger_fast_approval_seconds,
             slack_draft_ttl_hours,
             audit_retention_days,
             users_seed,
@@ -1410,6 +1427,35 @@ mod tests {
             assert!(cfg(&with(&fake, &[("PMOS_LEDGER_EXPIRE_DAYS", bad)]))
                 .unwrap_err()
                 .contains("PMOS_LEDGER_EXPIRE_DAYS"));
+        }
+    }
+
+    #[test]
+    fn fast_approval_threshold_defaults_to_five_seconds() {
+        let fake = [
+            ("PMOS_SERVICE_TOKEN", TOKEN),
+            ("PMOS_DEV", "1"),
+            ("PMOS_CONNECTORS", "fake"),
+        ];
+        assert_eq!(cfg(&fake).unwrap().ledger_fast_approval_seconds, 5);
+        assert_eq!(
+            cfg(&with(&fake, &[("PMOS_LEDGER_FAST_APPROVAL_SECONDS", "")]))
+                .unwrap()
+                .ledger_fast_approval_seconds,
+            5
+        );
+        assert_eq!(
+            cfg(&with(&fake, &[("PMOS_LEDGER_FAST_APPROVAL_SECONDS", "10")]))
+                .unwrap()
+                .ledger_fast_approval_seconds,
+            10
+        );
+        for bad in ["0", "-1", "soon", "2.5"] {
+            assert!(
+                cfg(&with(&fake, &[("PMOS_LEDGER_FAST_APPROVAL_SECONDS", bad)]))
+                    .unwrap_err()
+                    .contains("PMOS_LEDGER_FAST_APPROVAL_SECONDS")
+            );
         }
     }
 

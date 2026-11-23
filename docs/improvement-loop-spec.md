@@ -48,9 +48,19 @@ returns `{rows: [...]}`, newest first.
 - counts by outcome;
 - the label coverage, meaning the share of rows that are decided or expired (phase 0's 95% gate);
 - the median `edit_distance`;
-- the rejection reasons.
+- the rejection reasons;
+- the median decision time (`median_decision_seconds`): from `created_at` to `decided_at`,
+  over the rows a person decided (`decision_time_rows` of them; pending, expired and rows the
+  tool server closed itself are left out);
+- the fast-approval share (`fast_approval_share`): of the `approved` (unchanged) rows, those
+  decided within `PMOS_LEDGER_FAST_APPROVAL_SECONDS` (default 5) of being created
+  (`fast_approvals` of `fast_approval_rows`, so a small sample is visible; the threshold is
+  `fast_approval_seconds` at the top). It is computed from the timestamps the ledger already
+  stores. Like approval rate, **a tripwire, never a target**: a rising share is a reason to
+  look for rubber-stamping (`docs/runbooks/quality.md`), and nothing optimizes for it.
 
-**Admin access.** `pmos-admin ledger [--since 7d]` prints the summary. `pmos-admin ledger --export`
+**Admin access.** `pmos-admin ledger [--since 7d]` prints the summary, the median decision
+time and fast-approval share (with its count) included. `pmos-admin ledger --export`
 writes JSON lines to stdout.
 
 ## 2. A bounded retry for invalid drafts (tool server)

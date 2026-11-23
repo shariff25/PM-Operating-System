@@ -141,6 +141,7 @@ services:
       PMOS_DOCS_URL: http://docs.pmos.internal:8730/mcp
       PMOS_DOCS_TOKEN: ${PMOS_DOCS_TOKEN}
       PMOS_LEDGER_EXPIRE_DAYS: ${PMOS_LEDGER_EXPIRE_DAYS:-7}
+      PMOS_LEDGER_FAST_APPROVAL_SECONDS: ${PMOS_LEDGER_FAST_APPROVAL_SECONDS:-5}
       # Audit events older than this are deleted daily (docs/audit-retention.md). 90 or more;
       # the tool server refuses to start with less.
       PMOS_AUDIT_RETENTION_DAYS: ${PMOS_AUDIT_RETENTION_DAYS:-90}

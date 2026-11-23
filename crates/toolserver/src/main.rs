@@ -250,6 +250,7 @@ async fn main() -> Result<()> {
         .map_err(anyhow::Error::msg)?
         .with_people(people)
         .with_ledger_expire_days(config.ledger_expire_days)
+        .with_ledger_fast_approval_seconds(config.ledger_fast_approval_seconds)
         .with_slack_draft_ttl_hours(config.slack_draft_ttl_hours)
         .with_audit_retention_days(config.audit_retention_days)
         // Slice H4: every session open and tool call checks the gateway's model source.
