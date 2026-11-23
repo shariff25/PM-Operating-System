@@ -50,6 +50,24 @@ enum Command {
         #[command(subcommand)]
         command: BotCommand,
     },
+    /// Checks on the content checkout as a whole.
+    Content {
+        #[command(subcommand)]
+        command: ContentCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ContentCommand {
+    /// Fake-data mode's content check (docs/openshell-any-host-spec.md §3.6): the content
+    /// root has a TEST-CONTENT marker and no file under it is marked `sensitivity: restricted`.
+    /// Exits 1 with one line per cause; `pmos-admin sandbox` runs it before it uploads anything
+    /// under PMOS_MODEL_SOURCE=hosted-test.
+    CheckTest {
+        /// Path to the content root.
+        #[arg(long, default_value = "content")]
+        root: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -142,6 +160,31 @@ fn main() -> Result<ExitCode> {
         Command::Bot {
             command: BotCommand::AddPersonal { root, handle },
         } => bot_add_personal(&root, &handle),
+        Command::Content {
+            command: ContentCommand::CheckTest { root },
+        } => Ok(content_check_test(&root)),
+    }
+}
+
+/// `pmos content check-test`: the content check of fake-data mode.
+fn content_check_test(root: &Path) -> ExitCode {
+    match pmos_contract::model_source::check_test_content(root) {
+        Ok(()) => {
+            println!(
+                "{}: test content (a TEST-CONTENT marker, no file marked restricted)",
+                root.display()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(causes) => {
+            for c in causes {
+                eprintln!(
+                    "error: {}",
+                    pmos_contract::model_source::fake_data_refusal(&c)
+                );
+            }
+            ExitCode::FAILURE
+        }
     }
 }
 

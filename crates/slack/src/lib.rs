@@ -50,6 +50,7 @@ pub mod level;
 pub mod member_cards;
 pub mod members;
 pub mod mention;
+pub mod model_source;
 pub mod notify;
 pub mod nudge_copy;
 pub mod nudges;

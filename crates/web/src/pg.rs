@@ -72,6 +72,38 @@ impl PgStore {
             .await
             .map_err(|e| StoreError(e.to_string()))
     }
+
+    /// Has this database ever held real data (slice H4)? Never cleared once written.
+    pub async fn held_real_data(&self) -> Result<bool, StoreError> {
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM web_held_real_data)")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| StoreError(e.to_string()))
+    }
+
+    /// The `held_real_data` rule at start-up (spec §3.6): with live connectors the marker is
+    /// written (for good), whatever the source; in fake-data mode a database with it is refused.
+    pub async fn check_held_real_data(&self, live: bool, fake_only: bool) -> Result<(), String> {
+        if live {
+            sqlx::query(
+                "INSERT INTO web_held_real_data (id) VALUES (true) ON CONFLICT (id) DO NOTHING",
+            )
+            .execute(&self.pool)
+            .await
+            .map_err(|e| format!("writing the held_real_data marker: {e}"))?;
+        }
+        if fake_only
+            && self
+                .held_real_data()
+                .await
+                .map_err(|e| format!("reading the held_real_data marker: {e}"))?
+        {
+            return Err(pmos_contract::model_source::fake_data_refusal(
+                pmos_contract::model_source::HELD_REAL_DATA,
+            ));
+        }
+        Ok(())
+    }
 }
 
 // Sessions.

@@ -770,3 +770,30 @@ async fn postgres_stores_the_hash_not_the_cookie() {
     assert_eq!(n, 0);
     pg.drop_schema().await;
 }
+
+/// Slice H4: the `held_real_data` marker. Written at a start with live connectors, refusing a
+/// later fake-data start, kept across a restart, and impossible to delete.
+#[tokio::test]
+async fn postgres_keeps_the_held_real_data_marker_for_good() {
+    let Some(pg) = TestPg::new().await else {
+        return;
+    };
+    pg.pg.check_held_real_data(false, true).await.unwrap();
+    assert!(!pg.pg.held_real_data().await.unwrap());
+    pg.pg.check_held_real_data(true, false).await.unwrap();
+    let err = pg.pg.check_held_real_data(false, true).await.unwrap_err();
+    assert!(err.contains("this database has held real data"), "{err}");
+    pg.pg.check_held_real_data(false, false).await.unwrap();
+    for sql in [
+        "DELETE FROM web_held_real_data",
+        "UPDATE web_held_real_data SET first_at = now()",
+        "TRUNCATE web_held_real_data",
+    ] {
+        let err = sqlx::query(sql).execute(pg.pg.pool()).await.unwrap_err();
+        assert!(err.to_string().contains("permanent"), "{sql}: {err}");
+    }
+    let again = TestPg::open(&pg.base, &pg.schema).await;
+    assert!(again.held_real_data().await.unwrap());
+    again.pool().close().await;
+    pg.drop_schema().await;
+}

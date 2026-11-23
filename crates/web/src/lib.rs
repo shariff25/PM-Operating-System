@@ -34,6 +34,7 @@ pub mod content_admin;
 pub mod drafts;
 pub mod entra;
 pub mod followups;
+pub mod host;
 pub mod pg;
 pub mod policy_admin;
 pub mod progress;

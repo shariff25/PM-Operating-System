@@ -9,8 +9,26 @@ async fn main() -> Result<()> {
         .json()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
+    // Slice H4, first: PMOS_EXPOSURE (`public` refused until H10), PMOS_MODEL_SOURCE and
+    // PMOS_CONNECTORS, each required.
+    let host = pmos_web::host::HostSettings::from_env().map_err(anyhow::Error::msg)?;
+    let fake_only = host.model_source.fake_data_only();
+    tracing::info!(
+        exposure = ?host.exposure,
+        model_source = host.model_source.as_str(),
+        fake_data_only = fake_only,
+        "host settings"
+    );
     // Refuses to start without a sign-in provider, weak tokens or bad URLs.
     let config = Config::from_env().map_err(anyhow::Error::msg)?;
+    // Fake-data mode: the content checkout the admin screens read must be test content.
+    if fake_only {
+        pmos_contract::model_source::check_test_content(&config.content_root).map_err(|c| {
+            anyhow::anyhow!(pmos_contract::model_source::fake_data_refusal(
+                &c.join("; ")
+            ))
+        })?;
+    }
     // Who may sign in, and their roles, come from the user database at the tool server
     // (`resolve`), not from a file: nothing to check here.
     let providers = app::providers(&config).map_err(anyhow::Error::msg)?;
@@ -72,7 +90,12 @@ async fn main() -> Result<()> {
         tracing::info!("no PMOS_WEB_STATIC_DIR: serving /api only");
     }
     let (bind, internal_bind) = (config.bind, config.internal_bind);
-    let mut deps = pmos_web::store_config::deps_from_env()
+    let stores = pmos_web::store_config::StoreConfig::from_env().map_err(anyhow::Error::msg)?;
+    let mut deps = stores.deps().await.map_err(anyhow::Error::msg)?;
+    // The permanent marker (slice H4): written at a start with live connectors; a fake-data
+    // start refuses a database that has it.
+    stores
+        .check_held_real_data(host.connectors_live, fake_only)
         .await
         .map_err(anyhow::Error::msg)?;
     // The admin policy and content screens. pmos-web holds no GitHub token: the tool server
@@ -87,7 +110,12 @@ async fn main() -> Result<()> {
     if deps.admin.policies_root.is_none() {
         tracing::info!("no policies root: the policy screen can't compare with checked-in files");
     }
-    let server = app::build_server(config, deps).map_err(anyhow::Error::msg)?;
+    let mut server = app::build_server(config, deps).map_err(anyhow::Error::msg)?;
+    if fake_only {
+        // What people type can't be checked by code: every page says so.
+        server.public = pmos_web::host::with_test_stack_banner(server.public);
+        tracing::warn!("PMOS_MODEL_SOURCE=hosted-test: every page shows the test-stack banner");
+    }
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("binding {bind}"))?;
