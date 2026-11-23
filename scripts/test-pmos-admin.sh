@@ -179,6 +179,11 @@ if [ "${1:-}" = network ]; then
 fi
 # `compose … ps --services`: the running services, when the test gives them.
 if [[ " $* " == *" ps "*"--services"* ]] && [ -n "${FAKE_PS:-}" ]; then echo "$FAKE_PS"; fi
+# `docker ps -aq --filter …service=vllm-default`: a model server container Compose can't see,
+# when the test gives one (FAKE_STRAY).
+if [ "${1:-}" = ps ] && [[ "$*" == *"com.docker.compose.service=vllm-default"* ]] && [ -n "${FAKE_STRAY:-}" ]; then
+  echo "$FAKE_STRAY"
+fi
 # `compose … config --services`: the stack's services (logs and restart check against them).
 if [[ " $* " == *" config --services "* ]]; then
   printf '%s\n' ${FAKE_SERVICES:-postgres docs toolserver gateway bots slack console web worker-docs vllm-default vllm-extraction}
@@ -507,6 +512,34 @@ grep -q 'compose.yaml -f [^ ]*/compose.local.yaml .* up -d' "$DOCKER_LOG" || fai
 stack_env require PMOS_GATEWAY_STUB=1
 run_stack up >/dev/null 2>&1 || fail "up under local with the stub failed"
 ! grep -q 'compose.local.yaml' "$DOCKER_LOG" || fail "the stub added compose.local.yaml"
+# PMOS_VLLM_IMAGE has no default (H4): with it blank, the commands that use every profile
+# (status, logs, restart, down) leave out `--profile models`, which Compose can't load without
+# an image (CI's deploy job, after the H4 merge: "service \"vllm-default\" has neither an image
+# nor a build context specified"); with it set they keep it. The rendering checks below run
+# the same profiles through the real Compose.
+for cmd in status "logs gateway" "restart gateway" down; do
+  stack_env require PMOS_GATEWAY_STUB=1 PMOS_VLLM_IMAGE=
+  # shellcheck disable=SC2086 # the command and its argument
+  run_stack $cmd >/dev/null 2>&1 || fail "$cmd with no vLLM image failed: $(cat "$DOCKER_LOG")"
+  grep -q 'args=compose .*--profile slack' "$DOCKER_LOG" || fail "$cmd didn't use every profile: $(cat "$DOCKER_LOG")"
+  ! grep -q -- '--profile models' "$DOCKER_LOG" || fail "$cmd enabled the models profile with no vLLM image: $(cat "$DOCKER_LOG")"
+  stack_env require PMOS_GATEWAY_STUB=1
+  # shellcheck disable=SC2086
+  run_stack $cmd >/dev/null 2>&1 || fail "$cmd with a vLLM image failed: $(cat "$DOCKER_LOG")"
+  grep -q -- '--profile models' "$DOCKER_LOG" || fail "$cmd left out the models profile with a vLLM image: $(cat "$DOCKER_LOG")"
+done
+# Model servers started before the image was cleared: `status` warns, `down` removes them before
+# Compose stops the rest (they would hold the network); with the image set, neither looks.
+stack_env require PMOS_GATEWAY_STUB=1 PMOS_VLLM_IMAGE=
+out=$(FAKE_STRAY=c0ffee123456 run_stack status 2>&1) || fail "status with a stray model server failed: $out"
+[[ "$out" == *"models"*"WARN"*"PMOS_VLLM_IMAGE is blank"* ]] || fail "status doesn't warn about a stray model server: $out"
+: >"$DOCKER_LOG"
+FAKE_STRAY=c0ffee123456 run_stack down >/dev/null 2>&1 || fail "down with a stray model server failed: $(cat "$DOCKER_LOG")"
+awk '/args=rm -f c0ffee123456/ { rm = NR } / down$/ && /args=compose / { down = NR } END { exit !(rm && down && rm < down) }' "$DOCKER_LOG" ||
+  fail "down didn't remove the stray model server before compose down: $(cat "$DOCKER_LOG")"
+stack_env require PMOS_GATEWAY_STUB=1
+out=$(FAKE_STRAY=c0ffee123456 run_stack down 2>&1) || fail "down failed: $out"
+! grep -q 'args=ps -aq\|args=rm -f' "$DOCKER_LOG" || fail "down looked for stray model servers with the image set: $(cat "$DOCKER_LOG")"
 # up --bringup runs the NOT isolated bring-up workers only on a stack that can hold nothing real:
 # fake connectors, no GitHub memory (deploy/.env or live.env), and test content.
 printf -- '---\nsensitivity: restricted\n---\nsecret\n' >"$WORK/restricted.md"
@@ -2288,6 +2321,16 @@ PY
     --env-file "$WORK/novllm.env" config -q >/dev/null 2>&1 || fail "compose.local.yaml renders without PMOS_VLLM_IMAGE"
   docker compose --project-directory "$DEPLOY_SRC" -f "$DEPLOY_SRC/compose.yaml" -f "$DEPLOY_SRC/compose.local.yaml" \
     --env-file "$WORK/full.env" config -q || fail "compose.local.yaml refuses a named vLLM image"
+  # The profiles pmos-admin's status, logs, restart and down use, as it passes them, through the
+  # real Compose with no vLLM image and the stub on (CI's deploy job after the H4 merge): the
+  # project loads, as it must for an operator without local model servers.
+  stack_env require PMOS_GATEWAY_STUB=1 PMOS_VLLM_IMAGE=
+  run_stack status >/dev/null 2>&1 || fail "status with no vLLM image failed: $(cat "$DOCKER_LOG")"
+  mapfile -t used < <(grep -m1 'args=compose .* ps ' "$DOCKER_LOG" | grep -o -- '--profile [a-z-]*' | tr ' ' '\n')
+  [ "${#used[@]}" -ge 2 ] || fail "status passed no profiles: $(cat "$DOCKER_LOG")"
+  sed "s|^PMOS_GATEWAY_STUB=.*|PMOS_GATEWAY_STUB=1|" "$WORK/novllm.env" >"$WORK/novllm-stub.env"
+  render "$WORK/novllm-stub.env" "${used[@]}" >/dev/null ||
+    fail "compose can't load the stack with the profiles status uses and no vLLM image: ${used[*]}"
   # The hosted-test overlay turns CLOUD_TEST on for the gateway alone.
   sed -e "s|^PMOS_MODEL_SOURCE=.*|PMOS_MODEL_SOURCE=hosted-test|" -e "s|^PMOS_GATEWAY_REMOTE_KEY=.*|PMOS_GATEWAY_REMOTE_KEY=proxy-injected|" \
     "$WORK/full.env" >"$WORK/ht.env"
