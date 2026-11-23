@@ -780,6 +780,13 @@ async fn create_session(
         Err(e @ (SessionError::NotAMember(_) | SessionError::NotOwner { .. })) => {
             error(StatusCode::FORBIDDEN, e.to_string())
         }
+        // Slice H4: the runtime puts the task back in the queue (503), never fails it.
+        Err(e @ SessionError::ModelSourceChanged(_)) => coded(
+            StatusCode::SERVICE_UNAVAILABLE,
+            crate::model_source::MODEL_SOURCE_CHANGED,
+            e.to_string(),
+            json!({}),
+        ),
         Err(SessionError::Store(e)) => unavailable(e),
         Err(e) => error(StatusCode::BAD_REQUEST, e.to_string()),
     }
@@ -1685,6 +1692,14 @@ async fn call_tool(
                 ToolError::NotFound(_) => StatusCode::NOT_FOUND,
                 ToolError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
                 ToolError::Connector(_) => StatusCode::BAD_GATEWAY,
+                ToolError::ModelSourceChanged => {
+                    return coded(
+                        StatusCode::CONFLICT,
+                        crate::model_source::MODEL_SOURCE_CHANGED,
+                        e.to_string(),
+                        json!({}),
+                    )
+                }
             };
             error(status, e.to_string())
         }

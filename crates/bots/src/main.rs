@@ -18,11 +18,30 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     let config = Config::from_env().map_err(anyhow::Error::msg)?;
+    let fake_only = config.model_source.fake_data_only();
+    tracing::info!(
+        model_source = config.model_source.as_str(),
+        fake_data_only = fake_only,
+        "model source"
+    );
+    // Fake-data mode (slice H4): the content checkout must be test content.
+    if fake_only {
+        pmos_contract::model_source::check_test_content(&config.content_root).map_err(|c| {
+            anyhow::anyhow!(pmos_contract::model_source::fake_data_refusal(
+                &c.join("; ")
+            ))
+        })?;
+    }
 
     // A content tree with lint errors stops the start: no task should run against a bot
     // definition CI would reject. After that, a content change is picked up without a
     // restart; one that fails the lint keeps the catalog already loaded.
     let reloader = Reloader::new(&config.content_root);
+    let reloader = if fake_only {
+        reloader.with_test_content_check()
+    } else {
+        reloader
+    };
     let catalog = Catalog::load(&config.content_root, chrono::Utc::now().date_naive())
         .map_err(anyhow::Error::msg)?;
 
@@ -41,6 +60,9 @@ async fn main() -> Result<()> {
             Arc::new(MemoryStore::default())
         }
     };
+    // The permanent marker (slice H4): written at a start with live connectors, whatever the
+    // source; a fake-data start refuses a database that has it.
+    held_real_data(store.as_ref(), config.connectors_live, fake_only).await?;
 
     // Who may ask: the tool server's user directory, read with the orchestrator token and
     // polled every 10 seconds by `spawn_loops` (docs/user-database-spec.md §2). Never
@@ -56,7 +78,11 @@ async fn main() -> Result<()> {
         Arc::new(catalog),
         people,
         ToolServer::new(&config.toolserver_url, &config.service_token.0),
-        Gateway::new(&config.gateway_url, &config.gateway_token.0),
+        Gateway::new(
+            &config.gateway_url,
+            &config.gateway_token.0,
+            config.model_source,
+        ),
         stop.clone(),
     ));
     // Their first pass runs now: tasks interrupted by the last shutdown are recovered and a
@@ -93,4 +119,12 @@ async fn main() -> Result<()> {
         let _ = l.await;
     }
     Ok(())
+}
+
+/// Writes the marker when the stack runs with live connectors, then refuses a fake-data start
+/// on a database that has it.
+async fn held_real_data(store: &dyn BotsStore, live: bool, fake_only: bool) -> Result<()> {
+    pmos_bots::store::check_held_real_data(store, live, fake_only)
+        .await
+        .map_err(anyhow::Error::msg)
 }

@@ -41,6 +41,22 @@ async fn main() -> Result<()> {
         .init();
 
     let config = Config::from_env().map_err(anyhow::Error::msg)?;
+    let fake_only = config.model_source.fake_data_only();
+    tracing::info!(
+        model_source = config.model_source.as_str(),
+        fake_data_only = fake_only,
+        "model source"
+    );
+    // Fake-data mode (slice H4): the content checkout must be test content.
+    if fake_only {
+        pmos_contract::model_source::check_test_content(&config.content_root).map_err(|c| {
+            anyhow::anyhow!(c
+                .iter()
+                .map(|c| pmos_contract::model_source::fake_data_refusal(c))
+                .collect::<Vec<_>>()
+                .join("\n"))
+        })?;
+    }
     let catalog =
         Catalog::load(&config.content_root, Utc::now().date_naive()).context("loading content")?;
     let cancel = CancellationToken::new();
@@ -51,6 +67,13 @@ async fn main() -> Result<()> {
                 .await
                 .context("connecting to Postgres")?;
             pg.migrate().await.context("applying migrations")?;
+            // The permanent marker (slice H4): written at a start with live connectors or
+            // GitHub memory, whatever the source; a fake-data start refuses a database with it.
+            let real = matches!(config.connectors, Connectors::Live(_))
+                || config.memory == MemoryBackend::Github;
+            pg.check_held_real_data(real, fake_only)
+                .await
+                .map_err(anyhow::Error::msg)?;
             let report = pg
                 .reindex(&load_docs(&config.content_root))
                 .await
@@ -228,7 +251,12 @@ async fn main() -> Result<()> {
         .with_people(people)
         .with_ledger_expire_days(config.ledger_expire_days)
         .with_slack_draft_ttl_hours(config.slack_draft_ttl_hours)
-        .with_audit_retention_days(config.audit_retention_days);
+        .with_audit_retention_days(config.audit_retention_days)
+        // Slice H4: every session open and tool call checks the gateway's model source.
+        .with_model_source(Arc::new(pmos_toolserver::model_source::SourceGuard::new(
+            config.model_source,
+            &config.gateway_url,
+        )));
     // Password sign-in (docs/password-sign-in.md): on when the vault has a key to seal
     // authenticator secrets with; its routes also need assertion `require`.
     match &config.password_keys {
@@ -289,6 +317,13 @@ async fn main() -> Result<()> {
     }
     if config.content_sync_secs > 0 {
         let sync = ContentSync::new(&config.content_root, svc.clone());
+        // Fake-data mode: a pull that would bring a restricted file, or lose the TEST-CONTENT
+        // marker, is not applied (slice H4).
+        let sync = if fake_only {
+            sync.with_test_content_check()
+        } else {
+            sync
+        };
         sync.clone().spawn(
             Duration::from_secs(config.content_sync_secs),
             cancel.clone(),

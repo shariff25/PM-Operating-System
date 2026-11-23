@@ -90,9 +90,20 @@ pub enum Error {
     /// again from `0`.
     #[error("{CURSOR_AHEAD}: the notification cursor {after} is past this feed's head {head}; it is from an earlier runtime or database. Start again from 0 (the Slack service: delete its notifications.cursor)")]
     CursorAhead { after: i64, head: i64 },
+    /// Slice H4: the gateway serves another model source than this runtime's, or its source
+    /// can't be read: no routine is parsed (`503 {"code": "model_source_changed"}`).
+    #[error("{MODEL_SOURCE_CHANGED}: the model gateway serves another model source than this runtime may use; nothing was sent to it")]
+    ModelSourceChanged,
     #[error(transparent)]
     Store(#[from] StoreError),
 }
+
+/// The code of [`Error::ModelSourceChanged`].
+pub const MODEL_SOURCE_CHANGED: &str = "model_source_changed";
+
+/// The kind of the task event that records the model source a task was first claimed under
+/// (slice H4): a later claim waits until the gateway serves it again.
+pub const MODEL_SOURCE_EVENT: &str = "model_source";
 
 /// The code and the start of the message of [`Error::CursorAhead`].
 pub const CURSOR_AHEAD: &str = "cursor_ahead";
@@ -267,6 +278,10 @@ pub struct Runtime {
     /// may), so this is the bound: at most one task and one claim per person and bot per
     /// window from Slack. In memory, at most [`NOT_ON_TEAM_MARKS`].
     not_on_team: std::sync::Mutex<std::collections::HashMap<(String, String), Instant>>,
+    /// Fake-data mode only (slice H4): why the content checkout as it is now may not be used
+    /// (no `TEST-CONTENT` marker, a file marked restricted). While set, nothing is claimed and
+    /// the runtime isn't ready.
+    content_refused: std::sync::Mutex<Option<String>>,
 }
 
 /// How long a not-on-team refusal at claim stands for a Slack ask of the same bot by the same
@@ -304,7 +319,30 @@ impl Runtime {
             changed: watch::channel(0).0,
             stop,
             not_on_team: std::sync::Mutex::default(),
+            content_refused: std::sync::Mutex::default(),
         }
+    }
+
+    /// Fake-data mode: set when the content check fails at a reload (with why), cleared when
+    /// it passes again ([`crate::catalog::Reloader`]).
+    pub fn set_content_refused(&self, why: Option<String>) {
+        *self.content_refused.lock().expect("content lock") = why;
+    }
+
+    /// Why the content may not be used now, in fake-data mode.
+    pub fn content_refused(&self) -> Option<String> {
+        self.content_refused.lock().expect("content lock").clone()
+    }
+
+    /// The source a task was first claimed under, from its events.
+    async fn recorded_source(&self, task: &Task) -> Result<Option<String>> {
+        Ok(self
+            .store
+            .events(&task.id)
+            .await?
+            .into_iter()
+            .find(|e| e.kind == MODEL_SOURCE_EVENT)
+            .map(|e| e.text))
     }
 
     /// Is `persona` marked not on `requester`'s team (refused at claim within
@@ -529,11 +567,49 @@ impl Runtime {
         bots: Option<&[String]>,
         now: DateTime<Utc>,
     ) -> Result<Option<Claim>> {
+        // Slice H4 (spec §3.6, "Keeping every caller on one source"): nothing is handed to a
+        // worker while the content may not be used (fake-data mode), or while the gateway
+        // serves another source than this runtime's, or its source can't be read.
+        if let Some(why) = self.content_refused() {
+            tracing::warn!(reason = %why, "claiming nothing: the content checkout may not be used");
+            return Ok(None);
+        }
+        let Ok(source) = self.gateway.checked_source().await else {
+            return Ok(None);
+        };
         loop {
             let lease_until = now + chrono::Duration::seconds(LEASE_SECONDS);
             let Some(task) = self.store.claim(bots, worker, lease_until, now).await? else {
                 return Ok(None);
             };
+            // A task keeps the source of its first claim: a retry waits until the gateway
+            // serves that source again, and never runs under another.
+            match self.recorded_source(&task).await? {
+                Some(recorded) if recorded != source => {
+                    tracing::warn!(
+                        task = %task.id, %recorded, gateway = %source,
+                        "task left in the queue: the model source changed since it started"
+                    );
+                    let back = Transition {
+                        worker: Some(worker.to_string()),
+                        to: Some(TaskStatus::Queued),
+                        lease: Lease::Clear,
+                        attempts_delta: -1,
+                        ..Transition::from(&[TaskStatus::Working])
+                    };
+                    let _ = self.store.transition(&task.id, &back, now).await?;
+                    return Ok(None);
+                }
+                Some(_) => {}
+                None => {
+                    let record = Transition {
+                        worker: Some(worker.to_string()),
+                        event: Some((MODEL_SOURCE_EVENT.into(), source.clone())),
+                        ..Transition::from(&[TaskStatus::Working])
+                    };
+                    let _ = self.store.transition(&task.id, &record, now).await?;
+                }
+            }
             let catalog = self.catalog();
             let found = catalog
                 .bot(&task.bot)
@@ -598,6 +674,8 @@ impl Runtime {
                     headers.insert("X-Pmos-User".into(), json!(task.requested_by));
                     headers.insert("X-Pmos-Run".into(), json!(task.id));
                     headers.insert("X-Pmos-Priority".into(), json!(task.priority.as_str()));
+                    // X4: the worker names this source on every model call of the task.
+                    headers.insert("X-Pmos-Model-Source".into(), json!(source));
                     let model_role = serde_json::to_value(role.model)
                         .ok()
                         .and_then(|v| v.as_str().map(str::to_string))
@@ -631,6 +709,17 @@ impl Runtime {
                     let reason =
                         format!("the tool server wouldn't start this bot's session: {why}");
                     self.fail_claimed(&task, worker, &reason, now).await?;
+                }
+                Err(CallError::ModelSourceChanged) => {
+                    let change = Transition {
+                        worker: Some(worker.to_string()),
+                        to: Some(TaskStatus::Queued),
+                        lease: Lease::Clear,
+                        attempts_delta: -1,
+                        ..Transition::from(&[TaskStatus::Working])
+                    };
+                    let _ = self.store.transition(&task.id, &change, now).await?;
+                    return Ok(None);
                 }
                 Err(CallError::Unavailable(what)) => {
                     // Not the task's fault: give it back without counting the attempt.
@@ -1207,7 +1296,10 @@ impl Runtime {
             .gateway
             .extract_json(&routines::system_prompt(&bot.name, tz, now), &text, owner)
             .await
-            .map_err(|e| Error::Unavailable(format!("{e}; try again in a minute")))?;
+            .map_err(|e| match e {
+                CallError::ModelSourceChanged => Error::ModelSourceChanged,
+                e => Error::Unavailable(format!("{e}; try again in a minute")),
+            })?;
         match routines::read_reply(&reply, &bot.name, owner, tz, now) {
             Parsed::Draft(draft) => {
                 let summary = routines::summary(&draft, bot.scope == BotScope::Personal);
@@ -1485,13 +1577,20 @@ impl Runtime {
                 Ok(Ok(()))
             )
         };
-        let (storage, toolserver, gateway) =
-            tokio::join!(storage, self.toolserver.ready(), self.gateway.ready());
+        let source = async { self.gateway.checked_source().await.is_ok() };
+        let (storage, toolserver, gateway, model_source) = tokio::join!(
+            storage,
+            self.toolserver.ready(),
+            self.gateway.ready(),
+            source
+        );
         Readiness {
             storage,
             toolserver,
             gateway,
             directory: self.people.fresh().is_some(),
+            model_source,
+            content: self.content_refused().is_none(),
         }
     }
 
@@ -1581,11 +1680,21 @@ pub struct Readiness {
     pub gateway: bool,
     /// A directory snapshot at most 30 seconds old.
     pub directory: bool,
+    /// The gateway serves this runtime's model source (or the stub), read at most 10 seconds
+    /// ago (slice H4).
+    pub model_source: bool,
+    /// Fake-data mode: the content checkout passes the content check (always true otherwise).
+    pub content: bool,
 }
 
 impl Readiness {
     pub fn ok(&self) -> bool {
-        self.storage && self.toolserver && self.gateway && self.directory
+        self.storage
+            && self.toolserver
+            && self.gateway
+            && self.directory
+            && self.model_source
+            && self.content
     }
 }
 

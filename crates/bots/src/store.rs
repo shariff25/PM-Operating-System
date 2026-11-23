@@ -230,6 +230,40 @@ pub trait BotsStore: Send + Sync {
     async fn member_settings(&self, handle: &str) -> StoreResult<Option<MemberSettings>>;
     /// Save a PM's settings, replacing any they had.
     async fn set_member_settings(&self, settings: &MemberSettings) -> StoreResult<()>;
+
+    /// Has this database ever held real data (slice H4)? The marker, once written, is never
+    /// cleared ([`BotsStore::mark_held_real_data`]).
+    async fn held_real_data(&self) -> StoreResult<bool>;
+    /// Write the permanent `held_real_data` marker (idempotent): the runtime started with live
+    /// connectors. Postgres refuses to change or delete it afterwards.
+    async fn mark_held_real_data(&self) -> StoreResult<()>;
+}
+
+/// The `held_real_data` rule at start-up (slice H4, spec §3.6): with live connectors the
+/// marker is written (for good), whatever the model source; in fake-data mode a database that
+/// has it is refused ("this database has held real data").
+pub async fn check_held_real_data(
+    store: &dyn BotsStore,
+    live: bool,
+    fake_only: bool,
+) -> Result<(), String> {
+    if live {
+        store
+            .mark_held_real_data()
+            .await
+            .map_err(|e| format!("writing the held_real_data marker: {e}"))?;
+    }
+    if fake_only
+        && store
+            .held_real_data()
+            .await
+            .map_err(|e| format!("reading the held_real_data marker: {e}"))?
+    {
+        return Err(pmos_contract::model_source::fake_data_refusal(
+            pmos_contract::model_source::HELD_REAL_DATA,
+        ));
+    }
+    Ok(())
 }
 
 /// Apply `change` to `task` if its guards hold. Shared by both stores so they decide alike.
@@ -325,6 +359,7 @@ struct State {
     notification_seq: i64,
     routines: BTreeMap<String, Routine>,
     member_settings: BTreeMap<String, MemberSettings>,
+    held_real_data: bool,
 }
 
 impl State {
@@ -728,6 +763,15 @@ impl BotsStore for MemoryStore {
         self.state()
             .member_settings
             .insert(settings.handle.clone(), settings.clone());
+        Ok(())
+    }
+
+    async fn held_real_data(&self) -> StoreResult<bool> {
+        Ok(self.state().held_real_data)
+    }
+
+    async fn mark_held_real_data(&self) -> StoreResult<()> {
+        self.state().held_real_data = true;
         Ok(())
     }
 }

@@ -109,6 +109,44 @@ impl PgStore {
         Ok(())
     }
 
+    /// Has this database ever held real data (slice H4)? Never cleared once written.
+    pub async fn held_real_data(&self) -> StoreResult<bool> {
+        let held: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM held_real_data)")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(held)
+    }
+
+    /// Writes the permanent `held_real_data` marker (idempotent).
+    pub async fn mark_held_real_data(&self) -> StoreResult<()> {
+        sqlx::query("INSERT INTO held_real_data (id) VALUES (true) ON CONFLICT (id) DO NOTHING")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// The `held_real_data` rule at start-up (spec §3.6): with live connectors or GitHub memory
+    /// (`real`) the marker is written, whatever the model source; in fake-data mode a database
+    /// that has it is refused.
+    pub async fn check_held_real_data(&self, real: bool, fake_only: bool) -> Result<(), String> {
+        if real {
+            self.mark_held_real_data()
+                .await
+                .map_err(|e| format!("writing the held_real_data marker: {e}"))?;
+        }
+        if fake_only
+            && self
+                .held_real_data()
+                .await
+                .map_err(|e| format!("reading the held_real_data marker: {e}"))?
+        {
+            return Err(pmos_contract::model_source::fake_data_refusal(
+                pmos_contract::model_source::HELD_REAL_DATA,
+            ));
+        }
+        Ok(())
+    }
+
     /// Every store, backed by this database.
     pub fn stores(&self) -> Stores {
         let s = std::sync::Arc::new(self.clone());

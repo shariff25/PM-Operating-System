@@ -201,6 +201,13 @@ pub struct Config {
     /// without a client id: the first-link route answers `501 not_configured`. The tenant id
     /// alone is what the host commands (`users set-entra`) read.
     pub entra: Option<pmos_entra::Tenant>,
+    /// `PMOS_MODEL_SOURCE` (slice H4): required, no default. `hosted-test` is fake-data mode:
+    /// live connectors, GitHub memory and the GitHub App are refused here, and `main` refuses
+    /// content that isn't test content and a database that has held real data.
+    pub model_source: pmos_contract::model_source::ModelSource,
+    /// `PMOS_GATEWAY_URL`: the model gateway, whose `/readyz` says the source it serves; every
+    /// session open and tool call checks it (`crate::model_source`). Required.
+    pub gateway_url: String,
 }
 
 /// The tool server's Entra settings: the first-link route validates ID tokens for this tenant
@@ -243,6 +250,12 @@ impl Config {
     }
 
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, String> {
+        // Slice H4: the model source first, so fake-data mode says what it refuses, one line per
+        // cause, before any other setting is read.
+        let model_source = pmos_contract::model_source::ModelSource::from_lookup(&get)?;
+        if model_source.fake_data_only() {
+            fake_data_refusals(&get)?;
+        }
         let service_token = get("PMOS_SERVICE_TOKEN").ok_or("PMOS_SERVICE_TOKEN is required")?;
         if service_token.len() < 32 {
             return Err("PMOS_SERVICE_TOKEN must be at least 32 characters".into());
@@ -309,6 +322,13 @@ impl Config {
                 "PMOS_DATABASE_URL is required (or set PMOS_DEV=1 to keep everything in memory)"
                     .into(),
             );
+        }
+        let gateway_url = get("PMOS_GATEWAY_URL")
+            .map(|u| u.trim().trim_end_matches('/').to_string())
+            .filter(|u| !u.is_empty())
+            .ok_or("PMOS_GATEWAY_URL is required: the model gateway, whose source every session and tool call is checked against")?;
+        if !(gateway_url.starts_with("http://") || gateway_url.starts_with("https://")) {
+            return Err("PMOS_GATEWAY_URL must be an http:// or https:// URL".into());
         }
         let connectors = match get("PMOS_CONNECTORS").as_deref() {
             Some("fake") => Connectors::Fake,
@@ -512,7 +532,40 @@ impl Config {
             password_keys,
             dev_password_setup,
             entra: entra_settings(&get)?,
+            model_source,
+            gateway_url,
         })
+    }
+}
+
+/// Fake-data mode's refusals of settings (spec §3.6, "Where each refusal lives"): one line per
+/// cause, each in the words `fake_data_refusal` gives.
+fn fake_data_refusals(get: &impl Fn(&str) -> Option<String>) -> Result<(), String> {
+    use pmos_contract::model_source::fake_data_refusal;
+    let set = |k: &str| get(k).is_some_and(|v| !v.trim().is_empty());
+    let mut causes = Vec::new();
+    match get("PMOS_CONNECTORS").as_deref().map(str::trim) {
+        Some("fake") | None => {}
+        Some(other) => causes.push(format!("PMOS_CONNECTORS must be fake (it is {other})")),
+    }
+    if get("PMOS_MEMORY").as_deref().map(str::trim) == Some("github") {
+        causes.push("PMOS_MEMORY must not be github (it reads PMs' own memory repos)".into());
+    }
+    for k in ["PMOS_GITHUB_CLIENT_ID", "PMOS_GITHUB_CLIENT_SECRET"] {
+        if set(k) {
+            causes.push(format!(
+                "{k} must be blank (the GitHub App reaches the company's repositories)"
+            ));
+        }
+    }
+    if causes.is_empty() {
+        Ok(())
+    } else {
+        Err(causes
+            .iter()
+            .map(|c| fake_data_refusal(c))
+            .collect::<Vec<_>>()
+            .join("\n"))
     }
 }
 
@@ -710,12 +763,105 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    /// The settings, with `PMOS_MODEL_SOURCE=local` and a gateway URL unless `pairs` gives
+    /// them (their own tests are below).
     fn cfg(pairs: &[(&str, &str)]) -> Result<Config, String> {
-        let map: HashMap<String, String> = pairs
+        let mut map: HashMap<String, String> = pairs
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
+        map.entry("PMOS_MODEL_SOURCE".into())
+            .or_insert_with(|| "local".into());
+        map.entry("PMOS_GATEWAY_URL".into())
+            .or_insert_with(|| "http://127.0.0.1:8740/v1".into());
         Config::from_lookup(|k| map.get(k).cloned())
+    }
+
+    #[test]
+    fn the_model_source_and_the_gateway_are_required() {
+        let base: Vec<(String, String)> = [
+            ("PMOS_SERVICE_TOKEN", TOKEN),
+            ("PMOS_DEV", "1"),
+            ("PMOS_CONNECTORS", "fake"),
+            ("PMOS_MODEL_SOURCE", "local"),
+            ("PMOS_GATEWAY_URL", "http://gateway.pmos.internal:8740/v1"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let run = |drop: &str, set: Option<(&str, &str)>| {
+            let mut m: HashMap<String, String> =
+                base.iter().filter(|(k, _)| k != drop).cloned().collect();
+            if let Some((k, v)) = set {
+                m.insert(k.into(), v.into());
+            }
+            Config::from_lookup(|k| m.get(k).cloned())
+        };
+        let ok = run("", None).unwrap();
+        assert_eq!(ok.gateway_url, "http://gateway.pmos.internal:8740/v1");
+        assert!(run("PMOS_MODEL_SOURCE", None)
+            .unwrap_err()
+            .contains("PMOS_MODEL_SOURCE is required"));
+        assert!(run("", Some(("PMOS_MODEL_SOURCE", " ")))
+            .unwrap_err()
+            .contains("PMOS_MODEL_SOURCE is required"));
+        assert!(run("", Some(("PMOS_MODEL_SOURCE", "hosted")))
+            .unwrap_err()
+            .contains("not built yet"));
+        assert!(run("PMOS_GATEWAY_URL", None)
+            .unwrap_err()
+            .contains("PMOS_GATEWAY_URL is required"));
+        assert!(run("", Some(("PMOS_GATEWAY_URL", "gateway:8740")))
+            .unwrap_err()
+            .contains("http://"));
+    }
+
+    #[test]
+    fn fake_data_mode_refuses_every_real_source_with_one_line_each() {
+        let fake = |extra: &[(&str, &str)]| {
+            let mut pairs = vec![
+                ("PMOS_SERVICE_TOKEN", TOKEN),
+                ("PMOS_DEV", "1"),
+                ("PMOS_CONNECTORS", "fake"),
+                ("PMOS_MODEL_SOURCE", "hosted-test"),
+            ];
+            pairs.extend_from_slice(extra);
+            cfg(&pairs)
+        };
+        assert!(fake(&[]).unwrap().model_source.fake_data_only());
+        let err = fake(&[
+            ("PMOS_CONNECTORS", "live"),
+            ("PMOS_MEMORY", "github"),
+            ("PMOS_GITHUB_CLIENT_ID", "Iv1.x"),
+        ])
+        .unwrap_err();
+        let lines: Vec<&str> = err.lines().collect();
+        assert_eq!(lines.len(), 3, "{err}");
+        for l in &lines {
+            assert!(
+                l.starts_with(
+                    "PMOS_MODEL_SOURCE=hosted-test sends prompts to an endpoint nobody approved, \
+                     so it allows fake data only: "
+                ),
+                "{l}"
+            );
+        }
+        assert!(
+            lines[0].ends_with("PMOS_CONNECTORS must be fake (it is live)"),
+            "{err}"
+        );
+        assert!(lines[1].contains("PMOS_MEMORY"), "{err}");
+        assert!(lines[2].contains("PMOS_GITHUB_CLIENT_ID"), "{err}");
+        // The same settings under `local` are only refused for what they lack, not for being
+        // real.
+        let err = cfg(&[
+            ("PMOS_SERVICE_TOKEN", TOKEN),
+            ("PMOS_DEV", "1"),
+            ("PMOS_CONNECTORS", "live"),
+            ("PMOS_MODEL_SOURCE", "local"),
+        ])
+        .unwrap_err();
+        assert!(!err.contains("fake data only"), "{err}");
     }
 
     const TOKEN: &str = "0123456789abcdef0123456789abcdef";

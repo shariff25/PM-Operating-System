@@ -113,6 +113,19 @@ fn content(hostile: bool) -> (tempfile::TempDir, std::path::PathBuf) {
     (dir, root)
 }
 
+/// A stand-in model gateway that only says which model source it serves (`GET /readyz`), as
+/// the runtime reads it before every claim (slice H4). Its OpenAI base, with `/v1`.
+async fn gateway_serving(source: &'static str, cancel: &CancellationToken) -> String {
+    let app = axum::Router::new().route(
+        "/readyz",
+        axum::routing::get(move || async move {
+            axum::Json(json!({"ready": true, "class": "test", "stub": false,
+                              "model_source": source}))
+        }),
+    );
+    format!("{}/v1", serve(app, cancel).await)
+}
+
 async fn serve(app: axum::Router, cancel: &CancellationToken) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -264,8 +277,13 @@ async fn start_with(hostile: bool) -> Stack {
         Arc::new(pmos_bots::catalog::Catalog::load(&root, Utc::now().date_naive()).unwrap()),
         people,
         pmos_bots::clients::ToolServer::new(&toolserver, SERVICE_TOKEN),
-        // Never called: the stand-in worker answers without a model.
-        pmos_bots::clients::Gateway::new("http://127.0.0.1:9/v1", GATEWAY_TOKEN),
+        // Only its model source is read (slice H4): the stand-in worker answers without a
+        // model.
+        pmos_bots::clients::Gateway::new(
+            &gateway_serving("local", &cancel).await,
+            GATEWAY_TOKEN,
+            pmos_contract::model_source::ModelSource::Local,
+        ),
         cancel.child_token(),
     ));
     let runtime = serve(

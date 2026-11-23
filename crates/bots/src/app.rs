@@ -159,6 +159,14 @@ impl IntoResponse for Error {
             )
                 .into_response(),
             Error::Unavailable(m) => error(StatusCode::SERVICE_UNAVAILABLE, m),
+            ref e @ Error::ModelSourceChanged => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "code": crate::runtime::MODEL_SOURCE_CHANGED,
+                    "error": e.to_string(),
+                })),
+            )
+                .into_response(),
             ref e @ Error::CursorAhead { head, .. } => (
                 StatusCode::CONFLICT,
                 Json(json!({
@@ -437,6 +445,8 @@ async fn readyz(State(state): State<AppState>) -> Response {
                 "toolserver": mark(r.toolserver),
                 "gateway": mark(r.gateway),
                 "directory": mark(r.directory),
+                "model_source": mark(r.model_source),
+                "content": mark(r.content),
             },
         })),
     )

@@ -460,6 +460,13 @@ pub struct MockGateway {
     pub status: Mutex<u16>,
     /// Requests seen: (headers we care about, body).
     pub seen: Mutex<Vec<(HashMap<String, String>, Value)>>,
+    /// The model source it serves (`/readyz`, and what a call must name), `local` by default.
+    pub source: Mutex<String>,
+    /// The source its answers say, when it should differ from `source` (a gateway that changed
+    /// between the check and the answer).
+    pub answer_source: Mutex<Option<String>>,
+    /// `/readyz` answers `500` with no body.
+    pub readyz_broken: Mutex<bool>,
 }
 
 impl Default for MockGateway {
@@ -468,8 +475,21 @@ impl Default for MockGateway {
             reply: Mutex::new("{}".into()),
             status: Mutex::new(200),
             seen: Mutex::default(),
+            source: Mutex::new("local".into()),
+            answer_source: Mutex::default(),
+            readyz_broken: Mutex::default(),
         }
     }
+}
+
+/// `GET /readyz`: the source it serves, as the real gateway says it.
+async fn gw_readyz(State(gw): State<Arc<MockGateway>>) -> Response {
+    if *gw.readyz_broken.lock().unwrap() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let source = gw.source.lock().unwrap().clone();
+    Json(json!({"ready": true, "class": "test", "stub": false, "model_source": source}))
+        .into_response()
 }
 
 async fn gw_chat(
@@ -482,26 +502,53 @@ async fn gw_chat(
     {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let keep: HashMap<String, String> = ["x-pmos-user", "x-pmos-priority", "x-pmos-run"]
-        .iter()
-        .filter_map(|k| {
-            headers
-                .get(*k)
-                .and_then(|v| v.to_str().ok())
-                .map(|v| (k.to_string(), v.to_string()))
-        })
-        .collect();
+    let keep: HashMap<String, String> = [
+        "x-pmos-user",
+        "x-pmos-priority",
+        "x-pmos-run",
+        "x-pmos-model-source",
+    ]
+    .iter()
+    .filter_map(|k| {
+        headers
+            .get(*k)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| (k.to_string(), v.to_string()))
+    })
+    .collect();
+    let source = gw.source.lock().unwrap().clone();
+    let answered = gw
+        .answer_source
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| source.clone());
+    // As the gateway does (X4): a call that doesn't name its source never reaches the model.
+    if keep.get("x-pmos-model-source") != Some(&source) {
+        return (
+            StatusCode::CONFLICT,
+            [("x-pmos-model-source", source)],
+            Json(json!({"error": {"type": "model_source_mismatch"}})),
+        )
+            .into_response();
+    }
     gw.seen.lock().unwrap().push((keep, body));
     let status = *gw.status.lock().unwrap();
     if status != 200 {
         return (
             StatusCode::from_u16(status).unwrap(),
+            [("x-pmos-model-source", answered)],
             Json(json!({"error": {"message": "busy"}})),
         )
             .into_response();
     }
     let content = gw.reply.lock().unwrap().clone();
-    Json(json!({"choices": [{"index": 0, "message": {"role": "assistant", "content": content}}]}))
+    (
+        [("x-pmos-model-source", answered)],
+        Json(
+            json!({"choices": [{"index": 0, "message": {"role": "assistant", "content": content}}]}),
+        ),
+    )
         .into_response()
 }
 
@@ -591,6 +638,7 @@ impl Env {
                 .route("/v1/chat/completions", post(gw_chat))
                 .route("/v1/models", get(gw_models))
                 .route("/v1/pmos/roles", get(gw_roles))
+                .route("/readyz", get(gw_readyz))
                 .with_state(gw.clone()),
             &stop,
         )
@@ -607,7 +655,12 @@ impl Env {
             Arc::new(catalog),
             snapshots,
             ToolServer::new(&ts_base, SERVICE),
-            Gateway::new(&format!("{gw_base}/v1"), GATEWAY),
+            Gateway::with_source_cache(
+                &format!("{gw_base}/v1"),
+                GATEWAY,
+                pmos_contract::model_source::ModelSource::Local,
+                std::time::Duration::ZERO,
+            ),
             stop.child_token(),
         ));
         let app = match assertions {

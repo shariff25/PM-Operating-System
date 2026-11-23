@@ -108,6 +108,15 @@ pub struct Config {
     /// `PMOS_EVALS_AS`: the handles the `evals` client may request tasks as, comma-separated.
     /// Empty or unset means [`DEFAULT_EVALS_AS`]: the benchmark member only.
     pub evals_as: Vec<String>,
+    /// `PMOS_MODEL_SOURCE` (slice H4): required, no default. The runtime claims nothing and
+    /// parses no routine while the gateway reports another source, and under `hosted-test`
+    /// (fake data only) it refuses content without a `TEST-CONTENT` marker or with a file marked
+    /// restricted, and a database that has held real data.
+    pub model_source: pmos_contract::model_source::ModelSource,
+    /// `PMOS_CONNECTORS`: `live` or `fake`, required. The runtime reads no connector itself; it
+    /// is here for the database's `held_real_data` marker only (spec §3.6): a start with `live`
+    /// writes it, for good.
+    pub connectors_live: bool,
 }
 
 /// The benchmark member the `evals` client runs tasks as when `PMOS_EVALS_AS` is unset.
@@ -176,7 +185,22 @@ impl Config {
             gateway_token: Secret(need("PMOS_GATEWAY_TOKEN")?),
             assertions,
             evals_as: parse_evals_as(get("PMOS_EVALS_AS").as_deref())?,
+            model_source: pmos_contract::model_source::ModelSource::from_lookup(&get)?,
+            connectors_live: connectors_live(get("PMOS_CONNECTORS").as_deref())?,
         })
+    }
+}
+
+/// `PMOS_CONNECTORS`, as the runtime and the web app read it: only to know whether this stack
+/// holds real data (`held_real_data`). Required, `live` or `fake`.
+pub fn connectors_live(value: Option<&str>) -> Result<bool, String> {
+    match value.map(str::trim) {
+        Some("live") => Ok(true),
+        Some("fake") => Ok(false),
+        None | Some("") => Err("PMOS_CONNECTORS is required (`live` or `fake`)".into()),
+        Some(other) => Err(format!(
+            "PMOS_CONNECTORS must be `live` or `fake`, not `{other}`"
+        )),
     }
 }
 
@@ -271,7 +295,40 @@ mod tests {
                 "PMOS_GATEWAY_TOKEN",
                 "gateway-token-0123456789abcdef0123".into(),
             ),
+            ("PMOS_MODEL_SOURCE", "local".into()),
+            ("PMOS_CONNECTORS", "fake".into()),
         ]
+    }
+
+    #[test]
+    fn the_model_source_and_connectors_are_required() {
+        let t = "a".repeat(32);
+        let tokens = format!("slack={t}");
+        let owned = base(&tokens);
+        let mut pairs: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        pairs.push(("PMOS_DEV", "1"));
+        let ok = cfg(&pairs).unwrap();
+        assert_eq!(
+            ok.model_source,
+            pmos_contract::model_source::ModelSource::Local
+        );
+        assert!(!ok.connectors_live);
+        for (key, value, want) in [
+            ("PMOS_MODEL_SOURCE", "", "PMOS_MODEL_SOURCE is required"),
+            ("PMOS_MODEL_SOURCE", "hosted", "not built yet"),
+            ("PMOS_CONNECTORS", "", "PMOS_CONNECTORS is required"),
+            ("PMOS_CONNECTORS", "maybe", "must be `live` or `fake`"),
+        ] {
+            let changed: Vec<(&str, &str)> = pairs
+                .iter()
+                .map(|(k, v)| if *k == key { (*k, value) } else { (*k, *v) })
+                .collect();
+            let err = cfg(&changed).unwrap_err();
+            assert!(err.contains(want), "{key}={value}: {err}");
+            let without: Vec<(&str, &str)> =
+                pairs.iter().copied().filter(|(k, _)| *k != key).collect();
+            assert!(cfg(&without).unwrap_err().contains(key), "{key} missing");
+        }
     }
 
     #[test]

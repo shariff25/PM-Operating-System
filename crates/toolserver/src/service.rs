@@ -102,6 +102,10 @@ pub enum ToolError {
     /// Storage failed. The call did not complete; it is safe to retry.
     #[error("PM OS storage is unavailable; try again shortly")]
     Unavailable(String),
+    /// Slice H4: the model gateway no longer serves the source this session opened under (or
+    /// its source can't be read). The call was refused and the session closed.
+    #[error("model_source_changed: the model gateway no longer serves the model source this session opened under, so this session is closed")]
+    ModelSourceChanged,
 }
 
 impl From<ConnectorError> for ToolError {
@@ -157,6 +161,10 @@ pub enum SessionError {
     /// The persona is offered but not on the PM's team.
     #[error("{name} isn't on your team any more. Add it on the Bots page in PM OS, or ask Nudge.")]
     PersonaNotOnTeam { name: String },
+    /// Slice H4: the model gateway serves another source than this stack's, or its source
+    /// can't be read (`503 model_source_changed`).
+    #[error("model_source_changed: {0}")]
+    ModelSourceChanged(String),
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -503,6 +511,10 @@ pub struct ToolService {
     /// row per window instead of one per call (gate-fix-4). In memory, at most
     /// [`QUIET_MARKS`] entries.
     quiet_marks: Mutex<HashMap<(&'static str, String), DateTime<Utc>>>,
+    /// Slice H4: the cross-check of the model gateway's source at every session open and
+    /// tool call (`crate::model_source`). `main` always sets it; `None` (tests that run no
+    /// gateway) checks nothing.
+    model_source: Option<Arc<crate::model_source::SourceGuard>>,
 }
 
 /// The most (kind, person) marks [`ToolService::first_in_window`] keeps.
@@ -560,7 +572,96 @@ impl ToolService {
             passwords: None,
             team_changes: Mutex::default(),
             quiet_marks: Mutex::default(),
+            model_source: None,
         })
+    }
+
+    /// Check the model gateway's source at every session open and tool call (slice H4).
+    pub fn with_model_source(mut self, guard: Arc<crate::model_source::SourceGuard>) -> Self {
+        self.model_source = Some(guard);
+        self
+    }
+
+    /// The source a new session opens under, when the gateway is checked.
+    async fn open_source(&self) -> Result<Option<String>, SessionError> {
+        let Some(guard) = &self.model_source else {
+            return Ok(None);
+        };
+        match guard.at_open().await {
+            Ok(s) => Ok(Some(s)),
+            Err(why) => {
+                let detail = why.detail(guard.own());
+                tracing::warn!(reason = %detail, "session refused: the model gateway's source");
+                Err(SessionError::ModelSourceChanged(detail))
+            }
+        }
+    }
+
+    /// Records the source `session` opened under.
+    fn record_source(&self, session: &Session, source: Option<String>) {
+        if let (Some(guard), Some(source)) = (&self.model_source, source) {
+            guard.record(&session.token, source);
+        }
+    }
+
+    /// Before a tool call: the gateway still serves the session's source. Otherwise the
+    /// session is closed and the change recorded.
+    async fn check_call_source(
+        &self,
+        client: Client,
+        session: &Session,
+        now: DateTime<Utc>,
+    ) -> Result<(), ToolError> {
+        let Some(guard) = &self.model_source else {
+            return Ok(());
+        };
+        let Err(why) = guard.at_call(&session.token).await else {
+            return Ok(());
+        };
+        let detail = why.detail(guard.own());
+        tracing::warn!(user = %session.user, run = %session.run_id, reason = %detail,
+            "tool call refused and session closed: the model gateway's source changed");
+        if let Err(e) = self.revoke_session(&session.token).await {
+            tracing::error!(error = %e, "closing a session whose model source changed failed");
+        }
+        guard.forget(&session.token);
+        let event = |tool: &str, user: String, run: String, detail: String| AuditEvent {
+            client,
+            at: now,
+            run_id: run,
+            user,
+            skill: session.skill.clone(),
+            bot: session.bot.clone(),
+            tool: tool.to_string(),
+            outcome: Outcome::Denied,
+            sources: Vec::new(),
+            source_titles: Default::default(),
+            args_hash: None,
+            output_ref: None,
+            detail: Some(detail),
+            persona: session.persona.clone(),
+        };
+        if guard.first_seen(&why) {
+            let mut e = event(
+                crate::model_source::SYSTEM_MODEL_SOURCE,
+                session.user.clone(),
+                session.run_id.clone(),
+                detail.clone(),
+            );
+            e.client = Client::System;
+            self.audit(e).await;
+        }
+        self.audit(event(
+            crate::model_source::SESSION_CLOSED,
+            session.user.clone(),
+            session.run_id.clone(),
+            format!(
+                "reason: {}; {detail}",
+                crate::model_source::MODEL_SOURCE_CHANGED
+            ),
+        ))
+        .await;
+        Err(ToolError::ModelSourceChanged)
     }
 
     /// Turn password sign-in on, with its service (the vault's keys, the hashing parameters).
@@ -773,10 +874,12 @@ impl ToolService {
         if run_id.is_empty() || run_id.len() > 128 {
             return Err(SessionError::InvalidRun);
         }
+        let source = self.open_source().await?;
         let ttl = ttl.unwrap_or_else(|| Duration::minutes(DEFAULT_SESSION_TTL_MINUTES));
         let mut session = Session::new(user, skill, run_id, ttl, now);
         session.sources_sensitivity = floor;
         self.stores.sessions.insert(&session, now).await?;
+        self.record_source(&session, source);
         Ok(session)
     }
 
@@ -865,11 +968,13 @@ impl ToolService {
                 });
             }
         }
+        let source = self.open_source().await?;
         let ttl = ttl.unwrap_or_else(|| Duration::minutes(DEFAULT_SESSION_TTL_MINUTES));
         let mut session = Session::for_bot(user, bot, run_id, ttl, now);
         session.persona = persona.map(String::from);
         session.sources_sensitivity = floor;
         self.stores.sessions.insert(&session, now).await?;
+        self.record_source(&session, source);
         Ok(session)
     }
 
@@ -1009,6 +1114,8 @@ impl ToolService {
         args: Value,
         now: DateTime<Utc>,
     ) -> Result<Value, ToolError> {
+        // Slice H4: every tool call, before anything else.
+        self.check_call_source(client, session, now).await?;
         let args = if args.is_null() { json!({}) } else { args };
         let mut event = AuditEvent {
             client,
