@@ -6,21 +6,26 @@
 # The gateway refuses this file unless PMOS_GATEWAY_CLOUD_TEST=1. The API key comes from
 # PMOS_GATEWAY_ANTHROPIC_KEY. See
 # docs/testing-with-claude.md.
+# Every role has a `label:`: the gateway takes this config only as PMOS_MODEL_SOURCE=hosted-test
+# (slice H4), which needs one on every role, so it reports and logs the label, never the model id.
 upstreams:
   claude: anthropic+https://api.anthropic.com
 roles:
   default:
     upstream: claude
     model: claude-opus-5-5
+    label: claude-test-a
     effort: medium
   # The PM assistant's drafting and critique. Point it at a larger model if the bake-off picks one.
   reasoning:
     upstream: claude
     model: claude-opus-5-5
+    label: claude-test-a
     effort: medium
   extraction:
     upstream: claude
     model: claude-opus-5-5
+    label: claude-test-a
     effort: low
 limits:
   max-in-flight: 4

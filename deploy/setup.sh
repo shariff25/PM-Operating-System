@@ -3,9 +3,13 @@
 # never replaces a value already in deploy/.env, and only fills in what's missing.
 #
 #   deploy/setup.sh [--content /srv/pmos/content-repo] [--clone <git url>] [--state /srv/pmos/state]
+#                   [--model-source hosted-test|local] [--exposure public|private]
 #
-# It checks the tools, writes deploy/.env with fresh secrets, makes the state directories and,
-# with --clone, clones the content repo. Then build and start with deploy/pmos-admin.
+# It checks the tools, writes deploy/.env with fresh secrets and the host settings
+# (docs/openshell-any-host-spec.md §3.1: PMOS_MODEL_SOURCE, default hosted-test, fake data only;
+# PMOS_EXPOSURE, default public; PMOS_OPENSHELL_DRIVER, docker), makes the state directories
+# and, with --clone, clones the content repo. A value already in deploy/.env is never replaced.
+# Then build and start with deploy/pmos-admin.
 set -euo pipefail
 
 DEPLOY="$(cd "$(dirname "$0")" && pwd)"
@@ -13,15 +17,38 @@ ENV="$DEPLOY/.env"
 CONTENT=/srv/pmos/content-repo
 STATE=/srv/pmos/state
 CLONE=""
+MODEL_SOURCE=""
+EXPOSURE=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --content) CONTENT="$2"; shift 2 ;;
     --state) STATE="$2"; shift 2 ;;
     --clone) CLONE="$2"; shift 2 ;;
-    -h|--help) sed -n '2,9p' "$0"; exit 0 ;;
+    --model-source | --exposure)
+      [ $# -ge 2 ] && [ -n "$2" ] || { echo "$1 needs a value" >&2; exit 2; }
+      if [ "$1" = --model-source ]; then MODEL_SOURCE=$2; else EXPOSURE=$2; fi
+      shift 2 ;;
+    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac
 done
+# The host settings (§3.1). Each default is the value that allows less; `local` and `private`
+# must be chosen. `hosted` (an approved provider) isn't built yet (slice H12).
+case "$MODEL_SOURCE" in
+  '' | local | hosted-test) ;;
+  hosted) echo "--model-source hosted (an approved provider) isn't built yet (slice H12): use hosted-test (fake data only) or local" >&2; exit 2 ;;
+  *) echo "--model-source $(printf '%q' "$MODEL_SOURCE"): use hosted-test or local" >&2; exit 2 ;;
+esac
+case "$EXPOSURE" in
+  '' | private | public) ;;
+  *) echo "--exposure $(printf '%q' "$EXPOSURE"): use public or private" >&2; exit 2 ;;
+esac
+# What deploy/.env says already (a second run), else the flag, else the default: never replaced.
+env_value() { [ -f "$ENV" ] && grep -E "^$1=" "$ENV" | head -1 | cut -d= -f2- || true; }
+HAD_SOURCE=$(env_value PMOS_MODEL_SOURCE)
+HAD_EXPOSURE=$(env_value PMOS_EXPOSURE)
+PF_SOURCE=${HAD_SOURCE:-${MODEL_SOURCE:-hosted-test}}
+PF_EXPOSURE=${HAD_EXPOSURE:-${EXPOSURE:-public}}
 
 # The two paths go into deploy/.env, which pmos-admin reads as data and Docker Compose
 # interpolates: only an absolute path of plain characters is taken (no space, `$`, quote, `#`,
@@ -66,7 +93,8 @@ fail() { printf '  \033[31mfail\033[0m %s\n' "$1"; exit 1; }
 # fail stops here, with nothing changed. It reads deploy/.env when one exists (a second run).
 echo "== host preflight (deploy/preflight.sh --stage install)"
 pf_code=0
-"$DEPLOY/preflight.sh" --stage install --env-file "$ENV" || pf_code=$?
+"$DEPLOY/preflight.sh" --stage install --env-file "$ENV" \
+  --model-source "$PF_SOURCE" --exposure "$PF_EXPOSURE" || pf_code=$?
 if [ "$pf_code" != 0 ]; then
   echo "setup.sh stops: the host preflight failed (each fail above). Nothing was changed." >&2
   exit 1
@@ -80,10 +108,13 @@ command -v openssl >/dev/null || fail "openssl is not installed"
 command -v git >/dev/null || fail "git is not installed"
 command -v flock >/dev/null || fail "flock is not installed (util-linux: sudo apt-get install util-linux); deploy/.env is changed only under its lock"
 ok "openssl, git and flock"
-if docker info 2>/dev/null | grep -qi nvidia; then
-  ok "NVIDIA container runtime"
-else
-  warn "no NVIDIA container runtime found: the model servers (--models) won't start"
+# The NVIDIA runtime matters only for PMOS_MODEL_SOURCE=local, which runs model servers here.
+if [ "$PF_SOURCE" = local ]; then
+  if docker info 2>/dev/null | grep -qi nvidia; then
+    ok "NVIDIA container runtime"
+  else
+    warn "no NVIDIA container runtime found: the model servers (--models) won't start"
+  fi
 fi
 if command -v openshell >/dev/null; then
   ok "openshell $(openshell --version 2>/dev/null | head -1)"
@@ -210,6 +241,24 @@ ok "secrets filled in (existing values kept)"
 # Kept in deploy/.env, so every later `pmos-admin up`, `add-bot` and `restore` keeps it: the
 # runtime and the tool server refuse to start in another mode while the web app's or the
 # console's tokens are set (docs/user-assertion.md, Modes).
+# The host settings (§3.1): the defaults that allow less, unless a flag chose another; a value
+# already there is kept (and a flag that differs from it is reported, not applied).
+fill PMOS_MODEL_SOURCE "${MODEL_SOURCE:-hosted-test}"
+fill PMOS_EXPOSURE "${EXPOSURE:-public}"
+fill PMOS_OPENSHELL_DRIVER docker
+for pair in "PMOS_MODEL_SOURCE:$MODEL_SOURCE:$HAD_SOURCE" "PMOS_EXPOSURE:$EXPOSURE:$HAD_EXPOSURE"; do
+  IFS=: read -r k want had <<<"$pair"
+  if [ -n "$want" ] && [ -n "$had" ] && [ "$want" != "$had" ]; then
+    warn "$k=$had in deploy/.env is kept; change it there by hand to use $want"
+  fi
+done
+ms=$(env_value PMOS_MODEL_SOURCE)
+if [ "$ms" = hosted-test ]; then
+  warn "PMOS_MODEL_SOURCE=hosted-test: TESTING ONLY, prompts go to an endpoint nobody approved, so the stack takes fake data only; set PMOS_HOSTED_TEST_URL, PMOS_HOSTED_TEST_MODEL and PMOS_GATEWAY_REMOTE_KEY"
+else
+  ok "PMOS_MODEL_SOURCE=$ms"
+fi
+ok "PMOS_EXPOSURE=$(env_value PMOS_EXPOSURE)"
 fill PMOS_ASSERTION_MODE require
 fill PMOS_ONBOARDING_V2 1
 fill PMOS_NUDGES 1

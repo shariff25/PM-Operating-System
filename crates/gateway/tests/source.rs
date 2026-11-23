@@ -487,3 +487,31 @@ fn each_source_starts_only_with_its_own_kind_of_config() {
         assert!(err.contains("pinned"), "{other}: {err}");
     }
 }
+
+/// The shipped configs start under the source each is for: deploy/gateway.yaml under `local`
+/// (and nothing else), the hosted-test example and the test stack's Claude config under
+/// `hosted-test` with CLOUD_TEST.
+#[test]
+fn the_shipped_configs_fit_their_sources() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let read = |p: &str| std::fs::read_to_string(root.join(p)).unwrap();
+    let local = config(&[("PMOS_MODEL_SOURCE", "local")]).unwrap();
+    let hosted_test = config(&[
+        ("PMOS_MODEL_SOURCE", "hosted-test"),
+        ("PMOS_GATEWAY_CLOUD_TEST", "1"),
+    ])
+    .unwrap();
+    let production = Models::parse(&read("deploy/gateway.yaml"), false).unwrap();
+    assert!(local.check_source(&production).is_ok());
+    assert!(hosted_test.check_source(&production).is_err());
+    for p in ["deploy/gateway.hosted-test.yaml", "config/gateway.claude-test.yaml"] {
+        let m = Models::parse(&read(p), true).unwrap();
+        assert!(hosted_test.check_source(&m).is_ok(), "{p}");
+        assert!(local.check_source(&m).is_err(), "{p}");
+    }
+    // The example names no real host: its upstream is under `.invalid`.
+    let example = Models::parse(&read("deploy/gateway.hosted-test.yaml"), true).unwrap();
+    for r in example.roles.values() {
+        assert!(r.upstream_host().ends_with(".invalid"), "{}", r.name);
+    }
+}

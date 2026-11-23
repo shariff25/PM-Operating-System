@@ -52,6 +52,10 @@ services:
     environment:
       PMOS_DEV: "1"
       PMOS_CONNECTORS: fake
+      # The main stack's source, whose gateway this stack shares (slice H4): every session open
+      # and tool call checks the gateway still serves it.
+      PMOS_MODEL_SOURCE: ${PMOS_MODEL_SOURCE:?run deploy/setup.sh first}
+      PMOS_GATEWAY_URL: http://gateway.pmos.internal:8740/v1
       PMOS_BIND: 0.0.0.0:8710
       PMOS_ALLOWED_HOSTS: toolserver,localhost,127.0.0.1
       PMOS_SERVICE_TOKEN: ${PMOS_EVAL_SERVICE_TOKEN:?}
@@ -79,6 +83,8 @@ services:
     command: ["pmos-bots"]
     environment:
       PMOS_DEV: "1"
+      PMOS_MODEL_SOURCE: ${PMOS_MODEL_SOURCE:?run deploy/setup.sh first}
+      PMOS_CONNECTORS: fake
       PMOS_BOTS_BIND: 0.0.0.0:8750
       PMOS_BOTS_TOKENS: evals=${PMOS_EVAL_RT_EVALS:?},console=${PMOS_EVAL_RT_CONSOLE:?},worker-docs=${PMOS_EVAL_RT_DOCS:?},worker-pm-evals=${PMOS_EVAL_RT_PERSONAL:?}
       # The `console` token here is only the benchmark runner's trace reader (PMOS_EVALS_TRACE_TOKEN):

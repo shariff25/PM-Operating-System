@@ -1,0 +1,11 @@
+# PMOS_MODEL_SOURCE=local with the model servers on (PMOS_GATEWAY_STUB not 1): the vLLM image
+# is required (docs/openshell-any-host-spec.md §3.6, "The local model path on a generic GPU
+# host"; slice H4). deploy/pmos-admin adds this file to every `docker compose` call then, so
+# `up`, `status` and `compose config` all fail until PMOS_VLLM_IMAGE names the image for this
+# host's architecture and GPU, pinned by tag (never `latest`). The preflight's H-NVIDIA says the
+# same before anything starts.
+services:
+  vllm-default:
+    image: "${PMOS_VLLM_IMAGE:?PMOS_MODEL_SOURCE=local needs PMOS_VLLM_IMAGE in deploy/.env, the vLLM image for this host GPU, pinned by tag}"
+  vllm-extraction:
+    image: "${PMOS_VLLM_IMAGE:?PMOS_MODEL_SOURCE=local needs PMOS_VLLM_IMAGE in deploy/.env, the vLLM image for this host GPU, pinned by tag}"

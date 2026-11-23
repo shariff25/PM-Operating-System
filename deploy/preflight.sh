@@ -26,9 +26,10 @@
 #   --only <ids>      run only these checks (diagnosis and tests); pmos-admin never passes it
 #
 # The model source and the exposure come from the flags, else deploy/.env, else: PMOS_EXPOSURE
-# `public` (the value that allows less, §3.1) and PMOS_MODEL_SOURCE `local`, which is what
-# deploy/pmos-admin starts today for a blank value (slice H4 changes the default to hosted-test;
-# until then `local` is also the reading under which more is checked: H-NVIDIA and H-LOCAL).
+# `public` (the value that allows less, §3.1) and PMOS_MODEL_SOURCE `local`. Since slice H4 a
+# blank source is refused by deploy/pmos-admin and by every service (setup.sh writes hosted-test
+# unless told otherwise, and passes its choice here at install); this script reads a blank one as
+# `local` only because that is the reading under which the most is checked (H-NVIDIA, H-LOCAL).
 #
 # Exit status: 0 every check passes (warnings allowed), 1 any fails, 2 the script couldn't run.
 # --json prints {"checks": [{"id", "status", "measured", "expected", "hint"}, …],

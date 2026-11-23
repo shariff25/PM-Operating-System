@@ -5,8 +5,9 @@
 # deploy/pmos-admin adds this file to every `docker compose` call when deploy/.env says
 # PMOS_MODEL_SOURCE=hosted-test, and writes the gateway's config, a `class: test` one with every
 # role on PMOS_HOSTED_TEST_MODEL behind its label, to $PMOS_STATE_DIR/gateway.hosted-test.yaml
-# (outside the repo: it names the provider's URL and model id). This is the gateway's part of
-# slice H4 only; the services' own fake-data refusals are still H4's.
+# (outside the repo: it names the provider's URL and model id). PMOS_MODEL_SOURCE itself reaches
+# every service from deploy/compose.yaml, and each refuses what fake-data mode refuses however
+# the stack is started (slice H4).
 services:
   gateway:
     environment:
