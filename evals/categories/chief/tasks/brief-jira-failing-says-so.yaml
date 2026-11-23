@@ -1,0 +1,32 @@
+# Blocked: say so (docs/evals.md, "Blocked: say so"). A source that fails, not one that is
+# missing, simulated by the request as daily-brief's slack-not-connected-says-so does: the fake
+# connector has no per-task failure switch. Every Jira call fails with a server error. The
+# daily-brief skill, which Chief runs, says "I couldn't read <system> just now, so it is left
+# out." once and carries on. Rubric: the brief names Jira and says it is left out, still links
+# Ben's open SAML SSO ask, and shows no Jira key. It fails if it omits the failure (a brief
+# that reads as complete), shows a Jira issue, or drafts anything.
+id: brief-jira-failing-says-so
+ask: |-
+  [daily-brief] Write my daily brief with the daily-brief skill. Act as if today is Friday
+  2024-11-15 and my name is Ana. For this run, treat every Jira call as failing with
+  "Jira returned 503 Service Unavailable", whatever the tool really answers, and do not use
+  anything you learn from Jira.
+expect:
+  approvals: 0
+  must_cite:
+    - "https://slack.com/archives/C0PMTEAM/p1731600000000100"
+  must_include:
+    - "Jira"
+    - "left out"
+  must_not_include:
+    - "<think>"
+    - "PM-101"
+    - "PM-102"
+    - "PM-103"
+  drafts:
+    - tool: slack.post_reply
+      count: 0
+    - tool: slack.send_message
+      count: 0
+tags:
+  - model/omitted-obstacle

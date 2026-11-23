@@ -918,6 +918,12 @@ async fn cli_judge_calibration_decides_blocking() {
 async fn cli_affected_reads_changed_paths() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals");
     let content = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content");
+    let every: String = pmos_evals::spec::category_names(&root)
+        .unwrap()
+        .iter()
+        .map(|n| format!("{n}\n"))
+        .collect();
+    // A skill change runs every category, not only the Docs bot's (owner, 2026-11-23).
     let o = cli_async(
         &root,
         &["affected", "--content", content.to_str().unwrap()],
@@ -925,7 +931,16 @@ async fn cli_affected_reads_changed_paths() {
     )
     .await;
     assert_eq!(o.status.code(), Some(0), "{}", out(&o));
-    assert_eq!(String::from_utf8_lossy(&o.stdout), "docs-qa\n");
+    assert_eq!(String::from_utf8_lossy(&o.stdout), every);
+    // A change outside the evals, the gateway config and the bots' content runs nothing.
+    let o = cli_async(
+        &root,
+        &["affected", "--content", content.to_str().unwrap()],
+        Some("README.md\ncontent/templates/prd.md\n"),
+    )
+    .await;
+    assert_eq!(o.status.code(), Some(0), "{}", out(&o));
+    assert_eq!(String::from_utf8_lossy(&o.stdout), "");
     let o = cli_async(
         &root,
         &[

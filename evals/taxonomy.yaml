@@ -13,6 +13,7 @@ model:
   description: The bot had what it needed and got it wrong.
   tags:
     answered-beyond-sources: Answered a question its sources don't answer, instead of saying so (a `must_decline` task that got an answer).
+    omitted-obstacle: A tool failed or what the PM named (an issue, a page, a thread) was missing, and the answer or draft didn't say so; it presented partial or invented work as complete. Tasks that name a missing source or simulate a failing tool exist to catch it (docs/evals.md, the blocked section); also found by a reviewer.
     missing-citation: The answer doesn't link a page it had to cite, though retrieval surfaced it or no tool was called.
     leaked-reasoning: The answer contains the model's reasoning, such as a `<think>` block.
     missing-fact: The answer leaves out a fact it had to state (`must_include`).
