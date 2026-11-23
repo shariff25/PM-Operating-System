@@ -453,8 +453,9 @@ services:
   # The local models (verify on the Spark: image tag, model ids and memory split).
   # PMOS_VLLM_IMAGE has no default (slice H4): the host's operator chooses the image for its
   # architecture and GPU, pinned by tag. Blank, `--profile models` fails ("neither an image nor
-  # a build context"); under PMOS_MODEL_SOURCE=local with the stub off, pmos-admin adds
-  # compose.local.yaml, which makes every `docker compose` call fail without it.
+  # a build context"), so pmos-admin's every-profile commands (status, logs, restart, down)
+  # leave that profile out then; under PMOS_MODEL_SOURCE=local with the stub off, pmos-admin
+  # adds compose.local.yaml, which makes every `docker compose` call fail without it.
   vllm-default:
     &vllm
     image: ${PMOS_VLLM_IMAGE:-}

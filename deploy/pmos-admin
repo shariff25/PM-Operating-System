@@ -1512,7 +1512,23 @@ bringup_personal() {
 
 # The stack's services, as Docker Compose lists them from deploy/compose.yaml with every
 # profile. `logs` and `restart` take only one of these (never an option, never anything else).
-ALL_PROFILES=(--profile slack --profile console --profile web --profile models --profile bringup --profile bringup-personal)
+# The models profile only with PMOS_VLLM_IMAGE set: it has no default (slice H4), and Compose
+# refuses to load a project in which an enabled service has no image, so with it blank `status`,
+# `logs`, `restart` and `down` would all fail on every stack without the local model servers
+# (the stub, hosted-test). None of them can be running then, as `up --models` needs the image;
+# for model servers left from before it was cleared, see stray_model_servers.
+ALL_PROFILES=(--profile slack --profile console --profile web --profile bringup --profile bringup-personal)
+[ -z "${PMOS_VLLM_IMAGE:-}" ] || ALL_PROFILES+=(--profile models)
+MODEL_SERVICES=(vllm-default vllm-extraction)
+# The model server containers of this stack (project pmos) Compose can't see because
+# PMOS_VLLM_IMAGE is blank now: their ids, one per line. Empty with the image set.
+stray_model_servers() {
+  [ -z "${PMOS_VLLM_IMAGE:-}" ] || return 0
+  local s
+  for s in "${MODEL_SERVICES[@]}"; do
+    docker ps -aq --filter label=com.docker.compose.project=pmos --filter "label=com.docker.compose.service=$s" 2>/dev/null || true
+  done
+}
 require_service() { # command service
   local list
   case "$2" in
@@ -1670,6 +1686,14 @@ case "$cmd" in
     ;;
 
   down)
+    # Model servers started before PMOS_VLLM_IMAGE was cleared: Compose can't stop them without
+    # the models profile (which needs the image), and they would keep the network in use.
+    stray=$(stray_model_servers)
+    if [ -n "$stray" ]; then
+      say "stopping model servers started before PMOS_VLLM_IMAGE was cleared in deploy/.env"
+      # shellcheck disable=SC2086 # container ids, one per line
+      docker rm -f $stray >/dev/null || say "WARNING: couldn't remove them: docker ps --filter label=com.docker.compose.project=pmos" >&2
+    fi
     compose "${ALL_PROFILES[@]}" down || {
       say "docker compose couldn't stop the stack (it may not be able to read deploy/.env either)." >&2
       down_advice
@@ -1681,6 +1705,9 @@ case "$cmd" in
     say "== containers"
     compose "${ALL_PROFILES[@]}" ps \
       --format 'table {{.Service}}\t{{.Status}}'
+    if [ -n "$(stray_model_servers)" ]; then
+      row models WARN "model server containers exist but PMOS_VLLM_IMAGE is blank in deploy/.env: set it back, or deploy/pmos-admin down"
+    fi
     # The pinned addresses and the host names (slice H2): what sandboxes reach.
     say "== network and host names"
     if problems=$(network_settings_problems); then
