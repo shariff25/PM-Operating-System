@@ -53,6 +53,8 @@ export interface FixedService {
   rule: string;
   host: string;
   port: number;
+  /** The one address the host may resolve to: its own pinned `/32` (decision O6). */
+  allowed_ips: string[];
   protocol: string;
   routes: string[] | null;
   credential_profile: string | null;
@@ -82,6 +84,8 @@ export interface NetworkAllowance {
   port: number | null;
   ports: number[];
   allowed_ips: string[];
+  /** The service is known and `allowed_ips` is exactly its own pinned address, as generated. */
+  pinned: boolean;
   protocol: string | null;
   enforcement: string | null;
   tls: string | null;

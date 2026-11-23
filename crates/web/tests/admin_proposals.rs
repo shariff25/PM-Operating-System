@@ -912,6 +912,24 @@ async fn policy_read_shows_the_spec_the_files_drift_and_allowances() {
         .any(|f| f["path"] == "policies/bots/docs.yaml" && f["state"] == "same"));
     assert!(f[0]["generated"].is_string() && f[0]["checked_in"].is_string());
     assert_eq!(b["fixed"]["services"].as_array().unwrap().len(), 3);
+    // Each name only at its own pinned address (decision O6), in the fixed facts and in what the
+    // checked-in file allows.
+    let pins: Vec<(&str, &Value)> = b["fixed"]["services"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| (s["host"].as_str().unwrap(), &s["allowed_ips"]))
+        .collect();
+    assert_eq!(
+        pins,
+        [
+            ("toolserver.pmos.internal", &json!(["10.201.77.10/32"])),
+            ("gateway.pmos.internal", &json!(["10.201.77.11/32"])),
+            ("bots.pmos.internal", &json!(["10.201.77.12/32"])),
+        ]
+    );
+    assert!(net.iter().all(|n| n["pinned"] == true), "{net:?}");
+    assert_eq!(ts["allowed_ips"], json!(["10.201.77.10/32"]));
     assert_eq!(b["proposals_configured"], true);
     // Branch protection, as the tool server read it with adam's own account.
     assert_eq!(b["protection"]["required_reviews"], 1);

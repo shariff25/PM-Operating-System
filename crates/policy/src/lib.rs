@@ -7,7 +7,9 @@
 //! - **Network:** egress is denied by default; the only allowed destinations are the tool
 //!   server's MCP endpoint ([`TOOLSERVER_HOST`]`:`[`TOOLSERVER_PORT`]), the model gateway
 //!   ([`GATEWAY_HOST`]`:`[`GATEWAY_PORT`]) and the bot runtime's worker routes
-//!   ([`RUNTIME_HOST`]`:`[`RUNTIME_PORT`]), all inspected and enforced.
+//!   ([`RUNTIME_HOST`]`:`[`RUNTIME_PORT`]), all inspected and enforced, and each name only
+//!   where it resolves to its own pinned address ([`TOOLSERVER_ADDR`], [`GATEWAY_ADDR`],
+//!   [`BOTS_ADDR`], one `/32` each in `allowed_ips`).
 //! - **Filesystem:** the bot's workspace is writable; its role's skills and its master context
 //!   are read-only; nothing else is readable beyond the system paths OpenShell needs.
 //! - **Credentials:** only the bot's own gateway and runtime-worker tokens, as OpenShell
@@ -24,8 +26,8 @@
 //! | `providers/<profile>.yaml` | OpenShell provider profile | `openshell provider profile import` |
 //!
 //! The OpenShell policy can't carry PM OS metadata (OpenShell rejects unknown fields), which is
-//! why the launch spec is a separate file. Format details and what is still to verify on the
-//! Spark are in `docs/sandbox-policies.md`.
+//! why the launch spec is a separate file. Format details and what is still to verify on a real
+//! host are in `docs/sandbox-policies.md`.
 
 pub mod admin;
 pub mod check;
@@ -36,6 +38,8 @@ pub mod yaml;
 
 pub use check::{check, check_policy, check_spec, CheckReport, Violation};
 pub use generate::{generate, write, BotContext, Generated, WriteSummary};
+
+use std::net::Ipv4Addr;
 
 /// The tool server, as sandboxes reach it (spec section 7).
 pub const TOOLSERVER_HOST: &str = "toolserver.pmos.internal";
@@ -51,6 +55,24 @@ pub const GATEWAY_ROUTES: [(&str, &str); 1] = [("POST", "/v1/chat/completions")]
 /// The bot runtime, as sandboxes reach it: the harness worker claims and reports tasks here.
 pub const RUNTIME_HOST: &str = "bots.pmos.internal";
 pub const RUNTIME_PORT: u16 = 8750;
+
+// The three services' addresses on the `pmos` network (`docs/openshell-any-host-spec.md` §3.3
+// and §3.5, decision O6). Each endpoint's `allowed_ips` is exactly its own address as a `/32`,
+// so OpenShell refuses a connection when the name resolves anywhere else: a missing or stale
+// `/etc/hosts` block, a resolver that answers `*.internal`, a tampered entry, two names swapped.
+// They are reviewed code, never settings: they equal the `ipv4_address` literals in
+// `deploy/compose.yaml` and the `PINNED_SERVICE_ADDRS` of `deploy/pmos-admin` and
+// `deploy/preflight.sh` (`crates/policy/tests/policies.rs` checks all three), and moving them
+// is a network change under POL-2 (`policies/README.md`).
+// Verify on a real host: that OpenShell reads `allowed_ips` as the docs say ("every address
+// its hostname resolves to must fall within the list") and takes a single address written as
+// a `/32` (the docs don't say whether a bare address is accepted); RT-13b.
+/// The tool server's pinned address.
+pub const TOOLSERVER_ADDR: Ipv4Addr = Ipv4Addr::new(10, 201, 77, 10);
+/// The model gateway's pinned address.
+pub const GATEWAY_ADDR: Ipv4Addr = Ipv4Addr::new(10, 201, 77, 11);
+/// The bot runtime's pinned address (`bots.pmos.internal`).
+pub const BOTS_ADDR: Ipv4Addr = Ipv4Addr::new(10, 201, 77, 12);
 /// The runtime routes a worker may call (spec section 3, client `worker`), and nothing else:
 /// no task, routine or notification reads. In OpenShell's REST path globs `*` matches one path
 /// segment, so `*` stands for exactly one task id.
@@ -66,7 +88,7 @@ pub const RUNTIME_ROUTES: [(&str, &str); 6] = [
 /// MCP methods a worker may send. The first three are what a 2025-revision client sends before
 /// and around tool calls (OpenShell's own MCP example allows exactly these); tool calls are
 /// further limited to the role's tools.
-/// Verify on the Spark: the harness's MCP client sends nothing else (for example `ping` or
+/// Verify on a real host: the harness's MCP client sends nothing else (for example `ping` or
 /// `notifications/cancelled`) during a normal task.
 pub const MCP_METHODS: [&str; 4] = [
     "initialize",
@@ -78,19 +100,21 @@ pub const MCP_METHODS: [&str; 4] = [
 /// MCP revisions the tool-server endpoint accepts. OpenShell's default is only `2025-11-25`,
 /// and it treats a request without an `MCP-Protocol-Version` header as `2025-03-26`, so all
 /// three 2025 revisions are listed.
-/// Verify on the Spark: the revision the harness client (`@modelcontextprotocol/sdk`) and the
+/// Verify on a real host: the revision the harness client (`@modelcontextprotocol/sdk`) and the
 /// tool server (`rmcp`) negotiate is one of these.
 pub const MCP_VERSIONS: [&str; 3] = ["2025-03-26", "2025-06-18", "2025-11-25"];
 
 /// The one executable allowed to open connections: the harness worker's Node.js.
-/// Verify on the Spark: the real (non-symlink) path of `node` in the worker image. OpenShell
-/// matches the binary that opens the connection, or any of its parents, by real path.
+/// Verify on a real host (once per architecture): the real (non-symlink) path of `node` in the
+/// worker image. OpenShell matches the binary that opens the connection, or any of its
+/// parents, by real path.
 pub const WORKER_BINARY: &str = "/usr/local/bin/node";
 
 /// Where content goes inside every sandbox: the content-relative path under this prefix, so
 /// `skills/docs` is uploaded to `/sandbox/skills/docs`.
-/// Verify on the Spark: `/sandbox` is the sandbox's working directory with the Docker driver,
-/// and uploads into paths that Landlock makes read-only succeed at `sandbox create --upload`.
+/// Verify on a real host (once per OpenShell version and driver): `/sandbox` is the sandbox's
+/// working directory with the Docker driver, and uploads into paths that Landlock makes
+/// read-only succeed at `sandbox create --upload`.
 pub const CONTENT_MOUNT: &str = "/sandbox";
 /// The tool registry, uploaded with the content: the worker reads it at start-up to tell a
 /// bot's read tools from its writes. It holds only tool names, systems and kinds.
@@ -159,6 +183,20 @@ impl Service {
             Self::Gateway => GATEWAY_PORT,
             Self::Runtime => RUNTIME_PORT,
         }
+    }
+
+    /// The service's own pinned address on the `pmos` network.
+    pub fn addr(self) -> Ipv4Addr {
+        match self {
+            Self::ToolServer => TOOLSERVER_ADDR,
+            Self::Gateway => GATEWAY_ADDR,
+            Self::Runtime => BOTS_ADDR,
+        }
+    }
+
+    /// The endpoint's `allowed_ips`, exactly: its own address as a `/32` and nothing else.
+    pub fn allowed_ips(self) -> Vec<String> {
+        vec![format!("{}/32", self.addr())]
     }
 
     /// The `network_policies` key, which is also the name in OpenShell's logs.
@@ -285,5 +323,15 @@ mod tests {
         assert_eq!(Service::at("bots.pmos.internal", 8751), None);
         assert_eq!(Service::at("toolserver.pmos.internal", 8740), None);
         assert_eq!(Service::at("docs.pmos.internal", 8730), None);
+    }
+
+    #[test]
+    fn each_service_is_pinned_to_its_own_address_only() {
+        assert_eq!(Service::ToolServer.allowed_ips(), ["10.201.77.10/32"]);
+        assert_eq!(Service::Gateway.allowed_ips(), ["10.201.77.11/32"]);
+        assert_eq!(Service::Runtime.allowed_ips(), ["10.201.77.12/32"]);
+        // Three different addresses, so no name may resolve to another service's.
+        let addrs: std::collections::BTreeSet<_> = Service::ALL.map(Service::addr).into();
+        assert_eq!(addrs.len(), 3);
     }
 }

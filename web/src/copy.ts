@@ -2142,6 +2142,8 @@ export const copy = {
         tlsSkip: 'TLS passed through uninspected',
         extraPorts: (p: string) => `extra ports ${p}`,
         ipRanges: (r: string) => `IP ranges ${r}`,
+        notPinned: (ips: string) =>
+          ips ? `not pinned to its own address (allows ${ips})` : 'not pinned to its own address (reached wherever its name resolves)',
         accessPreset: (a: string) => `access preset ${a}`,
         workdir: 'The working directory is writable too',
         middleware: (m: string) => `Middleware ${m}`,
@@ -2180,6 +2182,7 @@ export const copy = {
         runAs: 'Runs as',
         landlock: 'Landlock',
         noCredential: 'No credential',
+        pinnedAt: (ips: string) => `only at ${ips}`,
         routes: (n: number) => `${n} ${n === 1 ? 'route' : 'routes'}`,
       },
       files: {

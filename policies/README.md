@@ -37,8 +37,11 @@ its author.** Platform owners are the active `admin` users in the PM OS user dat
 (`docs/runbooks/users.md`).
 
 - **What counts as a network change:** any change to `network_policies` in `bots/*.yaml`, or to
-  the code that produces it: the hosts, ports, routes, MCP methods and binaries in
-  `crates/policy/src/lib.rs`, and `crates/policy/src/generate.rs`. A new bot or a role with new
+  the code that produces it: the hosts, ports, pinned addresses (`TOOLSERVER_ADDR`,
+  `GATEWAY_ADDR`, `BOTS_ADDR`, each endpoint's `allowed_ips`), routes, MCP methods and binaries
+  in `crates/policy/src/lib.rs`, and `crates/policy/src/generate.rs`. The pinned addresses equal
+  the `ipv4_address` literals in `deploy/compose.yaml` (a test holds them equal), so a change to
+  those literals is one too. A new bot or a role with new
   tools also changes what `tools/call` allows, so it counts.
 - **Who approves:** a platform-owner PM other than the author. If the author is a platform owner,
   that's a second one.

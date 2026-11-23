@@ -211,7 +211,9 @@ is_loopback() { case "$1" in 127.* | ::1 | localhost) return 0 ;; esac; return 1
 
 # --- The settings read like deploy/pmos-admin (published ports, the pinned network) -------------
 # The pinned addresses are reviewed code, equal to deploy/compose.yaml's literals and to
-# deploy/pmos-admin's (scripts/test-preflight.sh checks all three agree).
+# deploy/pmos-admin's (scripts/test-preflight.sh checks all three agree); the three services' are
+# also the policy crate's constants, each name's allowed_ips in every bot's policy (slice H3;
+# crates/policy/tests/policies.rs checks PINNED_NAMES and PINNED_SERVICE_ADDRS against them).
 PINNED_NAMES=(toolserver.pmos.internal gateway.pmos.internal bots.pmos.internal)
 PINNED_SERVICE_ADDRS=(10.201.77.10 10.201.77.11 10.201.77.12)
 PINNED_ADDRS=(10.201.77.10 10.201.77.11 10.201.77.12 10.201.77.13 10.201.77.14)
@@ -501,7 +503,7 @@ c_ports() {
   fi
 }
 network_settings_problems() {
-  local subnet gw range sn sb rn rb g a an bcast subnet_ok=0
+  local subnet gw range sn sb rn rb g a an i bcast held subnet_ok=0
   subnet=$(ev PMOS_NETWORK_SUBNET)
   subnet=${subnet:-$NETWORK_SUBNET_DEFAULT}
   gw=$(ev PMOS_NETWORK_GATEWAY)
@@ -515,13 +517,26 @@ network_settings_problems() {
   else
     subnet_ok=1
     bcast=$((sn | ((1 << (32 - sb)) - 1)))
-    for a in "${PINNED_ADDRS[@]}"; do
+    held=1
+    # The three services' first: the policy pins each name to its own /32 (slice H3).
+    for i in "${!PINNED_SERVICE_ADDRS[@]}"; do
+      a=${PINNED_SERVICE_ADDRS[$i]}
       an=$(ipv4_strict "$a")
       if ! ipv4_num_in "$an" "$sn" "$sb" || [ "$an" = "$sn" ] || [ "$an" = "$bcast" ]; then
-        echo "PMOS_NETWORK_SUBNET=$subnet doesn't hold the pinned address $a"
+        echo "PMOS_NETWORK_SUBNET=$subnet doesn't hold $a, where every sandbox's policy allows ${PINNED_NAMES[$i]} (allowed_ips $a/32, the policy crate's constant)"
+        held=0
         break
       fi
     done
+    if [ "$held" = 1 ]; then
+      for a in "${PINNED_ADDRS[@]}"; do
+        an=$(ipv4_strict "$a")
+        if ! ipv4_num_in "$an" "$sn" "$sb" || [ "$an" = "$sn" ] || [ "$an" = "$bcast" ]; then
+          echo "PMOS_NETWORK_SUBNET=$subnet doesn't hold the pinned address $a"
+          break
+        fi
+      done
+    fi
   fi
   if ! g=$(ipv4_strict "$gw"); then
     echo "PMOS_NETWORK_GATEWAY=$(printf '%q' "$gw") isn't an IPv4 address"
@@ -593,7 +608,7 @@ c_subnet() {
   if [ ${#probs[@]} -eq 0 ]; then
     res H-SUBNET pass "$subnet; gateway $gwv; range $rangev" "the pmos network as pinned"
   else
-    res H-SUBNET fail "$(join_sc "${probs[@]}")" "the pmos network as pinned" "see docs/openshell-any-host-spec.md §3.3; the subnet against the policy constants comes with slice H3"
+    res H-SUBNET fail "$(join_sc "${probs[@]}")" "the pmos network as pinned" "see docs/openshell-any-host-spec.md §3.3 and §3.5: the addresses are the policy crate's constants, moved only by a code change under POL-2"
   fi
 }
 # The managed block (as deploy/pmos-admin host-names check, slice H2).
@@ -1104,9 +1119,9 @@ reach_policy() {
   for i in 0 1 2; do
     name=${PINNED_NAMES[$i]}
     port=${ports[$i]}
-    # Slice H3 adds each name's allowed_ips (its own /32) here and in every bot's policy.
-    printf '  %s:\n    binaries:\n      - path: /usr/local/bin/node\n    endpoints:\n      - enforcement: enforce\n        host: %s\n        port: %s\n        protocol: rest\n        rules:\n          - allow:\n              method: GET\n              path: /healthz\n    name: %s\n' \
-      "${keys[$i]}" "$name" "$port" "${keys[$i]}"
+    # Each name only at its own pinned address, as in every bot's policy (slice H3, allowed_ips).
+    printf '  %s:\n    binaries:\n      - path: /usr/local/bin/node\n    endpoints:\n      - allowed_ips:\n          - \"%s/32\"\n        enforcement: enforce\n        host: %s\n        port: %s\n        protocol: rest\n        rules:\n          - allow:\n              method: GET\n              path: /healthz\n    name: %s\n' \
+      "${keys[$i]}" "${PINNED_SERVICE_ADDRS[$i]}" "$name" "$port" "${keys[$i]}"
   done
   printf '%s\n' "process:" "  run_as_group: sandbox" "  run_as_user: sandbox" "version: 1"
 }

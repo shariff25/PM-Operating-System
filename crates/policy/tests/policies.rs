@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 use chrono::NaiveDate;
 use pmos_policy::check::{
     CONTENT_INVALID, CRED_BINDING, CRED_PROVIDERS, FS_READABLE, FS_UPLOADS, FS_WRITABLE,
-    NET_EGRESS, NET_RUNTIME_ROUTES, POLICY_MISSING, POLICY_ORPHAN, POLICY_STALE,
+    NET_ALLOWED_IPS, NET_EGRESS, NET_RUNTIME_ROUTES, POLICY_MISSING, POLICY_ORPHAN, POLICY_STALE,
 };
-use pmos_policy::{check, generate, write};
+use pmos_policy::{check, generate, write, Service};
 
 fn today() -> NaiveDate {
     NaiveDate::from_ymd_opt(2026, 11, 14).unwrap()
@@ -123,6 +123,133 @@ fn a_hand_edit_fails_its_rule_and_as_stale() {
     assert_eq!(
         report.violations[0].path,
         format!("{}/bots/docs.yaml", fx.policies.display())
+    );
+}
+
+// The pinned addresses (decision O6; `docs/openshell-any-host-spec.md` §3.5): every policy pins
+// each name to its own `/32`, and the constants are the deploy kit's literals, so the address a
+// sandbox may reach is the one the service has.
+
+#[test]
+fn the_committed_policies_pin_each_name_to_its_own_address() {
+    let root = repo();
+    let text = fs::read_to_string(root.join("policies/bots/docs.yaml")).unwrap();
+    let policy = pmos_policy::openshell::parse(&text).unwrap();
+    let mut pins: Vec<(String, Vec<String>)> = policy
+        .network_policies
+        .values()
+        .flat_map(|r| &r.endpoints)
+        .map(|e| (e.host.clone().unwrap(), e.allowed_ips.clone()))
+        .collect();
+    pins.sort();
+    let pin = |host: &str, ip: &str| (host.to_string(), vec![ip.to_string()]);
+    assert_eq!(
+        pins,
+        [
+            pin("bots.pmos.internal", "10.201.77.12/32"),
+            pin("gateway.pmos.internal", "10.201.77.11/32"),
+            pin("toolserver.pmos.internal", "10.201.77.10/32"),
+        ]
+    );
+    // The generated headers name no deployment host, only "a real host" or "PM OS's host".
+    for file in [
+        "bots/docs.yaml",
+        "bots/docs.sandbox.yaml",
+        "providers/pmos-gateway.yaml",
+        "providers/pmos-worker.yaml",
+    ] {
+        let text = fs::read_to_string(root.join("policies").join(file)).unwrap();
+        assert!(!text.to_lowercase().contains("spark"), "{file}");
+    }
+}
+
+#[test]
+fn the_pinned_addresses_equal_the_deploy_kits_literals() {
+    let root = repo();
+    let text = fs::read_to_string(root.join("deploy/compose.yaml")).unwrap();
+    let compose: serde_norway::Value = serde_norway::from_str(&text).unwrap();
+    let services = compose["services"].as_mapping().unwrap();
+    for (service, name) in [
+        (Service::ToolServer, "toolserver"),
+        (Service::Gateway, "gateway"),
+        (Service::Runtime, "bots"),
+    ] {
+        let addr = service.addr().to_string();
+        let net = &compose["services"][name]["networks"]["pmos"];
+        assert_eq!(
+            net["ipv4_address"].as_str(),
+            Some(addr.as_str()),
+            "deploy/compose.yaml pins `{name}` elsewhere than the policy's constant"
+        );
+        assert_eq!(
+            net["aliases"],
+            serde_norway::to_value([service.host()]).unwrap(),
+            "{name}"
+        );
+        // No other container on the network has that address.
+        let holders: Vec<&str> = services
+            .iter()
+            .filter(|(_, v)| v["networks"]["pmos"]["ipv4_address"].as_str() == Some(addr.as_str()))
+            .map(|(k, _)| k.as_str().unwrap())
+            .collect();
+        assert_eq!(holders, [name], "{addr}");
+    }
+    // The same literals in the deploy kit's scripts: pmos-admin's subnet refusal in `up` and its
+    // hosts block, and the preflight's H-SUBNET, H-NAMES and O-REACH.
+    let names: Vec<&str> = Service::ALL.iter().map(|s| s.host()).collect();
+    let addrs: Vec<String> = Service::ALL.iter().map(|s| s.addr().to_string()).collect();
+    let want_names = format!("PINNED_NAMES=({})", names.join(" "));
+    let want_addrs = format!("PINNED_SERVICE_ADDRS=({})", addrs.join(" "));
+    for script in ["deploy/pmos-admin", "deploy/preflight.sh"] {
+        let text = fs::read_to_string(root.join(script)).unwrap();
+        for (prefix, want) in [
+            ("PINNED_NAMES=", &want_names),
+            ("PINNED_SERVICE_ADDRS=", &want_addrs),
+        ] {
+            let lines: Vec<&str> = text.lines().filter(|l| l.starts_with(prefix)).collect();
+            assert_eq!(lines, [want.as_str()], "{script}");
+        }
+    }
+}
+
+#[test]
+fn a_hand_edit_dropping_or_widening_a_pin_fails_net_allowed_ips_in_place() {
+    let fx = Fixture::new();
+    fx.edit("bots/docs.yaml", |t| {
+        t.replace(
+            "          - \"10.201.77.10/32\"\n",
+            "          - 10.201.77.0/24\n",
+        )
+    });
+    fx.edit("bots/pm-ana.yaml", |t| {
+        t.replace(
+            "      - allowed_ips:\n          - \"10.201.77.11/32\"\n        ",
+            "      - ",
+        )
+    });
+    let report = fx.check();
+    let mut rules = report.rules();
+    rules.sort();
+    assert_eq!(
+        rules,
+        [NET_ALLOWED_IPS, NET_ALLOWED_IPS, POLICY_STALE, POLICY_STALE],
+        "{:#?}",
+        report.violations
+    );
+    let says = |file: &str, what: &str| {
+        report.violations.iter().any(|v| {
+            v.rule == NET_ALLOWED_IPS && v.path.ends_with(file) && v.message.contains(what)
+        })
+    };
+    assert!(
+        says("bots/docs.yaml", "`10.201.77.0/24`"),
+        "{:#?}",
+        report.violations
+    );
+    assert!(
+        says("bots/pm-ana.yaml", "has no allowed_ips"),
+        "{:#?}",
+        report.violations
     );
 }
 
