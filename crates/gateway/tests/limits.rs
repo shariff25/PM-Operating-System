@@ -1592,7 +1592,9 @@ async fn the_test_stacks_eval_lanes_keep_one_call_in_flight_each() {
     let render = |up: &str, per_user: usize, in_flight: usize| {
         let text = body
             .replace("${PMOS_TEST_MODEL_URL%/}", &format!("{up}/v1"))
-            .replace("${PMOS_TEST_MODEL_FAST:-$PMOS_TEST_MODEL}", "m-fast")
+            .replace("$FAST_MODEL", "m-fast")
+            .replace("$FAST_LABEL", "label-fast")
+            .replace("$MODEL_LABEL", "label-a")
             .replace("$PMOS_TEST_MODEL", "m")
             .replace("$GW_IN_FLIGHT", &in_flight.to_string())
             .replace("$GW_PER_USER", &per_user.to_string())
@@ -1602,6 +1604,19 @@ async fn the_test_stacks_eval_lanes_keep_one_call_in_flight_each() {
     };
     for (lanes, per_user, in_flight) in [(4usize, 4usize, 6usize), (2, 2, 4)] {
         let m = Models::parse(&render("http://127.0.0.1:9", per_user, in_flight), true).unwrap();
+        // Every role is reported by its label (PMOS_TEST_MODEL_LABEL), never the model id.
+        for (role, model, label) in [
+            ("default", "m", "label-a"),
+            ("reasoning", "m", "label-a"),
+            ("extraction", "m-fast", "label-fast"),
+        ] {
+            let r = &m.roles[role];
+            assert_eq!(
+                (r.model.as_str(), r.reported_model()),
+                (model, label),
+                "{role}"
+            );
+        }
         for c in ["runtime", "worker"] {
             assert_eq!(
                 m.client_policy(c).per_user_share,

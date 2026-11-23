@@ -51,13 +51,17 @@ async fn main() -> Result<()> {
     {
         tracing::warn!(
             role = %role.alias(),
-            upstream = %role.upstream_host(),
+            upstream = %role.logged_upstream_host(),
             "TESTING ONLY: a remote test upstream is on (an OpenAI-compatible API on the internet), \
              so this role's prompts leave this machine; use test data and test accounts only"
         );
     }
     for role in models.roles.values() {
-        tracing::info!(role = %role.alias(), model = %role.model, upstream = %role.upstream, "model role");
+        // A labelled role is logged by its label and upstream kind only (`config::Role::label`).
+        tracing::info!(
+            role = %role.alias(), model = %role.reported_model(),
+            upstream = %role.logged_upstream(), labelled = role.label.is_some(), "model role"
+        );
     }
     // Names and settings only, never a token.
     for client in &config.clients {

@@ -25,6 +25,10 @@
 #   PMOS_TEST_MODEL       the model name for every role (it must support tool calling)
 #   PMOS_GATEWAY_REMOTE_KEY  the provider's API key
 #   PMOS_TEST_MODEL_FAST  optional: a model for the `extraction` role (default PMOS_TEST_MODEL)
+#   PMOS_TEST_MODEL_LABEL optional: the neutral name the gateway reports for PMOS_TEST_MODEL
+#                         (default hosted-model-a), so reports and logs never name the model
+#   PMOS_TEST_MODEL_FAST_LABEL  optional: the same for a different PMOS_TEST_MODEL_FAST
+#                         (default hosted-model-b)
 # Optional:
 #   PMOS_TEST_HANDLE      your PM OS handle in the test (default: tester)
 #   PMOS_TEST_STATE       where state and logs go (default: state/claude-test)
@@ -135,7 +139,24 @@ if [ -n "${PMOS_TEST_MODEL_URL:-}" ]; then
     https://*) ;;
     *) echo "error: PMOS_TEST_MODEL_URL must start with https://" >&2; exit 1 ;;
   esac
-  MODEL_DESC="$PMOS_TEST_MODEL at $PMOS_TEST_MODEL_URL"
+  # Every role is reported by a neutral label (`label:` in the gateway config), never by the
+  # model id or the provider's host: the eval reports, the roles answer and the gateway's logs
+  # carry only the label (docs/gateway.md).
+  MODEL_LABEL="${PMOS_TEST_MODEL_LABEL:-hosted-model-a}"
+  FAST_MODEL="${PMOS_TEST_MODEL_FAST:-$PMOS_TEST_MODEL}"
+  if [ "$FAST_MODEL" = "$PMOS_TEST_MODEL" ]; then
+    FAST_LABEL="$MODEL_LABEL"
+  else
+    FAST_LABEL="${PMOS_TEST_MODEL_FAST_LABEL:-hosted-model-b}"
+  fi
+  for label in "$MODEL_LABEL" "$FAST_LABEL"; do
+    case "$label" in
+      '' | *[!A-Za-z0-9._-]*)
+        echo "error: PMOS_TEST_MODEL_LABEL and PMOS_TEST_MODEL_FAST_LABEL may hold only letters, digits, '.', '_' and '-'" >&2
+        exit 1 ;;
+    esac
+  done
+  MODEL_DESC="$MODEL_LABEL on a remote OpenAI-compatible provider"
 else
   : "${PMOS_GATEWAY_ANTHROPIC_KEY:?set PMOS_GATEWAY_ANTHROPIC_KEY (a Claude API key), or PMOS_TEST_MODEL_URL for another provider}"
   MODEL_DESC="Claude (config/gateway.claude-test.yaml)"
@@ -292,9 +313,9 @@ if [ -n "${PMOS_TEST_MODEL_URL:-}" ]; then
 upstreams:
   remote: "openai+${PMOS_TEST_MODEL_URL%/}"
 roles:
-  default: {upstream: remote, model: "$PMOS_TEST_MODEL"}
-  reasoning: {upstream: remote, model: "$PMOS_TEST_MODEL"}
-  extraction: {upstream: remote, model: "${PMOS_TEST_MODEL_FAST:-$PMOS_TEST_MODEL}"}
+  default: {upstream: remote, model: "$PMOS_TEST_MODEL", label: "$MODEL_LABEL"}
+  reasoning: {upstream: remote, model: "$PMOS_TEST_MODEL", label: "$MODEL_LABEL"}
+  extraction: {upstream: remote, model: "$FAST_MODEL", label: "$FAST_LABEL"}
 limits:
   max-in-flight: $GW_IN_FLIGHT
   per-user: $GW_PER_USER

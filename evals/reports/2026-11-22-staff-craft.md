@@ -8,7 +8,7 @@
 | Runtime | http://127.0.0.1:8750 |
 | Asked as | `evals` |
 | Gateway workarounds | not declared |
-| Note | model: hosted-model-a (hosted-provider.invalid, OpenAI-compatible, every role); first full run (E1) on the test stack, fake fixtures |
+| Note | model: hosted-model-a (the owner's hosted provider, OpenAI-compatible, every role); first full run (E1) on the test stack, fake fixtures |
 | Ran | 2026-11-22 00:13:35 to 00:34:05 UTC |
 | Pass rate | 70.8% ± 9.8% (standard error, clustered over 8 clusters) |
 | pass^3 | 38% (3 of 8 tasks passed every run) |

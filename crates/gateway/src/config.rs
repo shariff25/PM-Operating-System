@@ -254,6 +254,9 @@ struct RoleSpec {
     /// Claude test upstream only: `output_config.effort`.
     #[serde(default)]
     effort: Option<String>,
+    /// A neutral name reported to clients in place of `model` ([`Role::label`]).
+    #[serde(default)]
+    label: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -307,6 +310,14 @@ pub struct Role {
     pub kind: UpstreamKind,
     /// Claude test upstream only: the effort level sent with each request.
     pub effort: Option<String>,
+    /// `label:`, a neutral name for the model (such as `hosted-model-a`). When set, it is what
+    /// the gateway reports to clients and writes in its logs in place of `model`
+    /// (`GET /v1/pmos/roles`, the `x-pmos-model` header, an answer's `model` field, the usage
+    /// log), and the upstream is logged by its kind, not its address, so neither the model id
+    /// nor the provider's host leaves the gateway's config. `model` is still what is sent
+    /// upstream. A label names one model: give it a new label when the model changes, since
+    /// benchmark reports compare roles by what the gateway reports.
+    pub label: Option<String>,
 }
 
 /// What an upstream speaks.
@@ -336,7 +347,42 @@ impl Role {
         format!("pmos/{}", self.name)
     }
 
-    /// The upstream's host, for the usage log.
+    /// The model as the gateway reports it to clients and in its logs: the label when one is
+    /// set, else the model id.
+    pub fn reported_model(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.model)
+    }
+
+    /// The neutral name for the upstream's kind, never its address: `local`, `claude-test` or
+    /// `remote-test`.
+    pub fn upstream_kind_label(&self) -> &'static str {
+        match self.kind {
+            UpstreamKind::OpenAi => "local",
+            UpstreamKind::ClaudeTest => "claude-test",
+            UpstreamKind::RemoteOpenAi => "remote-test",
+        }
+    }
+
+    /// The upstream as the gateway's logs name it: its base URL, or, for a labelled role, its
+    /// kind ([`Role::upstream_kind_label`]), so a log doesn't name the provider's host.
+    pub fn logged_upstream(&self) -> String {
+        if self.label.is_some() {
+            self.upstream_kind_label().to_string()
+        } else {
+            self.upstream.clone()
+        }
+    }
+
+    /// The upstream's host for the usage log, or, for a labelled role, its kind.
+    pub fn logged_upstream_host(&self) -> String {
+        if self.label.is_some() {
+            self.upstream_kind_label().to_string()
+        } else {
+            self.upstream_host()
+        }
+    }
+
+    /// The upstream's host.
     pub fn upstream_host(&self) -> String {
         reqwest::Url::parse(&self.upstream)
             .ok()
@@ -576,6 +622,14 @@ impl Models {
             if spec.model.trim().is_empty() {
                 return Err(format!("gateway config: role `{name}` has no model"));
             }
+            if let Some(l) = &spec.label {
+                if !valid_label(l) {
+                    return Err(format!(
+                        "gateway config: role `{name}` label must be 1 to 64 letters, digits, \
+                         `.`, `_` and `-`"
+                    ));
+                }
+            }
             if let Some(e) = &spec.effort {
                 if kind != UpstreamKind::ClaudeTest {
                     return Err(format!(
@@ -626,6 +680,7 @@ impl Models {
                     workarounds: spec.workarounds,
                     kind,
                     effort: spec.effort,
+                    label: spec.label,
                 },
             );
         }
@@ -736,6 +791,15 @@ impl Models {
     pub fn aliases(&self) -> Vec<String> {
         self.roles.values().map(Role::alias).collect()
     }
+}
+
+/// A role's `label:`: 1 to 64 ASCII letters, digits, `.`, `_` and `-`.
+fn valid_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= 64
+        && label
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
 fn valid_role_name(name: &str) -> bool {
@@ -1036,6 +1100,33 @@ roles:\n  default: {upstream: qwen, model: qwen3.6-35b-a3b, workarounds: [strip-
         for (yaml, want) in cases {
             let err = Models::from_yaml(yaml).unwrap_err();
             assert!(err.contains(want), "{want}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_label_is_reported_in_place_of_the_model() {
+        let yaml = "upstreams: {x: 'http://vllm/v1'}\nroles:\n  default: {upstream: x, model: real-id, label: hosted-model-a}\n  extraction: {upstream: x, model: other-id}\n";
+        let m = Models::from_yaml(yaml).unwrap();
+        let labelled = m.role("pmos/default").unwrap();
+        assert_eq!(
+            labelled.model, "real-id",
+            "the real id is still what goes upstream"
+        );
+        assert_eq!(labelled.reported_model(), "hosted-model-a");
+        assert_eq!(labelled.logged_upstream(), "local");
+        assert_eq!(labelled.logged_upstream_host(), "local");
+        let plain = m.role("pmos/extraction").unwrap();
+        assert_eq!(plain.label, None);
+        assert_eq!(plain.reported_model(), "other-id");
+        assert_eq!(plain.logged_upstream(), "http://vllm/v1");
+        assert_eq!(plain.logged_upstream_host(), "vllm");
+        let long = "x".repeat(65);
+        for bad in ["''", "'has space'", "'a/b'", long.as_str()] {
+            let yaml = format!(
+                "upstreams: {{x: 'http://vllm/v1'}}\nroles: {{default: {{upstream: x, model: m, label: {bad}}}}}\n"
+            );
+            let err = Models::from_yaml(&yaml).unwrap_err();
+            assert!(err.contains("label"), "{bad}: {err}");
         }
     }
 
