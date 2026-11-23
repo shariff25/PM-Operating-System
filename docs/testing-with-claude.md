@@ -1,5 +1,14 @@
 # Testing PM OS with Claude and a test Slack workspace
 
+**Since slice H4 (2026-11-23): no Slack bot on this stack.** `scripts/claude-test-stack.sh` runs
+every service as `PMOS_MODEL_SOURCE=hosted-test` (fake data only,
+`docs/openshell-any-host-spec.md` §3.6), and in that mode `pmos-slack` refuses to start with
+Slack tokens: a test workspace can't be told apart from a real one. The script ignores
+`PMOS_SLACK_APP_TOKEN` and `PMOS_SLACK_BOT_TOKEN` (it says so) and skips the Slack preflight; try
+the bots in the web app (`PMOS_TEST_WEB=1`, which shows a "test stack: fake data only" banner on
+every page) or through the benchmarks (`PMOS_TEST_EVALS=1`). The Slack rows below describe the
+stack as it was before H4.
+
 **Testing only (decided 2026-11-14).** Before the Spark's local models are up, PM OS can be
 tried end to end with a Claude model behind the gateway, in a Slack workspace made for testing.
 Prompts to Claude leave the machine. So this setup uses only:
