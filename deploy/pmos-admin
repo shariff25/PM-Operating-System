@@ -121,12 +121,16 @@ if [ "$ENV_UNUSED" = 0 ] && [ ! -f "$ENV" ]; then
 fi
 
 # Every call uses the same files, so `status`, `logs` and `down` see the stack `up` started: with
-# PMOS_MODEL_SOURCE=hosted-test, the gateway's testing-only overlay (and its CA, when set).
+# PMOS_MODEL_SOURCE=hosted-test, the gateway's testing-only overlay (and its CA, when set); with
+# `local` and the model servers on (the stub off), the overlay that makes PMOS_VLLM_IMAGE
+# required (slice H4).
 compose() {
   local files=(-f "$DEPLOY/compose.yaml")
-  if [ "${PMOS_MODEL_SOURCE:-local}" = hosted-test ]; then
+  if [ "${PMOS_MODEL_SOURCE:-}" = hosted-test ]; then
     files+=(-f "$DEPLOY/compose.hosted-test.yaml")
     [ -z "${PMOS_GATEWAY_CA_FILE:-}" ] || files+=(-f "$DEPLOY/compose.gateway-ca.yaml")
+  elif [ "${PMOS_MODEL_SOURCE:-}" = local ] && [ "${PMOS_GATEWAY_STUB:-0}" != 1 ]; then
+    files+=(-f "$DEPLOY/compose.local.yaml")
   fi
   docker compose --project-directory "$DEPLOY" "${files[@]}" --env-file "$ENV" "$@"
 }
@@ -422,8 +426,20 @@ entra_configured() {
 LABEL_CHARS=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-
 MODEL_ID_CHARS=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:/-
 model_source_checks() {
-  local source=${PMOS_MODEL_SOURCE:-local} url model label bad=0 cfg
+  local source=${PMOS_MODEL_SOURCE:-} url model label bad=0 cfg
+  # Slice H4: the three host settings are required (setup.sh writes them); a blank one is never
+  # read as the value that allows more (§3.1, "Defaults that allow less").
+  case "${PMOS_EXPOSURE:-}" in
+    private | public) ;;
+    '') say "PMOS_EXPOSURE is blank in deploy/.env: run deploy/setup.sh, which writes public (or --exposure private)" >&2; return 1 ;;
+    *) say "PMOS_EXPOSURE=$(printf '%q' "$PMOS_EXPOSURE") in deploy/.env: use private or public" >&2; return 1 ;;
+  esac
+  case "${PMOS_OPENSHELL_DRIVER:-docker}" in
+    docker) ;;
+    *) say "PMOS_OPENSHELL_DRIVER=$(printf '%q' "$PMOS_OPENSHELL_DRIVER"): only docker is supported (Tier 1); podman and kubernetes aren't verified" >&2; return 1 ;;
+  esac
   case "$source" in
+    '') say "PMOS_MODEL_SOURCE is blank in deploy/.env: run deploy/setup.sh, which writes hosted-test (or --model-source local); a blank source is never read as local" >&2; return 1 ;;
     local)
       if [ -n "${PMOS_GATEWAY_CA_FILE:-}" ]; then
         say "PMOS_GATEWAY_CA_FILE is for PMOS_MODEL_SOURCE=hosted-test only: the production sources take no run-time CA (docs/openshell-any-host-spec.md §3.6, Egress). Clear it." >&2
@@ -456,6 +472,23 @@ model_source_checks() {
   fi
   if [ "${PMOS_CONNECTORS:-fake}" != fake ]; then
     say "PMOS_MODEL_SOURCE=hosted-test sends prompts to an endpoint nobody approved, so it allows fake data only: PMOS_CONNECTORS must be fake (it is ${PMOS_CONNECTORS})" >&2
+    bad=1
+  fi
+  # What every service refuses itself (slice H4), said here first, before anything starts.
+  if [ "$(env_or_live PMOS_MEMORY)" = github ]; then
+    say "PMOS_MODEL_SOURCE=hosted-test sends prompts to an endpoint nobody approved, so it allows fake data only: PMOS_MEMORY must not be github" >&2
+    bad=1
+  fi
+  for k in PMOS_GITHUB_CLIENT_ID PMOS_GITHUB_CLIENT_SECRET; do
+    if [ -n "$(env_or_live "$k")" ]; then
+      say "PMOS_MODEL_SOURCE=hosted-test sends prompts to an endpoint nobody approved, so it allows fake data only: $k must be blank" >&2
+      bad=1
+    fi
+  done
+  if ! problems=$(test_content_problems); then
+    while IFS= read -r p; do
+      say "PMOS_MODEL_SOURCE=hosted-test sends prompts to an endpoint nobody approved, so it allows fake data only: $p" >&2
+    done <<<"$problems"
     bad=1
   fi
   if [ -n "${PMOS_GATEWAY_CA_FILE:-}" ] && { [[ "$PMOS_GATEWAY_CA_FILE" != /* ]] || ! [ -f "$PMOS_GATEWAY_CA_FILE" ] || ! [ -r "$PMOS_GATEWAY_CA_FILE" ]; }; then
@@ -494,10 +527,65 @@ EOF
   say "model source: hosted-test, every role as $label (TESTING ONLY: prompts leave this host; fake data only)"
 }
 
+# A setting as the tool server gets it: deploy/.env, else deploy/live.env (its env_file), which
+# holds the live settings. Read as data, never sourced.
+env_or_live() { # key
+  local v=${!1:-}
+  if [ -z "$v" ] && [ -f "$DEPLOY/live.env" ] && [ -r "$DEPLOY/live.env" ]; then
+    v=$(LIVE_KEY=$1 awk -F= '$1 == ENVIRON["LIVE_KEY"] { v = substr($0, length($1) + 2) } END { print v }' "$DEPLOY/live.env")
+    v=${v%$'\r'}
+    v=${v%%[[:space:]]#*}
+    v=${v#\"}; v=${v%\"}; v=${v#\'}; v=${v%\'}
+  fi
+  printf '%s' "$v"
+}
+
+# The content checkout as fake-data mode needs it (spec §3.6; `pmos content check-test` in Rust
+# is the same check, front matter only): a TEST-CONTENT marker at the content root and no
+# Markdown file under it with a line `sensitivity: restricted` (anywhere in the file here, the
+# safe side). Prints one problem per line and returns 1, or returns 0.
+test_content_problems() {
+  local root="${PMOS_CONTENT_CHECKOUT:-}/content" bad=0 f
+  if [ -z "${PMOS_CONTENT_CHECKOUT:-}" ] || [ ! -d "$root" ]; then
+    printf '%s\n' "the content checkout (PMOS_CONTENT_CHECKOUT) has no content/ folder"
+    return 1
+  fi
+  if [ -L "$root/TEST-CONTENT" ] || [ ! -f "$root/TEST-CONTENT" ]; then
+    printf '%s\n' "the content root has no TEST-CONTENT marker (a committed file stating the checkout holds no company data)"
+    bad=1
+  fi
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    printf '%s\n' "${f#"$root"/} is marked restricted"
+    bad=1
+  done < <(grep -rlIiE --include='*.md' '^sensitivity:[[:space:]]*["'"'"']?restricted' -- "$root" 2>/dev/null | LC_ALL=C sort)
+  return "$bad"
+}
+
+# The bring-up workers (worker-docs, worker-personal) are plain containers, not sandboxes, so they
+# run only on a stack that can hold nothing real (slice H4): fake connectors, no GitHub memory and
+# test content. Prints one problem per line and returns 1, or returns 0.
+bringup_problems() {
+  local bad=0 problems
+  if [ "${PMOS_CONNECTORS:-fake}" != fake ]; then
+    printf '%s\n' "PMOS_CONNECTORS must be fake (it is $PMOS_CONNECTORS)"
+    bad=1
+  fi
+  if [ "$(env_or_live PMOS_MEMORY)" = github ]; then
+    printf '%s\n' "PMOS_MEMORY must not be github"
+    bad=1
+  fi
+  if ! problems=$(test_content_problems); then
+    printf '%s\n' "$problems"
+    bad=1
+  fi
+  return "$bad"
+}
+
 profiles() {
   local p=()
   if [ -n "${PMOS_SLACK_APP_TOKEN:-}" ] && [ -n "${PMOS_SLACK_BOT_TOKEN:-}" ]; then
-    if [ "${PMOS_MODEL_SOURCE:-local}" = hosted-test ]; then
+    if [ "${PMOS_MODEL_SOURCE:-}" = hosted-test ]; then
       # A test workspace can't be told apart from a real one, so Slack stays off in fake-data
       # mode (docs/openshell-any-host-spec.md §3.6, "hosted-test, and fake-data mode").
       say "note: the Slack bot stays off with PMOS_MODEL_SOURCE=hosted-test (fake data only; a real workspace can't be told apart)" >&2
@@ -508,7 +596,7 @@ profiles() {
   for arg in "$@"; do
     case "$arg" in
       --models)
-        if [ "${PMOS_MODEL_SOURCE:-local}" = hosted-test ]; then
+        if [ "${PMOS_MODEL_SOURCE:-}" = hosted-test ]; then
           say "--models starts the local model servers, which PMOS_MODEL_SOURCE=hosted-test doesn't use" >&2
           exit 2
         fi
@@ -529,6 +617,14 @@ profiles() {
         fi
         p+=(--profile web) ;;
       --bringup)
+        # Slice H4: the bring-up workers aren't isolated, so fake data only, checked here.
+        if ! problems=$(bringup_problems); then
+          {
+            say "up --bringup starts plain, NOT isolated containers that hold a bot's tokens, so it runs only on a stack that can hold nothing real:"
+            sed 's/^/  /' <<<"$problems"
+          } >&2
+          exit 2
+        fi
         p+=(--profile bringup)
         [ -z "${PMOS_BRINGUP_PERSONAL_BOT:-}" ] || p+=(--profile bringup-personal) ;;
       *) say "unknown option $arg" >&2; exit 2 ;;
@@ -1635,9 +1731,26 @@ for a in d["attestations"]:
       done < <(systemctl --user list-units 'pmos-worker@*' --state=failed --no-legend --plain 2>/dev/null || true)
     fi
     say "== readiness"
-    if [ "${PMOS_MODEL_SOURCE:-local}" = hosted-test ]; then
-      row model WARN "PMOS_MODEL_SOURCE=hosted-test: TESTING ONLY, prompts leave this host (fake data only)"
-    fi
+    case "${PMOS_MODEL_SOURCE:-}" in
+      hosted-test) row model WARN "PMOS_MODEL_SOURCE=hosted-test: TESTING ONLY, prompts leave this host (fake data only)" ;;
+      local) row model ok "PMOS_MODEL_SOURCE=local: model servers on this host" ;;
+      *) row model FAIL "PMOS_MODEL_SOURCE=$(printf '%q' "${PMOS_MODEL_SOURCE:-}"): run deploy/setup.sh (every service refuses a blank or unknown source)" ;;
+    esac
+    case "${PMOS_EXPOSURE:-}" in
+      private | public) row exposure ok "PMOS_EXPOSURE=$PMOS_EXPOSURE" ;;
+      *) row exposure FAIL "PMOS_EXPOSURE=$(printf '%q' "${PMOS_EXPOSURE:-}"): run deploy/setup.sh (pmos-web refuses a blank one, and public until slice H10)" ;;
+    esac
+    # A bring-up worker running on a stack that could hold real data (slice H4).
+    running=$(compose "${ALL_PROFILES[@]}" ps --status running --services 2>/dev/null || true)
+    for w in worker-docs worker-personal; do
+      grep -qx "$w" <<<"$running" || continue
+      if problems=$(bringup_problems); then
+        row "$w" WARN "running: a bring-up worker, NOT isolated (fake data only)"
+      else
+        while IFS= read -r p; do row "$w" FAIL "running on a stack that isn't fake-data only: $p; stop it: deploy/pmos-admin down, then up without --bringup"; done <<<"$problems"
+        status_failed=1
+      fi
+    done
     check() { # name url
       local body code
       body=$(curl -sS --noproxy '*' -m 5 -w '\n%{http_code}' "$2" 2>/dev/null) || { row "$1" DOWN "no answer from $2"; return; }
@@ -1679,6 +1792,8 @@ for a in d["attestations"]:
     else
       row docs "not" "ready (normal until the first sync finishes; or no docs site set in PMOS_DOCS_BASE_URL)"
     fi
+    # Slice H4: a bring-up worker on a stack that could hold real data fails `status`.
+    [ "${status_failed:-0}" = 0 ] || exit 1
     ;;
 
   logs)
@@ -1942,6 +2057,23 @@ for g in s["groups"]:
         say "Fix it, then run this again: sudo deploy/pmos-admin host-names apply"
       } >&2
       exit 2
+    fi
+    # Fake-data mode (slice H4): nothing is uploaded from a checkout that isn't test content,
+    # with --dry-run too.
+    if [ "${PMOS_MODEL_SOURCE:-}" = hosted-test ] && ! problems=$(test_content_problems); then
+      {
+        say "pmos-admin sandbox: PMOS_MODEL_SOURCE=hosted-test allows fake data only, and the content checkout isn't test content, so nothing is uploaded:"
+        sed 's/^/  /' <<<"$problems"
+      } >&2
+      exit 2
+    fi
+    # And the same check in the image (`pmos content check-test`, slice H4), as the services
+    # run it, before anything is created.
+    if [ "${PMOS_MODEL_SOURCE:-}" = hosted-test ] && [ "$dry" != 1 ]; then
+      pmos_cli pmos content check-test --root content >&2 || {
+        say "pmos-admin sandbox: the content check refused the checkout (above); nothing was uploaded" >&2
+        exit 2
+      }
     fi
     [ "$dry" = 1 ] || command -v openshell >/dev/null || { say "openshell is not installed" >&2; exit 1; }
     # The host preflight with the OpenShell checks, two canary sandboxes included (slice H1).

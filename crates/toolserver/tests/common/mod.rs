@@ -436,6 +436,30 @@ fn build(dir: TempDir, root: PathBuf, stores: Stores, audit: Arc<MemoryAudit>) -
     build_with(dir, root, stores, audit, false)
 }
 
+/// [`fixture`], with the tool server checking the model gateway's source at every session
+/// open and tool call through `guard` (slice H4).
+pub fn fixture_with_model_source(
+    guard: Arc<pmos_toolserver::model_source::SourceGuard>,
+) -> Fixture {
+    let (dir, root) = content_tree();
+    let (stores, audit) = Stores::in_memory(&root);
+    let mut f = build(dir, root, stores, audit);
+    let catalog = Catalog::load(&f.root, now().date_naive()).expect("fixture content lints");
+    let connectors: Vec<Arc<dyn Connector>> = vec![
+        f.jira.clone(),
+        f.confluence.clone(),
+        f.slack.clone(),
+        Arc::new(FakeConnector::docs()),
+    ];
+    f.svc = Arc::new(
+        ToolService::new(catalog, f.stores.clone(), connectors)
+            .unwrap()
+            .with_open_directory()
+            .with_model_source(guard),
+    );
+    f
+}
+
 /// `enforced`: the user database decides who may use PM OS; otherwise it is open (tests
 /// only: any valid handle not listed may).
 fn build_with(
@@ -542,4 +566,25 @@ pub fn content_tree() -> (TempDir, PathBuf) {
 /// Write a file under the fixture's content root, as a merge to the content repo would.
 pub fn write_content(root: &Path, rel: &str, text: &str) {
     write(root, rel, text)
+}
+
+/// A stand-in model gateway that only says which model source it serves (`GET /readyz`, slice
+/// H4), for a runtime or tool server that checks it before a claim or a session. Its base URL,
+/// with `/v1`; it runs until the test ends.
+pub async fn gateway_serving(source: &str) -> String {
+    let body = serde_json::json!({"ready": true, "class": "test", "stub": false,
+                                  "model_source": source});
+    let app = axum::Router::new().route(
+        "/readyz",
+        axum::routing::get(move || {
+            let body = body.clone();
+            async move { axum::Json(body) }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    format!("{base}/v1")
 }

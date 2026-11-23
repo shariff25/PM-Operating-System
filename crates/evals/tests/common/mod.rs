@@ -421,6 +421,10 @@ pub struct Gateway {
     pub calls: Mutex<Vec<Value>>,
 }
 
+/// The model source the mock gateway serves (slice H4): its roles answer says it, and a call
+/// that doesn't name it is refused `409` before it is answered, as the gateway does.
+pub const GATEWAY_SOURCE: &str = "local";
+
 async fn completions(
     State(g): State<Arc<Gateway>>,
     headers: HeaderMap,
@@ -444,13 +448,30 @@ async fn completions(
         )
             .into_response();
     }
+    if headers
+        .get("x-pmos-model-source")
+        .and_then(|v| v.to_str().ok())
+        != Some(GATEWAY_SOURCE)
+    {
+        return (
+            StatusCode::CONFLICT,
+            [("x-pmos-model-source", GATEWAY_SOURCE)],
+            Json(json!({"error": {"type": "model_source_mismatch"}})),
+        )
+            .into_response();
+    }
     let user = body["messages"][1]["content"]
         .as_str()
         .unwrap_or_default()
         .to_string();
     g.calls.lock().unwrap().push(body);
     let content = (g.reply)(&user);
-    Json(json!({"choices": [{"index": 0, "message": {"role": "assistant", "content": content}}]}))
+    (
+        [("x-pmos-model-source", GATEWAY_SOURCE)],
+        Json(
+            json!({"choices": [{"index": 0, "message": {"role": "assistant", "content": content}}]}),
+        ),
+    )
         .into_response()
 }
 
@@ -459,7 +480,8 @@ async fn roles(headers: HeaderMap) -> Response {
     if bearer(&headers).as_deref() != Some(GATEWAY_TOKEN) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    Json(json!({"stub": false, "cloud_test": false, "workarounds": true, "roles": [
+    Json(json!({"stub": false, "cloud_test": false, "workarounds": true,
+        "model_source": GATEWAY_SOURCE, "roles": [
         {"role": "default", "alias": "pmos/default", "model": "qwen-prod", "upstream": "local"},
         {"role": "extraction", "alias": "pmos/extraction", "model": "nemo-prod", "upstream": "local"},
     ]}))

@@ -378,6 +378,8 @@ pub enum Reload {
 pub struct Reloader {
     root: PathBuf,
     seen: u64,
+    /// Fake-data mode (slice H4): run the content check before each reload.
+    test_content: bool,
 }
 
 impl Reloader {
@@ -386,11 +388,46 @@ impl Reloader {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
         let seen = fingerprint(&root);
-        Self { root, seen }
+        Self {
+            root,
+            seen,
+            test_content: false,
+        }
+    }
+
+    /// In fake-data mode (`PMOS_MODEL_SOURCE=hosted-test`), the checkout must pass the content
+    /// check (`pmos_contract::model_source::check_test_content`) on every pass, before any
+    /// reload; while it doesn't, the runtime claims nothing and isn't ready.
+    pub fn with_test_content_check(mut self) -> Self {
+        self.test_content = true;
+        self
     }
 
     /// Reload if the content changed since the last check.
     pub async fn check(&mut self, rt: &crate::Runtime, today: NaiveDate) -> Reload {
+        // Fake-data mode: the whole checkout is checked on every pass, not only when the files
+        // the catalog reads change (a restricted context file, or a removed TEST-CONTENT
+        // marker, changes no bot or role).
+        if self.test_content {
+            let root = self.root.clone();
+            let checked = tokio::task::spawn_blocking(move || {
+                pmos_contract::model_source::check_test_content(&root)
+            })
+            .await
+            .unwrap_or_else(|_| Err(vec!["the content check didn't finish".into()]));
+            if let Err(causes) = checked {
+                let why = pmos_contract::model_source::fake_data_refusal(&causes.join("; "));
+                if rt.content_refused().as_deref() != Some(why.as_str()) {
+                    tracing::error!(reason = %why, "the content checkout fails the fake-data content check; claiming nothing until it passes");
+                }
+                rt.set_content_refused(Some(why.clone()));
+                return Reload::Kept(why);
+            }
+            if rt.content_refused().is_some() {
+                tracing::info!("the content checkout passes the fake-data content check again");
+            }
+            rt.set_content_refused(None);
+        }
         let root = self.root.clone();
         let now = tokio::task::spawn_blocking(move || fingerprint(&root))
             .await

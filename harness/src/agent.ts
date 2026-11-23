@@ -57,6 +57,45 @@ export const MODEL_ALIASES = {
 } as const;
 export type ModelRole = keyof typeof MODEL_ALIASES;
 
+/** Thrown by [`ModelSourceGuard`]'s fetch: the gateway serves another model source. */
+export class ModelSourceChangedError extends Error {
+  constructor() {
+    super("model source changed");
+    this.name = "ModelSourceChangedError";
+  }
+}
+
+/**
+ * Keeps one task's model calls on the model source it started under (slice H4,
+ * docs/openshell-any-host-spec.md §3.6, "Keeping every caller on one source"). Every call names
+ * the source in `X-Pmos-Model-Source` (set with the other gateway headers); the gateway refuses
+ * a mismatch with `409` before it forwards anything (X4). As a second line, this checks every
+ * answer: a `409`, or an answer whose `x-pmos-model-source` isn't the task's, marks the task
+ * changed, and from then on no call is sent at all, so no tool result reaches a model of
+ * another source. The review panel's sub-agents share the task's model, and so this guard.
+ */
+export class ModelSourceGuard {
+  changed = false;
+
+  constructor(
+    readonly expected: string,
+    private readonly base: typeof fetch = globalThis.fetch,
+  ) {}
+
+  readonly fetch = async (input: string | URL | Request, init?: RequestInit) => {
+    if (this.changed) {
+      throw new ModelSourceChangedError();
+    }
+    const res = await this.base(input, init);
+    if (res.status === 409 || res.headers.get("x-pmos-model-source") !== this.expected) {
+      this.changed = true;
+      await res.body?.cancel().catch(() => {});
+      throw new ModelSourceChangedError();
+    }
+    return res;
+  };
+}
+
 export interface GatewayModelOptions {
   /** Base URL of the gateway's OpenAI-compatible API, e.g. `https://gateway.pmos.internal/v1`. */
   gatewayUrl: string;
@@ -71,6 +110,8 @@ export interface GatewayModelOptions {
    * `X-Pmos-Priority` (docs/gateway.md).
    */
   headers?: Record<string, string>;
+  /** Checks every answer's model source (slice H4). */
+  sourceGuard?: ModelSourceGuard;
 }
 
 export function gatewayModel({
@@ -78,6 +119,7 @@ export function gatewayModel({
   role = "default",
   apiKey = "pmos-sandbox-placeholder",
   headers,
+  sourceGuard,
 }: GatewayModelOptions): BaseChatModel {
   return new ChatOpenAI({
     model: MODEL_ALIASES[role],
@@ -88,7 +130,11 @@ export function gatewayModel({
     // model server"). A LangChain retry here would multiply with it, and a PM would wait far
     // longer than intended. `maxRetries` is LangChain's own retry count, default 6.
     maxRetries: 0,
-    configuration: { baseURL: gatewayUrl, defaultHeaders: headers },
+    configuration: {
+      baseURL: gatewayUrl,
+      defaultHeaders: headers,
+      ...(sourceGuard ? { fetch: sourceGuard.fetch } : {}),
+    },
   });
 }
 

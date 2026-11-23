@@ -231,13 +231,26 @@ export interface FakeGateway {
   close(): Promise<void>;
 }
 
+/** One scripted answer of the fake gateway (slice H4): the source it says, a status, a tool call. */
+export interface GatewayStep {
+  /** `x-pmos-model-source` on the answer; default `local`. */
+  source?: string;
+  /** Answer this status (such as `409`) instead of a completion. */
+  status?: number;
+  /** Answer with a call of this tool (its harness name) instead of text. */
+  toolCall?: { name: string; args: Record<string, unknown> };
+}
+
 /**
  * An OpenAI-compatible `/v1/chat/completions` that always answers `answer`, or, with `fail`,
- * always answers that status with the gateway's `X-Pmos-Upstream-Attempts` header.
+ * always answers that status with the gateway's `X-Pmos-Upstream-Attempts` header. Every
+ * answer says `x-pmos-model-source: local`, as the gateway does, unless `steps` says otherwise
+ * for that call (the n-th call takes the n-th step; calls past the list take its last).
  */
 export async function startFakeGateway(
   answer: string,
   fail?: { status: number; upstreamAttempts: number },
+  steps: GatewayStep[] = [],
 ): Promise<FakeGateway> {
   const requests: Recorded[] = [];
   const server = createServer(async (req, res) => {
@@ -248,6 +261,12 @@ export async function startFakeGateway(
       body: await readBody(req),
     };
     requests.push(recorded);
+    const step = steps[Math.min(requests.length, steps.length) - 1] ?? {};
+    res.setHeader("x-pmos-model-source", step.source ?? "local");
+    if (step.status) {
+      json(res, step.status, { error: { type: "model_source_mismatch" } });
+      return;
+    }
     if (fail) {
       res
         .writeHead(fail.status, {
@@ -255,6 +274,36 @@ export async function startFakeGateway(
           "x-pmos-upstream-attempts": String(fail.upstreamAttempts),
         })
         .end(JSON.stringify({ error: { message: "busy", type: "server_error" } }));
+      return;
+    }
+    if (step.toolCall) {
+      json(res, 200, {
+        id: "chatcmpl-fake",
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model: recorded.body?.model,
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: "assistant",
+              content: "",
+              tool_calls: [
+                {
+                  id: `call_${requests.length}`,
+                  type: "function",
+                  function: {
+                    name: step.toolCall.name,
+                    arguments: JSON.stringify(step.toolCall.args),
+                  },
+                },
+              ],
+            },
+            finish_reason: "tool_calls",
+          },
+        ],
+        usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+      });
       return;
     }
     if (recorded.path !== "/v1/chat/completions") {

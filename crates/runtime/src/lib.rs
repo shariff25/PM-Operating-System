@@ -2,6 +2,8 @@
 
 use subtle::ConstantTimeEq;
 
+pub mod model_source;
+
 /// Compare a presented token with the expected one in constant time, so a token can't be
 /// guessed byte by byte from response timing. Both sides are hashed with SHA-256 first and
 /// the digests compared, so the time taken doesn't depend on either token's length either.

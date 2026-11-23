@@ -14,6 +14,56 @@ bot runtime / harness ──► pmos-gateway ──► vLLM (default role: Qwen)
    (ChatOpenAI, model "pmos/default")  └──► vLLM (extraction role: Nemotron)
 ```
 
+## Model sources (slice H4)
+
+Where prompts go is `PMOS_MODEL_SOURCE` (`docs/openshell-any-host-spec.md` §3.1 and §3.6),
+required by the gateway and by every service that calls it or reads its answers, with no
+default: a blank value is refused, never read as `local`.
+
+| Source | Config `class` | Upstreams | Data |
+| --- | --- | --- | --- |
+| `local` | `production` only (`deploy/gateway.yaml`), never with `PMOS_GATEWAY_CLOUD_TEST=1` | the two model servers, `vllm-default.pmos.internal` and `vllm-extraction.pmos.internal`, and no other name | real data, after Gate 1 |
+| `hosted-test` | `test` only (`deploy/gateway.hosted-test.yaml` is an example; `deploy/pmos-admin` writes the real one outside the repo), with `PMOS_GATEWAY_CLOUD_TEST=1` unless the stub is on, and a `label:` on every role | a remote test upstream (`openai+https://…`) | **fake data only** |
+| `hosted` | (slice H12) | | refused: not built |
+
+The stub may be on under either source (a first install); the gateway then reports the source
+`stub`, which sends nothing anywhere and which every caller accepts in place of its own.
+
+**The names' answers (`local`).** A `class: production` gateway's HTTP clients resolve each
+model server's name with a resolver of their own, at every connection: `vllm-default` only to
+`10.201.77.13` and `vllm-extraction` only to `10.201.77.14`, the addresses `deploy/compose.yaml`
+pins (a unit test checks they are equal). Any other answer (loopback, an address in the
+network's range, another service, a second address beside the right one) fails that call with a
+`502` and a warning naming the server, never the address. These are compiled constants:
+`PMOS_NETWORK_SUBNET` and `PMOS_NETWORK_IP_RANGE` never reach the gateway.
+
+**Every answer says the source.** Each response, errors, refusals, streams, `/healthz` and
+`/readyz` included, carries `x-pmos-model-source: <source>` (`local`, `hosted-test` or `stub`;
+`hosted:<name>` from H12). `/readyz` and `GET /v1/pmos/roles` also have `model_source`.
+
+**Every model call names the source it expects (X4).** `POST /v1/chat/completions` and
+`POST /v1/embeddings` need `X-Pmos-Model-Source`: missing, `400 model_source_required`; another
+source, `409 model_source_mismatch` (with the gateway's own in `x-pmos-model-source`). Checked
+before the call is queued, counted or forwarded, so nothing reaches a model server. The harness
+sends the source the runtime recorded when it first claimed the task; the runtime's routine
+parsing sends the one it checked; the benchmark judges send the one `GET /v1/pmos/roles` said
+when the run started. The tool server and the runtime also read `/readyz` (no token) before a
+session, a tool call, a claim or a routine parse, and refuse on a mismatch.
+
+**Error bodies and logs (V3).** Under `hosted-test` every upstream error body is replaced by
+`{"error": {"type", "status", "message"}}` with a fixed message (as for a labelled role), keeping
+`Retry-After`; under `local` an unlabelled role's own error (PM OS's vLLM) still reaches the
+caller. Every per-request warning and start-up line names the role and the upstream's kind
+label, never its URL, and a transport error by its kind (`connect`, `timeout`, `body`, …), never
+its text; the HTTP libraries' own lines are held at `warn` whatever `RUST_LOG` says, since
+theirs name addresses. A production model server's start-up line keeps its `*.pmos.internal` name.
+
+**No redirects.** Neither HTTP client follows one: a `3xx` from a model server is a `502` for
+that call, and neither its body nor its `Location` reaches the caller.
+
+**Readiness of a remote test upstream.** `/readyz`'s probe of a testing-only upstream (it carries
+the provider's key) is reused for at least 30 seconds, however many callers ask.
+
 ## Swapping a model (D11)
 Edit `config/gateway.yaml` and restart the gateway.
 
@@ -305,12 +355,14 @@ moment. The gateway retries these itself, so a brief limit doesn't lose a PM's r
 | `GET /healthz` | none | Liveness |
 | `GET /readyz` | none | `200` when every model server answers `/models` within 2 seconds; `503` when one doesn't. `upstreams` is keyed by role, each with its upstream's kind label (`local`, `claude-test`, `remote-test`, as in `GET /v1/pmos/roles`) and `ok` or `down`: `{"default": {"upstream": "local", "status": "ok"}, …}`. Labels only, never an address, host name, URL or key (review at 6bb806f: before, the keys were the model servers' base URLs, so this unauthenticated route named their hosts and a remote test upstream's provider). Every answer also has `class` (as served: `test` with the stub on) and `stub` (G2); with the stub on it is always `200`, has no `upstreams`, and asks no model server. `deploy/pmos-admin status` shows a `WARN` line for the gateway when `stub` is true or `class` isn't `production`. Docker's health check uses `/healthz`, so neither changes whether the stack starts. |
 
+**Required header** (slice H4): `X-Pmos-Model-Source` on every chat and embeddings call (above).
+
 **Optional headers:**
 - `X-Pmos-User`: a handle (used only from a trusted client);
 - `X-Pmos-Priority` (used only from a trusted client);
 - `X-Pmos-Run`: logged with the call;
-- each response carries `X-Pmos-Model`, the model that answered, and (for model-server
-  calls) `X-Pmos-Upstream-Attempts`.
+- each response carries `X-Pmos-Model`, the model that answered, `x-pmos-model-source`, and
+  (for model-server calls) `X-Pmos-Upstream-Attempts`.
 
 **Errors:** in the usual chat-completions error shape. A model server's own refusal, such as "context length exceeded", is passed through for a role without a label; for a labelled role it is replaced by a neutral one (below). An unreachable server is `502`.
 
@@ -417,6 +469,7 @@ It never holds prompts or answers. Events go to the service log, and with `PMOS_
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `PMOS_GATEWAY_TOKENS` | required | `name=token,…`, one per caller (the bot runtime, the benchmark runner). Each token is at least 32 characters, and all are distinct. |
+| `PMOS_MODEL_SOURCE` | required | `local` or `hosted-test` (slice H4, "Model sources" above); `hosted` is refused until slice H12. No default. |
 | `PMOS_GATEWAY_CONFIG` | `config/gateway.yaml` | Roles, upstreams, limits, clients (below) |
 | `PMOS_GATEWAY_BIND` | `127.0.0.1:8740` | |
 | `PMOS_GATEWAY_USAGE_LOG` | none | JSON-lines usage file |

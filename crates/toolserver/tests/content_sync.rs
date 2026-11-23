@@ -196,3 +196,129 @@ async fn a_checkout_outside_git_fails_without_panicking() {
         .unwrap_err();
     assert!(err.contains("git"), "{err}");
 }
+
+/// Fake-data mode (slice H4, spec §3.6): a pull that would bring a file marked restricted, or
+/// remove the TEST-CONTENT marker, is not applied: the sync fails, the checkout stays where it
+/// was, and nothing is reloaded. A clean change is applied as usual.
+#[tokio::test]
+async fn in_fake_data_mode_a_sync_bringing_restricted_content_is_not_applied() {
+    let dir = tempfile::tempdir().unwrap();
+    let remote = dir.path().join("remote.git");
+    let work = dir.path().join("work");
+    let checkout = dir.path().join("checkout");
+    std::fs::create_dir_all(&remote).unwrap();
+    git(&remote, &["init", "-q", "--bare", "--initial-branch=main"]);
+    git(
+        dir.path(),
+        &["clone", "-q", remote.to_str().unwrap(), "work"],
+    );
+    git(&work, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    let (_fixture, fixture_root) = common::content_tree();
+    copy_dir(&fixture_root, &work.join("content"));
+    // The fixture holds one restricted context file (the NDA); test content has none.
+    for entry in walkdir::WalkDir::new(work.join("content")) {
+        let entry = entry.unwrap();
+        if entry.file_type().is_file()
+            && pmos_contract::model_source::marked_restricted(
+                &std::fs::read_to_string(entry.path()).unwrap_or_default(),
+            )
+        {
+            std::fs::remove_file(entry.path()).unwrap();
+        }
+    }
+    std::fs::write(work.join("content/TEST-CONTENT"), "test data only\n").unwrap();
+    git(&work, &["add", "-A"]);
+    git(&work, &["commit", "-q", "-m", "content"]);
+    git(&work, &["push", "-q", "origin", "HEAD:main"]);
+    git(
+        dir.path(),
+        &["clone", "-q", remote.to_str().unwrap(), "checkout"],
+    );
+    let root = checkout.join("content");
+    assert_eq!(
+        pmos_contract::model_source::check_test_content(&root),
+        Ok(())
+    );
+    let catalog = Catalog::load(&root, Utc::now().date_naive()).unwrap();
+    let (stores, _audit) = Stores::in_memory(&root);
+    let connectors: Vec<Arc<dyn Connector>> = vec![
+        Arc::new(FakeConnector::jira()),
+        Arc::new(FakeConnector::confluence()),
+        Arc::new(FakeConnector::slack()),
+        Arc::new(FakeConnector::docs()),
+    ];
+    let svc = Arc::new(ToolService::new(catalog, stores, connectors).unwrap());
+    let sync = ContentSync::new(&root, svc.clone()).with_test_content_check();
+    let head = || {
+        String::from_utf8(
+            Command::new("git")
+                .arg("-C")
+                .arg(&checkout)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+    };
+
+    // A clean change is applied.
+    push(
+        &work,
+        &[(
+            "content/bots/pm-zed/BOT.md",
+            Some(&render_personal_bot("zed")),
+        )],
+        "Add zed",
+    );
+    let report = sync.sync_once(Utc::now()).await.unwrap();
+    assert!(report.moved && report.reindexed.is_some());
+    assert!(svc.roster().bot("pm-zed").is_some());
+
+    // A restricted file: not applied, the checkout stays.
+    let before = head();
+    push(
+        &work,
+        &[(
+            "content/context/partners/acme-contract.md",
+            Some("---\ntitle: Acme contract\nsensitivity: restricted\n---\nsecret"),
+        )],
+        "Add a restricted file",
+    );
+    let err = sync.sync_once(Utc::now()).await.unwrap_err();
+    assert!(err.contains("not applied"), "{err}");
+    assert!(
+        err.contains("content/context/partners/acme-contract.md is marked restricted"),
+        "{err}"
+    );
+    assert!(err.contains("PMOS_MODEL_SOURCE=hosted-test"), "{err}");
+    assert_eq!(head(), before, "the checkout didn't move");
+    assert!(!checkout
+        .join("content/context/partners/acme-contract.md")
+        .exists());
+
+    // Removing it again, and losing the marker in the same push: still refused.
+    push(
+        &work,
+        &[
+            ("content/context/partners/acme-contract.md", None),
+            ("content/TEST-CONTENT", None),
+        ],
+        "Drop the marker",
+    );
+    let err = sync.sync_once(Utc::now()).await.unwrap_err();
+    assert!(err.contains("no TEST-CONTENT marker"), "{err}");
+    assert_eq!(head(), before);
+    // The marker back: applied.
+    push(
+        &work,
+        &[("content/TEST-CONTENT", Some("test data only\n"))],
+        "Marker back",
+    );
+    sync.sync_once(Utc::now()).await.unwrap();
+    assert_ne!(head(), before);
+    assert_eq!(
+        pmos_contract::model_source::check_test_content(&root),
+        Ok(())
+    );
+}

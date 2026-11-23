@@ -12,6 +12,7 @@ use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use pmos_contract::model_source::ModelSource;
 use pmos_gateway::config::{Client, Models};
 use pmos_gateway::usage::UsageLog;
 use pmos_gateway::{router, GatewayConfig};
@@ -163,6 +164,7 @@ async fn setup() -> Setup {
             ..Default::default()
         },
         timeouts: Default::default(),
+        model_source: ModelSource::Local,
     });
     let (gw, stop_gw) = serve(app).await;
     Setup {
@@ -178,7 +180,7 @@ fn chat(s: &Setup, role: &str, stream: bool) -> reqwest::RequestBuilder {
 }
 
 fn ask(s: &Setup, role: &str, stream: bool, text: &str) -> reqwest::RequestBuilder {
-    reqwest::Client::new()
+    http()
         .post(format!("{}/v1/chat/completions", s.gw))
         .bearer_auth(TOKEN)
         .json(&json!({"model": role, "stream": stream,
@@ -199,7 +201,7 @@ async fn a_labelled_role_is_reported_by_its_label_and_still_sends_the_real_id_up
     let s = setup().await;
 
     // The roles answer names the label, never the real id; the unlabelled role is unchanged.
-    let v: Value = reqwest::Client::new()
+    let v: Value = http()
         .get(format!("{}/v1/pmos/roles", s.gw))
         .bearer_auth(TOKEN)
         .send()
@@ -396,4 +398,22 @@ async fn a_role_without_a_label_is_reported_as_before() {
     let e = s.usage.recent().pop().unwrap();
     assert_eq!(e.model, "nemo-test");
     assert_eq!(e.upstream, "127.0.0.1");
+}
+
+/// A client that names the model source the gateways here serve (`local`; X4, slice H4).
+fn http() -> reqwest::Client {
+    http_as("local")
+}
+
+/// A client that names `source` on every call.
+fn http_as(source: &str) -> reqwest::Client {
+    let mut h = reqwest::header::HeaderMap::new();
+    h.insert(
+        "x-pmos-model-source",
+        reqwest::header::HeaderValue::from_str(source).unwrap(),
+    );
+    reqwest::Client::builder()
+        .default_headers(h)
+        .build()
+        .unwrap()
 }

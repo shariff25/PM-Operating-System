@@ -61,6 +61,7 @@ function claim(id: string, extra: Record<string, unknown> = {}) {
     role: CHIEF_ROLE,
     tools: ["jira.search"],
     session_token: `sess-${id}`,
+    gateway: { model: "pmos/reasoning", headers: { "X-Pmos-Model-Source": "local" } },
     level: "staff",
     persona: CHIEF,
     ...extra,

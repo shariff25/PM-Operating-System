@@ -14,10 +14,11 @@ pub mod anthropic;
 pub mod app;
 pub mod config;
 pub mod remote;
+pub mod resolve;
 pub mod retry;
 pub mod scheduler;
 pub mod stub;
 pub mod usage;
 pub mod workarounds;
 
-pub use app::{router, GatewayConfig, Timeouts, READY_CACHE};
+pub use app::{router, GatewayConfig, Timeouts, READY_CACHE, REMOTE_READY_CACHE};

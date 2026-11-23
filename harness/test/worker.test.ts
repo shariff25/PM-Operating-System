@@ -7,6 +7,8 @@ import { milestoneFor } from "../src/progress.js";
 import { ClaimSchema } from "../src/runtime-client.js";
 import {
   type Logger,
+  MODEL_SOURCE_CHANGED,
+  MODEL_SOURCE_MISSING,
   type WorkerConfig,
   botSystemPrompt,
   createWorker,
@@ -69,6 +71,7 @@ function claim(id: string, overrides: { priority?: string; text?: string } = {})
     tools: ["docs.search", "docs.read"],
     session_token: `sess-${id}`,
     lease_until: new Date(Date.now() + 120_000).toISOString(),
+    gateway: { model: "pmos/default", headers: { "X-Pmos-Model-Source": "local" } },
   };
 }
 
@@ -398,8 +401,60 @@ describe("harness worker", () => {
     expect(request?.headers["x-pmos-user"]).toBe("ana");
     expect(request?.headers["x-pmos-run"]).toBe("tsk_gw");
     expect(request?.headers["x-pmos-priority"]).toBe("scheduled");
+    // X4 (slice H4): the source the task was claimed under, on every call.
+    expect(request?.headers["x-pmos-model-source"]).toBe("local");
     expect(request?.headers.authorization).toBe("Bearer gateway-token-0123456789abcdef0123456789");
     expect(request?.body.model).toBe("pmos/default");
+  });
+
+  it("ends a task when the model source changes between two answers, and sends nothing more", async () => {
+    const search = { toolCall: { name: "docs_search", args: { query: "ports" } } };
+    const gateway = await startFakeGateway("unused", undefined, [
+      search,
+      { ...search, source: "hosted-test" },
+      { source: "hosted-test" },
+    ]);
+    cleanups.push(gateway.close);
+    const { runtime } = await setup({
+      claims: [claim("tsk_switch")],
+      config: { gatewayUrl: gateway.url },
+    });
+    const failed = await waitFor(() => finished(runtime, "tsk_switch"));
+    expect(failed.path).toContain("/fail");
+    expect(failed.body.reason).toBe(MODEL_SOURCE_CHANGED);
+    // The answer that said another source ended it: no call carried its tool result on.
+    expect(gateway.requests).toHaveLength(2);
+    for (const r of gateway.requests) {
+      expect(r.headers["x-pmos-model-source"]).toBe("local");
+    }
+  });
+
+  it("ends a task when the gateway refuses its source (409), never retrying it", async () => {
+    const gateway = await startFakeGateway("unused", undefined, [
+      { status: 409, source: "hosted-test" },
+    ]);
+    cleanups.push(gateway.close);
+    const { runtime } = await setup({
+      claims: [claim("tsk_409")],
+      config: { gatewayUrl: gateway.url },
+    });
+    const failed = await waitFor(() => finished(runtime, "tsk_409"));
+    expect(failed.body.reason).toBe(MODEL_SOURCE_CHANGED);
+    expect(gateway.requests).toHaveLength(1);
+  });
+
+  it("calls no model for a claim that doesn't say its model source", async () => {
+    const gateway = await startFakeGateway("unused");
+    cleanups.push(gateway.close);
+    const bare = { ...claim("tsk_nosrc"), gateway: { model: "pmos/default", headers: {} } };
+    const { runtime, mcp } = await setup({
+      claims: [bare],
+      config: { gatewayUrl: gateway.url },
+    });
+    const failed = await waitFor(() => finished(runtime, "tsk_nosrc"));
+    expect(failed.body.reason).toBe(MODEL_SOURCE_MISSING);
+    expect(gateway.requests).toHaveLength(0);
+    expect(mcp.calls).toHaveLength(0);
   });
 
   it("makes one gateway call per model turn when the gateway keeps answering busy", async () => {

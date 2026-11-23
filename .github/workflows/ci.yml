@@ -120,7 +120,11 @@ jobs:
       - name: Host preflight checks (fixtures)
         run: scripts/test-preflight.sh
       - name: Settings
-        run: deploy/setup.sh --content "$GITHUB_WORKSPACE" --state "$RUNNER_TEMP/pmos-state"
+        # `local` with the stub model (env.example's PMOS_GATEWAY_STUB=1): no GPU and no hosted
+        # endpoint here. setup.sh's default, hosted-test, needs a provider's URL and key
+        # (slice H4). The repository's content carries content/TEST-CONTENT, which the bring-up
+        # workers need.
+        run: deploy/setup.sh --content "$GITHUB_WORKSPACE" --state "$RUNNER_TEMP/pmos-state" --model-source local
       - run: docker compose -f deploy/compose.yaml --env-file deploy/.env config -q
       - name: Images
         run: deploy/pmos-admin build

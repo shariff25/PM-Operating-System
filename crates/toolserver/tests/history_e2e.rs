@@ -81,8 +81,12 @@ async fn a_follow_up_cannot_draft_restricted_history_to_outsiders() {
         Arc::new(catalog),
         people,
         ToolServer::new(&base, SERVICE_TOKEN),
-        // Never called here.
-        Gateway::new("http://127.0.0.1:9/v1", "test-gateway-token-0123456789abcd"),
+        // Only its model source is read (slice H4).
+        Gateway::new(
+            &common::gateway_serving("local").await,
+            "test-gateway-token-0123456789abcd",
+            pmos_contract::model_source::ModelSource::Local,
+        ),
         cancel.child_token(),
     );
     let earlier = Utc::now() - Duration::minutes(2);

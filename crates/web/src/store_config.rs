@@ -108,6 +108,20 @@ impl StoreConfig {
     }
 }
 
+impl StoreConfig {
+    /// The `held_real_data` rule (slice H4) on the web app's database, after `deps()` has
+    /// migrated it. In memory there is no marker: every start is a fresh store.
+    pub async fn check_held_real_data(&self, live: bool, fake_only: bool) -> Result<(), String> {
+        let Some(url) = &self.database_url else {
+            return Ok(());
+        };
+        let pg = PgStore::connect(url)
+            .await
+            .map_err(|e| format!("PMOS_WEB_DATABASE_URL: {e}"))?;
+        pg.check_held_real_data(live, fake_only).await
+    }
+}
+
 /// `StoreConfig::from_env()` then `.deps()`: what `main` calls instead of
 /// `Deps::in_memory()`.
 pub async fn deps_from_env() -> Result<Deps, String> {

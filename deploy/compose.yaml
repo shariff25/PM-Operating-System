@@ -104,6 +104,13 @@ services:
       <<: *proxy
       PMOS_BIND: 0.0.0.0:8710
       PMOS_CONNECTORS: ${PMOS_CONNECTORS:-fake}
+      # Where prompts go (docs/openshell-any-host-spec.md §3.1, §3.6; slice H4): required, no
+      # default, so Compose itself fails without it. Under hosted-test (fake data only) the tool
+      # server refuses live connectors, GitHub memory, content that isn't test content and a
+      # database that has held real data, however the stack is started. Every session open and
+      # tool call checks that the gateway serves this source.
+      PMOS_MODEL_SOURCE: ${PMOS_MODEL_SOURCE:?run deploy/setup.sh first}
+      PMOS_GATEWAY_URL: http://gateway.pmos.internal:8740/v1
       PMOS_DATABASE_URL: postgresql://pmos_toolserver:${PMOS_DB_TOOLSERVER_PASSWORD}@postgres/pmos_toolserver
       PMOS_SERVICE_TOKEN: ${PMOS_SERVICE_TOKEN:?}
       PMOS_BOT_TOKEN: ${PMOS_BOT_TOKEN:?}
@@ -172,8 +179,19 @@ services:
       pmos: { aliases: [gateway.pmos.internal], ipv4_address: 10.201.77.11 }
     ports: ["127.0.0.1:${PMOS_GATEWAY_PORT:-8740}:8740"]
     environment:
+      # The host's outbound proxy, if it has one (slice H4), for hosted-test's endpoint; the
+      # model servers' names never go through it. Not PMOS_NETWORK_SUBNET or
+      # PMOS_NETWORK_IP_RANGE: the gateway accepts for each model server name only its own
+      # compiled address, never one derived from deploy/.env (spec §3.6).
+      <<: *proxy
       PMOS_GATEWAY_BIND: 0.0.0.0:8740
       PMOS_GATEWAY_CONFIG: /etc/pmos/gateway.yaml
+      # Slice H4: `local` takes only a `class: production` config (deploy/gateway.yaml) and
+      # never CLOUD_TEST; hosted-test (compose.hosted-test.yaml, which pmos-admin adds) only a
+      # `class: test` one with CLOUD_TEST=1 and a label on every role.
+      PMOS_MODEL_SOURCE: ${PMOS_MODEL_SOURCE:?run deploy/setup.sh first}
+      PMOS_GATEWAY_CLOUD_TEST: ${PMOS_GATEWAY_CLOUD_TEST:-0}
+      PMOS_GATEWAY_REMOTE_KEY: ${PMOS_GATEWAY_REMOTE_KEY:-}
       PMOS_GATEWAY_TOKENS: runtime=${PMOS_GW_RUNTIME_TOKEN:?},evals=${PMOS_GW_EVALS_TOKEN:?},bot-docs=${PMOS_GW_DOCS_BOT_TOKEN:?},${PMOS_GW_BOT_TOKENS:-}
       PMOS_GATEWAY_USAGE_LOG: /var/lib/pmos/usage/usage.jsonl
       # 1 until the model servers are up: answers with the stub model.
@@ -195,6 +213,10 @@ services:
     environment:
       PMOS_BOTS_BIND: 0.0.0.0:8750
       PMOS_BOTS_DATABASE_URL: postgresql://pmos_bots:${PMOS_DB_BOTS_PASSWORD}@postgres/pmos_bots
+      # Slice H4: nothing is claimed while the gateway serves another source; PMOS_CONNECTORS
+      # only for the database's held_real_data marker.
+      PMOS_MODEL_SOURCE: ${PMOS_MODEL_SOURCE:?run deploy/setup.sh first}
+      PMOS_CONNECTORS: ${PMOS_CONNECTORS:-fake}
       # The console's and the web app's tokens are listed only when set.
       PMOS_BOTS_TOKENS: "slack=${PMOS_RT_SLACK_TOKEN:?},${PMOS_RT_CONSOLE_TOKEN:+console=${PMOS_RT_CONSOLE_TOKEN},}${PMOS_RT_WEB_TOKEN:+web=${PMOS_RT_WEB_TOKEN},}evals=${PMOS_RT_EVALS_TOKEN:?},worker-docs=${PMOS_RT_DOCS_WORKER_TOKEN:?},${PMOS_RT_WORKER_TOKENS:-}"
       PMOS_CONTENT_ROOT: /srv/content-repo/content
@@ -226,6 +248,8 @@ services:
       <<: *proxy
       PMOS_SLACK_APP_TOKEN: ${PMOS_SLACK_APP_TOKEN:-}
       PMOS_SLACK_BOT_TOKEN: ${PMOS_SLACK_BOT_TOKEN:-}
+      # Slice H4: under hosted-test pmos-slack refuses to start with Slack tokens set.
+      PMOS_MODEL_SOURCE: ${PMOS_MODEL_SOURCE:?run deploy/setup.sh first}
       PMOS_TOOLSERVER_URL: http://toolserver.pmos.internal:8710
       PMOS_BOT_TOKEN: ${PMOS_BOT_TOKEN}
       PMOS_BOTS_URL: http://bots.pmos.internal:8750
@@ -322,6 +346,11 @@ services:
       # network only: no `ports:` entry publishes it, and the browser-facing listener above
       # answers 404 for it. Fixed here, not a setting: blank would put the route back on 8770.
       PMOS_WEB_INTERNAL_BIND: 0.0.0.0:8771
+      # Slice H4: required, no default. pmos-web refuses PMOS_EXPOSURE=public until slice H10,
+      # and under hosted-test shows the test-stack banner on every page.
+      PMOS_EXPOSURE: ${PMOS_EXPOSURE:?run deploy/setup.sh first}
+      PMOS_MODEL_SOURCE: ${PMOS_MODEL_SOURCE:?run deploy/setup.sh first}
+      PMOS_CONNECTORS: ${PMOS_CONNECTORS:-fake}
       # pmos-web refuses to start with neither this at 1 nor Entra sign-in configured.
       PMOS_WEB_DEV_LOGIN: ${PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY:-0}
       # Entra ID sign-in (docs/entra-sign-in.md): on when the tenant, the client id, the secret
@@ -422,9 +451,13 @@ services:
     profiles: [bringup-personal]
 
   # The local models (verify on the Spark: image tag, model ids and memory split).
+  # PMOS_VLLM_IMAGE has no default (slice H4): the host's operator chooses the image for its
+  # architecture and GPU, pinned by tag. Blank, `--profile models` fails ("neither an image nor
+  # a build context"); under PMOS_MODEL_SOURCE=local with the stub off, pmos-admin adds
+  # compose.local.yaml, which makes every `docker compose` call fail without it.
   vllm-default:
     &vllm
-    image: ${PMOS_VLLM_IMAGE:-nvcr.io/nvidia/vllm:25.10-py3}
+    image: ${PMOS_VLLM_IMAGE:-}
     restart: unless-stopped
     # deploy/gateway.yaml (`class: production`) names each model server
     # `<service>.pmos.internal`, the only form a production gateway accepts (docs/gateway.md).

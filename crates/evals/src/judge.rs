@@ -626,12 +626,19 @@ pub fn prompt(judge: &Judge, input: &str, output: &str) -> String {
 }
 
 /// The gateway, as client `evals` (`PMOS_EVALS_GATEWAY_TOKEN`).
+///
+/// Slice H4 (r7, X4): every judge call names, in `X-Pmos-Model-Source`, the model source the
+/// gateway reported in `GET /v1/pmos/roles` when this run first asked ([`Gateway::models`]),
+/// and an answer from another source is refused: a gateway restarted on another source
+/// mid-run can't judge part of it.
 #[derive(Clone)]
 pub struct Gateway {
     http: reqwest::Client,
     /// The OpenAI base, ending in `/v1`.
     base: String,
     token: String,
+    /// The source the gateway reported at the run's first roles read.
+    source: std::sync::Arc<tokio::sync::OnceCell<String>>,
 }
 
 impl Gateway {
@@ -649,7 +656,20 @@ impl Gateway {
             http,
             base,
             token: token.to_string(),
+            source: std::sync::Arc::default(),
         }
+    }
+
+    /// The source this run expects: the one the gateway reported at its first roles read.
+    async fn expected_source(&self) -> Result<String, String> {
+        if let Some(s) = self.source.get() {
+            return Ok(s.clone());
+        }
+        self.models().await?;
+        self.source
+            .get()
+            .cloned()
+            .ok_or_else(|| "the gateway didn't say which model source it serves".to_string())
     }
 
     /// Which model serves each role, as the gateway itself says (`GET /v1/pmos/roles`): the
@@ -670,6 +690,12 @@ impl Gateway {
             .json()
             .await
             .map_err(|e| format!("the gateway's roles answer: {}", e.without_url()))?;
+        // The first answer of the run fixes the source every judge call names.
+        if let Some(s) = v.get("model_source").and_then(Value::as_str) {
+            if pmos_contract::model_source::valid_reported(s) {
+                let _ = self.source.set(s.to_string());
+            }
+        }
         crate::report::GatewayModels::from_roles_answer(&v)
     }
 
@@ -684,17 +710,29 @@ impl Gateway {
                 {"role": "user", "content": prompt(judge, input, output)},
             ],
         });
+        let source = self.expected_source().await?;
         let resp = self
             .http
             .post(format!("{}/chat/completions", self.base))
             .bearer_auth(&self.token)
             .header("X-Pmos-Priority", "personal")
             .header("X-Pmos-Run", format!("eval-judge:{}", judge.name))
+            .header(pmos_contract::model_source::HEADER, &source)
             .json(&body)
             .send()
             .await
-            .map_err(|e| format!("the gateway: {e}"))?;
+            .map_err(|e| format!("the gateway: {}", e.without_url()))?;
         let code = resp.status();
+        let answered = resp
+            .headers()
+            .get(pmos_contract::model_source::HEADER)
+            .and_then(|v| v.to_str().ok());
+        if code.as_u16() == 409 || answered != Some(source.as_str()) {
+            return Err(format!(
+                "the gateway now serves another model source than this run started on ({source}); \
+                 judging stopped (model_source_changed)"
+            ));
+        }
         let text = resp.text().await.map_err(|e| format!("the gateway: {e}"))?;
         if !code.is_success() {
             let cut: String = text.chars().take(300).collect();

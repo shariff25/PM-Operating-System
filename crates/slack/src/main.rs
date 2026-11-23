@@ -81,6 +81,11 @@ async fn main() -> Result<()> {
     // rustls 0.23 needs a process-wide crypto provider before the first wss:// connection.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
+    // Slice H4: the model source is required, and fake-data mode keeps Slack off.
+    let source =
+        pmos_slack::model_source::check(|k| std::env::var(k).ok()).map_err(|e| anyhow!(e))?;
+    tracing::info!(model_source = source.as_str(), "model source");
+
     let app_token = need("PMOS_SLACK_APP_TOKEN")?;
     if !app_token.starts_with("xapp-") {
         return Err(anyhow!(

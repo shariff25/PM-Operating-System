@@ -1,9 +1,12 @@
 //! The two services the runtime calls: the tool server (bot sessions, approval items) and
 //! the gateway (the model, for parsing routines).
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use pmos_contract::model_source::{ModelSource, HEADER as MODEL_SOURCE_HEADER};
 use pmos_contract::Sensitivity;
+use pmos_runtime::model_source::GatewaySource;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -21,6 +24,10 @@ pub enum CallError {
     /// message is its sentence for the PM.
     #[error("{message}")]
     PersonaRefused { code: String, message: String },
+    /// The gateway serves another model source than this runtime may use, or one other than a
+    /// call expected, or its source couldn't be read (slice H4): nothing more is sent to it.
+    #[error("the model gateway serves another model source (model_source_changed)")]
+    ModelSourceChanged,
 }
 
 /// The tool server's codes for a refused persona session (`docs/bot-marketplace-spec.md` §6,
@@ -330,23 +337,71 @@ impl ToolServer {
 }
 
 /// The model gateway's OpenAI-compatible API.
+///
+/// Slice H4 (`docs/openshell-any-host-spec.md` §3.6, "Keeping every caller on one source"):
+/// it knows the model source this runtime may use (`PMOS_MODEL_SOURCE`) and reads the one the
+/// gateway serves from its `/readyz` ([`GatewaySource`], at most 10 seconds old, failing
+/// closed). Every model call names the source it expects in `X-Pmos-Model-Source`, and an
+/// answer whose `x-pmos-model-source` differs is dropped.
 #[derive(Clone)]
 pub struct Gateway {
     base: String,
     token: String,
     http: reqwest::Client,
+    expected: ModelSource,
+    source: Arc<GatewaySource>,
 }
 
 /// The model role routine parsing uses: extraction, not drafting.
 pub const EXTRACTION_MODEL: &str = "pmos/extraction";
 
 impl Gateway {
-    /// `base` is the OpenAI base, ending in `/v1`.
-    pub fn new(base: &str, token: &str) -> Self {
+    /// `base` is the OpenAI base, ending in `/v1`; `expected` is this runtime's
+    /// `PMOS_MODEL_SOURCE`.
+    pub fn new(base: &str, token: &str, expected: ModelSource) -> Self {
+        Self::with_source_cache(
+            base,
+            token,
+            expected,
+            pmos_runtime::model_source::SOURCE_CACHE,
+        )
+    }
+
+    /// [`Gateway::new`], reusing a reading of the gateway's source for `ttl` (at most 10
+    /// seconds; tests use less).
+    pub fn with_source_cache(
+        base: &str,
+        token: &str,
+        expected: ModelSource,
+        ttl: Duration,
+    ) -> Self {
+        let base = base.trim_end_matches('/').to_string();
         Self {
-            base: base.trim_end_matches('/').to_string(),
+            source: Arc::new(GatewaySource::new(&base).with_ttl(ttl)),
+            base,
             token: token.to_string(),
             http: http(Duration::from_secs(60)),
+            expected,
+        }
+    }
+
+    /// The source the gateway serves now, if this runtime may use it: its own
+    /// `PMOS_MODEL_SOURCE`, or the stub. `Err(ModelSourceChanged)` for any other, and when it
+    /// can't be read.
+    pub async fn checked_source(&self) -> Result<String, CallError> {
+        match self.source.current().await {
+            Ok(s) if self.expected.accepts(&s) => Ok(s),
+            Ok(s) => {
+                tracing::warn!(
+                    gateway = %s, runtime = self.expected.as_str(),
+                    "the model gateway serves another model source than this runtime's; refusing model calls and dispatch"
+                );
+                Err(CallError::ModelSourceChanged)
+            }
+            Err(why) => {
+                tracing::warn!(reason = %why, "the model gateway's source can't be read; refusing model calls and dispatch");
+                Err(CallError::ModelSourceChanged)
+            }
         }
     }
 
@@ -359,12 +414,16 @@ impl Gateway {
         prompt: &str,
         user: &str,
     ) -> Result<String, CallError> {
+        // Slice H4: checked before the call, named on the call (X4), and checked again on the
+        // answer.
+        let source = self.checked_source().await?;
         let res = self
             .http
             .post(format!("{}/chat/completions", self.base))
             .bearer_auth(&self.token)
             .header("X-Pmos-User", user)
             .header("X-Pmos-Priority", "interactive")
+            .header(MODEL_SOURCE_HEADER, &source)
             .json(&json!({
                 "model": EXTRACTION_MODEL,
                 "temperature": 0,
@@ -381,6 +440,18 @@ impl Gateway {
                 CallError::Unavailable("the model gateway")
             })?;
         let status = res.status();
+        let answered = res
+            .headers()
+            .get(MODEL_SOURCE_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        if status.as_u16() == 409 || answered.as_deref() != Some(source.as_str()) {
+            // The gateway changed source: whatever it answered is dropped, and the next call
+            // reads its source afresh.
+            tracing::warn!(%status, "the model gateway answered from another model source; answer dropped");
+            self.source.forget().await;
+            return Err(CallError::ModelSourceChanged);
+        }
         let body: Value = res.json().await.unwrap_or(Value::Null);
         if !status.is_success() {
             tracing::warn!(%status, "gateway error parsing a routine");

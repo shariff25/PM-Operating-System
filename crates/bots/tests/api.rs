@@ -76,7 +76,8 @@ async fn a_task_runs_from_slack_to_a_result(env: &Env) {
     assert_eq!(
         claim["gateway"],
         json!({"model": "pmos/default", "headers": {
-            "X-Pmos-User": "ana", "X-Pmos-Run": tid, "X-Pmos-Priority": "interactive"}})
+            "X-Pmos-User": "ana", "X-Pmos-Run": tid, "X-Pmos-Priority": "interactive",
+            "X-Pmos-Model-Source": "local"}})
     );
     assert_eq!(
         env.ts.sessions.lock().unwrap().clone(),
@@ -173,6 +174,8 @@ async fn a_task_runs_from_slack_to_a_result(env: &Env) {
         vec![
             ("status", "queued"),
             ("status", "claimed by worker w1"),
+            // The source of its first claim (slice H4).
+            ("model_source", "local"),
             ("status", "Working on it"),
             ("checklist", "1 of 2 done"),
             ("milestone", "Searching the support docs"),
@@ -1688,7 +1691,8 @@ async fn readiness_covers_storage_the_tool_server_the_gateway_and_the_directory(
     assert_eq!(status, 200, "{body}");
     assert_eq!(
         body,
-        json!({"ready": true, "checks": {"storage": "ok", "toolserver": "ok", "gateway": "ok", "directory": "ok"}})
+        json!({"ready": true, "checks": {"storage": "ok", "toolserver": "ok", "gateway": "ok",
+                "directory": "ok", "model_source": "ok", "content": "ok"}})
     );
     *env.ts.ready.lock().unwrap() = false;
     let (status, body) = env.get("/readyz", "none", None).await;

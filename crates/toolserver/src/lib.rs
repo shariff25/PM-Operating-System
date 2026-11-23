@@ -23,6 +23,7 @@ pub mod mcp;
 pub mod members;
 pub mod memory;
 pub mod memory_repo;
+pub mod model_source;
 pub mod oauth;
 pub mod onboarding;
 pub mod password;

@@ -268,6 +268,10 @@ stack_env() { # mode [extra lines...]
     # the local source has its model image named, so the preflight passes for these settings.
     echo "PMOS_EXPOSURE=private"
     echo "PMOS_VLLM_IMAGE=example.test/vllm:1"
+    # Slice H4: the source is required (blank is refused, never read as local), and a checkout
+    # of test content, which the bring-up workers and fake-data mode need.
+    echo "PMOS_MODEL_SOURCE=local"
+    echo "PMOS_CONTENT_CHECKOUT=$WORK/testcontent"
     printf '%s\n' "$@"
   } >"$WORK/stack/deploy/.env"
   chmod 600 "$WORK/stack/deploy/.env"
@@ -282,6 +286,9 @@ stack_env() { # mode [extra lines...]
   : >"$ARGV_LOG"
 }
 stack=("$WORK/stack/deploy/pmos-admin")
+mkdir -p "$WORK/testcontent/content/context"
+printf 'test data only\n' >"$WORK/testcontent/content/TEST-CONTENT"
+printf -- '---\nsensitivity: internal   # restricted | internal | public\n---\nx\n' >"$WORK/testcontent/content/context/a.md"
 run_stack() { PATH="$WORK/bin:$PATH" "${stack[@]}" "$@"; }
 
 # `up --web`, then `add-bot`: both start the runtime with `require`, from deploy/.env.
@@ -481,6 +488,63 @@ done
 stack_env require
 run_stack up --bringup >/dev/null 2>&1 || fail "up --bringup without a personal bot failed"
 ! grep -q 'bringup-personal' "$DOCKER_LOG" || fail "the personal worker started without PMOS_BRINGUP_PERSONAL_BOT"
+# --- Slice H4 ---------------------------------------------------------------------------------
+# The host settings are required: a blank source or exposure is refused (never read as local or
+# private), and only the docker driver is taken; nothing starts.
+for bad in "PMOS_MODEL_SOURCE=" "PMOS_EXPOSURE=" "PMOS_EXPOSURE=intranet" "PMOS_OPENSHELL_DRIVER=podman"; do
+  stack_env require "$bad"
+  code=0
+  out=$(run_stack up 2>&1) || code=$?
+  [ "$code" = 2 ] || fail "up with $bad exits $code, not 2: $out"
+  [[ "$out" == *"${bad%%=*}"* ]] || fail "up with $bad doesn't say why: $out"
+  ! grep -q ' up -d' "$DOCKER_LOG" || fail "up with $bad started something"
+done
+# `local` with the model servers on adds compose.local.yaml (PMOS_VLLM_IMAGE required); with the
+# stub on, or under hosted-test, it doesn't.
+stack_env require
+run_stack up >/dev/null 2>&1 || fail "up under local failed"
+grep -q 'compose.yaml -f [^ ]*/compose.local.yaml .* up -d' "$DOCKER_LOG" || fail "local without the stub didn't add compose.local.yaml: $(cat "$DOCKER_LOG")"
+stack_env require PMOS_GATEWAY_STUB=1
+run_stack up >/dev/null 2>&1 || fail "up under local with the stub failed"
+! grep -q 'compose.local.yaml' "$DOCKER_LOG" || fail "the stub added compose.local.yaml"
+# up --bringup runs the NOT isolated bring-up workers only on a stack that can hold nothing real:
+# fake connectors, no GitHub memory (deploy/.env or live.env), and test content.
+printf -- '---\nsensitivity: restricted\n---\nsecret\n' >"$WORK/restricted.md"
+for bad in "PMOS_CONNECTORS=live" "PMOS_MEMORY=github" "PMOS_CONTENT_CHECKOUT=$WORK/nocontent" "marker" "restricted" "live.env"; do
+  case "$bad" in
+    marker) stack_env require; rm "$WORK/testcontent/content/TEST-CONTENT" ;;
+    restricted) stack_env require; cp "$WORK/restricted.md" "$WORK/testcontent/content/context/secret.md" ;;
+    live.env) stack_env require; printf 'PMOS_MEMORY=github\n' >"$WORK/stack/deploy/live.env" ;;
+    *) stack_env require "$bad" ;;
+  esac
+  code=0
+  out=$(run_stack up --bringup 2>&1) || code=$?
+  [ "$code" = 2 ] && [[ "$out" == *"NOT isolated"* ]] || fail "up --bringup with $bad exits $code: $out"
+  ! grep -q ' up -d' "$DOCKER_LOG" || fail "up --bringup with $bad started something"
+  printf 'test data only\n' >"$WORK/testcontent/content/TEST-CONTENT"
+  rm -f "$WORK/testcontent/content/context/secret.md" "$WORK/stack/deploy/live.env"
+done
+[[ "$out" == *"PMOS_MEMORY must not be github"* ]] || fail "live.env's GitHub memory isn't named: $out"
+# `status` fails while a bring-up worker runs on a stack that could hold real data.
+stack_env require "PMOS_CONNECTORS=live"
+code=0
+out=$(FAKE_PS=$'toolserver\nworker-docs' run_stack status 2>&1) || code=$?
+[ "$code" = 1 ] && [[ "$out" == *"worker-docs"*"FAIL"*"PMOS_CONNECTORS must be fake"* ]] ||
+  fail "status with a bring-up worker on live connectors exits $code: $out"
+stack_env require
+out=$(FAKE_PS=$'toolserver\nworker-docs' run_stack status 2>&1) || fail "status with a bring-up worker on fake data failed: $out"
+[[ "$out" == *"worker-docs"*"WARN"*"NOT isolated"* ]] || fail "status doesn't flag the bring-up worker: $out"
+[[ "$out" == *"PMOS_MODEL_SOURCE=local"* && "$out" == *"PMOS_EXPOSURE=private"* ]] || fail "status doesn't show the host settings: $out"
+# Under hosted-test, pmos-admin says what each service refuses before anything starts: GitHub
+# memory, the GitHub App and content that isn't test content.
+for bad in "PMOS_MEMORY=github" "PMOS_GITHUB_CLIENT_ID=Iv1.test" "marker"; do
+  if [ "$bad" = marker ]; then stack_env require "${ht[@]}"; rm "$WORK/testcontent/content/TEST-CONTENT"; else stack_env require "${ht[@]}" "$bad"; fi
+  code=0
+  out=$(run_stack up 2>&1) || code=$?
+  [ "$code" = 2 ] && [[ "$out" == *"allows fake data only"* ]] || fail "hosted-test with $bad exits $code: $out"
+  ! grep -q ' up -d' "$DOCKER_LOG" || fail "hosted-test with $bad started something"
+  printf 'test data only\n' >"$WORK/testcontent/content/TEST-CONTENT"
+done
 # An overridden network that still holds the pinned addresses (slice H2: a /25 with its own
 # ip_range and gateway) starts; one that doesn't is refused in H2's checks below.
 stack_env require "PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=0" "PMOS_WEB_PASSWORD_LOGIN=1" \
@@ -710,7 +774,12 @@ setup_run() { PATH="$ARGV_BIN:$WORK/bin:$PATH" bash "$WORK/setup/deploy/setup.sh
 setup_run >/dev/null 2>&1 || fail "setup.sh failed: $(setup_run 2>&1 | tail -5)"
 senv="$WORK/setup/deploy/.env"
 # Slice H1: setup.sh ran the preflight's install stage first, before deploy/.env existed.
-grep -qx -- "--stage install --env-file $WORK/setup/deploy/.env" "$PF_LOG" || fail "setup.sh didn't run the install stage: $(cat "$PF_LOG")"
+grep -qx -- "--stage install --env-file $WORK/setup/deploy/.env --model-source hosted-test --exposure public" "$PF_LOG" ||
+  fail "setup.sh didn't run the install stage with the defaults: $(cat "$PF_LOG")"
+# Slice H4: the three host settings, each defaulting to the value that allows less (§3.1).
+for kv in PMOS_MODEL_SOURCE=hosted-test PMOS_EXPOSURE=public PMOS_OPENSHELL_DRIVER=docker; do
+  grep -qx "$kv" "$senv" || fail "setup.sh didn't write $kv: $(grep "^${kv%%=*}=" "$senv")"
+done
 [ "$(stat -c %a "$senv")" = 600 ] || fail "setup.sh's deploy/.env isn't 0600"
 # No secret it wrote reached a command line (T1): the vault key, the database passwords, every
 # token and assertion key went to awk (a value env.example has as `generated`) or printf only.
@@ -740,6 +809,7 @@ setup_run >/dev/null 2>&1 || fail "setup.sh failed the second time"
 cmp -s "$WORK/setup-env.old" "$WORK/setup-env.copy" && [ "$(stat -c %h "$senv")" = 1 ] ||
   fail "setup.sh rewrote deploy/.env in place, not by a rename"
 grep -qE '^PMOS_SERVICE_TOKEN=[0-9a-f]{48}$' "$senv" || fail "setup.sh didn't fill a generated value again"
+grep -qx PMOS_MODEL_SOURCE=hosted-test "$senv" || fail "setup.sh changed the model source on a second run"
 [ "$(grep '^PMOS_VAULT_KEY=' "$senv")" = "$kept" ] || fail "setup.sh replaced a real value"
 [ "$(stat -c %a "$senv")" = 600 ] || fail "setup.sh's deploy/.env isn't 0600 after a fill"
 [ -z "$(find "$WORK/setup/deploy" -maxdepth 1 -name '.env.??????')" ] || fail "setup.sh left a temporary file"
@@ -800,6 +870,30 @@ for bad in PMOS_UID=0 PMOS_GID=0 PMOS_UID=000 PMOS_UID=x1 'PMOS_UID="0"'; do
   cp "$WORK/setup-env.good" "$senv"
 done
 setup_run >/dev/null 2>&1 || fail "setup.sh failed after the PMOS_UID checks"
+# Slice H4: --model-source and --exposure choose the values that allow more on a new deploy/.env
+# (and reach the install preflight); `hosted` and unknown values are refused; a flag that differs
+# from what deploy/.env already says is reported and the file's value kept.
+for bad in "--model-source hosted" "--model-source bogus" "--model-source" "--exposure intranet"; do
+  code=0
+  # shellcheck disable=SC2086
+  PATH="$ARGV_BIN:$WORK/bin:$PATH" bash "$WORK/setup/deploy/setup.sh" --content "$WORK/setup-content" \
+    --state "$WORK/setup-state" $bad >/dev/null 2>&1 || code=$?
+  [ "$code" = 2 ] || fail "setup.sh $bad exits $code, not 2"
+done
+cp "$senv" "$WORK/setup-env.h4"
+rm -f "$senv"
+: >"$PF_LOG"
+PATH="$ARGV_BIN:$WORK/bin:$PATH" bash "$WORK/setup/deploy/setup.sh" --content "$WORK/setup-content" \
+  --state "$WORK/setup-state" --model-source local --exposure private >/dev/null 2>&1 ||
+  fail "setup.sh --model-source local --exposure private failed"
+grep -qx PMOS_MODEL_SOURCE=local "$senv" && grep -qx PMOS_EXPOSURE=private "$senv" ||
+  fail "setup.sh didn't write the chosen settings: $(grep -E '^PMOS_(MODEL_SOURCE|EXPOSURE)=' "$senv")"
+grep -q -- "--model-source local --exposure private" "$PF_LOG" || fail "the install preflight didn't get the chosen settings: $(cat "$PF_LOG")"
+out=$(PATH="$ARGV_BIN:$WORK/bin:$PATH" bash "$WORK/setup/deploy/setup.sh" --content "$WORK/setup-content" \
+  --state "$WORK/setup-state" --model-source hosted-test 2>&1) || fail "setup.sh on a filled deploy/.env failed: $out"
+grep -qx PMOS_MODEL_SOURCE=local "$senv" || fail "setup.sh replaced PMOS_MODEL_SOURCE"
+[[ "$out" == *"PMOS_MODEL_SOURCE=local in deploy/.env is kept"* ]] || fail "setup.sh didn't say it kept the source: $out"
+cp "$WORK/setup-env.h4" "$senv"
 
 # --- Bot names, token lookup, `--from` and the worker unit (slice H0) ------------------------
 # Stand-ins for openshell, systemctl, loginctl and id (only on this PATH, so `users` above still
@@ -900,6 +994,21 @@ out=$(run_bot sandbox pm 2>&1) || code=$?
 run_bot add-bot pm >/dev/null
 grep -q '^PMOS_RT_WORKER_TOKENS=worker-pm-ana=rt-1,worker-pm=' "$WORK/stack/deploy/.env" ||
   fail "add-bot pm thought pm-ana's token was its own"
+
+# Slice H4: under hosted-test (fake data only), `sandbox` uploads nothing from a checkout that
+# isn't test content, --dry-run included, before anything else runs.
+mkdir -p "$checkout/content"
+rm -f "$checkout/content/TEST-CONTENT"
+bot_env "PMOS_RT_WORKER_TOKENS=worker-pm-ana=rt-secret-1" "PMOS_GW_BOT_TOKENS=bot-pm-ana=gw-secret-1" \
+  "PMOS_MODEL_SOURCE=hosted-test"
+code=0
+out=$(run_bot sandbox pm-ana --dry-run 2>&1) || code=$?
+[ "$code" = 2 ] && [[ "$out" == *"isn't test content"*"no TEST-CONTENT marker"* ]] ||
+  fail "sandbox --dry-run under hosted-test without TEST-CONTENT exits $code: $out"
+[[ "$out" != *"--upload"* ]] && [ ! -s "$OPENSHELL_LOG" ] || fail "sandbox under hosted-test showed or ran an upload: $out"
+printf 'test data only\n' >"$checkout/content/TEST-CONTENT"
+run_bot sandbox pm-ana --dry-run >/dev/null || fail "sandbox --dry-run under hosted-test with test content failed"
+rm -f "$checkout/content/TEST-CONTENT"
 
 # `sandbox`: `--from`, no `&`, the unit installed and started, tokens nowhere but the providers.
 bot_env "PMOS_RT_WORKER_TOKENS=worker-pm-ana=rt-secret-1" "PMOS_GW_BOT_TOKENS=bot-pm-ana=gw-secret-1"
@@ -2045,6 +2154,8 @@ for args in "local-gpu --reason rack" "local-gpu --owner-controls" "local-gpu --
   [ "$code" = 2 ] || fail "host attest $args exits $code, not 2"
 done
 code=0
+# A blank source (the last line wins): never read as local.
+echo PMOS_MODEL_SOURCE= >>"$ENVP"
 SUDO_USER=ana FAKE_UID=0 run_fw host attest local-gpu --owner-controls --reason rack >/dev/null 2>&1 || code=$?
 [ "$code" = 2 ] || fail "host attest without PMOS_MODEL_SOURCE=local in deploy/.env exits $code, not 2"
 echo PMOS_MODEL_SOURCE=hosted-test >>"$ENVP"
@@ -2088,6 +2199,9 @@ if docker compose version >/dev/null 2>&1; then
     -e "s|^PMOS_CONTENT_CHECKOUT=.*|PMOS_CONTENT_CHECKOUT=$WORK/checkout|" \
     -e "s|^PMOS_STATE_DIR=.*|PMOS_STATE_DIR=$WORK/state|" \
     -e "s|^PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=.*|PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=1|" \
+    -e "s|^PMOS_MODEL_SOURCE=.*|PMOS_MODEL_SOURCE=local|" \
+    -e "s|^PMOS_EXPOSURE=.*|PMOS_EXPOSURE=private|" \
+    -e "s|^PMOS_VLLM_IMAGE=.*|PMOS_VLLM_IMAGE=example.test/vllm:1|" \
     "$DEPLOY_SRC/env.example" >"$WORK/full.env"
   # `up --web --console`, with Slack: a valid configuration.
   full=$(render "$WORK/full.env" --profile web --profile console --profile slack) ||
@@ -2137,6 +2251,55 @@ net = c["networks"]["pmos"]
 assert net["driver_opts"] == {"com.docker.network.bridge.name": "pmos0"}, net
 assert net["ipam"]["config"] == [{"subnet": "10.201.77.0/24", "gateway": "10.201.77.1",
                                   "ip_range": "10.201.77.128/25"}], net["ipam"]
+PY
+  # Slice H4 (§6, "The gateway's container settings"): the gateway gets the proxy settings,
+  # CLOUD_TEST, the remote key and the model source, and neither network setting; every service
+  # that enforces a host setting gets it from compose.yaml itself.
+  python3 -I - "$WORK/pinned.json" <<'PY' || fail "the host settings don't reach the services as slice H4 says"
+import json, sys
+c = json.load(open(sys.argv[1]))
+env = lambda s: c["services"][s].get("environment") or {}
+gw = env("gateway")
+for k in ("HTTPS_PROXY", "NO_PROXY", "PMOS_GATEWAY_CLOUD_TEST", "PMOS_GATEWAY_REMOTE_KEY", "PMOS_MODEL_SOURCE"):
+    assert k in gw, ("gateway", k)
+assert gw["PMOS_GATEWAY_CLOUD_TEST"] == "0", gw["PMOS_GATEWAY_CLOUD_TEST"]
+assert ".pmos.internal" in gw["NO_PROXY"], gw["NO_PROXY"]
+for k in ("PMOS_NETWORK_SUBNET", "PMOS_NETWORK_IP_RANGE"):
+    assert k not in gw, ("gateway", k)
+for s in ("gateway", "toolserver", "bots", "slack", "web"):
+    assert env(s).get("PMOS_MODEL_SOURCE") == "local", (s, env(s).get("PMOS_MODEL_SOURCE"))
+assert env("web").get("PMOS_EXPOSURE") == "private"
+assert env("toolserver").get("PMOS_GATEWAY_URL") == "http://gateway.pmos.internal:8740/v1"
+for s in ("bots", "web"):
+    assert env(s).get("PMOS_CONNECTORS") == "fake", s
+PY
+  # A blank PMOS_MODEL_SOURCE or PMOS_EXPOSURE fails Compose itself, whoever starts it.
+  for k in PMOS_MODEL_SOURCE PMOS_EXPOSURE; do
+    sed "s|^$k=.*|$k=|" "$WORK/full.env" >"$WORK/blank.env"
+    ! render "$WORK/blank.env" >/dev/null 2>&1 || fail "compose renders with $k blank"
+  done
+  # PMOS_VLLM_IMAGE has no default: under local with the model servers on, compose.local.yaml
+  # (which pmos-admin adds then) fails without it; without the overlay only `--profile models`
+  # does.
+  sed "s|^PMOS_VLLM_IMAGE=.*|PMOS_VLLM_IMAGE=|" "$WORK/full.env" >"$WORK/novllm.env"
+  render "$WORK/novllm.env" >/dev/null || fail "compose doesn't render without the vLLM image and no models"
+  ! render "$WORK/novllm.env" --profile models >/dev/null 2>&1 || fail "the models profile renders with no vLLM image"
+  ! docker compose --project-directory "$DEPLOY_SRC" -f "$DEPLOY_SRC/compose.yaml" -f "$DEPLOY_SRC/compose.local.yaml" \
+    --env-file "$WORK/novllm.env" config -q >/dev/null 2>&1 || fail "compose.local.yaml renders without PMOS_VLLM_IMAGE"
+  docker compose --project-directory "$DEPLOY_SRC" -f "$DEPLOY_SRC/compose.yaml" -f "$DEPLOY_SRC/compose.local.yaml" \
+    --env-file "$WORK/full.env" config -q || fail "compose.local.yaml refuses a named vLLM image"
+  # The hosted-test overlay turns CLOUD_TEST on for the gateway alone.
+  sed -e "s|^PMOS_MODEL_SOURCE=.*|PMOS_MODEL_SOURCE=hosted-test|" -e "s|^PMOS_GATEWAY_REMOTE_KEY=.*|PMOS_GATEWAY_REMOTE_KEY=proxy-injected|" \
+    "$WORK/full.env" >"$WORK/ht.env"
+  : >"$WORK/state/gateway.hosted-test.yaml"
+  docker compose --project-directory "$DEPLOY_SRC" -f "$DEPLOY_SRC/compose.yaml" -f "$DEPLOY_SRC/compose.hosted-test.yaml" \
+    --env-file "$WORK/ht.env" config --format json >"$WORK/ht.json" || fail "compose doesn't render the hosted-test overlay"
+  python3 -I - "$WORK/ht.json" <<'PY' || fail "the hosted-test overlay renders wrong"
+import json, sys
+c = json.load(open(sys.argv[1]))
+gw = c["services"]["gateway"]["environment"]
+assert gw["PMOS_GATEWAY_CLOUD_TEST"] == "1" and gw["PMOS_MODEL_SOURCE"] == "hosted-test", gw
+assert "PMOS_GATEWAY_CLOUD_TEST" not in (c["services"]["toolserver"].get("environment") or {})
 PY
   # The first Microsoft sign-in (U1): the tool server gets the web app's tenant and client id
   # (it validates the ID token itself), never its client secret.

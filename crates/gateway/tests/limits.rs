@@ -13,6 +13,7 @@ use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use pmos_contract::model_source::ModelSource;
 use pmos_gateway::config::{
     handle_in_name, person_key, spelled_handle, valid_client_name, Client, Config, GatewayClass,
     Models, UserRule, MAX_SPELLED_HANDLE,
@@ -248,6 +249,7 @@ async fn gateway_models(models: impl FnOnce(&str) -> Models) -> Gw {
         remote_key: "limits-test-remote-key".into(),
         retry: Default::default(),
         timeouts: Default::default(),
+        model_source: ModelSource::Local,
     }))
     .await;
     Gw {
@@ -260,7 +262,7 @@ async fn gateway_models(models: impl FnOnce(&str) -> Models) -> Gw {
 }
 
 fn ask(gw: &Gw, token: &str, text: &str, stream: bool) -> reqwest::RequestBuilder {
-    reqwest::Client::new()
+    http()
         .post(format!("{}/v1/chat/completions", gw.base))
         .bearer_auth(token)
         .json(&json!({"model": "pmos/default", "stream": stream,
@@ -506,6 +508,7 @@ async fn a_caller_that_hangs_up_cancels_the_upstream_call_and_frees_its_slot() {
         .unwrap()
         .post(format!("{}/v1/chat/completions", gw.base))
         .bearer_auth(RUNTIME)
+        .header("x-pmos-model-source", "local")
         .json(&json!({"model": "pmos/default", "messages": [{"role": "user", "content": "hang"}]}))
         .send()
         .await;
@@ -537,7 +540,7 @@ async fn a_caller_that_hangs_up_cancels_the_upstream_call_and_frees_its_slot() {
 #[tokio::test]
 async fn the_roles_endpoint_names_models_but_never_an_address() {
     let gw = gateway("{}", "{}").await;
-    let v: Value = reqwest::Client::new()
+    let v: Value = http()
         .get(format!("{}/v1/pmos/roles", gw.base))
         .bearer_auth(EVALS)
         .send()
@@ -835,6 +838,7 @@ async fn readiness_of_every_shipped_config_reports_roles_by_label() {
                 ready_cache: Duration::ZERO,
                 ..Default::default()
             },
+            model_source: ModelSource::Local,
         }))
         .await;
         let ready = async || {
@@ -870,10 +874,23 @@ async fn readiness_of_every_shipped_config_reports_roles_by_label() {
             .collect();
         assert_eq!(v["upstreams"], Value::Object(want), "{path}");
         assert_eq!(v["cloud_test"], label != "local", "{path}");
-        // The first model server goes away: its roles are down, the others still ok.
+        // The first model server goes away: its roles are down, the others still ok. A
+        // testing-only remote upstream's probe is reused for 30 seconds (slice H4), so that
+        // config still reads ready from its cache.
         mocks[0].1.cancel();
         tokio::time::sleep(Duration::from_millis(100)).await;
         let (status, v) = ready().await;
+        if label != "local" {
+            assert_eq!(
+                status, 200,
+                "{path}: answered from the 30-second cache: {v}"
+            );
+            stop.cancel();
+            for (_, s) in &mocks {
+                s.cancel();
+            }
+            continue;
+        }
         assert_eq!(status, 503, "{path}: {v}");
         for (name, role) in &original.roles {
             let want = if role.upstream == bases[0] {
@@ -1008,8 +1025,10 @@ fn every_valid_handle_fits_a_client_name_that_names_only_it() {
         let client = format!("bot-{}", pmos_contract::onboarding::personal_bot_name(h));
         assert!(valid_client_name(&client), "{h}: `{client}`");
         // PMOS_GATEWAY_TOKENS takes it.
-        let cfg = Config::from_lookup(|k| {
-            (k == "PMOS_GATEWAY_TOKENS").then(|| format!("{client}={}", token(i)))
+        let cfg = Config::from_lookup(|k| match k {
+            "PMOS_GATEWAY_TOKENS" => Some(format!("{client}={}", token(i))),
+            "PMOS_MODEL_SOURCE" => Some("local".into()),
+            _ => None,
         });
         assert!(cfg.is_ok(), "{h}: {:?}", cfg.err());
         let p = m.client_policy(&client);
@@ -1228,12 +1247,13 @@ fn client_patterns_and_user_rules_that_cover_too_much_are_refused() {
     // With the stub on, a production config starts but serves as `test`, with a warning; the
     // stub is never a production gateway (and a first install runs exactly that).
     let prod = Models::from_yaml(
-        "upstreams: {a: 'http://vllm.pmos.internal/v1'}\nroles: {default: {upstream: a, model: m}}\nclass: production\n",
+        "upstreams: {a: 'http://vllm-default.pmos.internal/v1'}\nroles: {default: {upstream: a, model: m}}\nclass: production\n",
     )
     .unwrap();
     let config = |stub: &'static str| {
         Config::from_lookup(move |k| match k {
             "PMOS_GATEWAY_TOKENS" => Some(format!("runtime={}", "a".repeat(32))),
+            "PMOS_MODEL_SOURCE" => Some("local".into()),
             "PMOS_GATEWAY_STUB" => Some(stub.into()),
             _ => None,
         })
@@ -1297,13 +1317,21 @@ fn a_production_gateway_names_its_model_servers_under_pmos_internal() {
     )
     .unwrap_err();
     assert!(err.contains("local-hosts"), "{err}");
-    // What the Spark uses, over http or https.
+    // The two pinned model servers (slice H4), over http or https; any other name under
+    // `pmos.internal` is refused, however it is written.
     for upstream in [
         "http://vllm-default.pmos.internal:8000/v1",
-        "https://gpu.models.pmos.internal/v1",
-        "http://VLLM.pmos.internal/v1",
+        "https://vllm-extraction.pmos.internal/v1",
     ] {
         assert!(config(upstream, "", "production").is_ok(), "{upstream}");
+    }
+    for upstream in [
+        "https://gpu.models.pmos.internal/v1",
+        "http://vllm.pmos.internal/v1",
+        "http://toolserver.pmos.internal:8710/v1",
+    ] {
+        let err = config(upstream, "", "production").unwrap_err();
+        assert!(err.contains("pinned"), "{upstream}: {err}");
     }
     // A test gateway keeps accepting the local forms.
     for upstream in ["http://vllm/v1", "http://127.0.0.1:8001/v1"] {
@@ -1336,6 +1364,7 @@ async fn the_deploy_config_serves_as_test_with_the_stub_and_production_without()
         let models = Models::parse(&text, false).unwrap();
         let config = Config::from_lookup(|k| match k {
             "PMOS_GATEWAY_TOKENS" => Some(format!("runtime={RUNTIME}")),
+            "PMOS_MODEL_SOURCE" => Some("local".into()),
             "PMOS_GATEWAY_STUB" => Some(if stub { "1" } else { "0" }.into()),
             _ => None,
         })
@@ -1352,9 +1381,10 @@ async fn the_deploy_config_serves_as_test_with_the_stub_and_production_without()
             remote_key: String::new(),
             retry: Default::default(),
             timeouts: Default::default(),
+            model_source: ModelSource::Local,
         }))
         .await;
-        let v: Value = reqwest::Client::new()
+        let v: Value = http()
             .get(format!("{base}/v1/pmos/roles"))
             .bearer_auth(RUNTIME)
             .send()
@@ -1367,7 +1397,7 @@ async fn the_deploy_config_serves_as_test_with_the_stub_and_production_without()
         assert_eq!(v["stub"], stub);
         if stub {
             // And it answers, with no model server behind it.
-            let res = reqwest::Client::new()
+            let res = http_as("stub")
                 .post(format!("{base}/v1/chat/completions"))
                 .bearer_auth(RUNTIME)
                 .json(&json!({"model": "pmos/default",
@@ -1437,6 +1467,7 @@ async fn a_production_gateway_says_its_class_when_ready() {
         remote_key: String::new(),
         retry: Default::default(),
         timeouts: Default::default(),
+        model_source: ModelSource::Local,
     }))
     .await;
     let res = reqwest::get(format!("{base}/readyz")).await.unwrap();
@@ -1807,4 +1838,22 @@ fn person_pools_are_checked_at_start_up() {
         let err = m(&rest).unwrap_err();
         assert!(err.contains(want), "{rest}\nwant `{want}`: {err}");
     }
+}
+
+/// A client that names the model source the gateways here serve (`local`; X4, slice H4).
+fn http() -> reqwest::Client {
+    http_as("local")
+}
+
+/// A client that names `source` on every call.
+fn http_as(source: &str) -> reqwest::Client {
+    let mut h = reqwest::header::HeaderMap::new();
+    h.insert(
+        "x-pmos-model-source",
+        reqwest::header::HeaderValue::from_str(source).unwrap(),
+    );
+    reqwest::Client::builder()
+        .default_headers(h)
+        .build()
+        .unwrap()
 }

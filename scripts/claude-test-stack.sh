@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# TESTING ONLY: run every PM OS service on this machine against a test Slack workspace, with a
-# cloud model behind the gateway (docs/testing-with-claude.md). Prompts leave this machine, so
-# use fake data only.
+# TESTING ONLY: run every PM OS service on this machine with a cloud model behind the gateway
+# (docs/testing-with-claude.md). Prompts leave this machine, so the stack runs as
+# PMOS_MODEL_SOURCE=hosted-test (docs/openshell-any-host-spec.md §3.6, slice H4): fake data only,
+# and every service enforces it itself. In particular the Slack bot does NOT run: a test Slack
+# workspace can't be told apart from a real one, so pmos-slack refuses to start with Slack tokens
+# under hosted-test. Use the web app (PMOS_TEST_WEB=1) or the benchmarks (PMOS_TEST_EVALS=1).
 #
 # Two model modes:
 #   Claude (the default): config/gateway.claude-test.yaml, the Claude test upstream.
@@ -10,15 +13,11 @@
 #     $STATE/gateway.yaml with one `openai+<url>` upstream and every role on PMOS_TEST_MODEL.
 #
 # What runs: pmos-docs (your public docs site, if PMOS_DOCS_BASE_URL is set), the tool server (fake Jira, Confluence and
-# Slack fixtures), the gateway (the test upstream), the bot runtime, one harness worker per
-# bot (docs and pm-<you>), and the Slack bot. Everything keeps its state in memory and in
-# $STATE; nothing touches the real content repo.
+# Slack fixtures), the gateway (the test upstream), the bot runtime and one harness worker per
+# bot (docs and pm-<you>). Everything keeps its state in memory and in $STATE; nothing touches
+# the real content repo. The content copy keeps the repo's content/TEST-CONTENT marker.
 #
-# Needs, in the environment (never in a file in the repo):
-#   PMOS_SLACK_APP_TOKEN  the test Slack app's app-level token (xapp-…, connections:write)
-#   PMOS_SLACK_BOT_TOKEN  the test Slack app's bot token (xoxb-…)
-#   PMOS_TEST_SLACK_ID    your member id in the test workspace (U…)
-# and for Claude:
+# Needs, in the environment (never in a file in the repo), for Claude:
 #   PMOS_GATEWAY_ANTHROPIC_KEY  a Claude API key
 # or for another provider:
 #   PMOS_TEST_MODEL_URL   the provider's OpenAI-compatible base URL (https)
@@ -30,6 +29,8 @@
 #   PMOS_TEST_MODEL_FAST_LABEL  optional: the same for a different PMOS_TEST_MODEL_FAST
 #                         (default hosted-model-b)
 # Optional:
+#   PMOS_TEST_SLACK_ID    the Slack member id your test user gets in the user database (default
+#                         U0TESTER0; nothing here talks to Slack)
 #   PMOS_TEST_HANDLE      your PM OS handle in the test (default: tester)
 #   PMOS_TEST_STATE       where state and logs go (default: state/claude-test)
 #   PMOS_TEST_SKIP_SLACK_PREFLIGHT=1
@@ -129,9 +130,14 @@ inherit DOCS_ENV PMOS_DOCS_BASE_URL PMOS_DOCS_NAME PMOS_DOCS_PAGE_PREFIXES PMOS_
 inherit GATEWAY_ENV PMOS_GATEWAY_ANTHROPIC_KEY PMOS_GATEWAY_REMOTE_KEY PMOS_GATEWAY_WORKAROUNDS \
   PMOS_GATEWAY_RETRY_MAX_ATTEMPTS PMOS_GATEWAY_RETRY_BUDGET_SECS PMOS_GATEWAY_RETRY_BASE_MS
 
-: "${PMOS_SLACK_APP_TOKEN:?set PMOS_SLACK_APP_TOKEN (the test app's xapp- token)}"
-: "${PMOS_SLACK_BOT_TOKEN:?set PMOS_SLACK_BOT_TOKEN (the test app's xoxb- token)}"
-: "${PMOS_TEST_SLACK_ID:?set PMOS_TEST_SLACK_ID (your member id in the test workspace)}"
+# Slice H4: this stack is PMOS_MODEL_SOURCE=hosted-test (fake data only), so the Slack bot stays
+# off whatever tokens are set: pmos-slack would refuse to start with them.
+MODEL_SOURCE=hosted-test
+if [ -n "${PMOS_SLACK_APP_TOKEN:-}${PMOS_SLACK_BOT_TOKEN:-}" ]; then
+  echo "note: the Slack bot stays off: this stack is PMOS_MODEL_SOURCE=hosted-test (fake data only), and a test Slack workspace can't be told apart from a real one"
+fi
+unset PMOS_SLACK_APP_TOKEN PMOS_SLACK_BOT_TOKEN
+PMOS_TEST_SLACK_ID="${PMOS_TEST_SLACK_ID:-U0TESTER0}"
 if [ -n "${PMOS_TEST_MODEL_URL:-}" ]; then
   : "${PMOS_TEST_MODEL:?set PMOS_TEST_MODEL (the model name at PMOS_TEST_MODEL_URL)}"
   : "${PMOS_GATEWAY_REMOTE_KEY:?set PMOS_GATEWAY_REMOTE_KEY (the API key for PMOS_TEST_MODEL_URL)}"
@@ -245,11 +251,8 @@ slack_preflight() {
   echo "   \"Sending messages to this app has been turned off\", turn on App Home → Show Tabs →"
   echo "   Messages Tab and \"Allow users to send Slash commands and messages from the messages tab\"."
 }
-if [ "${PMOS_TEST_SKIP_SLACK_PREFLIGHT:-}" = 1 ]; then
-  echo "== Slack preflight skipped (PMOS_TEST_SKIP_SLACK_PREFLIGHT=1)"
-else
-  slack_preflight
-fi
+# The Slack bot doesn't run under hosted-test (above), so its app isn't checked.
+echo "== Slack preflight skipped: the Slack bot stays off under PMOS_MODEL_SOURCE=$MODEL_SOURCE"
 
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
@@ -502,6 +505,7 @@ fi
 # Every service decides who may use PM OS from the tool server's user database, in memory
 # here, seeded from $STATE/users.seed.yaml (you, as pm and admin).
 start toolserver env PMOS_DEV=1 PMOS_CONNECTORS=fake \
+  PMOS_MODEL_SOURCE="$MODEL_SOURCE" PMOS_GATEWAY_URL=http://127.0.0.1:8740/v1 \
   PMOS_USERS_SEED="$STATE/users.seed.yaml" \
   PMOS_SERVICE_TOKEN="$SERVICE_TOKEN" PMOS_BOT_TOKEN="$BOT_TOKEN" \
   PMOS_WEB_TOKEN="$TS_WEB" PMOS_ASSERTION_MODE="$ASSERTION_MODE" PMOS_ASSERTION_KEYS="$AK_TOOLS" \
@@ -513,12 +517,14 @@ wait_for http://127.0.0.1:8710/healthz toolserver
 
 start gateway env ${GATEWAY_ENV[@]+"${GATEWAY_ENV[@]}"} \
   PMOS_GATEWAY_CLOUD_TEST=1 PMOS_GATEWAY_CONFIG="$GATEWAY_CONFIG" \
+  PMOS_MODEL_SOURCE="$MODEL_SOURCE" \
   PMOS_GATEWAY_TOKENS="$GW_TOKENS" \
   PMOS_GATEWAY_USAGE_LOG="$STATE/usage.jsonl" \
   "$BIN/pmos-gateway"
 wait_for http://127.0.0.1:8740/healthz gateway
 
 start bots env PMOS_DEV=1 PMOS_CONTENT_ROOT="$STATE/content" \
+  PMOS_MODEL_SOURCE="$MODEL_SOURCE" PMOS_CONNECTORS=fake \
   PMOS_BOTS_TOKENS="$BOTS_TOKENS" \
   PMOS_ASSERTION_MODE="$ASSERTION_MODE" PMOS_ASSERTION_KEYS="$AK_BOTS" \
   ${BOTS_EVALS[@]+"${BOTS_EVALS[@]}"} \
@@ -556,6 +562,7 @@ if [ "$EVALS_LANES" -gt 0 ]; then
     # value is the rest of the line, so none may hold a newline.
     lane_settings=(LANE_TOOLSERVER_BIN "$BIN/pmos-toolserver"
       PMOS_DEV 1 PMOS_CONNECTORS fake PMOS_USERS_SEED "$STATE/users.seed.yaml"
+      PMOS_MODEL_SOURCE "$MODEL_SOURCE" PMOS_GATEWAY_URL http://127.0.0.1:8740/v1
       PMOS_SERVICE_TOKEN "$SERVICE_TOKEN" PMOS_BOT_TOKEN "$BOT_TOKEN"
       PMOS_ASSERTION_MODE off PMOS_CONTENT_ROOT "$STATE/content"
       PMOS_DOCS_URL "$TS_DOCS_URL" PMOS_DOCS_TOKEN "$DOCS_TOKEN" NO_PROXY "127.0.0.1,localhost")
@@ -586,6 +593,7 @@ if [ "$EVALS_LANES" -gt 0 ]; then
     "$ROOT/scripts/eval-fresh-toolserver.sh" "$STATE" "$i"
     echo "   toolserver-lane-$i (127.0.0.1:$ts_port; replaced before every attempt)"
     start "bots-lane-$i" env PMOS_DEV=1 PMOS_CONTENT_ROOT="$STATE/content" \
+      PMOS_MODEL_SOURCE="$MODEL_SOURCE" PMOS_CONNECTORS=fake \
       PMOS_BOTS_BIND="127.0.0.1:$rt_port" PMOS_BOTS_TOKENS="$LANE_TOKENS" \
       PMOS_ASSERTION_MODE=off PMOS_ASSERTION_KEYS="" PMOS_EVALS_AS=evals PMOS_ASSERTION_INSECURE_OFF=1 \
       PMOS_TOOLSERVER_URL="http://127.0.0.1:$ts_port" PMOS_SERVICE_TOKEN="$SERVICE_TOKEN" \
@@ -597,17 +605,15 @@ if [ "$EVALS_LANES" -gt 0 ]; then
   done
 fi
 
-start slack env PMOS_SLACK_APP_TOKEN="$PMOS_SLACK_APP_TOKEN" \
-  PMOS_SLACK_BOT_TOKEN="$PMOS_SLACK_BOT_TOKEN" \
-  PMOS_TOOLSERVER_URL=http://127.0.0.1:8710 PMOS_BOT_TOKEN="$BOT_TOKEN" \
-  PMOS_BOTS_URL=http://127.0.0.1:8750 PMOS_BOTS_TOKEN="$RT_SLACK" \
-  PMOS_CONTENT_ROOT="$STATE/content" PMOS_SLACK_STATE_DIR="$STATE/slack" \
-  ${SLACK_WEB_FEED[@]+"${SLACK_WEB_FEED[@]}"} \
-  "$BIN/pmos-slack"
+# No Slack bot (slice H4, above). SLACK_WEB_FEED is kept for a stack that runs it with a
+# production source.
+: "${SLACK_WEB_FEED[@]+}"
 
 if [ "${PMOS_TEST_WEB:-}" = 1 ]; then
   # Development sign-in: closed to this machine (127.0.0.1) and never for a shared network.
+  # PMOS_EXPOSURE=private: this machine only. Every page shows the test-stack banner.
   start web env PMOS_WEB_BIND=127.0.0.1:8770 PMOS_WEB_DEV_LOGIN=1 \
+    PMOS_EXPOSURE=private PMOS_MODEL_SOURCE="$MODEL_SOURCE" PMOS_CONNECTORS=fake \
     PMOS_WEB_BOTS_TOKEN="$RT_WEB" PMOS_WEB_TOOLSERVER_TOKEN="$TS_WEB" \
     PMOS_ASSERTION_KEYS="$AK_BOTS,$AK_TOOLS" \
     PMOS_WEB_BRIEF=1 PMOS_WEB_BRIEF_TOKEN="$WEB_BRIEF_TOKEN" \
@@ -626,11 +632,9 @@ for i in "${!PIDS[@]}"; do
 done
 
 echo
-echo "== PM OS test stack is up, with $MODEL_DESC behind the gateway."
-echo "   In the test Slack workspace, DM the PM OS app:"
-echo "   docs: how do I get started?         (the Docs bot, your docs site)"
-echo "   summarize the open launch issues    (your bot $BOT_PERSONAL, fake Jira)"
-echo "   setup                               (the onboarding checklist)"
+echo "== PM OS test stack is up, with $MODEL_DESC behind the gateway (PMOS_MODEL_SOURCE=$MODEL_SOURCE)."
+echo "   The Slack bot is off (fake data only, slice H4). Ask the Docs bot and your bot"
+echo "   $BOT_PERSONAL in the web app (PMOS_TEST_WEB=1), or run the benchmarks (PMOS_TEST_EVALS=1)."
 if [ "${PMOS_TEST_WEB:-}" = 1 ]; then
   echo "   Web app: http://127.0.0.1:8770 (sign in as $HANDLE; development sign-in, this machine only)"
 fi

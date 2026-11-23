@@ -775,4 +775,20 @@ impl BotsStore for PgStore {
         .await?;
         Ok(())
     }
+
+    async fn held_real_data(&self) -> StoreResult<bool> {
+        let row = sqlx::query("SELECT EXISTS (SELECT 1 FROM bots_held_real_data) AS held")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.try_get("held")?)
+    }
+
+    async fn mark_held_real_data(&self) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO bots_held_real_data (id) VALUES (true) ON CONFLICT (id) DO NOTHING",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }

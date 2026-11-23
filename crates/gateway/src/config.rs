@@ -4,9 +4,10 @@
 //! is a reviewed one-line change plus a benchmark run (D11). Everything else is environment.
 
 use std::collections::BTreeMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
+use pmos_contract::model_source::ModelSource;
 use serde::Deserialize;
 
 use crate::scheduler::{PersonPool, Priority};
@@ -758,6 +759,22 @@ impl Models {
                     spec.upstream
                 ));
             }
+            // Slice H4 (spec §3.6, "Which gateway may serve `local`"): only the two model
+            // server names, each answered only by its own compiled address ([`pinned_address`],
+            // checked again at every connection by `resolve::PinnedResolver`).
+            if class == GatewayClass::Production && pinned_address(host).is_none() {
+                return Err(format!(
+                    "gateway config: upstream `{}` ({host}): a `class: production` gateway's \
+                     model servers are {}, each pinned to its own address; another model server \
+                     is a reviewed code change",
+                    spec.upstream,
+                    PINNED_MODEL_SERVERS
+                        .iter()
+                        .map(|(n, _)| *n)
+                        .collect::<Vec<_>>()
+                        .join(" and ")
+                ));
+            }
             roles.insert(
                 name.clone(),
                 Role {
@@ -1004,6 +1021,29 @@ pub fn is_production_host(host: &str) -> bool {
         })
 }
 
+/// The model servers a `class: production` gateway may name, each with the one address it
+/// accepts for it (slice H4, `docs/openshell-any-host-spec.md` §3.6): the addresses
+/// `deploy/compose.yaml` pins for the two vLLM services (slice H2), beside the policy crate's
+/// service addresses. A unit test checks they equal the compose file's literals. They are
+/// constants, never settings: `PMOS_NETWORK_SUBNET` and `PMOS_NETWORK_IP_RANGE` don't reach the
+/// gateway, so an edit to `deploy/.env` can't widen what it treats as its own model server.
+pub const PINNED_MODEL_SERVERS: [(&str, Ipv4Addr); 2] = [
+    ("vllm-default.pmos.internal", Ipv4Addr::new(10, 201, 77, 13)),
+    (
+        "vllm-extraction.pmos.internal",
+        Ipv4Addr::new(10, 201, 77, 14),
+    ),
+];
+
+/// The address compiled in for a production model server's name, compared exactly (a name in
+/// another case, or with a trailing dot, is not one of them).
+pub fn pinned_address(host: &str) -> Option<Ipv4Addr> {
+    PINNED_MODEL_SERVERS
+        .iter()
+        .find(|(name, _)| *name == host)
+        .map(|(_, addr)| *addr)
+}
+
 /// One caller and its token, such as the bot runtime or the benchmark runner.
 #[derive(Clone)]
 pub struct Client {
@@ -1046,6 +1086,9 @@ pub struct Config {
     pub remote_key: String,
     /// `PMOS_GATEWAY_RETRY_*`: how a `429`/`503` from the upstream is retried (`retry.rs`).
     pub retry: crate::retry::RetryPolicy,
+    /// `PMOS_MODEL_SOURCE`: where this gateway's prompts go (`local` or `hosted-test`), required
+    /// with no default ([`Config::check_source`]).
+    pub model_source: ModelSource,
 }
 
 impl std::fmt::Debug for Config {
@@ -1062,6 +1105,7 @@ impl std::fmt::Debug for Config {
             .field("anthropic_key", &redacted(&self.anthropic_key))
             .field("remote_key", &redacted(&self.remote_key))
             .field("retry", &self.retry)
+            .field("model_source", &self.model_source)
             .finish()
     }
 }
@@ -1102,7 +1146,70 @@ impl Config {
             anthropic_key: get("PMOS_GATEWAY_ANTHROPIC_KEY").unwrap_or_default(),
             remote_key: get("PMOS_GATEWAY_REMOTE_KEY").unwrap_or_default(),
             retry: crate::retry::RetryPolicy::from_lookup(&get)?,
+            model_source: ModelSource::from_lookup(&get)?,
         })
+    }
+
+    /// The source every answer reports (`x-pmos-model-source`, `/readyz`, the roles answer):
+    /// `stub` with the stub model on, which sends no prompt anywhere; else `PMOS_MODEL_SOURCE`.
+    pub fn served_source(&self) -> &'static str {
+        served_source(self.model_source, self.stub)
+    }
+
+    /// Refuses to start when the config doesn't fit `PMOS_MODEL_SOURCE` (slice H4, spec §3.6,
+    /// "Where each refusal lives"), checked on the config's own `class` (before the stub's
+    /// [`Config::served_class`]):
+    ///
+    /// - `local`: a `class: production` config only (its model servers are the two pinned
+    ///   names), and never `PMOS_GATEWAY_CLOUD_TEST=1`. The stub may be on (a first install).
+    /// - `hosted-test`: a `class: test` config only, with `PMOS_GATEWAY_CLOUD_TEST=1` unless the
+    ///   stub is on, and a `label:` on every role, so no model id reaches a client, a report or
+    ///   a log (r7, X1).
+    pub fn check_source(&self, models: &Models) -> Result<(), String> {
+        match self.model_source {
+            ModelSource::Local => {
+                if models.class != GatewayClass::Production {
+                    return Err(
+                        "PMOS_MODEL_SOURCE=local needs a `class: production` gateway config \
+                         (deploy/gateway.yaml), whose model servers are on this host; a `class: \
+                         test` config is for hosted-test"
+                            .into(),
+                    );
+                }
+                if self.cloud_test {
+                    return Err(
+                        "PMOS_MODEL_SOURCE=local can't be used with PMOS_GATEWAY_CLOUD_TEST=1, \
+                         which lets prompts leave this host"
+                            .into(),
+                    );
+                }
+            }
+            ModelSource::HostedTest => {
+                if models.class != GatewayClass::Test {
+                    return Err(
+                        "PMOS_MODEL_SOURCE=hosted-test needs a `class: test` gateway config \
+                         (deploy/gateway.hosted-test.yaml): its endpoint is unapproved, so \
+                         nothing it serves counts as production"
+                            .into(),
+                    );
+                }
+                if !self.cloud_test && !self.stub {
+                    return Err(
+                        "PMOS_MODEL_SOURCE=hosted-test needs PMOS_GATEWAY_CLOUD_TEST=1 (testing \
+                         only: prompts leave this host, so the stack takes fake data only)"
+                            .into(),
+                    );
+                }
+                if let Some(r) = models.roles.values().find(|r| r.label.is_none()) {
+                    return Err(format!(
+                        "PMOS_MODEL_SOURCE=hosted-test: role `{}` has no `label:`; every role \
+                         needs one, so the gateway reports and logs a label, never a model id",
+                        r.name
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The class this gateway serves as: the config's, except that with the stub model on it
@@ -1141,6 +1248,15 @@ impl Config {
             );
         }
         Ok(())
+    }
+}
+
+/// What a gateway reports as its source: `stub` with the stub on, else `source`.
+pub fn served_source(source: ModelSource, stub: bool) -> &'static str {
+    if stub {
+        pmos_contract::model_source::STUB
+    } else {
+        source.as_str()
     }
 }
 
@@ -1298,6 +1414,7 @@ roles:\n  default: {upstream: qwen, model: qwen3.6-35b-a3b, workarounds: [strip-
         let cfg = Config::from_lookup(|k| match k {
             "PMOS_GATEWAY_TOKENS" => Some(format!("runtime={t1}")),
             "PMOS_GATEWAY_WORKAROUNDS" => Some("off".into()),
+            "PMOS_MODEL_SOURCE" => Some("local".into()),
             _ => None,
         })
         .unwrap();
