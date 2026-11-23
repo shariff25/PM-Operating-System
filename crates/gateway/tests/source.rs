@@ -504,7 +504,10 @@ fn the_shipped_configs_fit_their_sources() {
     let production = Models::parse(&read("deploy/gateway.yaml"), false).unwrap();
     assert!(local.check_source(&production).is_ok());
     assert!(hosted_test.check_source(&production).is_err());
-    for p in ["deploy/gateway.hosted-test.yaml", "config/gateway.claude-test.yaml"] {
+    for p in [
+        "deploy/gateway.hosted-test.yaml",
+        "config/gateway.claude-test.yaml",
+    ] {
         let m = Models::parse(&read(p), true).unwrap();
         assert!(hosted_test.check_source(&m).is_ok(), "{p}");
         assert!(local.check_source(&m).is_err(), "{p}");
