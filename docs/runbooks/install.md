@@ -94,9 +94,19 @@ so an incident can be handled first; fix the value before the next `up`.
 
 ```sh
 deploy/pmos-admin build            # 15–30 minutes the first time
+sudo deploy/pmos-admin host-names apply      # the service names (Stage 4, step 1 explains them)
+sudo deploy/pmos-admin host-firewall apply   # keeps containers off the cloud metadata service
 deploy/pmos-admin up --bringup
 deploy/pmos-admin status
 ```
+
+`up` runs the host preflight first, every time, and refuses (exit 2, nothing started) on any
+`fail` (`docs/openshell-any-host-spec.md` §3.2). Two of its checks need the host prepared once
+by the two `sudo` lines above: H-NAMES (the three service names resolve on this host to their
+pinned addresses, through the managed block in `/etc/hosts`) and H-METADATA (no container can
+reach the VM's cloud metadata service; `host-firewall apply` adds the block, its
+`docker.service` drop-in and a timer that keeps it in place). `deploy/pmos-admin preflight`
+shows every check by hand.
 
 **Expect:**
 - every container is `healthy`;
