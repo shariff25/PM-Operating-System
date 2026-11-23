@@ -235,4 +235,7 @@ echo
 echo "Next:"
 echo "  1. Keep a copy of deploy/.env in the team password manager (it holds the vault key)."
 echo "  2. deploy/pmos-admin build     # builds the images on this machine"
-echo "  3. deploy/pmos-admin up        # starts the stack; then deploy/pmos-admin status"
+echo "  3. sudo deploy/pmos-admin host-names apply     # the three service names (H-NAMES)"
+echo "     sudo deploy/pmos-admin host-firewall apply  # the metadata block (H-METADATA)"
+echo "  4. deploy/pmos-admin up        # runs the host preflight, then starts the stack;"
+echo "                                 # then deploy/pmos-admin status"

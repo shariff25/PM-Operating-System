@@ -126,8 +126,13 @@ jobs:
         run: deploy/pmos-admin build
       - name: Stack up (stub model, fake connectors, bring-up worker)
         run: |
-          # The runner is a cloud VM: H-METADATA (run by `up`) fails while a container can reach
-          # its metadata service, and the generic fix is the block (slice H1).
+          # Prepared as an operator prepares a host before the first `up` (docs/runbooks/install.md,
+          # Stage 2), since `up` runs every host check (docs/openshell-any-host-spec.md §3.2):
+          # H-NAMES needs the managed block in /etc/hosts (slice H2), and the runner is a cloud
+          # VM, so H-METADATA fails while a container can reach its metadata service; the
+          # generic fix is the block (slice H1).
+          sudo deploy/pmos-admin host-names apply
+          deploy/pmos-admin host-names check
           sudo deploy/pmos-admin host-firewall apply
           deploy/pmos-admin up --bringup
           for i in $(seq 1 30); do deploy/pmos-admin status | grep -Eq '^ +bots +ok' && break; sleep 5; done
