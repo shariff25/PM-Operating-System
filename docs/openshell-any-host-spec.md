@@ -176,6 +176,20 @@ fixtures. Not run: the stack test (the brief `PUT` works on 8771 and answers 404
 stale `PMOS_WEB_BRIEF_URL` ending in `:8770` in an existing `deploy/.env` sends no brief and
 nothing refuses it yet.
 
+**Slice H3 status (2026-11-23): built and merged on `claude/web-app`, not yet reviewed.**
+Each of the three endpoints in every bot's policy carries `allowed_ips` with its own address
+only (`10.201.77.10/32`, `.11/32`, `.12/32`), from `TOOLSERVER_ADDR`, `GATEWAY_ADDR` and
+`BOTS_ADDR` in `crates/policy/src/lib.rs`. `pmos policy check` has the rule `net-allowed-ips`:
+a missing list, another service's address, a wider range, a second entry or another spelling
+fails. A test holds the constants equal to `deploy/compose.yaml`'s `ipv4_address` literals and
+to the address lines of `deploy/pmos-admin` and `deploy/preflight.sh`. `policies/` was
+regenerated once: `docs.yaml` gains the three lists. `pmos-admin up` and H-SUBNET refuse a
+subnet without the constants. O-REACH's canary carries the same `allowed_ips`. Policy Admin
+shows each service's pin in its fixed facts and treats any change to `allowed_ips` as a
+reviewed change, never as narrowing. Not verified: anything on OpenShell: how it reads
+`allowed_ips`, whether it takes the `/32` form, and which resolver a sandbox uses. Applying the
+change on a host needs a second platform owner's review and `openshell policy set` there.
+
 **The owner's requirement, 2026-11-22:** "I want to deploy it in another platform apart from
 spark", and, asked which cloud, "OpenShell on another platform generic implementation". So PM OS's
 bots must be able to run in NVIDIA OpenShell sandboxes on hosts other than the DGX Spark, through
