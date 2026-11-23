@@ -190,6 +190,28 @@ reviewed change, never as narrowing. Not verified: anything on OpenShell: how it
 `allowed_ips`, whether it takes the `/32` form, and which resolver a sandbox uses. Applying the
 change on a host needs a second platform owner's review and `openshell policy set` there.
 
+**Slice H4 status (2026-11-23): built and merged on `claude/web-app`, not yet reviewed.**
+Every service requires `PMOS_MODEL_SOURCE`; blank and `hosted` are refused. The gateway serves
+`local` only with `class: production` and its pinned-address resolver (`.13`, `.14`, compared
+with compose's literals), and `hosted-test` only with `class: test` and a label on every role;
+it reports `stub` with the stub on, puts `model_source` in `/readyz` and the roles answer and
+`x-pmos-model-source` on every answer, refuses a model call without the expected-source header
+(`400`) or naming another source (`409`) before forwarding (X4), replaces upstream error bodies
+and keeps URLs out of logs (V3), follows no redirects, and caches a remote probe for 30
+seconds. The tool server checks the gateway's source at every session open and tool call
+(10-second cache, fails closed, closes the session, audits it) and in fake-data mode refuses
+live connectors, GitHub memory, the GitHub App, content without the `TEST-CONTENT` marker or
+with a restricted file, and a database marked `held_real_data`. The runtime claims nothing on a
+mismatch and refuses routine parsing; the harness and the eval runner send the header and the
+harness ends a task on a change. `pmos-web` refuses `PMOS_EXPOSURE=public` until H10 and shows
+the test banner. `pmos-slack` refuses tokens under `hosted-test`, so the test stack runs
+without Slack. `pmos-admin` refuses blank settings and checks the bring-up workers and
+`sandbox`. The stub is accepted as matching any configured source (for CI and a first install):
+for the reviewer to confirm. The whole workspace's checks passed on the merged head. Not
+verified: anything on a real host or OpenShell; the test stack itself was not started.
+`deploy/preflight.sh` still reads a blank source as `local`, the reading that runs the most
+checks.
+
 **The owner's requirement, 2026-11-22:** "I want to deploy it in another platform apart from
 spark", and, asked which cloud, "OpenShell on another platform generic implementation". So PM OS's
 bots must be able to run in NVIDIA OpenShell sandboxes on hosts other than the DGX Spark, through
