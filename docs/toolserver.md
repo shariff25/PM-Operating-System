@@ -234,7 +234,7 @@ the log can't be read back, so the answer is `available: false` with no sources.
 | `GET /internal/approvals/{id}/sources?user=` | service or web token | What the run that drafted the item read: `{sources: [{system, title, url, ref, cite, tool, read_at}], available, truncated}`. `user` is required (`400`) and must be the item's user: anyone else's item, or a missing one, is `404`. See **What an item is shown with** |
 | `POST /internal/approvals/{id}/decision` `{decided_by, decision, args?, reason?, confirm_external?, expected_args_hash?}` | service, bot or web token | `approve`, `edit` (with `args`) or `reject`. `expected_args_hash` is the start of the `args_hash` the person was shown: a mismatch is `409 {code: "stale"}` and nothing is decided; it is required on `approve` from the bot and web tokens (`400 {code: "expected_args_hash_required"}`), optional for the service token (see "What the person was shown"). `decided_by` must be the item's user (`403`), and an active PM OS user (`403`; a deactivated owner's drafts are held this way). `reason` is optional and only with `reject` (`422` with anything else, or for an unknown value): `wrong_facts`, `wrong_target`, `tone`, `incomplete`, `should_not_draft` or `other` (`owner_deactivated` is the system's own, never accepted from a client). The audit records which token decided, and the reason in `detail` (`reason: tone`). For a Slack write, `confirm_external: true` confirms posting to a Slack Connect channel. Slack answers, each `{code, error, …}`: `409 audience_blocked` (with `outsiders`, `members`, `external`), `409 needs_external_confirm` (with `members`, `external`), `503 audience_unavailable`, and `409 expired`; see **Slack drafts**. From the bot or web token, an `edit` that changes where the draft goes is `422 target_changed` (see **How a write gets approved**). An internal failure is `500` with a generic `error`. |
 | `GET /internal/ledger?since=&until=&bot=&outcome=&min_edit=&limit=` | service or bot token | `{rows: […]}`, newest first; for the bot token, rows have no `id` (use `run_id`). See **Feedback ledger**. `422` for a bad parameter |
-| `GET /internal/ledger/summary?since=&bot=` | service token | Per bot (or skill) and tool: counts by outcome, label coverage, median edit distance, rejection reasons. `422` for a bad `since` |
+| `GET /internal/ledger/summary?since=&bot=` | service token | Per bot (or skill) and tool: counts by outcome, label coverage, median edit distance, rejection reasons, median decision time and fast-approval share (a tripwire, never a target). `422` for a bad `since` |
 | `POST /internal/reindex` | service token | Rebuild the context index from the content checkout and re-read the bots and their roles (users and roles are in the database); `422` if it fails `pmos lint` |
 | `GET /internal/oauth/{atlassian\|slack\|github}/start?user=` | service or bot token | The URL to send a PM to so they can link their account. The bot token gets URLs for team members only (`403` otherwise). `user=bots.<name>` (service token) gives the URL for a team bot's own account (`404` unless `<name>` is a team bot); GitHub links PMs only. |
 | `GET /oauth/{atlassian\|slack\|github}/callback` | none (the PM's browser) | Finishes linking; shows a short page |
@@ -521,10 +521,24 @@ first:
 | `limit` | `1`–`1000`, default `1000` |
 
 **The summary.** `GET /internal/ledger/summary?since=&bot=` (service token) returns
-`{since, rows, label_coverage, groups: […]}`. Each group is one bot (or skill) and tool, with
-`rows`, `counts` (every outcome, zeros included), `label_coverage` (the share of rows that are
-decided or expired: phase 0's 95% gate), `median_edit_distance` (over rows that have one;
-`null` if none) and `reasons` (rejections by reason, `none` for those without one).
+`{since, rows, label_coverage, fast_approval_seconds, groups: […]}`. Each group is one bot
+(or skill) and tool, with `rows`, `counts` (every outcome, zeros included), `label_coverage`
+(the share of rows that are decided or expired: phase 0's 95% gate), `median_edit_distance`
+(over rows that have one; `null` if none), `reasons` (rejections by reason, `none` for those
+without one), and the decision-time tripwire:
+- `median_decision_seconds`: the median seconds from `created_at` to `decided_at`, over the
+  `decision_time_rows` rows a person decided (approved, edited, rejected or failed, and an
+  approved write still running); rows without `decided_at`, `expired` rows and rows the tool
+  server closed itself (`owner_deactivated`) are left out. `null` if there are none.
+- `fast_approvals` of `fast_approval_rows`: the `approved` (unchanged) rows with a decision
+  time, and how many of them were decided within `fast_approval_seconds`
+  (`PMOS_LEDGER_FAST_APPROVAL_SECONDS`, default 5) of being created; `fast_approval_share` is
+  the one over the other, `null` when `fast_approval_rows` is 0. Edits and rejections don't
+  count in it.
+
+Both are worked out from the stored timestamps when the summary is read, the same for the
+in-memory and Postgres stores. Like approval rate, they are a tripwire, never a target: a
+rising fast-approval share is a reason to look for rubber-stamping, not a number to tune.
 `since` matches like the ledger's.
 
 ## Slack drafts
@@ -1815,6 +1829,7 @@ cargo run -p pmos-toolserver
 | `PMOS_ALLOWED_HOSTS` | `toolserver.pmos.internal,localhost,127.0.0.1` | `Host` values `/mcp` accepts |
 | `PMOS_CONTENT_SYNC_SECS` | `300` with live connectors, `0` with fake | How often the content checkout is pulled (see **Content sync**); `0` turns it off, after member commits too |
 | `PMOS_LEDGER_EXPIRE_DAYS` | `7` | Days after which a draft still pending is reported as `expired` in the feedback ledger. A whole number, 1 or more |
+| `PMOS_LEDGER_FAST_APPROVAL_SECONDS` | `5` | An approved-unchanged draft decided within this many seconds of its creation counts as a fast approval in the ledger summary (a tripwire, never a target). A whole number, 1 or more |
 | `PMOS_SLACK_DRAFT_TTL_HOURS` | `24` | Hours after which an undecided Slack draft expires, and a decided one loses its text after its decision. A whole number from 1 to 24: no Slack text is kept longer |
 
 With `PMOS_CONNECTORS=live`:

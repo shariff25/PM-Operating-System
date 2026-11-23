@@ -13,7 +13,8 @@ honest. This is how PM OS learns from edits and rejections without training on a
 - **Deterministic checks and people outrank LLM judges.** A judge blocks only once it is
   calibrated.
 - **Approval rate is a tripwire, never a target.** A falling rate tells you to look. Don't
-  tune anything to raise it: a bot that drafts less, or drafts blander, would.
+  tune anything to raise it: a bot that drafts less, or drafts blander, would. The same holds
+  for decision time and the fast-approval share (below).
 
 | When | What | Time |
 | --- | --- | --- |
@@ -55,7 +56,23 @@ A reply blocked by the audience check stays pending until it's rejected or expir
 check working, not a quality failure.
 
 For the week as a whole, `deploy/pmos-admin ledger --since 7d` prints counts by outcome, the
-label coverage (decided or expired rows; phase 0 wants 95%) and the median edit distance.
+label coverage (decided or expired rows; phase 0 wants 95%), the median edit distance, the
+median time from a draft to its decision (`med dec`) and the fast-approval share (`fast`: of
+the drafts approved unchanged, those decided within 5 seconds, `PMOS_LEDGER_FAST_APPROVAL_SECONDS`;
+shown as "67% of 3", so you can see how small the sample is).
+
+**When the fast-approval share rises.** It is a tripwire for rubber-stamping, never a target.
+A draft approved within seconds may have been read, or may not: human review is a weak
+control by itself (`docs/research/frontier-labs-self-improving-agents.md`). When a bot's or a
+tool's share climbs over a few weeks, on more than a handful of rows:
+- in the next 100-trace review, sample more of that bot's approved-unchanged drafts, the fast
+  ones first, and check each as if nobody had approved it;
+- keep that sample even when time is short; don't shrink it to fit;
+- if you find drafts that were wrong and approved anyway, write case cards for them and tell
+  the PMs concerned, without naming anyone in the review notes.
+
+Don't optimise it: don't add friction, delays or extra clicks to slow approvals down, and don't
+treat a low share as good. A share over 2 or 3 rows means nothing; read the count next to it.
 
 ## Every 2–4 weeks: the 100-trace review
 
@@ -65,7 +82,8 @@ check or tag knows yet. Block out half a day.
 1. **Pick 100 traces.** Export the ledger for the period
    (`deploy/pmos-admin ledger --export > /tmp/ledger.jsonl`) and pick about 100 runs: all the
    rejected ones, then edited ones from the highest edit distance down, then a random handful
-   of approved-unchanged ones, which are often wrong in ways nobody noticed. Spread them across
+   of approved-unchanged ones, which are often wrong in ways nobody noticed (more of them, fast
+   ones first, for a bot whose fast-approval share is rising). Spread them across
    PMs and tools.
 2. **Open coding.** For each trace, open its task page and write one or two plain sentences on
    the first thing that went wrong, or "fine". Don't use the taxonomy yet; describe what you

@@ -1991,13 +1991,22 @@ for r in json.load(sys.stdin)["rows"]: print(json.dumps(r))'
 import json, sys
 s = json.load(sys.stdin)
 print(f"drafts since {s.get("since", "?")}: {s["rows"]}, labelled {s["label_coverage"]:.0%} (phase 0 gate: 95%)")
-print(f"  {"bot/skill":<18} {"tool":<26} {"n":>4} {"ok":>4} {"edit":>4} {"rej":>4} {"exp":>4} {"med edit":>8}  reasons")
+fast_s = s.get("fast_approval_seconds", "?")
+print(f"  med dec: median time to a decision; fast: approved unchanged within {fast_s}s, of n timed (a tripwire, never a target)")
+print(f"  {"bot/skill":<18} {"tool":<26} {"n":>4} {"ok":>4} {"edit":>4} {"rej":>4} {"exp":>4} {"med edit":>8} {"med dec":>7} {"fast":>10}  reasons")
+def took(sec):
+    if sec is None: return "-"
+    if sec < 60: return f"{sec:.1f}s"
+    if sec < 3600: return f"{sec / 60:.0f}m"
+    return f"{sec / 3600:.1f}h"
 for g in s["groups"]:
     c = g["counts"]
     med = g.get("median_edit_distance")
+    share, base = g.get("fast_approval_share"), g.get("fast_approval_rows", 0)
+    fast = f"{share:.0%} of {base}" if share is not None else "-"
     reasons = ", ".join(f"{k} {v}" for k, v in sorted(g.get("reasons", {}).items()) if v)
     who = g.get("bot") or g.get("skill") or "?"
-    print(f"  {who:<18} {g["tool"]:<26} {g["rows"]:>4} {c.get("approved",0):>4} {c.get("edited",0):>4} {c.get("rejected",0):>4} {c.get("expired",0):>4} {(f"{med:.0%}" if med is not None else "-"):>8}  {reasons}")
+    print(f"  {who:<18} {g["tool"]:<26} {g["rows"]:>4} {c.get("approved",0):>4} {c.get("edited",0):>4} {c.get("rejected",0):>4} {c.get("expired",0):>4} {(f"{med:.0%}" if med is not None else "-"):>8} {took(g.get("median_decision_seconds")):>7} {fast:>10}  {reasons}")
 '
     ;;
 
