@@ -49,14 +49,12 @@ say() { printf '%s\n' "$*"; }
 cmd=${1:-help}
 
 # What is removed however the script stops (an error, Ctrl-C, a kill; the review of eb49991):
-# a new deploy/.env not yet renamed into place (set_env), the mkdir lock (lock_env) and the
+# a new deploy/.env not yet renamed into place (set_env) and the
 # eval stack (eval_stack_up). A signal becomes an exit, so the EXIT trap runs for it too.
 ENV_TMP=""
-ENV_LOCK_DIR=""
 EVAL_STACK_UP=0
 cleanup() {
   [ -z "$ENV_TMP" ] || rm -f -- "$ENV_TMP"
-  [ -z "$ENV_LOCK_DIR" ] || rmdir -- "$ENV_LOCK_DIR" 2>/dev/null || true
   [ "$EVAL_STACK_UP" = 0 ] || eval_stack_down
   return 0
 }
@@ -487,8 +485,7 @@ ENV_VALUE_CHARS='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_
 # written beside it (mktemp: mode 0600), given the old file's owner and ACL (the eval runner's
 # read ACL, docs/runbooks/upgrade.md), then renamed over it, so no reader ever sees half a file.
 # deploy/setup.sh does the same. The lock is flock on deploy/.env.lock; where flock isn't
-# installed, the directory deploy/.env.lock.d (mkdir either makes it or fails, atomically),
-# removed by cleanup when the script ends (the review of eb49991: there was no lock at all).
+# installed the change is refused (the review of eb49991: there was no lock at all).
 ENV_LOCK_HELD=0
 lock_env() {
   [ "$ENV_LOCK_HELD" = 0 ] || return 0
@@ -500,17 +497,8 @@ lock_env() {
       exit 1
     }
   else
-    local waited=0
-    until mkdir -- "$DEPLOY/.env.lock.d" 2>/dev/null; do
-      if [ "$waited" -ge 60 ]; then
-        say "another pmos-admin or setup.sh has been changing deploy/.env for a minute ($DEPLOY/.env.lock.d; flock isn't installed)." >&2
-        say "If none is running (one was killed), remove that directory and try again: rmdir $DEPLOY/.env.lock.d" >&2
-        exit 1
-      fi
-      sleep 1
-      waited=$((waited + 1))
-    done
-    ENV_LOCK_DIR="$DEPLOY/.env.lock.d"
+    say "flock (util-linux) isn't installed: install it and run this again. deploy/.env is changed only under its lock, so two commands can't lose each other's change." >&2
+    exit 1
   fi
   ENV_LOCK_HELD=1
 }

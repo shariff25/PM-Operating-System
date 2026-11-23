@@ -22,7 +22,7 @@
 #   tool's) arguments, from pmos-admin or setup.sh (T1); `pause` never reads deploy/.env, so one
 #   the caller can't read doesn't stop it (T2); a PMOS_UID or PMOS_GID of 0 is refused, and
 #   setup.sh refuses a root-owned checkout (T3); `pause` always tries the unit and names it when
-#   refusing root; without flock, an mkdir lock; an interrupted write leaves deploy/.env as it was.
+#   refusing root; without flock, deploy/.env is not changed; an interrupted write leaves deploy/.env as it was.
 set -euo pipefail
 
 SRC="$(cd "$(dirname "$0")/.." && pwd)/deploy/pmos-admin"
@@ -1072,8 +1072,8 @@ for b in pa pb pc pd; do
   grep -qE "^PMOS_RT_WORKER_TOKENS=.*worker-$b=[0-9a-f]{48}" "$envf" || fail "a concurrent add-bot lost $b's token: $(grep WORKER "$envf")"
   grep -qE "^PMOS_GW_BOT_TOKENS=.*bot-$b=[0-9a-f]{48}" "$envf" || fail "a concurrent add-bot lost $b's gateway token"
 done
-# The same where flock isn't installed (the review of eb49991: there was no lock at all): the
-# mkdir lock, removed afterwards. A PATH of links to every tool on this one but flock.
+# Where flock isn't installed (the review of eb49991: there was no lock at all), deploy/.env
+# isn't changed at all. A PATH of links to every tool on this one but flock.
 NOFLOCK="$WORK/noflock"
 mkdir -p "$NOFLOCK"
 IFS=: read -ra path_dirs <<<"$PATH"
@@ -1087,38 +1087,20 @@ for d in "${path_dirs[@]}"; do
 done
 ! PATH="$NOFLOCK" command -v flock >/dev/null || fail "the PATH without flock has flock"
 bot_env
-rm -f "$WORK/stack/deploy/.env.lock"
-pids=()
-for b in pa pb pc pd; do
-  PATH="$SBIN:$WORK/bin:$NOFLOCK" "${stack[@]}" add-bot "$b" >/dev/null 2>&1 &
-  pids+=($!)
-done
-for p in "${pids[@]}"; do wait "$p" || fail "a concurrent add-bot without flock failed"; done
-for b in pa pb pc pd; do
-  grep -qE "^PMOS_RT_WORKER_TOKENS=.*worker-$b=[0-9a-f]{48}" "$envf" || fail "a concurrent add-bot without flock lost $b's token: $(grep WORKER "$envf")"
-  grep -qE "^PMOS_GW_BOT_TOKENS=.*bot-$b=[0-9a-f]{48}" "$envf" || fail "a concurrent add-bot without flock lost $b's gateway token"
-done
-[ ! -e "$WORK/stack/deploy/.env.lock.d" ] || fail "add-bot without flock left its lock"
-[ ! -e "$WORK/stack/deploy/.env.lock" ] || fail "add-bot without flock used flock's lock file"
+cp "$envf" "$WORK/env.before"
+code=0
+out=$(PATH="$SBIN:$WORK/bin:$NOFLOCK" "${stack[@]}" add-bot pa 2>&1) || code=$?
+[ "$code" = 1 ] && [[ "$out" == *"flock (util-linux) isn't installed"* ]] || fail "add-bot without flock exits $code: $out"
+cmp -s "$WORK/env.before" "$envf" || fail "add-bot without flock changed deploy/.env"
+[ ! -s "$DOCKER_LOG" ] || fail "add-bot without flock went on to restart the runtime"
 # setup.sh too.
-rm -f "$WORK/setup/deploy/.env.lock"
 sed -i 's/^PMOS_SERVICE_TOKEN=.*/PMOS_SERVICE_TOKEN=generated/' "$senv"
-PATH="$WORK/bin:$NOFLOCK" bash "$WORK/setup/deploy/setup.sh" --content "$WORK/setup-content" \
-  --state "$WORK/setup-state" >/dev/null 2>&1 || fail "setup.sh without flock failed"
-grep -qE '^PMOS_SERVICE_TOKEN=[0-9a-f]{48}$' "$senv" || fail "setup.sh without flock didn't fill a value"
-[ ! -e "$WORK/setup/deploy/.env.lock.d" ] && [ ! -e "$WORK/setup/deploy/.env.lock" ] ||
-  fail "setup.sh without flock left a lock, or used flock's"
-# ... and it waits while another holds the lock, then goes on once it is released.
-sed -i 's/^PMOS_SERVICE_TOKEN=.*/PMOS_SERVICE_TOKEN=generated/' "$senv"
-mkdir "$WORK/setup/deploy/.env.lock.d"
-PATH="$WORK/bin:$NOFLOCK" bash "$WORK/setup/deploy/setup.sh" --content "$WORK/setup-content" \
-  --state "$WORK/setup-state" >/dev/null 2>&1 &
-held=$!
-sleep 3
-grep -qx 'PMOS_SERVICE_TOKEN=generated' "$senv" || fail "setup.sh without flock didn't wait for the lock"
-rmdir "$WORK/setup/deploy/.env.lock.d"
-wait "$held" || fail "setup.sh without flock failed after the lock was released"
-grep -qE '^PMOS_SERVICE_TOKEN=[0-9a-f]{48}$' "$senv" || fail "setup.sh without flock didn't go on after the lock was released"
+cp "$senv" "$WORK/senv.before"
+code=0
+out=$(PATH="$WORK/bin:$NOFLOCK" bash "$WORK/setup/deploy/setup.sh" --content "$WORK/setup-content" \
+  --state "$WORK/setup-state" 2>&1) || code=$?
+[ "$code" != 0 ] && [[ "$out" == *"flock (util-linux) isn't installed"* ]] || fail "setup.sh without flock exits $code: $out"
+cmp -s "$WORK/senv.before" "$senv" || fail "setup.sh without flock changed deploy/.env"
 
 # --- compose renders (C9, C14): without docker compose, say so and skip ---------------------
 if docker compose version >/dev/null 2>&1; then

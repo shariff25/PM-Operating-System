@@ -45,13 +45,11 @@ if [[ "$CLONE" =~ ^[A-Za-z][A-Za-z0-9+.-]*://[^/@]*@ ]]; then
 fi
 
 # What is removed however the script stops (an error, Ctrl-C, a kill; the review of eb49991): a
-# new deploy/.env not yet renamed into place (fill) and the mkdir lock. A signal becomes an exit,
+# new deploy/.env not yet renamed into place (fill). A signal becomes an exit,
 # so the EXIT trap runs for it too.
 ENV_TMP=""
-ENV_LOCK_DIR=""
 cleanup() {
   [ -z "$ENV_TMP" ] || rm -f -- "$ENV_TMP"
-  [ -z "$ENV_LOCK_DIR" ] || rmdir -- "$ENV_LOCK_DIR" 2>/dev/null || true
   return 0
 }
 trap cleanup EXIT
@@ -104,21 +102,13 @@ ok "$STATE (owned by $OWNER_UID:$OWNER_GID, the checkout's owner)"
 
 echo "== deploy/.env"
 # Under the same lock as pmos-admin (deploy/.env.lock with flock; where flock isn't installed,
-# the directory deploy/.env.lock.d, made by mkdir, which either makes it or fails, atomically),
-# so the two never change it at once.
+# nothing is changed), so the two never change it at once.
 if command -v flock >/dev/null; then
   (umask 077 && : >>"$DEPLOY/.env.lock")
   exec 9>>"$DEPLOY/.env.lock"
   flock -w 60 9 || fail "another setup.sh or pmos-admin has been changing deploy/.env for a minute: try again"
 else
-  waited=0
-  until mkdir -- "$DEPLOY/.env.lock.d" 2>/dev/null; do
-    [ "$waited" -lt 60 ] ||
-      fail "another setup.sh or pmos-admin has been changing deploy/.env for a minute (flock isn't installed). If none is running (one was killed), remove the lock and try again: rmdir $DEPLOY/.env.lock.d"
-    sleep 1
-    waited=$((waited + 1))
-  done
-  ENV_LOCK_DIR="$DEPLOY/.env.lock.d"
+  fail "flock (util-linux) isn't installed: install it and run this again. deploy/.env is changed only under its lock."
 fi
 # Made private before it holds anything (umask), then kept so.
 [ -f "$ENV" ] || { (umask 077 && cp "$DEPLOY/env.example" "$ENV"); ok "created from env.example"; }
