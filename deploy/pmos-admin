@@ -489,7 +489,9 @@ profiles() {
           exit 2
         fi
         p+=(--profile web) ;;
-      --bringup) p+=(--profile bringup) ;;
+      --bringup)
+        p+=(--profile bringup)
+        [ -z "${PMOS_BRINGUP_PERSONAL_BOT:-}" ] || p+=(--profile bringup-personal) ;;
       *) say "unknown option $arg" >&2; exit 2 ;;
     esac
   done
@@ -725,9 +727,30 @@ require_handle() { # command handle
   exit 2
 }
 
+# The bring-up personal worker (deploy/compose.yaml, worker-personal): one PM's personal bot as a
+# plain container, NOT isolated, for a host without OpenShell and fake data only. Its two tokens
+# are found by exact key in deploy/.env's lists (add-bot made them) and reach Compose through
+# this process's environment, never a command line.
+bringup_personal() {
+  local bot=${PMOS_BRINGUP_PERSONAL_BOT:-} rt gw
+  [ -n "$bot" ] || return 0
+  if ! valid_bot_name "$bot" || [ "$bot" = docs ]; then
+    say "PMOS_BRINGUP_PERSONAL_BOT=$(printf '%q' "$bot"): name one personal bot, such as pm-<handle> (the Docs bot has worker-docs)" >&2
+    return 1
+  fi
+  rt=$(list_value "${PMOS_RT_WORKER_TOKENS:-}" "worker-$bot")
+  gw=$(list_value "${PMOS_GW_BOT_TOKENS:-}" "bot-$bot")
+  if [ -z "$rt" ] || [ -z "$gw" ]; then
+    say "PMOS_BRINGUP_PERSONAL_BOT=$bot has no tokens yet: run deploy/pmos-admin add-bot $bot first" >&2
+    return 1
+  fi
+  export PMOS_BRINGUP_PERSONAL_RT_TOKEN=$rt PMOS_BRINGUP_PERSONAL_GW_TOKEN=$gw
+  say "bring-up worker for $bot (NOT isolated: fake data only)"
+}
+
 # The stack's services, as Docker Compose lists them from deploy/compose.yaml with every
 # profile. `logs` and `restart` take only one of these (never an option, never anything else).
-ALL_PROFILES=(--profile slack --profile console --profile web --profile models --profile bringup)
+ALL_PROFILES=(--profile slack --profile console --profile web --profile models --profile bringup --profile bringup-personal)
 require_service() { # command service
   local list
   case "$2" in
@@ -851,6 +874,7 @@ case "$cmd" in
     [ -z "$profile_lines" ] || mapfile -t prof <<<"$profile_lines"
     assertion_checks || exit 2
     model_source_checks || exit 2
+    if [[ " ${prof[*]} " == *" bringup-personal "* ]]; then bringup_personal || exit 2; fi
     if [ -z "${PMOS_SLACK_APP_TOKEN:-}" ] || [ -z "${PMOS_SLACK_BOT_TOKEN:-}" ]; then
       say "note: the Slack bot is off until PMOS_SLACK_APP_TOKEN and PMOS_SLACK_BOT_TOKEN are set"
     fi
@@ -859,7 +883,7 @@ case "$cmd" in
     ;;
 
   down)
-    compose --profile slack --profile console --profile web --profile models --profile bringup down || {
+    compose "${ALL_PROFILES[@]}" down || {
       say "docker compose couldn't stop the stack (it may not be able to read deploy/.env either)." >&2
       say "Stop PM OS's containers directly (data is kept):" >&2
       say "  docker ps -q --filter label=com.docker.compose.project=pmos | xargs -r docker stop" >&2
@@ -869,7 +893,7 @@ case "$cmd" in
 
   status)
     say "== containers"
-    compose --profile slack --profile console --profile web --profile models --profile bringup ps \
+    compose "${ALL_PROFILES[@]}" ps \
       --format 'table {{.Service}}\t{{.Status}}'
     say "== readiness"
     if [ "${PMOS_MODEL_SOURCE:-local}" = hosted-test ]; then
@@ -965,7 +989,7 @@ case "$cmd" in
     say "This replaces every PM OS database with the backup in $dir."
     read -r -p "Type RESTORE to go on: " answer
     [ "$answer" = RESTORE ] || { say "stopped; nothing changed"; exit 1; }
-    compose --profile slack --profile console --profile web --profile bringup stop docs toolserver gateway bots slack console web worker-docs 2>/dev/null || true
+    compose --profile slack --profile console --profile web --profile bringup --profile bringup-personal stop docs toolserver gateway bots slack console web worker-docs worker-personal 2>/dev/null || true
     compose up -d postgres
     until compose exec -T postgres pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
     for db in toolserver bots docs; do

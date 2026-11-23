@@ -367,6 +367,30 @@ services:
       bots: { condition: service_healthy }
     profiles: [bringup]
 
+  # Bring-up only, like worker-docs and just as NOT isolated (profile `bringup-personal`): one
+  # PM's personal bot (PMOS_BRINGUP_PERSONAL_BOT, such as pm-ana, after `pmos-admin add-bot`) as a
+  # plain container, so a host without OpenShell can try the web app's chat end to end with fake
+  # data. `pmos-admin up --bringup` starts it when the setting is there, and passes the bot's two
+  # tokens from deploy/.env (PMOS_RT_WORKER_TOKENS, PMOS_GW_BOT_TOKENS) through its environment.
+  worker-personal:
+    image: pmos-worker:${PMOS_VERSION:-local}
+    restart: unless-stopped
+    user: "${PMOS_UID:-10001}:${PMOS_GID:-10001}"
+    networks: [pmos]
+    environment:
+      PMOS_BOTS_URL: http://bots.pmos.internal:8750
+      PMOS_WORKER_BOT: ${PMOS_BRINGUP_PERSONAL_BOT:-}
+      PMOS_WORKER_TOKEN: ${PMOS_BRINGUP_PERSONAL_RT_TOKEN:-}
+      PMOS_GATEWAY_URL: http://gateway.pmos.internal:8740/v1
+      PMOS_GATEWAY_TOKEN: ${PMOS_BRINGUP_PERSONAL_GW_TOKEN:-}
+      PMOS_TOOLSERVER_MCP_URL: http://toolserver.pmos.internal:8710/mcp
+      PMOS_CONTENT_ROOT: /srv/content-repo/content
+    volumes:
+      - ${PMOS_CONTENT_CHECKOUT}:/srv/content-repo:ro
+    depends_on:
+      bots: { condition: service_healthy }
+    profiles: [bringup-personal]
+
   # The local models (verify on the Spark: image tag, model ids and memory split).
   vllm-default:
     &vllm

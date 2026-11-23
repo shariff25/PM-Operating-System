@@ -112,7 +112,8 @@ if [[ " $* " == *" config --services "* ]]; then
   printf '%s\n' ${FAKE_SERVICES:-postgres docs toolserver gateway bots slack console web worker-docs vllm-default vllm-extraction}
 fi
 # What reached docker through its environment, never its arguments (S1).
-printf 'evals_token=%s https_proxy=%s\n' "${PMOS_EVALS_TOKEN-unset}" "${HTTPS_PROXY-unset}" >>"${DOCKER_ENV_LOG:-/dev/null}"
+printf 'evals_token=%s https_proxy=%s personal_rt=%s personal_gw=%s\n' "${PMOS_EVALS_TOKEN-unset}" "${HTTPS_PROXY-unset}" \
+  "${PMOS_BRINGUP_PERSONAL_RT_TOKEN-unset}" "${PMOS_BRINGUP_PERSONAL_GW_TOKEN-unset}" >>"${DOCKER_ENV_LOG:-/dev/null}"
 [ "${FAKE_DOCKER_FAIL:-0}" != 1 ]
 EOF
 chmod +x "$WORK/bin/docker"
@@ -357,6 +358,30 @@ stack_env require "${ht[@]}"
 code=0
 run_stack up --models >/dev/null 2>&1 || code=$?
 [ "$code" = 2 ] || fail "up --models with hosted-test exits $code, not 2"
+# The bring-up personal worker (first deployment run: no OpenShell, so no worker for a PM's own
+# bot): `up --bringup` with PMOS_BRINGUP_PERSONAL_BOT starts it with the bot's two tokens, found
+# by exact key and passed through docker's environment, never its arguments; without the tokens
+# or with a bad name, nothing starts.
+stack_env require "PMOS_BRINGUP_PERSONAL_BOT=pm-ana" \
+  "PMOS_RT_WORKER_TOKENS=worker-pm-ana2=rt-other-0123,worker-pm-ana=rt-ana-0123456789abcdef" \
+  "PMOS_GW_BOT_TOKENS=bot-pm-ana=gw-ana-0123456789abcdef,bot-pm-an=gw-other-0123"
+run_stack up --bringup >/dev/null 2>&1 || fail "up --bringup with a personal bot failed"
+grep -q -- '--profile bringup --profile bringup-personal up -d' "$DOCKER_LOG" ||
+  fail "up --bringup didn't start the personal worker: $(cat "$DOCKER_LOG")"
+grep -q 'personal_rt=rt-ana-0123456789abcdef personal_gw=gw-ana-0123456789abcdef' "$DOCKER_ENV_LOG" ||
+  fail "the personal worker's tokens didn't reach docker's environment: $(cat "$DOCKER_ENV_LOG")"
+! sed 's/.* args=//' "$DOCKER_LOG" | grep -q 'rt-ana-0123456789abcdef\|gw-ana-0123456789abcdef' ||
+  fail "a personal worker token reached docker's arguments"
+for bad in "PMOS_BRINGUP_PERSONAL_BOT=pm-bob" "PMOS_BRINGUP_PERSONAL_BOT=docs" "PMOS_BRINGUP_PERSONAL_BOT=Pm_Ana"; do
+  stack_env require "$bad" "PMOS_RT_WORKER_TOKENS=worker-pm-ana=rt-ana-0123" "PMOS_GW_BOT_TOKENS=bot-pm-ana=gw-ana-0123"
+  code=0
+  run_stack up --bringup >/dev/null 2>&1 || code=$?
+  [ "$code" = 2 ] || fail "up --bringup with $bad exits $code, not 2"
+  ! grep -q ' up -d' "$DOCKER_LOG" || fail "up --bringup with $bad started something"
+done
+stack_env require
+run_stack up --bringup >/dev/null 2>&1 || fail "up --bringup without a personal bot failed"
+! grep -q 'bringup-personal' "$DOCKER_LOG" || fail "the personal worker started without PMOS_BRINGUP_PERSONAL_BOT"
 stack_env require "PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=0" "PMOS_WEB_PASSWORD_LOGIN=1" \
   "PMOS_NETWORK_SUBNET=10.50.0.0/24" "PMOS_NETWORK_GATEWAY=10.50.0.1" \
   "PMOS_WEB_TRUSTED_PROXIES=10.50.0.1" "PMOS_WEB_PUBLIC_URL=https://pmos.example.com"
@@ -1002,7 +1027,7 @@ no_secret_in_args evals
 : >"$DOCKER_ENV_LOG"
 run_stack build >/dev/null || fail "build failed"
 grep -q -- '--build-arg HTTPS_PROXY --build-arg NO_PROXY ' "$DOCKER_LOG" || fail "build didn't pass the proxy by name: $(cat "$DOCKER_LOG")"
-grep -q 'https_proxy=http://proxyuser:prx0SECRET@proxy.example:3128$' "$DOCKER_ENV_LOG" || fail "build didn't give docker the proxy in its environment"
+grep -q 'https_proxy=http://proxyuser:prx0SECRET@proxy.example:3128 personal_rt=' "$DOCKER_ENV_LOG" || fail "build didn't give docker the proxy in its environment"
 no_secret_in_args build
 # sandbox: the provider tokens only in openshell's environment; an existing provider (one that
 # survived `sandbox delete`, or a rotated token) is updated, not created again.
