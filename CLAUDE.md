@@ -125,22 +125,45 @@ follow-up tracking.
 - **Report honestly:** say what was verified and what was not. Nothing counts as measured
   against a model until an eval run has happened.
 
-## Where the build stood when work stopped on 2026-11-22
+## Owner's decisions of 2026-11-23
 
-- Pushed and checked: `claude/web-app` (draft pull request #10). Nothing is unmerged on a side
-  branch and no agent is running.
-- Next, in order: (1) the reviewer's answers on the batches at `0e1f4b8` and `c78b5fb` and on
-  the revised any-host spec (`docs/openshell-any-host-spec.md`, "Change of direction,
-  2026-11-22"); act on them. (2) Only after the reviewer has read that revision, build its
-  slices in its order: H2, then H1, H3 and H4, then H9, H10 and H12, H7, H6. H0 and H0b are
-  built. Nothing in the spec has run on real OpenShell on any host.
-- The eval re-run is scheduled for Tuesday 2026-11-24 at 10:00 am Pacific (a scheduled task in
-  the conductor session): isolated attempts, the owner's hosted model, fake data, 4 lanes; start
-  the test stack once with no model calls first, because its scripts changed after the last
-  real run. The model key is a network secret for the provider's host; the variable holds the
-  placeholder `proxy-injected`.
+- **Hide the vendor:** "Hide the vendor info in the code." No committed file names the hosted
+  model's vendor, its model id or its host. The gateway reports a neutral role `label:` and a
+  hash of the model id. Older commits on `claude/web-app` still carry the names; `main` never
+  did. Whether a plain hash is enough, or the hash needs a key the owner holds, is open.
+- **Eval:** run it the same day, then "stop the eval, we can pick it another time". Ten of
+  eleven categories ran (E3, isolated attempts, fake data, test class): slack-reply, jira-draft
+  and docs-qa met their bar. It is not a valid benchmark: 45 attempts were lost to a 300-second
+  cutoff on non-streamed model calls from a hop beyond the gateway, pm-craft did not finish and
+  the judges have no human labels. Before the next run: stream model calls or get that limit
+  raised, and have the runner cancel a task it times out.
+- **Deploy for end-to-end testing:** the deploy kit ran for the first time, in the conductor's
+  cloud container, with fake data and password sign-in. The owner cannot reach that container
+  and it does not survive a restart; how the owner tests hands-on (a host they can reach, Slack,
+  or directing the conductor) is not yet decided.
+- **Self-improving agents:** after the research in
+  `docs/research/frontier-labs-self-improving-agents.md`, the owner approved building three
+  measurements now (decision time in the feedback ledger, eval cases where the bot must say it
+  is blocked, every eval category on a role or skill change) and writing the rest as
+  requirements for phase 2 (`docs/improvement-loop-phase2-requirements.md`). The improver bot
+  itself waits for the pilot's real labels; training stays last.
+
+## Where the build stands (2026-11-23)
+
+- Pushed and checked: `claude/web-app` (draft pull request #10).
+- Security gate passed at `52dbae2` (no open High or Critical). Sent to the reviewer and not
+  yet answered: the fixes for its findings at `52dbae2`, spec revision r7, and slices H1, H2,
+  H3, H4 and H9.
+- Any-host slices built and passing CI's deploy job on a real Docker host: H0, H0b, H1, H2, H3,
+  H4, H9 (status notes at the top of `docs/openshell-any-host-spec.md`). Nothing has run on
+  OpenShell. Blocked until the reviewer reads r7: H10 (admin listener) and H12 (hosted source).
+  Not started: H7, H6. H13 is the owner's.
+- Since H4, every service needs `PMOS_MODEL_SOURCE`, Slack is refused in fake-data mode (the
+  test stack runs without Slack), and `pmos-web` refuses `PMOS_EXPOSURE=public` until H10.
 - The checks need Postgres running (`pg_ctlcluster 16 main start`); a restarted container has
-  it stopped, and the database tests then fail with "connection refused".
+  it stopped, and the database tests then fail with "connection refused". A restart also stops
+  the Docker daemon. Local kit tests use stand-ins for Docker, so only CI's deploy job shows
+  whether a service starts on a real stack.
 
 ## Waiting on the owner
 
@@ -151,5 +174,7 @@ terms; the first host (an Ubuntu 24.04 x86 virtual machine); an Entra app regist
 (`evals/judges/LABELLING.md`); pilot PM names; edits to the nudge wording; a GitHub App
 with pull-request permission and branch protection on the content branch; approval of the three
 plans (MCP servers and which ones for the pilot, the OpenShell prover, sandbox decisions in the
-audit log) and the go-ahead for requirement i; the CODEOWNERS lines and branch-protection settings in
+audit log) and the go-ahead for requirement i; where the provider's approval record is kept
+(outside the repository) and who besides the owner may approve a provider; whether to
+squash-merge pull request #10 so the vendor's name stays out of `main`'s history; the CODEOWNERS lines and branch-protection settings in
 `policies/README.md`, so a change to a bot's instructions needs a second reviewer.
