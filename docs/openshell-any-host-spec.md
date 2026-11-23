@@ -147,6 +147,25 @@ OpenShell resolves through the host's `/etc/hosts` and reaches the bridge; a rea
 `docker compose up` creating the network. The network checks run at `up` and the names check at
 `sandbox` only; `resume`, `add-bot` and `restore` are left to H1's preflight.
 
+**Slice H1 status (2026-11-23): built and merged on `claude/web-app`, not yet reviewed.**
+`deploy/preflight.sh` runs every §3.2 check at the stages `install` (`setup.sh`, first), `run`
+(`up`, `restore`, `add-bot`, `status`, and by hand; with the OpenShell checks at `sandbox` and
+`resume`) and `quick` (the worker unit's `ExecStartPre`), and refuses with exit 2 on any fail.
+`resume` also checks the names. H-PORTS and H-EXPOSURE read the configured ports. H-SUBNET adds
+the routes, the live network and a trusted proxy that is a pinned address. H-SIGNIN has the
+refusal that holds until H10; H-ADMIN reports "not checked until slice H10". H-NVIDIA is skipped
+while `PMOS_GATEWAY_STUB=1`, because no model server starts under the stub. `pmos-admin
+host-firewall apply|check|remove` installs the metadata block (rules, a `docker.service`
+drop-in and a one-minute timer); `host acknowledge` takes H-PRIVATE only; `host attest
+local-gpu` records the host's fingerprint; both write a root-owned, append-only log that
+`status` prints. O-CANARY and `sandbox` share `deploy/sandbox-create.sh`. Tested in
+`scripts/test-preflight.sh` (fixtures) and `scripts/test-pmos-admin.sh`. On CI's runner
+(2026-11-23) every check but H-NAMES passed or was skipped as designed; CI and the install
+runbook now write the names before the first `up`. Not verified: anything on OpenShell (every
+O-* check), the metadata probe's answers on AWS, GCP and Azure, the drop-in after a Docker
+restart, and the `ExecStartPre` path under real systemd. A blank `PMOS_MODEL_SOURCE` is still
+read as `local` until H4.
+
 **The owner's requirement, 2026-11-22:** "I want to deploy it in another platform apart from
 spark", and, asked which cloud, "OpenShell on another platform generic implementation". So PM OS's
 bots must be able to run in NVIDIA OpenShell sandboxes on hosts other than the DGX Spark, through
