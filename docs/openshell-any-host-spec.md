@@ -166,6 +166,16 @@ O-* check), the metadata probe's answers on AWS, GCP and Azure, the drop-in afte
 restart, and the `ExecStartPre` path under real systemd. A blank `PMOS_MODEL_SOURCE` is still
 read as `local` until H4.
 
+**Slice H9 status (2026-11-23): built and merged on `claude/web-app`, not yet reviewed.**
+`deploy/compose.yaml` sets `PMOS_WEB_INTERNAL_BIND: 0.0.0.0:8771` on `web` as a literal and
+publishes nothing for it. `deploy/env.example` documents
+`PMOS_WEB_BRIEF_URL=http://web.pmos.internal:8771`. H-EXPOSURE fails any host listener on 8771,
+on every address and every host. The install runbook records that the health and internal
+routes are not forwarded, and the body sizes. Tested by compose render assertions and preflight
+fixtures. Not run: the stack test (the brief `PUT` works on 8771 and answers 404 on 8770). A
+stale `PMOS_WEB_BRIEF_URL` ending in `:8770` in an existing `deploy/.env` sends no brief and
+nothing refuses it yet.
+
 **The owner's requirement, 2026-11-22:** "I want to deploy it in another platform apart from
 spark", and, asked which cloud, "OpenShell on another platform generic implementation". So PM OS's
 bots must be able to run in NVIDIA OpenShell sandboxes on hosts other than the DGX Spark, through
