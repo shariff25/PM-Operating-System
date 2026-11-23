@@ -9,6 +9,8 @@ Allow about half a day, most of it waiting for the first image build and model d
 
 - **The Spark:** DGX OS, with Docker and the NVIDIA container toolkit (both come with DGX OS).
   You need a user that may run `docker`.
+- **Tools:** `git`, `openssl` and `flock` (from `util-linux`, present on most Linux hosts;
+  `setup.sh` checks for all three before it clones anything).
 - **OpenShell:** installed on the Spark (`openshell --version`).
 - **Network:** outbound HTTPS to:
   - GitHub, for the code and content repos;
@@ -68,6 +70,25 @@ deploy/setup.sh --content /srv/pmos/content-repo --clone <the content repo> --st
    Slack first-time flow and nudges) are written as `1`; set either to `0` to turn it off.
 7. **Save the settings.** Copy `deploy/.env` into the team password manager now. It holds the
    vault key and the console proxy secret; without the vault key, stored tokens can't be read.
+
+### Service uid (`PMOS_UID` and `PMOS_GID`)
+
+The services and the bots' workers run as `PMOS_UID:PMOS_GID` in `deploy/.env`, which
+`setup.sh` takes from the content checkout's owner. They must be plain numbers and never 0:
+a root-owned checkout would make the services root. If `pmos-admin` or `setup.sh` refuses a
+uid or gid of 0 (an older install can have one), give the checkout and state directory to a
+service account and set its ids:
+
+```sh
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin pmos
+sudo chown -R pmos:pmos /srv/pmos/content-repo /srv/pmos/state
+# then in deploy/.env: PMOS_UID=$(id -u pmos) and PMOS_GID=$(id -g pmos), as numbers
+```
+
+`pmos-admin` is the gate. Docker Compose itself accepts `PMOS_UID=0` or a name, so don't start
+the stack with a bare `docker compose up`. The commands that don't start a container as that
+user (`status`, `logs`, `backup`, `reindex`, `revoke` and `down`) still work with a bad value,
+so an incident can be handled first; fix the value before the next `up`.
 
 ## Stage 2: First start, without models or Slack
 

@@ -81,9 +81,18 @@ env_problem() { # message: stop (exit 2), or for pause and down, warn and go on
     exit 2
   fi
 }
+# What to do by hand when `down` can't use deploy/.env (missing, unreadable, or Compose fails).
+down_advice() {
+  say "Stop PM OS's containers directly (data is kept):" >&2
+  say "  docker ps -q --filter label=com.docker.compose.project=pmos | xargs -r docker stop" >&2
+}
 if [ ! -f "$ENV" ]; then
   if [ "$cmd" = pause ]; then
     say "WARNING: there is no deploy/.env; pmos-admin pause goes on without it." >&2
+  elif [ "$cmd" = down ]; then
+    say "there is no deploy/.env, and docker compose needs it to stop the stack." >&2
+    down_advice
+    exit 1
   else
     echo "no deploy/.env yet: run deploy/setup.sh first" >&2
     exit 1
@@ -168,7 +177,16 @@ load_env() {
     export "$key=$value"
   done <"$ENV"
 }
-if [ "$cmd" != pause ] && [ -f "$ENV" ]; then load_env; fi
+# pause never reads it. down needs nothing pmos-admin reads from it (Compose reads the file
+# itself), so a deploy/.env the caller can't read is skipped here and `down` prints the manual
+# advice below when Compose can't read it either, instead of dying on the redirect.
+if [ "$cmd" != pause ] && [ -f "$ENV" ]; then
+  if [ "$cmd" != down ] || [ -r "$ENV" ]; then
+    load_env
+  else
+    say "WARNING: deploy/.env can't be read by this account; pmos-admin down goes on without it." >&2
+  fi
+fi
 row() { printf '  %-12s %-6s %s\n' "$1" "$2" "$3"; }
 
 # The console's sign-in settings. The console checks them too; this says so before anything
@@ -597,8 +615,18 @@ ENV_LOCK_HELD=0
 lock_env() {
   [ "$ENV_LOCK_HELD" = 0 ] || return 0
   if command -v flock >/dev/null; then
-    (umask 077 && : >>"$DEPLOY/.env.lock")
-    exec 9>>"$DEPLOY/.env.lock"
+    # Opened read-only where it exists: flock needs no write access, and a lock file made by
+    # root (after a `sudo deploy/setup.sh`) must not stop the operator. Created only if missing.
+    if [ ! -e "$DEPLOY/.env.lock" ]; then
+      (umask 077 && : >>"$DEPLOY/.env.lock") 2>/dev/null || {
+        say "couldn't create $DEPLOY/.env.lock (the lock for deploy/.env): check who owns deploy/" >&2
+        exit 1
+      }
+    fi
+    exec 9<"$DEPLOY/.env.lock" 2>/dev/null || {
+      say "couldn't open $DEPLOY/.env.lock for reading (the lock for deploy/.env): check its owner and mode" >&2
+      exit 1
+    }
     flock -w 60 9 || {
       say "another pmos-admin or setup.sh has been changing deploy/.env for a minute ($DEPLOY/.env.lock): try again" >&2
       exit 1
@@ -840,7 +868,15 @@ provider_upsert() { # name type variable
 cmd=${1:-help}
 shift || true
 # pause never reads deploy/.env (above); help runs nothing. down only warns (env_problem).
-case "$cmd" in pause | help | -h | --help) ;; *) uid_checks; port_checks ;; esac
+case "$cmd" in pause | help | -h | --help) ;; *)
+  # The uid check is for commands that start a container as PMOS_UID:PMOS_GID. These don't
+  # (they talk to the running stack, or only stop or read it), so a PMOS_UID=0 left by an older
+  # install must not stop `revoke` in the middle of an incident. Every other command, anything
+  # that can create or recreate a container, keeps the check (`up` refuses).
+  case "$cmd" in status | logs | backup | reindex | revoke) ;; *) uid_checks ;; esac
+  port_checks
+  ;;
+esac
 case "$cmd" in
   build)
     # The proxy settings by name only: Docker takes each value from this environment, so a proxy
@@ -885,8 +921,7 @@ case "$cmd" in
   down)
     compose "${ALL_PROFILES[@]}" down || {
       say "docker compose couldn't stop the stack (it may not be able to read deploy/.env either)." >&2
-      say "Stop PM OS's containers directly (data is kept):" >&2
-      say "  docker ps -q --filter label=com.docker.compose.project=pmos | xargs -r docker stop" >&2
+      down_advice
       exit 1
     }
     ;;

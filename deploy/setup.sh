@@ -67,7 +67,8 @@ docker compose version >/dev/null 2>&1 || fail "docker compose (v2) is not insta
 ok "docker $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo '(daemon not reachable)')"
 command -v openssl >/dev/null || fail "openssl is not installed"
 command -v git >/dev/null || fail "git is not installed"
-ok "openssl and git"
+command -v flock >/dev/null || fail "flock is not installed (util-linux: sudo apt-get install util-linux); deploy/.env is changed only under its lock"
+ok "openssl, git and flock"
 if docker info 2>/dev/null | grep -qi nvidia; then
   ok "NVIDIA container runtime"
 else
@@ -104,8 +105,11 @@ echo "== deploy/.env"
 # Under the same lock as pmos-admin (deploy/.env.lock with flock; where flock isn't installed,
 # nothing is changed), so the two never change it at once.
 if command -v flock >/dev/null; then
-  (umask 077 && : >>"$DEPLOY/.env.lock")
-  exec 9>>"$DEPLOY/.env.lock"
+  # Read-only where it exists (a lock file made by root must not stop another account's run).
+  if [ ! -e "$DEPLOY/.env.lock" ]; then
+    (umask 077 && : >>"$DEPLOY/.env.lock") 2>/dev/null || fail "couldn't create $DEPLOY/.env.lock (the lock for deploy/.env): check who owns deploy/"
+  fi
+  exec 9<"$DEPLOY/.env.lock" 2>/dev/null || fail "couldn't open $DEPLOY/.env.lock for reading (the lock for deploy/.env): check its owner and mode"
   flock -w 60 9 || fail "another setup.sh or pmos-admin has been changing deploy/.env for a minute: try again"
 else
   fail "flock (util-linux) isn't installed: install it and run this again. deploy/.env is changed only under its lock."
