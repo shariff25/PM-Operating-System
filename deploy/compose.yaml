@@ -23,6 +23,7 @@ x-service: &service
   stop_grace_period: 30s
   init: true
   networks: [pmos]
+  # The content checkout's owner; never root (pmos-admin and setup.sh refuse a uid or gid of 0).
   user: "${PMOS_UID:-10001}:${PMOS_GID:-10001}"
   logging:
     driver: json-file
@@ -348,7 +349,8 @@ services:
     restart: unless-stopped
     # As the checkout's owner, like the services, not the image's own `sandbox` (10100), which
     # is for OpenShell: 10100 can read a checkout only where every file is world-readable, and
-    # a checkout made with umask 077 (mode 0700) isn't. The worker writes only under /tmp.
+    # a checkout made with umask 077 (mode 0700) isn't. The worker writes only under /tmp. Never
+    # root: pmos-admin and setup.sh refuse a PMOS_UID or PMOS_GID of 0 (a root-owned checkout).
     user: "${PMOS_UID:-10001}:${PMOS_GID:-10001}"
     networks: [pmos]
     environment:

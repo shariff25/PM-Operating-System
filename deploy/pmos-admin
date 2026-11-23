@@ -48,11 +48,30 @@ ENV="$DEPLOY/.env"
 say() { printf '%s\n' "$*"; }
 cmd=${1:-help}
 
+# What is removed however the script stops (an error, Ctrl-C, a kill; the review of eb49991):
+# a new deploy/.env not yet renamed into place (set_env), the mkdir lock (lock_env) and the
+# eval stack (eval_stack_up). A signal becomes an exit, so the EXIT trap runs for it too.
+ENV_TMP=""
+ENV_LOCK_DIR=""
+EVAL_STACK_UP=0
+cleanup() {
+  [ -z "$ENV_TMP" ] || rm -f -- "$ENV_TMP"
+  [ -z "$ENV_LOCK_DIR" ] || rmdir -- "$ENV_LOCK_DIR" 2>/dev/null || true
+  [ "$EVAL_STACK_UP" = 0 ] || eval_stack_down
+  return 0
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 # `pause` and `down` are how an incident is stopped (docs/runbooks/incidents.md), so a
 # deploy/.env that can't be parsed, or that fails the checks below, warns loudly instead of
 # blocking them (the security review of 6bb806f, S3). `pause` needs nothing from the file (the
-# bot's name, this user's systemd and openshell); `down` needs only what Docker Compose reads
-# from it itself. Every other command stops.
+# bot's name, this user's systemd and openshell), so it never reads it: only its mode and owner
+# are looked at (stat, which needs no read access), and a deploy/.env the caller can't read
+# (root's, 0600, after a `sudo deploy/setup.sh`) doesn't stop it (the review of eb49991, T2).
+# `down` needs only what Docker Compose reads from it itself. Every other command stops.
 ENV_LENIENT=0
 case "$cmd" in pause | down) ENV_LENIENT=1 ;; esac
 env_problem() { # message: stop (exit 2), or for pause and down, warn and go on
@@ -113,8 +132,8 @@ env_file_checks
 # an unquoted value ends at ` #`, as Docker Compose reads the same file. Nothing is expanded, so a
 # value is written out in full (`k2:<base64>`, never `k2:$(openssl …)`). Only the settings this
 # script reads are exported (PMOS_*, HF_TOKEN and the proxy settings); Compose reads the whole
-# file itself through --env-file. Any other kind of line stops the script (pause and down warn,
-# skip the line and go on: env_problem above).
+# file itself through --env-file. Any other kind of line stops the script (down warns, skips the
+# line and goes on: env_problem above; pause doesn't read the file).
 load_env() {
   local line key value n=0
   while IFS= read -r line || [ -n "$line" ]; do
@@ -142,7 +161,7 @@ load_env() {
     export "$key=$value"
   done <"$ENV"
 }
-[ ! -f "$ENV" ] || load_env
+if [ "$cmd" != pause ] && [ -f "$ENV" ]; then load_env; fi
 row() { printf '  %-12s %-6s %s\n' "$1" "$2" "$3"; }
 
 # The console's sign-in settings. The console checks them too; this says so before anything
@@ -446,7 +465,7 @@ eval_stack_up() { # checkout
   for v in SERVICE_TOKEN BOT_TOKEN RT_EVALS RT_CONSOLE RT_DOCS RT_PERSONAL; do
     export "PMOS_EVAL_$v=$(openssl rand -hex 24)"
   done
-  trap eval_stack_down EXIT
+  EVAL_STACK_UP=1 # removed by cleanup (the EXIT trap at the top), however the script stops
   evals_compose up -d --wait toolserver bots worker-docs worker-personal >/dev/null
 }
 eval_stack_down() {
@@ -463,11 +482,13 @@ ENV_KEY_CHARS=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_
 # shell or Compose gives a meaning to (no `$`, quote, backslash, space, `#`, `~` or newline).
 ENV_VALUE_CHARS='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.,:=/+-'
 
-# Changes to deploy/.env (the security review of 6bb806f) are made under a lock
-# (deploy/.env.lock, with flock when it is installed), so two commands that change it at once
-# can't lose one change, and atomically: the new file is written beside it (mktemp: mode 0600),
-# given the old file's owner and ACL (the eval runner's read ACL, docs/runbooks/upgrade.md),
-# then renamed over it, so no reader ever sees half a file. deploy/setup.sh does the same.
+# Changes to deploy/.env (the security review of 6bb806f) are made under a lock, so two
+# commands that change it at once can't lose one change, and atomically: the new file is
+# written beside it (mktemp: mode 0600), given the old file's owner and ACL (the eval runner's
+# read ACL, docs/runbooks/upgrade.md), then renamed over it, so no reader ever sees half a file.
+# deploy/setup.sh does the same. The lock is flock on deploy/.env.lock; where flock isn't
+# installed, the directory deploy/.env.lock.d (mkdir either makes it or fails, atomically),
+# removed by cleanup when the script ends (the review of eb49991: there was no lock at all).
 ENV_LOCK_HELD=0
 lock_env() {
   [ "$ENV_LOCK_HELD" = 0 ] || return 0
@@ -479,7 +500,17 @@ lock_env() {
       exit 1
     }
   else
-    say "note: flock isn't installed, so deploy/.env is changed without a lock" >&2
+    local waited=0
+    until mkdir -- "$DEPLOY/.env.lock.d" 2>/dev/null; do
+      if [ "$waited" -ge 60 ]; then
+        say "another pmos-admin or setup.sh has been changing deploy/.env for a minute ($DEPLOY/.env.lock.d; flock isn't installed)." >&2
+        say "If none is running (one was killed), remove that directory and try again: rmdir $DEPLOY/.env.lock.d" >&2
+        exit 1
+      fi
+      sleep 1
+      waited=$((waited + 1))
+    done
+    ENV_LOCK_DIR="$DEPLOY/.env.lock.d"
   fi
   ENV_LOCK_HELD=1
 }
@@ -506,19 +537,44 @@ set_env() {
   fi
   lock_env
   tmp=$(mktemp "$DEPLOY/.env.XXXXXX")
+  ENV_TMP=$tmp
+  # The value reaches awk through its environment, never its command line (`-v`), where every
+  # account on this machine can read it in /proc/<pid>/cmdline while awk runs (the review of
+  # eb49991, T1: add-bot passes every bot's tokens here); printf is a builtin. ENVIRON also takes
+  # the value literally, where -v would expand backslash escapes in it.
   if {
     if grep -qE "^$1=" "$ENV"; then
-      awk -v k="$1" -v v="$2" -F= 'BEGIN{OFS="="} $1==k{print k, v; next} {print}' "$ENV" >"$tmp"
+      ENV_SET_VALUE=$2 awk -v k="$1" -F= 'BEGIN{OFS="="} $1==k{print k, ENVIRON["ENV_SET_VALUE"]; next} {print}' "$ENV" >"$tmp"
     else
       cat "$ENV" >"$tmp" && printf '%s=%s\n' "$1" "$2" >>"$tmp"
     fi
   }; then
     replace_env "$tmp"
+    ENV_TMP=""
   else
     rm -f "$tmp"
+    ENV_TMP=""
     say "couldn't write deploy/.env; it is unchanged" >&2
     exit 1
   fi
+}
+
+# The services, the bots' bring-up and eval workers and every one-off container run as
+# PMOS_UID:PMOS_GID (deploy/compose.yaml, deploy/compose.evals.yaml, pmos_cli, eval_stack_up),
+# which setup.sh takes from the content checkout's owner. A root-owned checkout made that root,
+# so the eval gate's workers ran as root on a pull request's content (the review of eb49991,
+# T3): uid or gid 0, or anything but a number, is refused. Blank means the images' default.
+uid_checks() {
+  local k v
+  for k in PMOS_UID PMOS_GID; do
+    v=${!k:-}
+    [ -n "$v" ] || continue
+    if ! only_chars "$v" 0123456789 || [ ${#v} -gt 10 ]; then
+      env_problem "$k=$(printf '%q' "$v") in deploy/.env isn't a number: set it to the content checkout's owner (stat -c '%u:%g' <checkout>)"
+    elif [ $((10#$v)) = 0 ]; then
+      env_problem "$k=$v in deploy/.env: the services and the bots' workers would run as root (or root's group). Give the content checkout and the state directory to a service account and set its ids, e.g. sudo useradd --system --no-create-home --shell /usr/sbin/nologin pmos; sudo chown -R pmos:pmos \"\$PMOS_CONTENT_CHECKOUT\" \"\$PMOS_STATE_DIR\"; then PMOS_UID=\$(id -u pmos) and PMOS_GID=\$(id -g pmos) in deploy/.env (docs/runbooks/install.md)"
+    fi
+  done
 }
 
 # --- Bots: names, tokens, sandboxes and their workers ---------------------------------------
@@ -646,6 +702,8 @@ provider_upsert() { # name type variable
 
 cmd=${1:-help}
 shift || true
+# pause never reads deploy/.env (above); help runs nothing. down only warns (env_problem).
+case "$cmd" in pause | help | -h | --help) ;; *) uid_checks ;; esac
 case "$cmd" in
   build)
     # The proxy settings by name only: Docker takes each value from this environment, so a proxy
@@ -1041,27 +1099,31 @@ for g in s["groups"]:
     [ $# -eq 1 ] || { say "usage: pmos-admin pause <bot>" >&2; exit 2; }
     bot=$1
     require_bot_name pause "$bot"
+    if command -v systemd-escape >/dev/null; then
+      unit=$(worker_unit "$bot")
+    else
+      unit="pmos-worker@<systemd-escape -- $bot>.service"
+    fi
     if [ "$(id -u)" = 0 ]; then
       say "run pause as the user whose OpenShell gateway runs, not as root or with sudo: root's systemctl --user" >&2
       say "and openshell aren't that user's, so the worker unit would stay enabled and start the worker again." >&2
       say "As that user: deploy/pmos-admin pause $bot" >&2
-      say "or by hand: systemctl --user disable --now 'pmos-worker@<systemd-escape -- $bot>.service'; openshell sandbox stop -n pmos-$bot" >&2
+      say "or by hand: systemctl --user disable --now '$unit'; openshell sandbox stop -n pmos-$bot" >&2
       exit 1
     fi
     left=()
     if ! command -v systemctl >/dev/null || ! command -v systemd-escape >/dev/null; then
       left+=("systemctl or systemd-escape isn't installed, so no worker unit was stopped: if pmos-$bot's worker runs, stop it (pgrep -af 'openshell sandbox exec -n pmos-$bot')")
+    elif systemctl --user disable --now "$unit"; then
+      # Tried whether or not the template is under this caller's XDG_CONFIG_HOME: the user's
+      # systemd may have it from another directory (the review of eb49991).
+      say "worker unit $unit stopped and disabled"
+    elif [ ! -f "$(user_unit_dir)/pmos-worker@.service" ]; then
+      say "couldn't stop and disable $unit, and no worker unit is installed for $(id -un) ($(user_unit_dir)/pmos-worker@.service is missing); stopping the sandbox anyway" >&2
+      left+=("no worker unit was found for $(id -un): if pmos-$bot's worker was started another way (with & before slice H0, or as another user), find and stop it: pgrep -af 'openshell sandbox exec -n pmos-$bot'")
     else
-      unit=$(worker_unit "$bot")
-      if [ ! -f "$(user_unit_dir)/pmos-worker@.service" ]; then
-        say "no worker unit is installed for $(id -un) ($(user_unit_dir)/pmos-worker@.service is missing)" >&2
-        left+=("no worker unit was found for $(id -un): if pmos-$bot's worker was started another way (with & before slice H0, or as another user), find and stop it: pgrep -af 'openshell sandbox exec -n pmos-$bot'")
-      elif systemctl --user disable --now "$unit"; then
-        say "worker unit $unit stopped and disabled"
-      else
-        say "couldn't stop and disable $unit; stopping the sandbox anyway" >&2
-        left+=("the worker unit $unit may still be enabled or running: systemctl --user status '$unit', then systemctl --user disable --now '$unit'")
-      fi
+      say "couldn't stop and disable $unit; stopping the sandbox anyway" >&2
+      left+=("the worker unit $unit may still be enabled or running: systemctl --user status '$unit', then systemctl --user disable --now '$unit'")
     fi
     if ! command -v openshell >/dev/null; then
       left+=("openshell isn't on PATH, so the sandbox pmos-$bot was NOT stopped: openshell sandbox stop -n pmos-$bot (or openshell sandbox delete pmos-$bot)")
