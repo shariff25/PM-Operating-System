@@ -70,28 +70,64 @@ it can be deleted.
 - **A client's share of one person** (`clients.<name>.per-user-share`, finding G3 of the review
   at 6bb806f): a trusted client that may name anyone (`user: any`: a team bot such as
   `bot-docs`, or the runtime) holds at most this many of one person's `per-user` running slots,
-  **1 by default**; a `from-name` client (the PM's own bot) may hold all of them. The share is
-  1 to `per-user` (1 to `per-user - 1` for a `user: any` client when a `from-name` client is
-  listed, below), and only for a trusted client. The test stack's configs raise it for their
-  shared `runtime` and `worker` tokens (below).
-- **A person's own bot's slot** (finding U1 of the review at c78b5fb): when `clients:` lists a
-  `user: from-name` client, the trusted `user: any` clients (the runtime and every team bot)
-  hold at most `per-user - 1` of one person's running slots **together**
-  (`Models::shared_person_cap`), so the last of them is only ever taken by that person's own
-  bot. What is guaranteed: a call from a PM's own bot for that PM never waits on the runtime's
-  or a team bot's calls for them; it starts as soon as the PM has fewer than `per-user` calls
-  running and a GPU slot (`max-in-flight`) and its own client's cap allow. It can still wait
-  behind its own bot's other calls, and behind other people's calls when every GPU slot is
-  taken. Before, each client's share counted on its own, so two `user: any` clients (the
-  runtime and `bot-docs`, or two team bots), each within its share of 1, held both of a PM's
-  2 slots between them and the PM's own bot waited; the earlier claim here that the own bot
-  "always finds a slot" was not true. A config that lists a `from-name` client needs
-  `per-user` of at least 2, and is refused at start-up otherwise, as is a `user: any` client's
-  `per-user-share` above `per-user - 1`. A config with no `from-name` client (the test
-  stack's) keeps no slot back: its `user: any` clients may hold all of `per-user` together.
-  Tested in `scheduler.rs`,
-  `clients_that_may_name_anyone_together_leave_a_pm_their_own_bots_slot`, and with the shipped
-  config in `limits.rs`, `two_shared_clients_cant_fill_a_pms_slots_and_her_own_bot_still_runs`.
+  **1 by default**, and never more than its person pool's slots (below). A `from-name` client
+  (the PM's own bot) may hold all of `per-user` without `person-pools:`, and what the pools
+  leave with it. Only for a trusted client. The test stack's configs raise it for their shared
+  `runtime` and `worker` tokens (below).
+- **A person's slots** (person pools; finding W1 of the review at 52dbae2, after U1 of the
+  review at c78b5fb): every trusted `user: any` client (the runtime, every team bot) is in a
+  **person pool**, and a pool's clients together hold at most the pool's slots of one
+  person's `per-user`. `person-pools:` names the pools and their slots; each such client says
+  its pool with `clients.<…>.person-pool`. What the pools leave of `per-user` is the PM's own
+  bot's (`from-name`): its share defaults to that and may not be more, so every pool's slots
+  and the own bot's are each really kept for them. `deploy/gateway.yaml` and
+  `config/gateway.yaml` (`per-user: 3`):
+
+  ```yaml
+  person-pools: {runtime: 1, team-bots: 1}   # and 3 - 1 - 1 = 1 for the PM's own bot
+  clients:
+    runtime: {trusted: true, max-in-flight: 2, person-pool: runtime}
+    bot-pm-*: {trusted: true, max-in-flight: 3, user: from-name}
+    bot-*: {trusted: true, max-in-flight: 3, person-pool: team-bots}
+  ```
+
+  **What is guaranteed**, for each PM: the runtime's call for them never waits on a team bot's
+  calls for them, nor on their own bot's; a team bot's call never waits on the runtime's or
+  their own bot's; their own bot's call never waits on the runtime's or any team bot's. Each
+  starts as soon as its own slot for that PM is free, a GPU slot (`max-in-flight`) is free,
+  and its client is under its own cap. It can still wait behind calls of its own kind for that
+  PM (the runtime's second call for a PM waits for the first, U2; one team bot's call waits
+  for another team bot's), and behind other people's calls when every GPU slot is taken. No
+  PM ever has more than `per-user` (3) calls running, from all clients together. **Capacity:
+  one PM can now hold 3 of the 4 model slots at once** (before W1, 2 of 4): the runtime's, the
+  team bots' and their own bot's. This follows the reviewer's recommendation; the owner is to
+  be told. Before W1 (U1), the runtime shared one slot with every team bot, so a team bot's
+  token, a stolen one included, that kept that slot busy for chosen PMs made their routine
+  parsing wait `queue-wait-secs` and get `503`. Tested in `scheduler.rs`,
+  `team_bots_saturated_the_runtime_still_starts`,
+  `runtime_and_team_bots_saturated_her_own_bot_still_starts` and
+  `one_person_never_holds_more_than_per_user`, and with the shipped config in `limits.rs`,
+  `team_bots_cant_hold_up_the_runtime_and_neither_holds_up_her_own_bot`.
+
+  **Checked at start-up** (`limits.rs`, `person_pools_are_checked_at_start_up`): a pool of 0
+  slots, a pool no client is in, a `person-pool` that isn't listed, a `person-pool` on a
+  client that isn't trusted or is `from-name`, a trusted `user: any` client in no pool when
+  `person-pools:` is given, a share above its pool's slots (or, for a `from-name` client,
+  above what the pools leave), and pools whose slots, plus one for the PM's own bot when a
+  `from-name` client is listed, are more than `per-user`: each refuses to start.
+
+  **Without `person-pools:`** (the test stack's configs, and any config written before W1)
+  nothing changes: every trusted `user: any` client is in one pool (`user-any`) of `per-user`
+  slots, or `per-user - 1` when a `from-name` client is listed (U1: the last is kept for the
+  PM's own bot, which may hold all of `per-user`; such a config needs `per-user` of at least 2).
+
+  **The reserve applies to everyone** (the Low on U1's shared cap): the gateway doesn't know
+  which people have an own bot, so once a `from-name` client is listed, the own bot's slot is
+  kept back for every person, including one with no personal bot (an Admin, or a PM who
+  hasn't picked one). For such a person, at most the pools' slots (2 of `per-user` 3 in
+  `deploy/gateway.yaml`) are ever used: one through the runtime and one through the team bots.
+  This is deliberate (a slot kept for no one costs nothing while others' calls can use the GPU
+  slot), and it never lets anyone hold more.
 - **Per client:** each client token has its own cap, `clients.<name>.max-in-flight` (default
   `limits.per-client`, itself defaulting to `per-user`), whoever its calls name. So one token
   can't hold every slot (review finding N3); in `deploy/gateway.yaml` the `evals` token, which
@@ -166,16 +202,17 @@ it can be deleted.
 - **`deploy/gateway.yaml`** trusts `runtime` (it names the PM its caller verified; cap 2),
   `bot-pm-*` with `user: from-name` (each PM's own bot's worker; cap 3 of 4) and `bot-*` (a
   team bot's worker, such as `bot-docs`, naming the PM whose task it runs; cap 3 of 4), and
-  caps `evals` at 1, `personal`. `runtime` and `bot-*` keep the default `per-user-share` of 1,
-  and together hold at most 1 of a PM's 2 running slots (U1, above); `bot-pm-*` may hold
-  both. **The runtime runs one call per PM at a time** (finding U2 of the review at c78b5fb):
-  a PM's second routine (or a routine beside a team bot's call for them) waits for the shared
-  slot, up to `queue-wait-secs` (300 s), and then gets `503` with `Retry-After: 5`. A share of
-  2 for the runtime would need `per-user` 3 (a PM could then hold 3 of the 4 GPU slots), a
-  capacity decision this config does not make. **Known residual (S8):** a team bot's token
-  can still name any PM, since it serves them all; it holds at most 3 slots, one of any one
-  PM's, and 6 waiting places. The test stack (`scripts/claude-test-stack.sh`)
-  gives all its workers one `worker` token, trusted to name anyone, as before, with
+  caps `evals` at 1, `personal`. A PM has 3 running slots (`per-user: 3`): one in the
+  runtime's pool, one in the team bots' pool, one for their own bot (W1, above). An unlisted
+  client holds at most 2 (`per-client: 2`, as before `per-user` went to 3), and a PM may have
+  4 calls waiting through each client (`per-user-queue: 4`, unchanged). **The runtime runs one
+  call per PM at a time** (finding U2 of the review at c78b5fb): a PM's second routine waits
+  for the first, up to `queue-wait-secs` (300 s), and then gets `503` with `Retry-After: 5`;
+  since W1 a team bot's call for them no longer takes that slot. **Known residual (S8):** a
+  team bot's token can still name any PM, since it serves them all; it holds at most 3 slots,
+  one of any one PM's (the team bots' one), and 6 waiting places. The test stack
+  (`scripts/claude-test-stack.sh`) writes no `person-pools:`, so it behaves as before W1: it
+  gives all its workers one `worker` token, trusted to name anyone, with
   `per-user-share` equal to `per-user` for `worker` and `runtime` (in the config it writes for
   another provider and in `config/gateway.claude-test.yaml`): its eval mode runs every attempt
   as the one user `evals`, one call per lane, so with 4 lanes (`per-user` 4) the 4 lanes still
@@ -189,7 +226,12 @@ it can be deleted.
   seconds (`Timeouts::ready_cache`, `READY_CACHE`), so a flood of unauthenticated requests
   sends at most one round of probes to the upstreams every 5 seconds (the Low on
   unauthenticated probes, review at c78b5fb); callers that arrive while a probe runs wait for
-  it. `running` and `waiting` are read afresh on every request. A model server that goes down
+  it. The probe runs in a task of its own (the Low on `/readyz`, review at 52dbae2), so a
+  caller that hangs up mid-probe doesn't cancel it: it completes and fills the cache anyway.
+  Before, it ran in the caller's request, so a client that connected and hung up over and
+  over kept the cache empty and a round of probes in flight (tested in `gateway.rs`,
+  `a_caller_that_hangs_up_mid_probe_still_fills_the_readiness_cache`). `running` and
+  `waiting` are read afresh on every request. A model server that goes down
   therefore shows as `down` up to 5 seconds late (plus the probe's own timeout). Tested in
   `gateway.rs`, `readiness_reuses_its_probe_for_a_while`; every shipped config's role-and-label
   answer, stub off, in `limits.rs`, `readiness_of_every_shipped_config_reports_roles_by_label`.
@@ -214,7 +256,8 @@ moment. The gateway retries these itself, so a brief limit doesn't lose a PM's r
   a wait that would pass it is not started, so a `Retry-After` longer than the time left
   gives up at once) and `PMOS_GATEWAY_RETRY_BASE_MS` (default `1000`).
 - **Giving up:** the caller gets the upstream's last status, body and `Retry-After`, exactly
-  as it would have without retries.
+  as it would have without retries; for a labelled role, the same status and `Retry-After`
+  with a neutral body ("Hiding the model behind a label", below).
 - **Quotas that won't recover:** if the error body says so, it fails at once with the same
   error. Detected: OpenAI's `insufficient_quota` and `billing_not_active`, and any body naming
   a per-day or daily quota (Gemini's `...PerDay...` quota ids). Anything unclear is left to
@@ -258,7 +301,7 @@ moment. The gateway retries these itself, so a brief limit doesn't lose a PM's r
 | `POST /v1/embeddings` | client token | Embeddings for a role that serves them |
 | `GET /v1/models` | client token | The role aliases |
 | `GET /v1/pmos/workarounds` | client token | The workaround registry |
-| `GET /v1/pmos/roles` | client token | The gateway's `class` (`production` or `test`), each role's model id (its `label` when it has one) and upstream kind (`local`, `claude-test` or `remote-test`; never an address), and whether the stub, a testing-only upstream and the workarounds are on. The bot runtime passes it to the benchmark runner (`GET /v1/personas`, client `evals`), which records it in each report (`docs/evals.md`). |
+| `GET /v1/pmos/roles` | client token | The gateway's `class` (`production` or `test`), each role's model id (its `label` when it has one, with `model_sha256` beside it) and upstream kind (`local`, `claude-test` or `remote-test`; never an address), and whether the stub, a testing-only upstream and the workarounds are on. The bot runtime passes it to the benchmark runner (`GET /v1/personas`, client `evals`), which records it in each report (`docs/evals.md`). |
 | `GET /healthz` | none | Liveness |
 | `GET /readyz` | none | `200` when every model server answers `/models` within 2 seconds; `503` when one doesn't. `upstreams` is keyed by role, each with its upstream's kind label (`local`, `claude-test`, `remote-test`, as in `GET /v1/pmos/roles`) and `ok` or `down`: `{"default": {"upstream": "local", "status": "ok"}, …}`. Labels only, never an address, host name, URL or key (review at 6bb806f: before, the keys were the model servers' base URLs, so this unauthenticated route named their hosts and a remote test upstream's provider). Every answer also has `class` (as served: `test` with the stub on) and `stub` (G2); with the stub on it is always `200`, has no `upstreams`, and asks no model server. `deploy/pmos-admin status` shows a `WARN` line for the gateway when `stub` is true or `class` isn't `production`. Docker's health check uses `/healthz`, so neither changes whether the stack starts. |
 
@@ -269,7 +312,7 @@ moment. The gateway retries these itself, so a brief limit doesn't lose a PM's r
 - each response carries `X-Pmos-Model`, the model that answered, and (for model-server
   calls) `X-Pmos-Upstream-Attempts`.
 
-**Errors:** in OpenAI's shape. A model server's own refusal, such as "context length exceeded", is passed through; an unreachable server is `502`.
+**Errors:** in the usual chat-completions error shape. A model server's own refusal, such as "context length exceeded", is passed through for a role without a label; for a labelled role it is replaced by a neutral one (below). An unreachable server is `502`.
 
 ## Hiding the model behind a label
 A role may carry `label:` (1 to 64 letters, digits, `.`, `_` and `-`), so that nothing the
@@ -283,31 +326,72 @@ roles:
 
 With a label set:
 - **`model` still goes upstream:** the model server is asked for its real id.
-- **Clients see the label:** `GET /v1/pmos/roles` reports it as the role's `model` (so the
-  benchmark runner records only the label in `gateway_models`), and so do the `x-pmos-model`
-  header, the `model` field of a whole answer, and the `model` of every event of a streamed
-  one (rewritten line by line).
+- **Clients see the label:** `GET /v1/pmos/roles` reports it as the role's `model`, and so do
+  the `x-pmos-model` header, the `model` field of a whole answer, and the `model` of every
+  event of a streamed one (rewritten line by line).
+- **Nothing else of the upstream's own** (the label hardening of the review at 52dbae2): an
+  upstream may add fields that name the model or the provider (`system_fingerprint`,
+  `provider`). For a labelled role, a whole answer and each streamed event keep only the
+  fields a client reads (`id`, `object`, `created`, `model`, `choices`, `usage`, `data`;
+  `LABELLED_FIELDS` in `app.rs`); an `error` inside a streamed event becomes
+  `{"type": "upstream_error", "message": "the model server reported an error mid-answer"}`.
+  In a stream, `data: [DONE]`, blank lines and `event:`, `id:` and `retry:` lines pass as they
+  came; a comment keeps only its `:` (still a keep-alive, without its text); a `data:` line
+  that doesn't parse as a JSON object, a line of no known kind, and an unterminated last line
+  that doesn't parse are dropped. Tested with a mock upstream in `labels.rs`,
+  `a_labelled_roles_answers_carry_nothing_of_the_upstreams_own`.
+- **Errors name nothing** (the spec's point V3, built for labelled roles only): an upstream's
+  non-2xx answer (after the gateway's retries, or one not retried) reaches the caller with the
+  same status and `Retry-After`, and in place of the upstream's body:
+
+  ```json
+  {"error": {"type": "rate_limit", "status": 429, "message": "the model server answered 429 (rate_limit)"}}
+  ```
+
+  `type` is coarse: `rate_limit` (`429`), `quota_exhausted` (`429` whose body says the quota
+  won't come back soon, as the retry rules detect it), `overloaded` (`503`, `529`), `auth`
+  (`401`, `403`), `bad_request` (`400`, `404`, `405`, `409`, `413`, `415`, `422`), else
+  `upstream_error`. The callers keep what they act on: the harness worker and the runtime key
+  on the status alone ("The model is busy" for `429`/`503`, `harness/src/worker.ts`;
+  `crates/bots` treats any non-2xx as unavailable), and the gateway's own retry still reads
+  the upstream's real body before it is replaced, so quota errors are retried, or not, as
+  before. What a labelled role's caller loses: the upstream's own explanation of a `400`
+  ("context length exceeded"). Every testing-only upstream's errors are replaced the same way for
+  a labelled role. A role without a label is unchanged. Tested in `labels.rs`,
+  `a_labelled_roles_errors_name_nothing_but_keep_what_callers_act_on`, and `app.rs`.
+- **The hash of the model id** (`model_sha256`): for a labelled role, `GET /v1/pmos/roles`
+  adds the lowercase hex SHA-256 of its real model id, the start-up line for the role logs
+  it, and so does every usage line (`model_sha256`, beside the label in `model`), so an
+  auditor can tell which model served a past call by hashing the ids the config has held. A
+  role without a label has none (its `model` is its id). The hash names nothing by itself,
+  but a short model id from a known list of ids can be found by hashing each one; the
+  reviewer judged that acceptable ("it reveals nothing" beyond what such a list already says).
 - **The logs name the label and the upstream's kind:** the usage log's `model` is the label and
   its `upstream` is the kind (`local`, `claude-test`, `remote-test`) instead of the host; the
   start-up line for the role, the remote-upstream warning, and the retry and "unreachable"
   warnings name the kind instead of the URL.
 - **`GET /readyz`** is unchanged: it never named a model or a host.
-- **Benchmarks compare labels:** for a labelled role in the production gateway config, the
-  production role models (`docs/evals.md`) read its `label`, since that is what reports
-  record. A label names one model: give the role a new label when its model changes, or reports
-  from before and after the swap look alike (a change to `deploy/gateway.yaml` still marks
-  every category affected).
+- **Benchmarks compare the label and the hash:** the benchmark runner records each role's
+  label and, for a labelled role, its `model_sha256` in a report's `gateway_models`. For a
+  labelled role in the production gateway config, the production role models (`docs/evals.md`)
+  are its `label` and the SHA-256 of its `model`, and a run counts only when both match, so a
+  model swapped behind an unchanged label restarts the streak rather than keeping old runs
+  counting. A report written before the gateway reported the hash (2026-11-23) records the
+  label only: it **never matches a labelled production role** (it says "no model hash
+  recorded"), still parses, and still matches a production role without a label (which has no
+  hash either), as before. A new label for a new model is still good practice.
 
 Without a label nothing changes: the model id is reported and logged as before.
 
 What a label doesn't hide: the gateway's config file itself (the model id and the upstream URL
-are in it), the environment the gateway or the test stack runs with, and an error body a model
-server returns (passed to the caller as it came, and it may name the model).
+are in it), the environment the gateway or the test stack runs with, and anything inside the
+fields a client reads (an answer's text, a tool call, `usage`) should the model itself write it
+there.
 
 ## Usage log
 One event per call:
 - client, user, run, role, model, upstream host (for a role with a `label:`, the label and
-  the upstream's kind instead);
+  the upstream's kind instead, and `model_sha256`, the hash of its real model id);
 - priority, stream or not, status;
 - queue and total time, token counts, workarounds applied;
 - `attempt` and `attempts`: every try at the model server gets a line, with `retrying: true`
@@ -358,17 +442,20 @@ bound every client, wait, stream and answer):
 | `limits.stream-max-secs` | `900` | Longest streamed answer, first byte to last (1 to 7200) |
 | `limits.max-answer-bytes` | `16777216` | Largest answer taken from a model server (1 KiB to 256 MiB) |
 | `limits.per-user-queue` | twice `per-user` | Calls one believed person may have waiting |
+| `person-pools` | none | Pool name to how many of one person's `per-user` running slots the pool's clients hold together (W1). Given, every trusted `user: any` client names its pool, and the pools' slots plus one for a PM's own bot (with a `from-name` client listed) must fit in `per-user`. Not given: one pool (`user-any`) of `per-user`, less one with a `from-name` client listed (U1) |
 | `class` | `test` | `production` only in `deploy/gateway.yaml`: reported in `GET /v1/pmos/roles`, and only such a gateway's eval reports count. A `production` config refuses testing-only upstreams, `local-hosts` and any model server not named `<name>.pmos.internal` at start-up. With `PMOS_GATEWAY_STUB=1` it starts, logs a warning, and reports class `test` (with `stub: true`), so a stub run never counts (below). |
 | `clients.<name or prefix*>.trusted` | `false` | Believe `X-Pmos-User` and `X-Pmos-Priority` |
 | `clients.<…>.max-in-flight` | `limits.per-client` | This client's cap |
 | `clients.<…>.max-queue` | twice its `max-in-flight` | Calls this client may have waiting |
 | `clients.<…>.user` | `any` | `from-name` (a pattern, trusted only): it may name only the person its name spells |
-| `clients.<…>.per-user-share` | `1` for a trusted `user: any` client, else `per-user` | How many of one person's `per-user` running slots this client may hold (1 to `per-user`; trusted only). With a `from-name` client listed, the `user: any` clients hold at most `per-user - 1` of them together, and each one's share is at most that (U1) |
+| `clients.<…>.per-user-share` | `1` for a trusted `user: any` client; for a `from-name` one what the person pools leave, or `per-user` without them; else `per-user` | How many of one person's `per-user` running slots this client may hold (trusted only): 1 to its person pool's slots for a `user: any` client, 1 to what the pools leave for a `from-name` one with `person-pools:`, else 1 to `per-user` |
+| `clients.<…>.person-pool` | none | The person pool (`person-pools:`) of a trusted `user: any` client; required for each such client when `person-pools:` is given, refused otherwise |
 | `clients.<…>.priority` | `interactive` if trusted, else `personal` | An untrusted client's every call; a trusted one's calls without the header |
 
 At start-up the gateway logs its class (as served: `test` with the stub on), and each client's
-name, trust, caps, priority, `user` rule, `per-user-share` and `shared_person_cap` (the U1
-cap a `user: any` client shares with the others; never a token).
+name, trust, caps, priority, `user` rule, `per-user-share`, and its person pool and that
+pool's slots (`person_pool`, `person_pool_slots`; never a token), and each role's label and,
+for a labelled role, `model_sha256`.
 
 **Upstream forms:**
 - `http://<local host>/<base>`: an OpenAI-compatible local model server (vLLM). The only form

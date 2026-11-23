@@ -30,6 +30,7 @@ const BOT_ANA: &str = "limits-test-bot-pm-ana-token-0123456";
 const BOT_DOCS: &str = "limits-test-bot-docs-token-01234567";
 const BOT_ANA_K: &str = "limits-test-bot-pm-ana-k-token-01234";
 const WORKER: &str = "limits-test-worker-token-0123456789a";
+const BOT_JIRA: &str = "limits-test-bot-jira-token-01234567";
 
 async fn serve(app: Router) -> (String, CancellationToken) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -238,6 +239,7 @@ async fn gateway_models(models: impl FnOnce(&str) -> Models) -> Gw {
             client("bot-docs", BOT_DOCS),
             client("bot-pm-ana-k", BOT_ANA_K),
             client("worker", WORKER),
+            client("bot-jira", BOT_JIRA),
         ],
         usage: usage.clone(),
         stub: false,
@@ -666,39 +668,49 @@ fn the_deploy_config_caps_evals_at_one_slot() {
     assert!(own.may_name("bot-pm-ana", "ana"));
     assert!(!own.may_name("bot-pm-ana", "bo"));
     assert!(m.client_policy("bot-docs").may_name("bot-docs", "bo"));
-    // R2: waiting is capped per client too, at twice its slots by default.
+    // R2: waiting is capped per client too, at twice its slots by default. A person's places
+    // stay 4 per client (`per-user-queue`), as before W1 raised `per-user` from 2 to 3.
     assert_eq!(own.max_queue, 2 * own.max_in_flight);
-    assert_eq!(m.limits.person_queue(), 2 * m.limits.per_user);
+    assert_eq!(m.limits.person_queue(), 4);
     // R3: the Spark's gateway is the production one.
     assert_eq!(m.class, GatewayClass::Production);
-    // G3 (review at 6bb806f): a client that may name anyone holds one of a PM's two running
-    // slots at most; the PM's own bot may hold both.
+    // W1 (review at 52dbae2), a deliberate change from G3 and U1: `per-user` is 3 (it was 2),
+    // and the runtime and the team bots are in separate person pools of one slot each, so a
+    // team bot's calls never hold up the runtime's; the PM's own bot holds the one slot the
+    // pools leave (before, it could hold both of two, and the runtime shared one with every
+    // team bot). One PM can so hold 3 of the 4 model slots at once.
+    assert_eq!((m.limits.per_user, m.limits.max_in_flight), (3, 4));
+    let pool = |c: &str| {
+        m.client_policy(c)
+            .pool
+            .map(|p| (m.pool_name(p.id).to_string(), p.cap))
+    };
+    assert_eq!(pool("runtime"), Some(("runtime".into(), 1)));
+    for c in ["bot-docs", "bot-jira"] {
+        assert_eq!(pool(c), Some(("team-bots".into(), 1)), "{c}");
+    }
     for c in ["runtime", "bot-docs"] {
         assert_eq!(m.client_policy(c).per_user_share, 1, "{c}");
     }
-    assert_eq!(own.per_user_share, m.limits.per_user);
-    assert!(
-        m.limits.per_user >= 2,
-        "a PM keeps a slot beside a team bot"
-    );
-    // U1 (review at c78b5fb): the runtime and the team bots hold one of a PM's two slots
-    // *together*, so the other is only ever her own bot's. U2: so the runtime, too, runs one
-    // call per PM at a time; a PM's second routine waits for the first (docs/gateway.md).
-    assert_eq!(m.shared_person_cap(), m.limits.per_user - 1);
-    for c in ["runtime", "bot-docs"] {
-        assert_eq!(m.client_policy(c).shared_person_cap, Some(1), "{c}");
-    }
-    assert_eq!(own.shared_person_cap, None);
-    assert_eq!(evals.shared_person_cap, None);
+    assert_eq!(m.own_bot_slots, Some(1));
+    assert_eq!(own.per_user_share, 1, "her own bot: what the pools leave");
+    assert_eq!(own.pool, None);
+    assert_eq!(evals.pool, None);
+    // Runtime, team bots and her own bot: exactly her `per-user`, so each one's slot is kept.
+    assert_eq!(1 + 1 + own.per_user_share, m.limits.per_user);
+    // An unlisted client still holds at most 2 slots (`per-client`), not `per-user`.
+    assert_eq!(m.client_policy("stranger").max_in_flight, 2);
 }
 
-/// U1 (review at c78b5fb), with the shipped `deploy/gateway.yaml` (its limits and clients;
-/// its model servers moved to a mock): two clients that may name anyone, the runtime and a
-/// team bot, each within its share of one, can't fill both of Ana's running slots between
-/// them; her own bot's call starts at once. Before, each client's share was counted on its
-/// own, so `runtime` and `bot-docs` held both and `bot-pm-ana` waited.
+/// W1 (review at 52dbae2), with the shipped `deploy/gateway.yaml` (its limits and clients;
+/// its model servers moved to a mock). Team bots that keep Ana's team-bot slot busy (a stolen
+/// team-bot token could) don't hold up the runtime's call for her; with the runtime's slot
+/// and the team bots' both busy, her own bot's call still starts; and she never has more than
+/// her 3 running. Before W1, the runtime shared one slot with every team bot (U1), so
+/// `bot-docs` holding it made her routine parsing wait `queue-wait-secs` and get `503`.
+/// (Deliberately changed from U1's test, which had the runtime's call hold up bot-docs'.)
 #[tokio::test]
-async fn two_shared_clients_cant_fill_a_pms_slots_and_her_own_bot_still_runs() {
+async fn team_bots_cant_hold_up_the_runtime_and_neither_holds_up_her_own_bot() {
     let gw = Arc::new(gateway_models(|up| shipped("deploy/gateway.yaml", up)).await);
     let send = |token: &'static str, text: &'static str| {
         let gw = gw.clone();
@@ -712,30 +724,53 @@ async fn two_shared_clients_cant_fill_a_pms_slots_and_her_own_bot_still_runs() {
                 .status()
         })
     };
-    let r = send(RUNTIME, "slow 600");
-    eventually("the runtime's call runs", async || {
-        load(&gw).await == (1, 0)
+    // Two team bots fill her team-bot slot and queue behind it.
+    let d = send(BOT_DOCS, "slow 800");
+    eventually("bot-docs runs", async || load(&gw).await == (1, 0)).await;
+    let j = send(BOT_JIRA, "slow 800");
+    let d2 = send(BOT_DOCS, "slow 800");
+    eventually("the team bots' calls wait", async || {
+        load(&gw).await == (1, 2)
     })
     .await;
-    // The team bot's call for her waits, though she has a slot free and bot-docs holds none.
-    let d = send(BOT_DOCS, "slow 600");
-    let r2 = send(RUNTIME, "slow 600");
-    eventually("the shared calls wait", async || load(&gw).await == (1, 2)).await;
-    // Her own bot's call starts at once, ahead of both.
+    // The runtime's call for her starts at once.
+    let r = send(RUNTIME, "slow 800");
+    eventually("the runtime's call runs beside them", async || {
+        load(&gw).await == (2, 2)
+    })
+    .await;
+    // Its second waits for the runtime's own slot (one call per PM at a time, U2).
+    let r2 = send(RUNTIME, "slow 100");
+    eventually("the runtime's second waits", async || {
+        load(&gw).await == (2, 3)
+    })
+    .await;
+    // Runtime and team bots both busy for her: her own bot's call starts at once.
     let t = std::time::Instant::now();
     assert_eq!(send(BOT_ANA, "now").await.unwrap(), 200);
     assert!(
         t.elapsed() < Duration::from_millis(400),
         "her own bot waited"
     );
-    // Someone else, through the same shared clients, isn't held up by her.
+    // Her own bot holds one slot: with it busy, she is at her three, and its next call waits.
+    let o = send(BOT_ANA, "slow 300");
+    eventually("her own bot's slot runs", async || {
+        load(&gw).await == (3, 3)
+    })
+    .await;
+    let o2 = send(BOT_ANA, "now");
+    eventually("her own bot's second waits", async || {
+        load(&gw).await == (3, 4)
+    })
+    .await;
+    // Someone else, through the same clients, takes the fourth GPU slot at once.
     let bo = ask(&gw, BOT_DOCS, "now", false)
         .header("x-pmos-user", "bo")
         .send()
         .await
         .unwrap();
     assert_eq!(bo.status(), 200);
-    for h in [r, d, r2] {
+    for h in [d, j, d2, r, r2, o, o2] {
         assert_eq!(h.await.unwrap(), 200);
     }
     assert_eq!(load(&gw).await, (0, 0));
@@ -1472,8 +1507,8 @@ async fn a_persons_running_cap_holds_across_clients_for_a_dotted_handle() {
 /// G3 (review at 6bb806f): a client that may name anyone (`user: any`, such as a team bot's
 /// token) holds at most its `per-user-share` of one person's running slots, 1 by default;
 /// dispatch is oldest-first, so before, two of the team bot's calls could take both. (Two
-/// *different* such clients are U1's test,
-/// `two_shared_clients_cant_fill_a_pms_slots_and_her_own_bot_still_runs`.)
+/// *different* such clients, with the shipped person pools, are W1's test,
+/// `team_bots_cant_hold_up_the_runtime_and_neither_holds_up_her_own_bot`.)
 #[tokio::test]
 async fn a_team_bot_holds_at_most_its_share_of_a_pms_slots() {
     let gw = Arc::new(
@@ -1523,7 +1558,7 @@ async fn a_team_bot_holds_at_most_its_share_of_a_pms_slots() {
     // Without a `from-name` client, a `user: any` client may hold all of `per-user`.
     let ok = m("{bot-*: {trusted: true, per-user-share: 2}, runtime: {trusted: true}}").unwrap();
     assert_eq!(ok.client_policy("bot-docs").per_user_share, 2);
-    assert_eq!(ok.shared_person_cap(), 2);
+    assert_eq!(ok.pools, [("user-any".to_string(), 2)]);
     assert_eq!(
         ok.client_policy("runtime").per_user_share,
         1,
@@ -1542,15 +1577,15 @@ async fn a_team_bot_holds_at_most_its_share_of_a_pms_slots() {
          bot-pm-*: {trusted: true, user: from-name}, runtime: {trusted: true}}\n",
     )
     .unwrap();
-    assert_eq!(ok.shared_person_cap(), 2);
+    assert_eq!(ok.pools, [("user-any".to_string(), 2)]);
     assert_eq!(ok.client_policy("bot-docs").per_user_share, 2);
-    assert_eq!(ok.client_policy("bot-docs").shared_person_cap, Some(2));
+    assert_eq!(ok.client_policy("bot-docs").pool.map(|p| p.cap), Some(2));
     assert_eq!(
         ok.client_policy("bot-pm-ana").per_user_share,
         3,
         "from-name: its own PM"
     );
-    assert_eq!(ok.client_policy("bot-pm-ana").shared_person_cap, None);
+    assert_eq!(ok.client_policy("bot-pm-ana").pool, None);
     // A `from-name` client needs a slot to keep: `per-user` 1 is refused beside one.
     let err = Models::from_yaml(
         "upstreams: {a: 'http://vllm/v1'}\nroles: {default: {upstream: a, model: m}}\n\
@@ -1650,5 +1685,126 @@ async fn the_test_stacks_eval_lanes_keep_one_call_in_flight_each() {
     let m = Models::parse(&text, true).unwrap();
     for c in ["runtime", "worker"] {
         assert_eq!(m.client_policy(c).per_user_share, m.limits.per_user, "{c}");
+    }
+}
+
+/// W1 (review at 52dbae2): `person-pools:` and `person-pool:` are checked at start-up, so a
+/// config can't leave a pool's slot or a PM's own bot's slot unkept by mistake; a config
+/// without them behaves as before (one pool for every client that may name anyone).
+#[test]
+fn person_pools_are_checked_at_start_up() {
+    let m = |rest: &str| {
+        Models::from_yaml(&format!(
+            "upstreams: {{a: 'http://vllm/v1'}}\nroles: {{default: {{upstream: a, model: m}}}}\n{rest}"
+        ))
+    };
+    let own = "bot-pm-*: {trusted: true, user: from-name}";
+    // The production shape, and the same pools with no own bot: then nothing is kept for one.
+    let ok = m(&format!(
+        "limits: {{per-user: 3}}\nperson-pools: {{runtime: 1, team-bots: 1}}\n\
+         clients: {{runtime: {{trusted: true, person-pool: runtime}}, \
+         bot-*: {{trusted: true, person-pool: team-bots}}, {own}}}\n"
+    ))
+    .unwrap();
+    assert_eq!(ok.own_bot_slots, Some(1));
+    assert_eq!(ok.client_policy("bot-pm-ana").per_user_share, 1);
+    let ok = m(
+        "limits: {per-user: 3}\nperson-pools: {runtime: 1, team-bots: 2}\n\
+         clients: {runtime: {trusted: true, person-pool: runtime}, \
+         bot-*: {trusted: true, person-pool: team-bots, per-user-share: 2}}\n",
+    )
+    .unwrap();
+    assert_eq!(ok.client_policy("bot-docs").pool.map(|p| p.cap), Some(2));
+    // Without pools: as before (one implicit pool of `per-user - 1` beside an own bot).
+    let ok = m(&format!(
+        "limits: {{per-user: 2}}\nclients: {{runtime: {{trusted: true}}, {own}}}\n"
+    ))
+    .unwrap();
+    assert_eq!(ok.pools, [("user-any".to_string(), 1)]);
+    assert_eq!(ok.own_bot_slots, None);
+    assert_eq!(ok.client_policy("bot-pm-ana").per_user_share, 2);
+    let cases: Vec<(String, &str)> = vec![
+        // The pools and the own bot's slot need more than `per-user`.
+        (
+            format!(
+                "limits: {{per-user: 2}}\nperson-pools: {{runtime: 1, team-bots: 1}}\n\
+                 clients: {{runtime: {{trusted: true, person-pool: runtime}}, \
+                 bot-*: {{trusted: true, person-pool: team-bots}}, {own}}}\n"
+            ),
+            "more than limits.per-user (2)",
+        ),
+        // A pool of no slots.
+        (
+            "limits: {per-user: 3}\nperson-pools: {runtime: 0}\n\
+             clients: {runtime: {trusted: true, person-pool: runtime}}\n"
+                .into(),
+            "at least 1 slot",
+        ),
+        // A client that may name anyone, in no pool, when pools are given.
+        (
+            "limits: {per-user: 3}\nperson-pools: {runtime: 1}\n\
+             clients: {runtime: {trusted: true, person-pool: runtime}, bot-*: {trusted: true}}\n"
+                .into(),
+            "must say which pool",
+        ),
+        // A pool no client is in (a misspelt name, say).
+        (
+            "limits: {per-user: 3}\nperson-pools: {runtime: 1, team-bot: 1}\n\
+             clients: {runtime: {trusted: true, person-pool: runtime}}\n"
+                .into(),
+            "person pool `team-bot` has no client",
+        ),
+        // A pool that isn't listed, or a pool without `person-pools:`.
+        (
+            "limits: {per-user: 3}\nperson-pools: {runtime: 1}\n\
+             clients: {runtime: {trusted: true, person-pool: runtimes}}\n"
+                .into(),
+            "isn't listed",
+        ),
+        (
+            "clients: {runtime: {trusted: true, person-pool: runtime}}\n".into(),
+            "isn't listed",
+        ),
+        // A pool for a client that names no one, or only its own PM.
+        (
+            "limits: {per-user: 3}\nperson-pools: {runtime: 1}\n\
+             clients: {runtime: {trusted: true, person-pool: runtime}, \
+             evals: {person-pool: runtime}}\n"
+                .into(),
+            "is for a trusted client that may name anyone",
+        ),
+        (
+            "limits: {per-user: 3}\nperson-pools: {runtime: 1}\n\
+             clients: {runtime: {trusted: true, person-pool: runtime}, \
+             bot-pm-*: {trusted: true, user: from-name, person-pool: runtime}}\n"
+                .into(),
+            "is for a trusted client that may name anyone",
+        ),
+        // A share above the pool's slots, or an own bot's above what the pools leave.
+        (
+            "limits: {per-user: 3}\nperson-pools: {runtime: 1}\n\
+             clients: {runtime: {trusted: true, person-pool: runtime, per-user-share: 2}}\n"
+                .into(),
+            "per-user-share must be 1 to 1, the slots of its person pool `runtime`",
+        ),
+        (
+            "limits: {per-user: 3}\nperson-pools: {runtime: 1, team-bots: 1}\n\
+             clients: {runtime: {trusted: true, person-pool: runtime}, \
+             bot-*: {trusted: true, person-pool: team-bots}, \
+             bot-pm-*: {trusted: true, user: from-name, per-user-share: 2}}\n"
+                .into(),
+            "what the person pools leave",
+        ),
+        // A pool name that isn't a plain name.
+        (
+            "limits: {per-user: 3}\nperson-pools: {Runtime: 1}\n\
+             clients: {runtime: {trusted: true, person-pool: Runtime}}\n"
+                .into(),
+            "lowercase letters",
+        ),
+    ];
+    for (rest, want) in cases {
+        let err = m(&rest).unwrap_err();
+        assert!(err.contains(want), "{rest}\nwant `{want}`: {err}");
     }
 }

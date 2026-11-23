@@ -432,8 +432,9 @@ impl Gateway {
 /// The parts of a gateway's `GET /v1/pmos/roles` answer the benchmark runner records, and
 /// nothing else: `class` (`production` or `test`; a gateway too old to say is `test`), the
 /// `stub`, `cloud_test` and `workarounds` flags, and per role its name, alias, model and
-/// upstream kind (`local`, `claude-test` or `remote-test`, never an address). `None`: the
-/// answer doesn't have that shape.
+/// upstream kind (`local`, `claude-test` or `remote-test`, never an address), and, for a
+/// labelled role, `model_sha256` (the hash of its model id, a SHA-256 in hex and nothing
+/// else). `None`: the answer doesn't have that shape.
 pub fn gateway_roles(v: &Value) -> Option<Value> {
     let class = match v.get("class").and_then(Value::as_str) {
         None | Some("test") => "test",
@@ -448,10 +449,17 @@ pub fn gateway_roles(v: &Value) -> Option<Value> {
         if !matches!(upstream, "local" | "claude-test" | "remote-test") {
             return None;
         }
-        roles.push(json!({
+        let mut role = json!({
             "role": s("role")?, "alias": s("alias").unwrap_or_default(),
             "model": s("model")?, "upstream": upstream,
-        }));
+        });
+        if let Some(h) = r.get("model_sha256") {
+            let h = h.as_str().filter(|h| {
+                h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            })?;
+            role["model_sha256"] = json!(h);
+        }
+        roles.push(role);
     }
     Some(json!({
         "class": class,
@@ -478,6 +486,17 @@ mod tests {
         assert!(!out.to_string().contains("10.0.0.5"));
         assert_eq!(out["class"], "production");
         assert_eq!(out["roles"][0]["model"], "qwen");
+        assert!(out["roles"][0].get("model_sha256").is_none());
+        // A labelled role's model hash passes through, and only as a SHA-256 in hex.
+        let hash = "0123456789abcdef".repeat(4);
+        let mut labelled = v.clone();
+        labelled["roles"][0]["model_sha256"] = json!(hash);
+        assert_eq!(
+            gateway_roles(&labelled).unwrap()["roles"][0]["model_sha256"],
+            json!(hash)
+        );
+        labelled["roles"][0]["model_sha256"] = json!("http://10.0.0.5");
+        assert!(gateway_roles(&labelled).is_none());
         // A gateway that says no class is a test one; an address as the upstream kind, or an
         // unknown class, is refused.
         let mut old = v.clone();

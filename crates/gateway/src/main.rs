@@ -60,6 +60,7 @@ async fn main() -> Result<()> {
         // A labelled role is logged by its label and upstream kind only (`config::Role::label`).
         tracing::info!(
             role = %role.alias(), model = %role.reported_model(),
+            model_sha256 = role.model_sha256().as_deref().unwrap_or(""),
             upstream = %role.logged_upstream(), labelled = role.label.is_some(), "model role"
         );
     }
@@ -69,7 +70,9 @@ async fn main() -> Result<()> {
         tracing::info!(
             client = %client.name, trusted = p.trusted, max_in_flight = p.max_in_flight,
             max_queue = p.max_queue, priority = ?p.priority, user = ?p.user,
-            per_user_share = p.per_user_share, shared_person_cap = ?p.shared_person_cap, "client"
+            per_user_share = p.per_user_share,
+            person_pool = p.pool.map_or("", |pool| models.pool_name(pool.id)),
+            person_pool_slots = ?p.pool.map(|pool| pool.cap), "client"
         );
     }
     let app = router(GatewayConfig {

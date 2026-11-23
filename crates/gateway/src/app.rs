@@ -16,7 +16,12 @@
 //!
 //! A role with a `label:` is reported by that label everywhere a client or a log sees it (the
 //! roles answer, `x-pmos-model`, an answer's `model`, the usage log); its real model id is only
-//! sent upstream.
+//! sent upstream. For such a role the gateway also keeps the upstream's own words from the
+//! caller, which may name the model or the provider: only the fields a chat-completions client
+//! reads are passed on from an answer ([`LABELLED_FIELDS`]), a streamed answer's comments and lines
+//! that don't parse are dropped, and an error answer is replaced by a neutral one that keeps
+//! its status, a coarse type and `Retry-After` ([`neutral_error`]). The roles answer and the
+//! usage log carry the SHA-256 of its model id beside the label ([`Role::model_sha256`]).
 //!
 //! Every `/v1` call needs a client token. `X-Pmos-User` (a handle), `X-Pmos-Priority`
 //! (`interactive`, `scheduled` or `personal`) and `X-Pmos-Run` place it in the queue and the
@@ -292,8 +297,14 @@ async fn list_roles(State(state): State<AppState>) -> Response {
         .roles
         .values()
         .map(|r| {
-            json!({"role": r.name, "alias": r.alias(), "model": r.reported_model(),
-                   "upstream": r.upstream_kind_label()})
+            let mut v = json!({"role": r.name, "alias": r.alias(), "model": r.reported_model(),
+                               "upstream": r.upstream_kind_label()});
+            // A labelled role: the hash of its real model id, so a benchmark report can tell a
+            // model swapped behind an unchanged label (`crates/evals`, "Which runs count").
+            if let Some(h) = r.model_sha256() {
+                v["model_sha256"] = json!(h);
+            }
+            v
         })
         .collect();
     let cloud_test = state
@@ -374,13 +385,28 @@ async fn readyz(State(state): State<AppState>) -> Response {
 
 /// Whether each upstream base answers `GET <base>/models`: the cached probe while it is
 /// younger than [`Timeouts::ready_cache`], else a new one.
-async fn probe_upstreams(inner: &Inner) -> std::collections::HashMap<String, bool> {
-    let mut cached = inner.probe.lock().await;
-    if let Some((at, result)) = cached.as_ref() {
-        if at.elapsed() < inner.ready_cache {
-            return result.clone();
-        }
+///
+/// The probe runs in a task of its own, so a caller that hangs up mid-probe doesn't cancel
+/// it: it still completes and fills the cache (the Low on `/readyz`, review at 52dbae2).
+/// Before, the probe ran in the caller's request, and a client that connected and hung up
+/// over and over left the cache empty and kept a round of probes in flight.
+async fn probe_upstreams(inner: &Arc<Inner>) -> std::collections::HashMap<String, bool> {
+    let task = tokio::spawn({
+        let inner = inner.clone();
+        async move { probe_now(&inner).await }
+    });
+    match task.await {
+        Ok(up) => up,
+        // The probe task failed: every upstream reads as down.
+        Err(_) => upstream_bases(inner)
+            .into_iter()
+            .map(|b| (b, false))
+            .collect(),
     }
+}
+
+/// Every upstream base the roles use, once each.
+fn upstream_bases(inner: &Inner) -> Vec<String> {
     let mut upstreams: Vec<String> = inner
         .models
         .roles
@@ -389,8 +415,19 @@ async fn probe_upstreams(inner: &Inner) -> std::collections::HashMap<String, boo
         .collect();
     upstreams.sort();
     upstreams.dedup();
+    upstreams
+}
+
+/// [`probe_upstreams`]' work, in its own task.
+async fn probe_now(inner: &Inner) -> std::collections::HashMap<String, bool> {
+    let mut cached = inner.probe.lock().await;
+    if let Some((at, result)) = cached.as_ref() {
+        if at.elapsed() < inner.ready_cache {
+            return result.clone();
+        }
+    }
     let mut up_by_base = std::collections::HashMap::new();
-    for base in upstreams {
+    for base in upstream_bases(inner) {
         let remote = inner
             .models
             .roles
@@ -742,6 +779,7 @@ async fn forward(
         endpoint: endpoint.path(),
         role: role.name.clone(),
         model: role.reported_model().to_string(),
+        model_sha256: role.model_sha256(),
         upstream: role.logged_upstream_host(),
         priority,
         stream,
@@ -800,12 +838,13 @@ async fn forward(
     // `X-Pmos-User`); the client's own cap always applies. Without a believed person, the
     // client's cap alone bounds its calls. The same holds for calls waiting (R2).
     // A client may hold only its share of the person's running slots (G3).
-    // Clients that may name anyone hold at most their shared cap of the person's running
-    // slots together, so with a PM's own bot configured, its calls never wait on theirs (U1).
+    // Clients that may name anyone hold at most their person pool's slots of the person's
+    // together (U1): the runtime in a pool of its own, the team bots in another, so a team
+    // bot's calls never hold up the runtime's, and neither holds up a PM's own bot (W1).
     let owner = Owner::new(who.user.as_deref(), &client, policy.max_in_flight)
         .with_queue(policy.max_queue)
         .with_person_share(policy.per_user_share)
-        .with_shared_cap(policy.shared_person_cap);
+        .with_pool(policy.pool);
     let permit = match slot(inner, &owner, who.priority).await {
         Ok(p) => p,
         Err(why) => {
@@ -829,6 +868,7 @@ async fn forward(
         endpoint: endpoint.path(),
         role: role.name.clone(),
         model: role.reported_model().to_string(),
+        model_sha256: role.model_sha256(),
         upstream: role.logged_upstream_host(),
         priority: who.priority,
         stream,
@@ -986,16 +1026,12 @@ async fn forward(
             headers,
             body,
         } => {
-            // Out of retries: the upstream's own answer, as it would have been without them.
+            // Out of retries: the upstream's own answer, as it would have been without them;
+            // for a labelled role, a neutral one in its place ([`neutral_error`]).
             event.status = status;
             event.latency_ms = started.elapsed().as_millis() as u64;
             inner.usage.record(event);
-            let mut res = (
-                StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
-                [(header::CONTENT_TYPE, "application/json")],
-                body,
-            )
-                .into_response();
+            let mut res = upstream_error_answer(&role, status, body);
             if let Some(v) = headers.get(header::RETRY_AFTER) {
                 res.headers_mut().insert(header::RETRY_AFTER, v.clone());
             }
@@ -1078,15 +1114,9 @@ async fn forward(
     if !status.is_success() {
         event.latency_ms = started.elapsed().as_millis() as u64;
         inner.usage.record(event);
-        // The model server's own error (bad parameters, context too long) helps the caller.
-        return finish(
-            (
-                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
-                [(header::CONTENT_TYPE, "application/json")],
-                bytes,
-            )
-                .into_response(),
-        );
+        // The model server's own error (bad parameters, context too long) helps the caller;
+        // for a labelled role it may name the model, so a neutral one takes its place.
+        return finish(upstream_error_answer(&role, status.as_u16(), bytes));
     }
     let mut answer: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
@@ -1198,6 +1228,10 @@ async fn claude(
             status = status.as_u16(),
             "Claude test upstream refused the request"
         );
+        if role.label.is_some() {
+            let raw = serde_json::to_vec(&answer).unwrap_or_default();
+            return upstream_error_answer(role, status.as_u16(), raw.into());
+        }
         return (
             StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
             Json(anthropic::error_body(&answer, status.as_u16())),
@@ -1231,16 +1265,77 @@ fn logged_error(role: &Role, e: &reqwest::Error) -> String {
     }
 }
 
-/// Puts `label` in an answer's `model` field, where the upstream wrote its own model id.
+/// The top-level fields of an answer (whole, or one streamed event) that a labelled role
+/// passes on: what a chat-completions client reads. Anything else the upstream adds, such as
+/// `system_fingerprint` or `provider`, can name the model or the provider, and is dropped.
+pub const LABELLED_FIELDS: &[&str] = &[
+    "id", "object", "created", "model", "choices", "usage", "data",
+];
+
+/// For a labelled role: puts `label` in an answer's `model` field, where the upstream wrote
+/// its own model id, keeps only [`LABELLED_FIELDS`], and replaces an `error` the upstream put
+/// in a streamed event with a neutral one.
 fn relabel(answer: &mut Value, label: &str) {
-    if let Some(model) = answer.get_mut("model").filter(|m| m.is_string()) {
+    let Some(obj) = answer.as_object_mut() else {
+        return;
+    };
+    let had_error = obj.contains_key("error");
+    obj.retain(|k, _| LABELLED_FIELDS.contains(&k.as_str()));
+    if let Some(model) = obj.get_mut("model").filter(|m| m.is_string()) {
         *model = json!(label);
+    }
+    if had_error {
+        obj.insert(
+            "error".into(),
+            json!({"type": "upstream_error",
+                   "message": "the model server reported an error mid-answer"}),
+        );
     }
 }
 
-/// Rewrites the `model` field of each `data:` line of a streamed answer ([`relabel`]), for a
-/// labelled role. Bytes are passed on a whole line at a time; a line that isn't a JSON object
-/// with a `model` (`data: [DONE]`, a comment, an `event:`) goes through as it came.
+/// The type a neutral error ([`neutral_error`]) gives a status: coarse enough to name
+/// nothing, fine enough for a caller to act on (wait and retry, or not).
+pub fn coarse_error_type(status: u16, body: &[u8]) -> &'static str {
+    match status {
+        // A quota that won't come back soon is worth telling apart: retrying won't help.
+        429 if crate::retry::unrecoverable(body) => "quota_exhausted",
+        429 => "rate_limit",
+        503 | 529 => "overloaded",
+        401 | 403 => "auth",
+        400 | 404 | 405 | 409 | 413 | 415 | 422 => "bad_request",
+        _ => "upstream_error",
+    }
+}
+
+/// A neutral error body for a labelled role's non-2xx answer (the spec's point V3): its
+/// status and a coarse type ([`coarse_error_type`]), and a fixed message, never the upstream's
+/// own words, which may name the model or the provider.
+pub fn neutral_error(status: u16, body: &[u8]) -> Value {
+    let kind = coarse_error_type(status, body);
+    json!({"error": {
+        "type": kind,
+        "status": status,
+        "message": format!("the model server answered {status} ({kind})"),
+    }})
+}
+
+/// The answer a caller gets for an upstream's non-2xx answer: as it came for a role without
+/// a label; for a labelled one, [`neutral_error`] with the same status. The caller adds any
+/// `Retry-After`.
+fn upstream_error_answer(role: &Role, status: u16, body: Bytes) -> Response {
+    let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+    match role.label {
+        Some(_) => (code, Json(neutral_error(status, &body))).into_response(),
+        None => (code, [(header::CONTENT_TYPE, "application/json")], body).into_response(),
+    }
+}
+
+/// Rewrites each line of a streamed answer for a labelled role. Bytes are passed on a whole
+/// line at a time: a `data:` JSON object is [`relabel`]led, `data: [DONE]`, blank lines and
+/// `event:`, `id:` and `retry:` lines go through as they came, a comment's text is dropped
+/// (a bare `:` keeps it as a keep-alive), and anything else (a `data:` line that doesn't
+/// parse, a line of no known kind) is dropped, since it may carry the upstream's own words.
+/// So is an unterminated last line that doesn't parse ([`SseRelabel::finish`]).
 #[derive(Debug)]
 struct SseRelabel {
     label: String,
@@ -1284,20 +1379,39 @@ impl SseRelabel {
                     .take_while(|b| matches!(b, b'\n' | b'\r'))
                     .count();
             let (line, ending) = piece.split_at(body_len);
-            let relabelled = line.strip_prefix(b"data:").and_then(|payload| {
-                let payload = payload.strip_prefix(b" ").unwrap_or(payload);
-                let mut v: Value = serde_json::from_slice(payload).ok()?;
-                v.get("model").filter(|m| m.is_string())?;
-                relabel(&mut v, &self.label);
-                serde_json::to_vec(&v).ok()
-            });
-            match relabelled {
-                Some(json) => {
-                    out.extend_from_slice(b"data: ");
-                    out.extend_from_slice(&json);
-                    out.extend_from_slice(ending);
-                }
-                None => out.extend_from_slice(piece),
+            if line.is_empty()
+                || [&b"event:"[..], b"id:", b"retry:"]
+                    .iter()
+                    .any(|p| line.starts_with(p))
+            {
+                out.extend_from_slice(piece);
+                continue;
+            }
+            if line.starts_with(b":") {
+                // A comment: kept as a keep-alive, without its text.
+                out.extend_from_slice(b":");
+                out.extend_from_slice(ending);
+                continue;
+            }
+            let Some(payload) = line.strip_prefix(b"data:") else {
+                continue;
+            };
+            let payload = payload.strip_prefix(b" ").unwrap_or(payload);
+            if payload == b"[DONE]" {
+                out.extend_from_slice(piece);
+                continue;
+            }
+            let relabelled = serde_json::from_slice::<Value>(payload)
+                .ok()
+                .filter(Value::is_object)
+                .and_then(|mut v| {
+                    relabel(&mut v, &self.label);
+                    serde_json::to_vec(&v).ok()
+                });
+            if let Some(json) = relabelled {
+                out.extend_from_slice(b"data: ");
+                out.extend_from_slice(&json);
+                out.extend_from_slice(ending);
             }
         }
         out
@@ -1350,11 +1464,87 @@ mod relabel_tests {
         out.extend_from_slice(&sse.finish());
         let text = String::from_utf8(out).unwrap();
         assert!(!text.contains("real-id"), "{text}");
+        // The comment's text is dropped (a bare `:` keeps it as a keep-alive): deliberately
+        // changed from passing it as it came, since a provider can write its name there.
         assert_eq!(
             text,
-            "data: {\"choices\":[],\"id\":\"1\",\"model\":\"hosted-model-a\"}\r\n\n: keep-alive\n\
+            "data: {\"choices\":[],\"id\":\"1\",\"model\":\"hosted-model-a\"}\r\n\n:\n\
              data: {\"id\":\"2\",\"model\":\"hosted-model-a\"}\n\ndata: [DONE]"
         );
+    }
+
+    #[test]
+    fn drops_pass_through_fields_unparsed_lines_and_a_broken_last_line() {
+        let mut sse = SseRelabel::new("hosted-model-a".into());
+        let mut out = Vec::new();
+        for chunk in [
+            &b"data: {\"id\":\"1\",\"model\":\"real-id\",\"system_fingerprint\":\"fp-real-id\",\
+               \"provider\":\"ProviderCo\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n"[..],
+            b": served by ProviderCo real-id\nevent: message\nid: 7\nretry: 100\n",
+            b"data: not json real-id\nsomething: ProviderCo\n",
+            b"data: {\"error\":{\"message\":\"real-id at ProviderCo failed\"}}\n\n",
+            b"data: {\"id\":\"2\",\"model\":\"real-id\",\"provider\":\"Prov",
+        ] {
+            out.extend_from_slice(&sse.feed(chunk));
+        }
+        out.extend_from_slice(&sse.finish());
+        let text = String::from_utf8(out).unwrap();
+        for f in [
+            "real-id",
+            "ProviderCo",
+            "fp-",
+            "system_fingerprint",
+            "provider",
+        ] {
+            assert!(!text.contains(f), "`{f}` passed: {text}");
+        }
+        assert_eq!(
+            text,
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"index\":0}],\"id\":\"1\",\
+             \"model\":\"hosted-model-a\"}\n\n:\nevent: message\nid: 7\nretry: 100\n\
+             data: {\"error\":{\"message\":\"the model server reported an error mid-answer\",\
+             \"type\":\"upstream_error\"}}\n\n"
+        );
+    }
+
+    #[test]
+    fn a_whole_answer_keeps_only_what_a_client_reads() {
+        let mut v = serde_json::json!({"id": "x", "object": "chat.completion", "created": 1,
+            "model": "real-id", "system_fingerprint": "fp", "provider": "ProviderCo",
+            "choices": [], "usage": {"prompt_tokens": 1}});
+        super::relabel(&mut v, "hosted-model-a");
+        assert_eq!(
+            v,
+            serde_json::json!({"id": "x", "object": "chat.completion", "created": 1,
+                "model": "hosted-model-a", "choices": [], "usage": {"prompt_tokens": 1}})
+        );
+    }
+
+    #[test]
+    fn neutral_errors_keep_the_status_and_a_coarse_type() {
+        use super::{coarse_error_type, neutral_error};
+        for (status, body, want) in [
+            (429, &b"{}"[..], "rate_limit"),
+            (
+                429,
+                b"{\"error\":{\"code\":\"insufficient_quota\"}}",
+                "quota_exhausted",
+            ),
+            (503, b"", "overloaded"),
+            (529, b"", "overloaded"),
+            (401, b"", "auth"),
+            (403, b"", "auth"),
+            (400, b"context too long for real-id", "bad_request"),
+            (422, b"", "bad_request"),
+            (500, b"", "upstream_error"),
+            (502, b"", "upstream_error"),
+        ] {
+            assert_eq!(coarse_error_type(status, body), want, "{status}");
+            let v = neutral_error(status, body);
+            assert_eq!(v["error"]["type"], want);
+            assert_eq!(v["error"]["status"], status);
+            assert!(!v.to_string().contains("real-id"));
+        }
     }
 }
 
