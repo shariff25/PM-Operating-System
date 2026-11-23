@@ -1474,7 +1474,8 @@ case "$cmd" in
     else
       args=("$@")
     fi
-    compose "${run[@]}" toolserver pmos-toolserver users "${args[@]}"
+    # The one-off service without the tool server's pinned address (deploy/compose.yaml).
+    compose --profile cli "${run[@]}" toolserver-cli pmos-toolserver users "${args[@]}"
     ;;
 
   ledger)

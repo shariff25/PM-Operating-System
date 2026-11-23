@@ -152,6 +152,18 @@ services:
       <<: *health
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8710/healthz"]
 
+  # One-off `pmos-toolserver users ...` commands (`pmos-admin users`). `docker compose run`
+  # starts a second container from a service's definition, and a second container can't take
+  # the tool server's pinned address while the first holds it ("Address already in use", CI at
+  # cf621b5). This copy has no pinned address and no alias: it gets one from the range like
+  # every other container, and nothing can reach it by the tool server's name.
+  toolserver-cli:
+    extends: { service: toolserver }
+    profiles: [cli]
+    restart: "no"
+    networks: !override [pmos]
+    ports: !reset []
+
   gateway:
     <<: *service
     command: ["pmos-gateway"]

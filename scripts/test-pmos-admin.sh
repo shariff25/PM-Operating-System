@@ -511,15 +511,15 @@ run_stack users import --from "$WORK/missing.yaml" </dev/null >/dev/null 2>&1 ||
 # The OS user who ran it: SUDO_USER first, else id -un.
 me=$(id -un)
 run_stack users list </dev/null >/dev/null
-grep -qF -- "run --rm --no-deps -e PMOS_HOST_USER=$me -T toolserver pmos-toolserver users list" "$DOCKER_LOG" ||
+grep -qF -- "--profile cli run --rm --no-deps -e PMOS_HOST_USER=$me -T toolserver-cli pmos-toolserver users list" "$DOCKER_LOG" ||
   fail "users list didn't pass PMOS_HOST_USER=$me: $(cat "$DOCKER_LOG")"
 : >"$DOCKER_LOG"
 # A password setup code (docs/password-sign-in.md): the host's own command, with its host user.
 run_stack users password-setup raj </dev/null >/dev/null
-grep -qF -- "-e PMOS_HOST_USER=$me -T toolserver pmos-toolserver users password-setup raj" "$DOCKER_LOG" ||
+grep -qF -- "-e PMOS_HOST_USER=$me -T toolserver-cli pmos-toolserver users password-setup raj" "$DOCKER_LOG" ||
   fail "users password-setup didn't run with PMOS_HOST_USER: $(cat "$DOCKER_LOG")"
 SUDO_USER=alice run_stack users deactivate ana </dev/null >/dev/null
-grep -qF -- "-e PMOS_HOST_USER=alice -T toolserver pmos-toolserver users deactivate ana" "$DOCKER_LOG" ||
+grep -qF -- "-e PMOS_HOST_USER=alice -T toolserver-cli pmos-toolserver users deactivate ana" "$DOCKER_LOG" ||
   fail "users deactivate didn't pass SUDO_USER as PMOS_HOST_USER: $(cat "$DOCKER_LOG")"
 # A name that can't be recorded: refused, docker never called.
 for bad in "Bad User" "ROOT" "x;y"; do
@@ -533,7 +533,7 @@ done
 printf 'members: []\n' >"$WORK/old-members.yaml"
 : >"$DOCKER_LOG"
 run_stack users import --commit abc1234 --from "$WORK/old-members.yaml" --bootstrap --apply </dev/null >/dev/null
-grep -qF -- "-v $WORK/old-members.yaml:/run/pmos-import/members.yaml:ro toolserver pmos-toolserver users import --commit abc1234 --bootstrap --apply --from /run/pmos-import/members.yaml" "$DOCKER_LOG" ||
+grep -qF -- "-v $WORK/old-members.yaml:/run/pmos-import/members.yaml:ro toolserver-cli pmos-toolserver users import --commit abc1234 --bootstrap --apply --from /run/pmos-import/members.yaml" "$DOCKER_LOG" ||
   fail "users import didn't mount the file read-only: $(cat "$DOCKER_LOG")"
 # The tenant for --oid comes from the web app's Entra settings.
 stack_env require PMOS_WEB_ENTRA_TENANT_ID=11111111-2222-3333-4444-555555555555
@@ -1616,6 +1616,14 @@ out=$(run_stack status 2>&1)
 [[ "$out" == *"network"*"FAIL"*"holds 10.201.77.10"* ]] || fail "status doesn't fail an ip_range holding a pinned address: $out"
 good_hosts
 
+# The one-off service for `users` has no pinned address, alias or published port (CI at cf621b5:
+# a second container can't take the tool server's pinned address while the first holds it).
+awk '/^  toolserver-cli:$/{on=1; next} on && /^  [a-z]/{on=0} on' "$DEPLOY_SRC/compose.yaml" >"$WORK/cli-service"
+grep -qF 'extends: { service: toolserver }' "$WORK/cli-service" || fail "toolserver-cli doesn't extend toolserver"
+grep -qF 'networks: !override [pmos]' "$WORK/cli-service" || fail "toolserver-cli keeps the pinned network settings"
+grep -qF 'ports: !reset []' "$WORK/cli-service" || fail "toolserver-cli keeps the published port"
+! grep -q 'ipv4_address\|aliases' "$WORK/cli-service" || fail "toolserver-cli has a pinned address or an alias"
+
 # --- compose renders (C9, C14): without docker compose, say so and skip ---------------------
 if docker compose version >/dev/null 2>&1; then
   mkdir -p "$WORK/checkout" "$WORK/state"
@@ -1656,7 +1664,7 @@ if docker compose version >/dev/null 2>&1; then
   # Slice H2: the five pinned addresses, the ip_range and the pmos0 bridge, with every profile;
   # nothing else pinned; `config -q` accepts them.
   docker compose --project-directory "$DEPLOY_SRC" -f "$DEPLOY_SRC/compose.yaml" --env-file "$WORK/full.env" \
-    --profile web --profile console --profile slack --profile models --profile bringup --profile bringup-personal \
+    --profile web --profile console --profile slack --profile models --profile bringup --profile bringup-personal --profile cli \
     config --format json >"$WORK/pinned.json" || fail "compose doesn't render every profile"
   docker compose --project-directory "$DEPLOY_SRC" -f "$DEPLOY_SRC/compose.yaml" --env-file "$WORK/full.env" \
     --profile models config -q || fail "compose config -q refused the pinned addresses"
@@ -1671,6 +1679,9 @@ for name, svc in c["services"].items():
 for name in want:
     aliases = c["services"][name]["networks"]["pmos"]["aliases"]
     assert aliases == [name + ".pmos.internal"], (name, aliases)
+cli = c["services"]["toolserver-cli"]
+assert cli["networks"] == {"pmos": None}, cli["networks"]
+assert not cli.get("ports"), cli.get("ports")
 net = c["networks"]["pmos"]
 assert net["driver_opts"] == {"com.docker.network.bridge.name": "pmos0"}, net
 assert net["ipam"]["config"] == [{"subnet": "10.201.77.0/24", "gateway": "10.201.77.1",
