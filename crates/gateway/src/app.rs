@@ -46,8 +46,10 @@ use chrono::Utc;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 
+use pmos_contract::model_source::{self as source, ModelSource};
+
 use crate::anthropic;
-use crate::config::{Client, ClientPolicy, Models, Role, UpstreamKind};
+use crate::config::{Client, ClientPolicy, GatewayClass, Models, Role, UpstreamKind};
 use crate::remote::{StreamScanner, ToolCallExtras};
 use crate::retry::RetryPolicy;
 use crate::scheduler::{Busy, Owner, Permit, Priority, Scheduler};
@@ -71,6 +73,11 @@ pub struct GatewayConfig {
     pub retry: RetryPolicy,
     /// How long an upstream may take ([`Timeouts`]).
     pub timeouts: Timeouts,
+    /// `PMOS_MODEL_SOURCE` (slice H4). Every answer reports it (`stub` with the stub on) in
+    /// `x-pmos-model-source`, and every model call must name it in `X-Pmos-Model-Source`
+    /// ([`check_expected_source`]). Under `hosted-test` every upstream error body is replaced
+    /// ([`neutral_error`]). The start-up rules are `Config::check_source`'s.
+    pub model_source: ModelSource,
 }
 
 /// How long an upstream may take. A streamed answer sends bytes as it goes, so a stream that
@@ -92,6 +99,12 @@ pub struct Timeouts {
 
 /// How long `GET /readyz` reuses a probe of the model servers, by default.
 pub const READY_CACHE: Duration = Duration::from_secs(5);
+
+/// The least time `GET /readyz` reuses a probe when a role's upstream is a testing-only remote
+/// one (spec §3.6, "Timeouts and retries", r6): that probe carries the provider's key, and the
+/// route needs no token, so no caller can make the gateway send keyed requests to the provider
+/// more often than this.
+pub const REMOTE_READY_CACHE: Duration = Duration::from_secs(30);
 
 impl Default for Timeouts {
     fn default() -> Self {
@@ -129,6 +142,11 @@ struct Inner {
     /// `GET /readyz`'s last probe. Held across a probe, so callers that arrive while one
     /// runs wait for it and use its result rather than probing again.
     probe: tokio::sync::Mutex<Option<Probe>>,
+    /// What every answer reports in `x-pmos-model-source`, and what every model call must
+    /// name: `PMOS_MODEL_SOURCE`, or `stub` with the stub on.
+    source: &'static str,
+    /// `PMOS_MODEL_SOURCE=hosted-test`: every upstream error body is replaced (V3).
+    hosted_test: bool,
 }
 
 #[derive(Clone)]
@@ -160,18 +178,38 @@ pub fn router(mut cfg: GatewayConfig) -> Router {
     }
     let sched = Scheduler::new(cfg.models.limits);
     // Both clients use the system proxy (`HTTPS_PROXY`, `NO_PROXY`) and trust store, so a
-    // remote test upstream works from behind a proxy.
-    let http = reqwest::Client::builder()
+    // remote test upstream works from behind a proxy. Neither follows a redirect (slice H4,
+    // spec §3.6, "Egress additions"): a `307` or `308` would resend the prompt to wherever it
+    // points, and a same-host one would keep the key; a `3xx` is a `502` for that call
+    // ([`redirect_refused`]). A `class: production` gateway resolves its two model server
+    // names only to their pinned addresses, at every connection (`resolve::PinnedResolver`).
+    let production = cfg.models.class == GatewayClass::Production;
+    let builder = |b: reqwest::ClientBuilder| {
+        let b = b.redirect(reqwest::redirect::Policy::none());
+        if production {
+            b.dns_resolver(Arc::new(crate::resolve::PinnedResolver::default()))
+        } else {
+            b
+        }
+    };
+    let http = builder(reqwest::Client::builder())
         .connect_timeout(Duration::from_secs(5))
         // A long generation streams for minutes; a server that goes silent this long is stuck.
         .read_timeout(cfg.timeouts.stream_silence)
         .build()
         .expect("http client builds");
-    let whole_http = reqwest::Client::builder()
+    let whole_http = builder(reqwest::Client::builder())
         .connect_timeout(Duration::from_secs(10))
         .timeout(cfg.timeouts.whole_answer)
         .build()
         .expect("http client builds");
+    let served = crate::config::served_source(cfg.model_source, cfg.stub);
+    // A remote test upstream's probe carries its key: at most one round per 30 seconds.
+    let ready_cache = if cfg.models.roles.values().any(|r| r.kind.is_cloud_test()) {
+        cfg.timeouts.ready_cache.max(REMOTE_READY_CACHE)
+    } else {
+        cfg.timeouts.ready_cache
+    };
     // Summary lines for held refusals (`UsageLog::record_refusal`), a few seconds after
     // their minute ends. The task stops when the log is gone.
     if let Ok(rt) = tokio::runtime::Handle::try_current() {
@@ -200,8 +238,10 @@ pub fn router(mut cfg: GatewayConfig) -> Router {
         remote_key: cfg.remote_key,
         retry: cfg.retry,
         extras: Arc::default(),
-        ready_cache: cfg.timeouts.ready_cache,
+        ready_cache,
         probe: tokio::sync::Mutex::new(None),
+        source: served,
+        hosted_test: cfg.model_source == ModelSource::HostedTest,
     }));
     let v1 = Router::new()
         .route("/models", get(models))
@@ -211,11 +251,44 @@ pub fn router(mut cfg: GatewayConfig) -> Router {
         .route("/pmos/roles", get(list_roles))
         .layer(middleware::from_fn_with_state(state.clone(), authenticate))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES));
+    // Every answer, errors, refusals and streams included, says the source it was served from
+    // (spec §3.6, "Keeping every caller on one source", r6, V4).
+    let label = HeaderValue::from_static(served);
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/readyz", get(readyz))
         .nest("/v1", v1)
         .with_state(state)
+        .layer(middleware::map_response(move |mut res: Response| {
+            let label = label.clone();
+            async move {
+                res.headers_mut().insert(source::HEADER, label);
+                res
+            }
+        }))
+}
+
+/// X4 (r7, spec §3.6, "Callers state the source they expect"): a model call must say, in
+/// `X-Pmos-Model-Source`, the source it expects; the gateway compares before it queues,
+/// counts or forwards anything. Missing: `400 model_source_required`, under every source, the
+/// stub included, so no caller can skip the check by leaving the header out. Another source:
+/// `409 model_source_mismatch` (the answer's `x-pmos-model-source` says this gateway's).
+/// `Some`: the refusal to answer with.
+fn check_expected_source(headers: &HeaderMap, served: &str) -> Option<Response> {
+    match headers.get(source::HEADER).map(|v| v.to_str()) {
+        None => Some(error(
+            StatusCode::BAD_REQUEST,
+            "model_source_required",
+            "say which model source this call expects in X-Pmos-Model-Source",
+        )),
+        Some(Ok(v)) if v == served => None,
+        Some(_) => Some(error(
+            StatusCode::CONFLICT,
+            "model_source_mismatch",
+            "this gateway serves another model source than the call expects \
+             (x-pmos-model-source); nothing was sent to a model",
+        )),
+    }
 }
 
 /// An error in the shape OpenAI clients expect.
@@ -315,6 +388,7 @@ async fn list_roles(State(state): State<AppState>) -> Response {
         .any(|r| r.kind.is_cloud_test());
     Json(json!({
         "class": state.0.models.class.as_str(),
+        "model_source": state.0.source,
         "stub": state.0.stub,
         "cloud_test": cloud_test,
         "workarounds": state.0.workarounds_on,
@@ -342,6 +416,7 @@ async fn readyz(State(state): State<AppState>) -> Response {
     let class = state.0.models.class.as_str();
     if state.0.stub {
         return Json(json!({"ready": true, "class": class, "stub": true,
+                           "model_source": state.0.source,
                            "running": running, "waiting": waiting}))
         .into_response();
     }
@@ -377,6 +452,7 @@ async fn readyz(State(state): State<AppState>) -> Response {
         status,
         Json(
             json!({"ready": ok, "class": class, "stub": false, "upstreams": checks,
+                    "model_source": state.0.source,
                     "cloud_test": cloud_test, "running": running, "waiting": waiting}),
         ),
     )
@@ -716,7 +792,11 @@ fn bounded_stream(
             Ok(None) => None,
             // Never the upstream's URL.
             Ok(Some(Err(e))) => {
-                let e = cut(&mut f, 502, e.without_url().to_string());
+                let e = cut(
+                    &mut f,
+                    502,
+                    format!("the streamed answer broke off ({})", error_kind(&e)),
+                );
                 Some((e, f))
             }
             Ok(Some(Ok(bytes))) => {
@@ -766,6 +846,14 @@ async fn forward(
     };
     let policy = inner.models.client_policy(&client);
     let stream = endpoint == Endpoint::Chat && req["stream"] == json!(true);
+    // X4: before the call is queued, counted or forwarded.
+    if let Some(refused) = check_expected_source(&headers, inner.source) {
+        tracing::warn!(
+            client = %client, role = %role.alias(), status = refused.status().as_u16(),
+            "a model call didn't name this gateway's model source; refused before forwarding"
+        );
+        return refused;
+    }
     // A usage line for a call refused before it reached the queue or a slot.
     let refused_line = |status: u16,
                         user: Option<String>,
@@ -990,7 +1078,8 @@ async fn forward(
             break this;
         };
         tracing::warn!(
-            upstream = %role.logged_upstream(), status, attempt, wait_ms = wait.as_millis() as u64,
+            role = %role.alias(), upstream = role.upstream_kind_label(), status, attempt,
+            wait_ms = wait.as_millis() as u64,
             "model server refused or was unreachable; retrying"
         );
         let mut line = event.clone();
@@ -1031,18 +1120,18 @@ async fn forward(
             event.status = status;
             event.latency_ms = started.elapsed().as_millis() as u64;
             inner.usage.record(event);
-            let mut res = upstream_error_answer(&role, status, body);
+            let mut res = upstream_error_answer(&role, inner.hosted_test, status, body);
             if let Some(v) = headers.get(header::RETRY_AFTER) {
                 res.headers_mut().insert(header::RETRY_AFTER, v.clone());
             }
             return finish(res);
         }
         Attempt::Down(e) => {
+            // V3: the role and its kind label, and the error's kind, never its text (which
+            // holds the URL, or the address a resolver answered).
             tracing::warn!(
-                upstream = %role.logged_upstream(),
-                error = %logged_error(&role, &e),
-                cause = %causes(&e),
-                timeout = e.is_timeout(),
+                role = %role.alias(), upstream = role.upstream_kind_label(),
+                error = error_kind(&e), timeout = e.is_timeout(),
                 "model server unreachable"
             );
             event.status = 502;
@@ -1058,6 +1147,18 @@ async fn forward(
     let permit = permit.expect("a live answer holds its slot");
     let status = res.status();
     event.status = status.as_u16();
+    if status.is_redirection() {
+        // No redirect is followed, and none is passed on (its `Location` names somewhere else).
+        event.status = 502;
+        event.latency_ms = started.elapsed().as_millis() as u64;
+        inner.usage.record(event);
+        drop(permit);
+        tracing::warn!(
+            role = %role.alias(), upstream = role.upstream_kind_label(), status = status.as_u16(),
+            "model server answered a redirect, which this gateway never follows"
+        );
+        return finish(redirect_refused(&role));
+    }
 
     if stream && status.is_success() {
         let end = StreamEnd {
@@ -1105,7 +1206,11 @@ async fn forward(
                     role.name
                 ),
                 ReadError::Broken(e) => {
-                    format!("the `{}` model server stopped mid-answer: {e}", role.name)
+                    format!(
+                        "the `{}` model server stopped mid-answer ({})",
+                        role.name,
+                        error_kind(&e)
+                    )
                 }
             };
             return finish(error(StatusCode::BAD_GATEWAY, "upstream_error", message));
@@ -1116,7 +1221,12 @@ async fn forward(
         inner.usage.record(event);
         // The model server's own error (bad parameters, context too long) helps the caller;
         // for a labelled role it may name the model, so a neutral one takes its place.
-        return finish(upstream_error_answer(&role, status.as_u16(), bytes));
+        return finish(upstream_error_answer(
+            &role,
+            inner.hosted_test,
+            status.as_u16(),
+            bytes,
+        ));
     }
     let mut answer: Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
@@ -1191,9 +1301,8 @@ async fn claude(
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(
-                upstream = %role.logged_upstream(),
-                error = %logged_error(role, &e),
-                "Claude test upstream unreachable"
+                role = %role.alias(), upstream = role.upstream_kind_label(),
+                error = error_kind(&e), "Claude test upstream unreachable"
             );
             event.status = 502;
             return error(
@@ -1208,6 +1317,10 @@ async fn claude(
     };
     let status = res.status();
     event.status = status.as_u16();
+    if status.is_redirection() {
+        event.status = 502;
+        return redirect_refused(role);
+    }
     let answer: Value = match read_capped(res, inner.models.limits.max_answer_bytes).await {
         Ok(b) => serde_json::from_slice(&b).unwrap_or(Value::Null),
         Err(ReadError::TooLarge) => {
@@ -1228,9 +1341,9 @@ async fn claude(
             status = status.as_u16(),
             "Claude test upstream refused the request"
         );
-        if role.label.is_some() {
+        if role.label.is_some() || inner.hosted_test {
             let raw = serde_json::to_vec(&answer).unwrap_or_default();
-            return upstream_error_answer(role, status.as_u16(), raw.into());
+            return upstream_error_answer(role, inner.hosted_test, status.as_u16(), raw.into());
         }
         return (
             StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
@@ -1255,14 +1368,37 @@ async fn claude(
     }
 }
 
-/// A transport error as the logs show it: for a labelled role ([`Role::label`]) without the
-/// upstream's URL, which names the provider's host.
-fn logged_error(role: &Role, e: &reqwest::Error) -> String {
-    let text = e.to_string();
-    match (&role.label, e.url()) {
-        (Some(_), Some(url)) => text.replace(url.as_str(), role.upstream_kind_label()),
-        _ => text,
+/// A transport error as the logs and callers see it (V3, slice H4): its kind only, never its
+/// text, which holds the URL (and so the provider's host) or a resolver's answer.
+pub fn error_kind(e: &reqwest::Error) -> &'static str {
+    if e.is_timeout() {
+        "timeout"
+    } else if e.is_connect() {
+        "connect"
+    } else if e.is_redirect() {
+        "redirect"
+    } else if e.is_body() {
+        "body"
+    } else if e.is_decode() {
+        "decode"
+    } else if e.is_request() {
+        "request"
+    } else {
+        "transport"
     }
+}
+
+/// The answer for an upstream's `3xx`: a `502`, with neither the upstream's body nor its
+/// `Location` (spec §3.6, "Egress additions").
+fn redirect_refused(role: &Role) -> Response {
+    error(
+        StatusCode::BAD_GATEWAY,
+        "upstream_error",
+        format!(
+            "the `{}` model server answered a redirect, which this gateway never follows",
+            role.name
+        ),
+    )
 }
 
 /// The top-level fields of an answer (whole, or one streamed event) that a labelled role
@@ -1320,13 +1456,17 @@ pub fn neutral_error(status: u16, body: &[u8]) -> Value {
 }
 
 /// The answer a caller gets for an upstream's non-2xx answer: as it came for a role without
-/// a label; for a labelled one, [`neutral_error`] with the same status. The caller adds any
-/// `Retry-After`.
-fn upstream_error_answer(role: &Role, status: u16, body: Bytes) -> Response {
+/// a label under `local` (PM OS's own vLLM, whose messages, such as "context too long", help
+/// the caller); for a labelled role, and for every role under `hosted-test` (V3, slice H4),
+/// [`neutral_error`] with the same status, so a provider's `401` body (a masked key, an
+/// account id, the vendor's name) never reaches a worker, a trace or a draft. The caller adds
+/// any `Retry-After`.
+fn upstream_error_answer(role: &Role, hosted_test: bool, status: u16, body: Bytes) -> Response {
     let code = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
-    match role.label {
-        Some(_) => (code, Json(neutral_error(status, &body))).into_response(),
-        None => (code, [(header::CONTENT_TYPE, "application/json")], body).into_response(),
+    if role.label.is_some() || hosted_test {
+        (code, Json(neutral_error(status, &body))).into_response()
+    } else {
+        (code, [(header::CONTENT_TYPE, "application/json")], body).into_response()
     }
 }
 
@@ -1545,50 +1685,5 @@ mod relabel_tests {
             assert_eq!(v["error"]["status"], status);
             assert!(!v.to_string().contains("real-id"));
         }
-    }
-}
-
-/// What lies under a transport error ("connection reset by peer", "operation timed out"),
-/// which reqwest's own message ("error sending request for url ...") leaves out. Never holds
-/// a header, so never the remote key.
-fn causes(e: &(dyn std::error::Error + 'static)) -> String {
-    let mut out = Vec::new();
-    let mut next = e.source();
-    while let Some(cause) = next {
-        out.push(cause.to_string());
-        next = cause.source();
-    }
-    out.join(": ")
-}
-
-#[cfg(test)]
-mod causes_tests {
-    #[derive(Debug)]
-    struct Layer(&'static str, Option<Box<Layer>>);
-    impl std::fmt::Display for Layer {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str(self.0)
-        }
-    }
-    impl std::error::Error for Layer {
-        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-            self.1.as_deref().map(|l| l as _)
-        }
-    }
-
-    #[test]
-    fn lists_every_cause_under_the_error() {
-        let e = Layer(
-            "error sending request",
-            Some(Box::new(Layer(
-                "client error (SendRequest)",
-                Some(Box::new(Layer("connection reset by peer", None))),
-            ))),
-        );
-        assert_eq!(
-            super::causes(&e),
-            "client error (SendRequest): connection reset by peer"
-        );
-        assert_eq!(super::causes(&Layer("alone", None)), "");
     }
 }

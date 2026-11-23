@@ -1,0 +1,7 @@
+This content checkout holds no company data.
+
+It is PM OS's seed library: example skills, context, reviewers and templates written for
+testing. A stack whose PMOS_MODEL_SOURCE is `hosted-test` (fake data only) refuses a content
+checkout without this file, and any file in it marked `sensitivity: restricted`
+(docs/openshell-any-host-spec.md §3.6). Remove this file from a content repository the
+moment it holds anything real.

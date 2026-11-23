@@ -10,6 +10,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use pmos_contract::model_source::ModelSource;
 use pmos_gateway::config::{Client, Config, Limits, Models, UpstreamKind};
 use pmos_gateway::scheduler::Priority;
 use pmos_gateway::usage::UsageLog;
@@ -108,6 +109,8 @@ struct Gw {
     base: String,
     usage: Arc<UsageLog>,
     stop: CancellationToken,
+    /// The source it serves: `stub` with the stub on, else `local`.
+    source: &'static str,
 }
 
 async fn start_gateway(upstream: &str, limits: Limits, stub: bool, workarounds_on: bool) -> Gw {
@@ -146,9 +149,15 @@ async fn start_gateway(upstream: &str, limits: Limits, stub: bool, workarounds_o
             ready_cache: Duration::ZERO,
             ..Default::default()
         },
+        model_source: ModelSource::Local,
     });
     let (base, stop) = serve(app).await;
-    Gw { base, usage, stop }
+    Gw {
+        base,
+        usage,
+        stop,
+        source: if stub { "stub" } else { "local" },
+    }
 }
 
 fn wide() -> Limits {
@@ -161,7 +170,7 @@ fn wide() -> Limits {
 }
 
 fn chat(gw: &Gw, model: &str, text: &str) -> reqwest::RequestBuilder {
-    reqwest::Client::new()
+    http_as(gw.source)
         .post(format!("{}/v1/chat/completions", gw.base))
         .bearer_auth(TOKEN)
         .json(&json!({"model": model, "messages": [{"role": "user", "content": text}]}))
@@ -171,7 +180,7 @@ fn chat(gw: &Gw, model: &str, text: &str) -> reqwest::RequestBuilder {
 async fn roles_route_to_their_local_model_and_nothing_else_gets_through() {
     let (up, vllm, stop_up) = start_vllm().await;
     let gw = start_gateway(&up, wide(), false, true).await;
-    let http = reqwest::Client::new();
+    let http = http();
 
     // No token, or a wrong one.
     let res = http
@@ -338,7 +347,7 @@ async fn workarounds_apply_per_role_and_switch_off_together() {
         .starts_with("<think>"));
 
     // The registry is visible, with each entry's delete-when test.
-    let reg: Value = reqwest::Client::new()
+    let reg: Value = http()
         .get(format!("{}/v1/pmos/workarounds", on.base))
         .bearer_auth(TOKEN)
         .send()
@@ -367,7 +376,7 @@ async fn workarounds_apply_per_role_and_switch_off_together() {
 async fn streams_pass_through_and_are_logged_when_they_end() {
     let (up, _vllm, stop_up) = start_vllm().await;
     let gw = start_gateway(&up, wide(), false, true).await;
-    let res = reqwest::Client::new()
+    let res = http()
         .post(format!("{}/v1/chat/completions", gw.base))
         .bearer_auth(TOKEN)
         .json(&json!({"model": "pmos/default", "stream": true,
@@ -546,7 +555,7 @@ async fn the_stub_model_needs_no_model_server() {
         body["choices"][0]["message"]["content"],
         "Stub reply to: Critique this PRD"
     );
-    let text = reqwest::Client::new()
+    let text = http_as("stub")
         .post(format!("{}/v1/chat/completions", gw.base))
         .bearer_auth(TOKEN)
         .json(&json!({"model": "pmos/default", "stream": true,
@@ -558,7 +567,7 @@ async fn the_stub_model_needs_no_model_server() {
         .await
         .unwrap();
     assert!(text.contains("Stub") && text.ends_with("data: [DONE]\n\n"));
-    let emb: Value = reqwest::Client::new()
+    let emb: Value = http()
         .post(format!("{}/v1/embeddings", gw.base))
         .bearer_auth(TOKEN)
         .json(&json!({"model": "pmos/embedding", "input": ["a", "a"]}))
@@ -701,9 +710,10 @@ async fn the_claude_test_upstream_needs_its_switch_and_translates_both_ways() {
         remote_key: String::new(),
         retry: Default::default(),
         timeouts: Default::default(),
+        model_source: ModelSource::Local,
     }))
     .await;
-    let http = reqwest::Client::new();
+    let http = http();
     let ask = json!({
         "model": "pmos/default",
         "temperature": 0,
@@ -898,6 +908,7 @@ async fn a_remote_test_upstream_needs_its_switch_and_forwards_as_is_with_its_key
         let token = token.clone();
         Config::from_lookup(move |k| match k {
             "PMOS_GATEWAY_TOKENS" => Some(format!("runtime={token}")),
+            "PMOS_MODEL_SOURCE" => Some("local".into()),
             "PMOS_GATEWAY_CLOUD_TEST" => Some("1".into()),
             "PMOS_GATEWAY_REMOTE_KEY" => key.map(String::from),
             _ => None,
@@ -924,9 +935,10 @@ async fn a_remote_test_upstream_needs_its_switch_and_forwards_as_is_with_its_key
         remote_key: REMOTE_KEY.into(),
         retry: Default::default(),
         timeouts: Default::default(),
+        model_source: ModelSource::Local,
     }))
     .await;
-    let http = reqwest::Client::new();
+    let http = http();
     let ask = json!({
         "model": "pmos/default",
         "temperature": 0,
@@ -1138,6 +1150,7 @@ async fn readiness_names_no_upstream_host_url_model_or_key() {
                 ready_cache: Duration::ZERO,
                 ..Default::default()
             },
+            model_source: ModelSource::Local,
         }))
         .await
     };
@@ -1196,14 +1209,20 @@ async fn readiness_names_no_upstream_host_url_model_or_key() {
         .filter(|l| !l.contains("reasoning:"))
         .collect::<Vec<_>>()
         .join("\n");
-    let (gw, stop_gw) = start(two).await;
+    let (gw, stop_gw) = start(two.clone()).await;
     let (status, text, v) = ready(gw.clone()).await;
     assert_eq!(status, 200, "{text}");
     check(&text);
     assert_eq!(v["upstreams"]["default"]["status"], "ok");
-    // The remote one goes away: 503, and still nothing but labels.
+    // The remote one goes away. A remote test upstream's probe is reused for at least 30
+    // seconds (slice H4), so this gateway still answers from its cache; a fresh one says 503,
+    // and still nothing but labels.
     stop_remote.cancel();
     tokio::time::sleep(Duration::from_millis(100)).await;
+    let (status, _, _) = ready(gw).await;
+    assert_eq!(status, 200, "answered from the 30-second cache");
+    stop_gw.cancel();
+    let (gw, stop_gw) = start(two).await;
     let (status, text, v) = ready(gw).await;
     assert_eq!(status, 503, "{text}");
     check(&text);
@@ -1237,6 +1256,7 @@ async fn readiness_of_the_shipped_config_names_none_of_its_hosts() {
         remote_key: String::new(),
         retry: Default::default(),
         timeouts: Default::default(),
+        model_source: ModelSource::Local,
     }))
     .await;
     let res = reqwest::get(format!("{gw}/readyz")).await.unwrap();
@@ -1299,6 +1319,7 @@ async fn readiness_reuses_its_probe_for_a_while() {
             ready_cache: cache,
             ..Default::default()
         },
+        model_source: ModelSource::Local,
     }))
     .await;
     let ready = async || {
@@ -1382,6 +1403,7 @@ async fn a_caller_that_hangs_up_mid_probe_still_fills_the_readiness_cache() {
             ready_cache: Duration::from_secs(30),
             ..Default::default()
         },
+        model_source: ModelSource::Local,
     }))
     .await;
     // Five callers, one after another, each hanging up 50 ms into the probe.
@@ -1431,8 +1453,8 @@ async fn the_gateway_binary_needs_the_remote_key_and_never_logs_it() {
     std::fs::write(
         &config,
         format!(
-            "upstreams: {{r: 'openai+http://127.0.0.1:{dead_port}/v1'}}\n\
-             roles: {{default: {{upstream: r, model: remote-model}}}}\n"
+            "upstreams: {{r: 'openai+http://127.0.0.1:{dead_port}/secret-path/v1'}}\n\
+             roles: {{default: {{upstream: r, model: remote-model, label: remote-label}}}}\n"
         ),
     )
     .unwrap();
@@ -1443,6 +1465,7 @@ async fn the_gateway_binary_needs_the_remote_key_and_never_logs_it() {
             .env("PMOS_GATEWAY_CONFIG", &config)
             .env("PMOS_GATEWAY_BIND", bind.to_string())
             .env("PMOS_GATEWAY_CLOUD_TEST", "1")
+            .env("PMOS_MODEL_SOURCE", "hosted-test")
             .env("RUST_BACKTRACE", "0")
             .env("RUST_LOG", "debug")
             .stdout(Stdio::piped())
@@ -1477,7 +1500,7 @@ async fn the_gateway_binary_needs_the_remote_key_and_never_logs_it() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(up, "the gateway didn't start: {:?}", lines.lock().unwrap());
-    let res = reqwest::Client::new()
+    let res = http_as("hosted-test")
         .post(format!("{base}/v1/chat/completions"))
         .bearer_auth(TOKEN)
         .json(&json!({"model": "pmos/default", "messages": [{"role": "user", "content": "hi"}]}))
@@ -1495,6 +1518,16 @@ async fn the_gateway_binary_needs_the_remote_key_and_never_logs_it() {
     assert!(log.contains("a remote test upstream is on"), "{log}");
     assert!(log.contains("model server unreachable"), "{log}");
     assert!(!log.contains(REMOTE_KEY), "{log}");
+    // V3 (slice H4): no line names the upstream's URL, host, port, path or model id, the
+    // start-up lines and the refused connection's warning included.
+    for f in [
+        "secret-path",
+        "remote-model",
+        "http://",
+        &dead_port.to_string(),
+    ] {
+        assert!(!log.contains(f), "the log carries `{f}`: {log}");
+    }
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -1594,6 +1627,7 @@ async fn retry_gateway(steps: Vec<Step>, retry: RetryPolicy) -> (Gw, Arc<Scripte
         remote_key: String::new(),
         retry,
         timeouts: Default::default(),
+        model_source: ModelSource::Local,
     }))
     .await;
     (
@@ -1601,6 +1635,7 @@ async fn retry_gateway(steps: Vec<Step>, retry: RetryPolicy) -> (Gw, Arc<Scripte
             base: gw,
             usage,
             stop,
+            source: "local",
         },
         s,
     )
@@ -1615,7 +1650,7 @@ fn quick(max_attempts: u32, budget_ms: u64) -> RetryPolicy {
 }
 
 fn streamed(gw: &Gw) -> reqwest::RequestBuilder {
-    reqwest::Client::new()
+    http()
         .post(format!("{}/v1/chat/completions", gw.base))
         .bearer_auth(TOKEN)
         .json(&json!({"model": "pmos/default", "stream": true,
@@ -1829,10 +1864,11 @@ async fn a_whole_answer_may_take_longer_than_a_stream_may_stay_silent() {
             remote_key: String::new(),
             retry: Default::default(),
             timeouts,
+            model_source: ModelSource::Local,
         })
     };
     let ask = |gw: &str, stream: bool| {
-        reqwest::Client::new()
+        http()
             .post(format!("{gw}/v1/chat/completions"))
             .bearer_auth(TOKEN)
             .header("X-Pmos-User", "ana")
@@ -1863,4 +1899,22 @@ async fn a_whole_answer_may_take_longer_than_a_stream_may_stay_silent() {
     assert_eq!(ask(&gw, true).await.unwrap().status(), 200);
     stop.cancel();
     stop_up.cancel();
+}
+
+/// A client that names the model source the gateways here serve (`local`; X4, slice H4).
+fn http() -> reqwest::Client {
+    http_as("local")
+}
+
+/// A client that names `source` on every call.
+fn http_as(source: &str) -> reqwest::Client {
+    let mut h = reqwest::header::HeaderMap::new();
+    h.insert(
+        "x-pmos-model-source",
+        reqwest::header::HeaderValue::from_str(source).unwrap(),
+    );
+    reqwest::Client::builder()
+        .default_headers(h)
+        .build()
+        .unwrap()
 }

@@ -11,6 +11,7 @@ pub mod cite;
 pub mod frontmatter;
 pub mod lint;
 pub mod model;
+pub mod model_source;
 pub mod onboarding;
 pub mod permissions;
 pub mod personas;

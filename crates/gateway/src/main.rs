@@ -8,9 +8,16 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // The HTTP libraries' own lines are kept at `warn` whatever RUST_LOG says: their debug and
+    // info lines name the upstream's address and port ("connecting to …"), which no gateway
+    // line may (V3, slice H4).
+    let mut filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    for quiet in ["reqwest", "hyper", "hyper_util", "h2", "rustls"] {
+        filter = filter.add_directive(format!("{quiet}=warn").parse().expect("a valid directive"));
+    }
     tracing_subscriber::fmt()
         .json()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_env_filter(filter)
         .init();
     let config = Config::from_env().map_err(anyhow::Error::msg)?;
     let text = std::fs::read_to_string(&config.models_path)
@@ -28,12 +35,18 @@ async fn main() -> Result<()> {
         tracing::warn!("PMOS_GATEWAY_WORKAROUNDS=off: every workaround is switched off");
     }
     config.check_keys(&models).map_err(anyhow::Error::msg)?;
+    // Slice H4: the config must fit PMOS_MODEL_SOURCE, checked on its own class.
+    config.check_source(&models).map_err(anyhow::Error::msg)?;
     let (class, warning) = config.served_class(&models);
     if let Some(w) = warning {
         tracing::warn!("{w}");
     }
     models.class = class;
-    tracing::info!(class = models.class.as_str(), "gateway class");
+    tracing::info!(
+        class = models.class.as_str(),
+        model_source = config.served_source(),
+        "gateway class and model source"
+    );
     if models
         .roles
         .values()
@@ -49,19 +62,29 @@ async fn main() -> Result<()> {
         .values()
         .filter(|r| r.kind == UpstreamKind::RemoteOpenAi)
     {
+        // V3 (slice H4): the role and its kind label, never the provider's host.
         tracing::warn!(
             role = %role.alias(),
-            upstream = %role.logged_upstream_host(),
+            upstream = role.upstream_kind_label(),
             "TESTING ONLY: a remote test upstream is on (an OpenAI-compatible API on the internet), \
              so this role's prompts leave this machine; use test data and test accounts only"
         );
     }
     for role in models.roles.values() {
-        // A labelled role is logged by its label and upstream kind only (`config::Role::label`).
+        // A labelled role is logged by its label and upstream kind only (`config::Role::label`);
+        // every role's upstream by its kind, never its URL (V3, slice H4), except that a
+        // production gateway's model server keeps its pinned `*.pmos.internal` name.
+        let host = role.upstream_host();
+        let server = if pmos_gateway::config::pinned_address(&host).is_some() {
+            host
+        } else {
+            String::new()
+        };
         tracing::info!(
             role = %role.alias(), model = %role.reported_model(),
             model_sha256 = role.model_sha256().as_deref().unwrap_or(""),
-            upstream = %role.logged_upstream(), labelled = role.label.is_some(), "model role"
+            upstream = role.upstream_kind_label(), model_server = %server,
+            labelled = role.label.is_some(), "model role"
         );
     }
     // Names and settings only, never a token.
@@ -85,6 +108,7 @@ async fn main() -> Result<()> {
         remote_key: config.remote_key.clone(),
         retry: config.retry,
         timeouts: Default::default(),
+        model_source: config.model_source,
     });
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
