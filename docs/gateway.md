@@ -37,6 +37,8 @@ clients:
   `deploy/gateway.yaml` are the *production role models*: an eval report counts towards a bar
   only if the models the gateway reported for its run are these (`docs/evals.md`, "Which runs
   count"), so a swap there starts every streak again.
+- **`label`** (optional) is a neutral name for the model, such as `hosted-model-a`, reported
+  in its place: see "Hiding the model behind a label" below.
 - **The `reasoning` role** serves the PM-craft skills (`docs/pm-craft.md`). It ships pointing
   at the same upstream and model as `default`. If the `pm-craft` benchmarks show that model
   doesn't meet the bar, point `reasoning` at a larger one here; no skill changes.
@@ -256,7 +258,7 @@ moment. The gateway retries these itself, so a brief limit doesn't lose a PM's r
 | `POST /v1/embeddings` | client token | Embeddings for a role that serves them |
 | `GET /v1/models` | client token | The role aliases |
 | `GET /v1/pmos/workarounds` | client token | The workaround registry |
-| `GET /v1/pmos/roles` | client token | The gateway's `class` (`production` or `test`), each role's model id and upstream kind (`local`, `claude-test` or `remote-test`; never an address), and whether the stub, a testing-only upstream and the workarounds are on. The bot runtime passes it to the benchmark runner (`GET /v1/personas`, client `evals`), which records it in each report (`docs/evals.md`). |
+| `GET /v1/pmos/roles` | client token | The gateway's `class` (`production` or `test`), each role's model id (its `label` when it has one) and upstream kind (`local`, `claude-test` or `remote-test`; never an address), and whether the stub, a testing-only upstream and the workarounds are on. The bot runtime passes it to the benchmark runner (`GET /v1/personas`, client `evals`), which records it in each report (`docs/evals.md`). |
 | `GET /healthz` | none | Liveness |
 | `GET /readyz` | none | `200` when every model server answers `/models` within 2 seconds; `503` when one doesn't. `upstreams` is keyed by role, each with its upstream's kind label (`local`, `claude-test`, `remote-test`, as in `GET /v1/pmos/roles`) and `ok` or `down`: `{"default": {"upstream": "local", "status": "ok"}, …}`. Labels only, never an address, host name, URL or key (review at 6bb806f: before, the keys were the model servers' base URLs, so this unauthenticated route named their hosts and a remote test upstream's provider). Every answer also has `class` (as served: `test` with the stub on) and `stub` (G2); with the stub on it is always `200`, has no `upstreams`, and asks no model server. `deploy/pmos-admin status` shows a `WARN` line for the gateway when `stub` is true or `class` isn't `production`. Docker's health check uses `/healthz`, so neither changes whether the stack starts. |
 
@@ -269,9 +271,43 @@ moment. The gateway retries these itself, so a brief limit doesn't lose a PM's r
 
 **Errors:** in OpenAI's shape. A model server's own refusal, such as "context length exceeded", is passed through; an unreachable server is `502`.
 
+## Hiding the model behind a label
+A role may carry `label:` (1 to 64 letters, digits, `.`, `_` and `-`), so that nothing the
+gateway reports names the model or its provider (owner, 2026-11-23: no committed file may
+identify the hosted model's vendor):
+
+```yaml
+roles:
+  default: {upstream: remote, model: <the provider's model id>, label: hosted-model-a}
+```
+
+With a label set:
+- **`model` still goes upstream:** the model server is asked for its real id.
+- **Clients see the label:** `GET /v1/pmos/roles` reports it as the role's `model` (so the
+  benchmark runner records only the label in `gateway_models`), and so do the `x-pmos-model`
+  header, the `model` field of a whole answer, and the `model` of every event of a streamed
+  one (rewritten line by line).
+- **The logs name the label and the upstream's kind:** the usage log's `model` is the label and
+  its `upstream` is the kind (`local`, `claude-test`, `remote-test`) instead of the host; the
+  start-up line for the role, the remote-upstream warning, and the retry and "unreachable"
+  warnings name the kind instead of the URL.
+- **`GET /readyz`** is unchanged: it never named a model or a host.
+- **Benchmarks compare labels:** for a labelled role in the production gateway config, the
+  production role models (`docs/evals.md`) read its `label`, since that is what reports
+  record. A label names one model: give the role a new label when its model changes, or reports
+  from before and after the swap look alike (a change to `deploy/gateway.yaml` still marks
+  every category affected).
+
+Without a label nothing changes: the model id is reported and logged as before.
+
+What a label doesn't hide: the gateway's config file itself (the model id and the upstream URL
+are in it), the environment the gateway or the test stack runs with, and an error body a model
+server returns (passed to the caller as it came, and it may name the model).
+
 ## Usage log
 One event per call:
-- client, user, run, role, model, upstream host;
+- client, user, run, role, model, upstream host (for a role with a `label:`, the label and
+  the upstream's kind instead);
 - priority, stream or not, status;
 - queue and total time, token counts, workarounds applied;
 - `attempt` and `attempts`: every try at the model server gets a line, with `retrying: true`
@@ -410,7 +446,9 @@ deploy-kit job and a fresh install.
   (Gemini's thought signature) and refuse a later request whose history lacks it, which the
   harness's client drops. The gateway remembers it per tool-call id and puts it back
   (`crates/gateway/src/remote.rs`). Local upstreams never get this.
-- **Per-role setting:** none beyond `model` and `workarounds` (`effort` is Claude only).
+- **Per-role setting:** none beyond `model`, `label` and `workarounds` (`effort` is Claude
+  only). Give each role a `label:` to keep the model id and the provider's host out of reports
+  and logs (above); the test stack does.
 - **How to run a full test stack with it:** "Another provider" in
   [testing-with-claude.md](testing-with-claude.md).
 

@@ -97,7 +97,9 @@ fn load_where(dir: &Path, keep: impl Fn(&Report) -> bool) -> Result<Vec<(String,
 
 /// The production role models: role name to model id, from the `model` of each role in the
 /// production gateway config that `config.yaml`'s `benchmark.production_gateway` names
-/// (`deploy/gateway.yaml`). Only the model ids are read, never an upstream address.
+/// (`deploy/gateway.yaml`), or its `label` when it has one, since a labelled role is reported
+/// by its label (`GET /v1/pmos/roles`), so that is what a report records. Only the model ids
+/// and labels are read, never an upstream address.
 pub fn production_models(evals_root: &Path) -> Result<BTreeMap<String, String>, String> {
     let config = crate::config::Config::load(evals_root)?;
     let path = evals_root.join(&config.benchmark.production_gateway);
@@ -115,8 +117,11 @@ pub fn production_models(evals_root: &Path) -> Result<BTreeMap<String, String>, 
         .ok_or_else(|| format!("{}: no `roles`", path.display()))?;
     let mut out = BTreeMap::new();
     for (name, role) in roles {
-        let (Some(name), Some(model)) = (name.as_str(), role.get("model").and_then(|m| m.as_str()))
-        else {
+        let reported = role
+            .get("label")
+            .and_then(|l| l.as_str())
+            .or_else(|| role.get("model").and_then(|m| m.as_str()));
+        let (Some(name), Some(model)) = (name.as_str(), reported) else {
             return Err(format!(
                 "{}: a role without a name or `model`",
                 path.display()

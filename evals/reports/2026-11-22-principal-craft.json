@@ -8,7 +8,7 @@
   "runtime_url": "http://127.0.0.1:8750",
   "requested_by": "evals",
   "gateway_workarounds": null,
-  "note": "model: hosted-model-a (hosted-provider.invalid, OpenAI-compatible, every role); first full run (E1) on the test stack, fake fixtures",
+  "note": "model: hosted-model-a (the owner's hosted provider, OpenAI-compatible, every role); first full run (E1) on the test stack, fake fixtures",
   "repeats": 3,
   "judges": [
     {

@@ -88,7 +88,7 @@ the reviewer session: the user database, the required assertion, 90-day purge); 
   at `c00e682` with fake data: pick a team in onboarding, ask Chief and Echo, attributed drafts,
   Echo's draft line, approving after a bot left the team, the Admin's view. Not verified: a real
   Slack workspace, a held draft and the brief switch on the stack.
-  First eval run on 2026-11-21 and 22 (E1, the owner's model `hosted-model-a`, fake data, 93 tasks
+  First eval run on 2026-11-21 and 22 (E1, the owner's hosted model, fake data, 93 tasks
   three times each; reports in `evals/reports/`): 4 of 11 categories met their bar. It is not a
   valid benchmark: attempts shared one inbox, 28 attempts were lost to the provider's connection,
   and the judges have no human labels. Attempts are isolated since E2 (test stack only). Every

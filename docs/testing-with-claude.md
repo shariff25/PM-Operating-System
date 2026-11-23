@@ -142,6 +142,8 @@ company data.
 | `PMOS_TEST_MODEL` | The model name for the `default`, `reasoning` and `extraction` roles. It must support tool calling. |
 | `PMOS_GATEWAY_REMOTE_KEY` | The provider's API key, sent as `Authorization: Bearer`. It is never logged. |
 | `PMOS_TEST_MODEL_FAST` | Optional: a different model for `extraction` (routine parsing) |
+| `PMOS_TEST_MODEL_LABEL` | Optional, default `hosted-model-a`: the neutral name the gateway reports for `PMOS_TEST_MODEL` (letters, digits, `.`, `_`, `-`). Eval reports, the roles answer and the gateway's logs carry only this. |
+| `PMOS_TEST_MODEL_FAST_LABEL` | Optional, default `hosted-model-b`: the same for a `PMOS_TEST_MODEL_FAST` that differs from `PMOS_TEST_MODEL` |
 
 Then run the same script:
 
@@ -150,8 +152,13 @@ scripts/claude-test-stack.sh
 ```
 
 With `PMOS_TEST_MODEL_URL` set, the script writes `state/claude-test/gateway.yaml` with one
-upstream, `openai+<url>`, and every role on `PMOS_TEST_MODEL`, and starts the gateway with it.
-The usage log (`state/claude-test/usage.jsonl`) names the provider's host on every call.
+upstream, `openai+<url>`, and every role on `PMOS_TEST_MODEL` with `label:` set to
+`PMOS_TEST_MODEL_LABEL`, and starts the gateway with it. The gateway then reports and logs the
+label, never the model id or the provider's host (`docs/gateway.md`, "Hiding the model behind
+a label"): an eval run's report records only the label, the script's own messages name only the
+label, and the usage log (`state/claude-test/usage.jsonl`) shows `remote-test` as the upstream.
+The model id and URL are still in `state/claude-test/gateway.yaml` and your environment, both
+outside the repo.
 
 **Worked example: Gemini.** Create an API key in Google AI Studio, then:
 

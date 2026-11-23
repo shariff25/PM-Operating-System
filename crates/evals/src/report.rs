@@ -87,7 +87,8 @@ pub struct Report {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayModels {
-    /// Role name (`default`) to the model id that served it.
+    /// Role name (`default`) to the model id that served it, or the neutral `label:` the
+    /// gateway reports in its place (`docs/gateway.md`).
     pub roles: BTreeMap<String, String>,
     /// Role name to a neutral label for its upstream: `local` (a model server on the Spark),
     /// `claude-test` or `remote-test` (testing-only upstreams off the machine). Never a host.

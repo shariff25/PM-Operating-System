@@ -10,8 +10,13 @@
 //!   say what kind of gateway is serving, `cloud_test` whether a testing-only upstream, whose
 //!   prompts leave this machine, is on).
 //!
-//! - `GET /v1/pmos/roles`: each role's model id and upstream kind (never an address), and
-//!   whether the stub or a testing-only upstream is on, for the benchmark runner's report.
+//! - `GET /v1/pmos/roles`: each role's model id (or its `label:`, when the config gives one)
+//!   and upstream kind (never an address), and whether the stub or a testing-only upstream is
+//!   on, for the benchmark runner's report.
+//!
+//! A role with a `label:` is reported by that label everywhere a client or a log sees it (the
+//! roles answer, `x-pmos-model`, an answer's `model`, the usage log); its real model id is only
+//! sent upstream.
 //!
 //! Every `/v1` call needs a client token. `X-Pmos-User` (a handle), `X-Pmos-Priority`
 //! (`interactive`, `scheduled` or `personal`) and `X-Pmos-Run` place it in the queue and the
@@ -287,8 +292,8 @@ async fn list_roles(State(state): State<AppState>) -> Response {
         .roles
         .values()
         .map(|r| {
-            json!({"role": r.name, "alias": r.alias(), "model": r.model,
-                   "upstream": upstream_label(r.kind)})
+            json!({"role": r.name, "alias": r.alias(), "model": r.reported_model(),
+                   "upstream": r.upstream_kind_label()})
         })
         .collect();
     let cloud_test = state
@@ -305,16 +310,6 @@ async fn list_roles(State(state): State<AppState>) -> Response {
         "roles": roles,
     }))
     .into_response()
-}
-
-/// The neutral label for an upstream's kind, never its address: what `GET /v1/pmos/roles` and
-/// `GET /readyz` show.
-fn upstream_label(kind: UpstreamKind) -> &'static str {
-    match kind {
-        UpstreamKind::OpenAi => "local",
-        UpstreamKind::ClaudeTest => "claude-test",
-        UpstreamKind::RemoteOpenAi => "remote-test",
-    }
 }
 
 /// `GET /readyz`. Every answer says the gateway's `class` as served (`production` only for a
@@ -357,7 +352,7 @@ async fn readyz(State(state): State<AppState>) -> Response {
             let up = up_by_base.get(&r.upstream).copied().unwrap_or(false);
             (
                 r.name.clone(),
-                json!({"upstream": upstream_label(r.kind),
+                json!({"upstream": r.upstream_kind_label(),
                        "status": if up { "ok" } else { "down" }}),
             )
         })
@@ -746,8 +741,8 @@ async fn forward(
         run,
         endpoint: endpoint.path(),
         role: role.name.clone(),
-        model: role.model.clone(),
-        upstream: role.upstream_host(),
+        model: role.reported_model().to_string(),
+        upstream: role.logged_upstream_host(),
         priority,
         stream,
         stub: inner.stub,
@@ -833,8 +828,8 @@ async fn forward(
         run: who.run,
         endpoint: endpoint.path(),
         role: role.name.clone(),
-        model: role.model.clone(),
-        upstream: role.upstream_host(),
+        model: role.reported_model().to_string(),
+        upstream: role.logged_upstream_host(),
         priority: who.priority,
         stream,
         stub: inner.stub,
@@ -853,7 +848,7 @@ async fn forward(
         refused_users_more: None,
         user_key: None,
     };
-    let model_header = HeaderValue::from_str(&role.model).ok();
+    let model_header = HeaderValue::from_str(role.reported_model()).ok();
     let finish = |mut res: Response| {
         if let Some(v) = model_header.clone() {
             res.headers_mut().insert("x-pmos-model", v);
@@ -868,11 +863,15 @@ async fn forward(
         return finish(match (endpoint, stream) {
             (Endpoint::Chat, true) => (
                 [(header::CONTENT_TYPE, "text/event-stream")],
-                stub::chat_stream(&req, &role.model),
+                stub::chat_stream(&req, role.reported_model()),
             )
                 .into_response(),
-            (Endpoint::Chat, false) => Json(stub::chat(&req, &role.model)).into_response(),
-            (Endpoint::Embeddings, _) => Json(stub::embeddings(&req, &role.model)).into_response(),
+            (Endpoint::Chat, false) => {
+                Json(stub::chat(&req, role.reported_model())).into_response()
+            }
+            (Endpoint::Embeddings, _) => {
+                Json(stub::embeddings(&req, role.reported_model())).into_response()
+            }
         });
     }
 
@@ -951,7 +950,7 @@ async fn forward(
             break this;
         };
         tracing::warn!(
-            upstream = %role.upstream, status, attempt, wait_ms = wait.as_millis() as u64,
+            upstream = %role.logged_upstream(), status, attempt, wait_ms = wait.as_millis() as u64,
             "model server refused or was unreachable; retrying"
         );
         let mut line = event.clone();
@@ -1004,8 +1003,8 @@ async fn forward(
         }
         Attempt::Down(e) => {
             tracing::warn!(
-                upstream = %role.upstream,
-                error = %e,
+                upstream = %role.logged_upstream(),
+                error = %logged_error(&role, &e),
                 cause = %causes(&e),
                 timeout = e.is_timeout(),
                 "model server unreachable"
@@ -1041,13 +1040,17 @@ async fn forward(
             tokio::time::Instant::now() + Duration::from_secs(limits.stream_max_secs),
             limits.max_answer_bytes,
         );
+        let body = match &role.label {
+            Some(label) => Body::from_stream(relabel_stream(body, label.clone())),
+            None => Body::from_stream(body),
+        };
         return finish(
             (
                 [
                     (header::CONTENT_TYPE, "text/event-stream"),
                     (header::CACHE_CONTROL, "no-cache"),
                 ],
-                Body::from_stream(body),
+                body,
             )
                 .into_response(),
         );
@@ -1105,6 +1108,9 @@ async fn forward(
         event.workarounds =
             workarounds::apply(&role.workarounds, inner.workarounds_on, &mut answer);
     }
+    if role.label.is_some() {
+        relabel(&mut answer, role.reported_model());
+    }
     event.prompt_tokens = answer["usage"]["prompt_tokens"].as_u64();
     event.completion_tokens = answer["usage"]["completion_tokens"].as_u64();
     event.latency_ms = started.elapsed().as_millis() as u64;
@@ -1154,7 +1160,11 @@ async fn claude(
     let res = match res {
         Ok(r) => r,
         Err(e) => {
-            tracing::warn!(upstream = %role.upstream, error = %e, "Claude test upstream unreachable");
+            tracing::warn!(
+                upstream = %role.logged_upstream(),
+                error = %logged_error(role, &e),
+                "Claude test upstream unreachable"
+            );
             event.status = 502;
             return error(
                 StatusCode::BAD_GATEWAY,
@@ -1194,7 +1204,7 @@ async fn claude(
         )
             .into_response();
     }
-    let answer = anthropic::from_messages(&answer, &role.model);
+    let answer = anthropic::from_messages(&answer, role.reported_model());
     event.prompt_tokens = answer["usage"]["prompt_tokens"].as_u64();
     event.completion_tokens = answer["usage"]["completion_tokens"].as_u64();
     if stream {
@@ -1208,6 +1218,143 @@ async fn claude(
             .into_response()
     } else {
         Json(answer).into_response()
+    }
+}
+
+/// A transport error as the logs show it: for a labelled role ([`Role::label`]) without the
+/// upstream's URL, which names the provider's host.
+fn logged_error(role: &Role, e: &reqwest::Error) -> String {
+    let text = e.to_string();
+    match (&role.label, e.url()) {
+        (Some(_), Some(url)) => text.replace(url.as_str(), role.upstream_kind_label()),
+        _ => text,
+    }
+}
+
+/// Puts `label` in an answer's `model` field, where the upstream wrote its own model id.
+fn relabel(answer: &mut Value, label: &str) {
+    if let Some(model) = answer.get_mut("model").filter(|m| m.is_string()) {
+        *model = json!(label);
+    }
+}
+
+/// Rewrites the `model` field of each `data:` line of a streamed answer ([`relabel`]), for a
+/// labelled role. Bytes are passed on a whole line at a time; a line that isn't a JSON object
+/// with a `model` (`data: [DONE]`, a comment, an `event:`) goes through as it came.
+#[derive(Debug)]
+struct SseRelabel {
+    label: String,
+    pending: Vec<u8>,
+}
+
+impl SseRelabel {
+    fn new(label: String) -> Self {
+        Self {
+            label,
+            pending: Vec::new(),
+        }
+    }
+
+    /// The complete lines received so far, rewritten; a partial line waits for its end.
+    fn feed(&mut self, bytes: &[u8]) -> Bytes {
+        self.pending.extend_from_slice(bytes);
+        match self.pending.iter().rposition(|b| *b == b'\n') {
+            Some(i) => {
+                let rest = self.pending.split_off(i + 1);
+                let lines = std::mem::replace(&mut self.pending, rest);
+                Bytes::from(self.rewrite(&lines))
+            }
+            None => Bytes::new(),
+        }
+    }
+
+    /// Whatever is left when the upstream ends.
+    fn finish(&mut self) -> Bytes {
+        let lines = std::mem::take(&mut self.pending);
+        Bytes::from(self.rewrite(&lines))
+    }
+
+    fn rewrite(&self, text: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(text.len());
+        for piece in text.split_inclusive(|b| *b == b'\n') {
+            let body_len = piece.len()
+                - piece
+                    .iter()
+                    .rev()
+                    .take_while(|b| matches!(b, b'\n' | b'\r'))
+                    .count();
+            let (line, ending) = piece.split_at(body_len);
+            let relabelled = line.strip_prefix(b"data:").and_then(|payload| {
+                let payload = payload.strip_prefix(b" ").unwrap_or(payload);
+                let mut v: Value = serde_json::from_slice(payload).ok()?;
+                v.get("model").filter(|m| m.is_string())?;
+                relabel(&mut v, &self.label);
+                serde_json::to_vec(&v).ok()
+            });
+            match relabelled {
+                Some(json) => {
+                    out.extend_from_slice(b"data: ");
+                    out.extend_from_slice(&json);
+                    out.extend_from_slice(ending);
+                }
+                None => out.extend_from_slice(piece),
+            }
+        }
+        out
+    }
+}
+
+/// A streamed answer with each event's `model` rewritten to `label` ([`SseRelabel`]).
+fn relabel_stream(
+    upstream: impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+    label: String,
+) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send {
+    let state = (Box::pin(upstream), SseRelabel::new(label), false);
+    futures_util::stream::unfold(state, |(mut up, mut sse, done)| async move {
+        if done {
+            return None;
+        }
+        loop {
+            match up.next().await {
+                Some(Ok(bytes)) => {
+                    let out = sse.feed(&bytes);
+                    if !out.is_empty() {
+                        return Some((Ok(out), (up, sse, false)));
+                    }
+                }
+                Some(Err(e)) => return Some((Err(e), (up, sse, true))),
+                None => {
+                    let out = sse.finish();
+                    return (!out.is_empty()).then_some((Ok(out), (up, sse, true)));
+                }
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+mod relabel_tests {
+    use super::SseRelabel;
+
+    #[test]
+    fn rewrites_the_model_of_each_event_across_chunk_boundaries() {
+        let mut sse = SseRelabel::new("hosted-model-a".into());
+        let mut out = Vec::new();
+        for chunk in [
+            &b"data: {\"id\":\"1\",\"model\":\"real"[..],
+            b"-id\",\"choices\":[]}\r\n\n: keep-alive\n",
+            b"data: {\"id\":\"2\",\"model\":\"real-id\"}\n\ndata: [DONE]",
+        ] {
+            out.extend_from_slice(&sse.feed(chunk));
+        }
+        out.extend_from_slice(&sse.finish());
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains("real-id"), "{text}");
+        assert_eq!(
+            text,
+            "data: {\"choices\":[],\"id\":\"1\",\"model\":\"hosted-model-a\"}\r\n\n: keep-alive\n\
+             data: {\"id\":\"2\",\"model\":\"hosted-model-a\"}\n\ndata: [DONE]"
+        );
     }
 }
 

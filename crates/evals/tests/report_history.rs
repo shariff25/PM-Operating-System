@@ -933,3 +933,29 @@ fn the_gateways_roles_answer_is_read_as_labels_only() {
     assert!(GatewayModels::from_roles_answer(&bad).is_err());
     assert!(GatewayModels::from_roles_answer(&serde_json::json!({"roles": []})).is_err());
 }
+
+/// A production role with a `label:` is reported by its gateway under that label
+/// (`GET /v1/pmos/roles`), so the production role models read the label for it, and a run
+/// whose gateway reported the label counts; one that reported the real model id doesn't.
+#[test]
+fn a_labelled_production_role_is_compared_by_its_label() {
+    use pmos_evals::history::{counts, production_models};
+    let (_dir, evals, _content) = bench_dirs("1");
+    std::fs::write(
+        evals.join("prod-gateway.yaml"),
+        "upstreams: {q: 'http://vllm:8000/v1'}\nroles:\n  default: {upstream: q, model: qwen-prod, label: model-a}\n  extraction: {upstream: q, model: nemo-prod}\n",
+    )
+    .unwrap();
+    let prod = production_models(&evals).unwrap();
+    assert_eq!(prod["default"], "model-a");
+    assert_eq!(prod["extraction"], "nemo-prod");
+    let mut r = report("2026-11-16", 9, 10);
+    let mut m = prod_models();
+    m.roles.insert("default".into(), "model-a".into());
+    r.gateway_models = Some(m);
+    assert_eq!(counts(&r, &prod, None), Ok(()));
+    r.gateway_models = Some(prod_models());
+    assert!(counts(&r, &prod, None)
+        .unwrap_err()
+        .contains("default: `qwen-prod`, production `model-a`"));
+}
