@@ -131,6 +131,22 @@ provider commands' exit codes and that `provider create` refuses an existing nam
 `openshell sandbox stop`/`start`, which `pause` and `resume` use but OpenShell's current
 public docs don't show (they show `sandbox delete`).
 
+**Slice H2 status (2026-11-23): built and merged on `claude/web-app`, not yet reviewed.**
+`deploy/compose.yaml` pins `toolserver`, `gateway` and `bots` at `10.201.77.10` to `.12` and the
+two local model servers at `.13` and `.14`, gives every other container an address only from
+`PMOS_NETWORK_IP_RANGE` (default `10.201.77.128/25`) and names the bridge `pmos0`.
+`pmos-admin host-names apply` (with sudo) writes only its own block in `/etc/hosts`,
+idempotently and by a rename, with no argument, setting or file override, and never reads
+`deploy/.env`; `host-names check` fails on a missing, stale, doubled or broken block, any other
+line naming the three names, and any resolver answer but the pinned one. `up` refuses a subnet
+shorter than `/24` or not holding `.10` to `.14`, a gateway or range that collides with them,
+and a live `pmos_pmos` network made with other settings (fix: `down`, then `up`). `sandbox`
+refuses while the check fails; `status` shows the network and names. Tested in
+`scripts/test-pmos-admin.sh` with a temporary hosts file and stand-ins. Not verified: that
+OpenShell resolves through the host's `/etc/hosts` and reaches the bridge; a real
+`docker compose up` creating the network. The network checks run at `up` and the names check at
+`sandbox` only; `resume`, `add-bot` and `restore` are left to H1's preflight.
+
 **The owner's requirement, 2026-11-22:** "I want to deploy it in another platform apart from
 spark", and, asked which cloud, "OpenShell on another platform generic implementation". So PM OS's
 bots must be able to run in NVIDIA OpenShell sandboxes on hosts other than the DGX Spark, through
