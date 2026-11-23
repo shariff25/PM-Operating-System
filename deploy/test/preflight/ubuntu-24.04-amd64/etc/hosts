@@ -1,0 +1,7 @@
+127.0.0.1 localhost
+::1 localhost ip6-localhost ip6-loopback
+# BEGIN pmos (managed by pmos-admin)
+10.201.77.10 toolserver.pmos.internal
+10.201.77.11 gateway.pmos.internal
+10.201.77.12 bots.pmos.internal
+# END pmos

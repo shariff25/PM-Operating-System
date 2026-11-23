@@ -30,6 +30,17 @@
 #   pmos-admin host-names apply       (with sudo) write the managed block in /etc/hosts that maps
 #                                     the three service names to their pinned addresses
 #   pmos-admin host-names check       do the three names resolve on this host as pinned?
+#   pmos-admin preflight [args]       the host preflight, deploy/preflight.sh (--help for its
+#                                     arguments); up, restore, add-bot, sandbox and resume run it
+#   pmos-admin host-firewall apply|check|remove
+#                                     (apply and remove with sudo) the block that keeps PM OS's
+#                                     containers from the cloud metadata services
+#   pmos-admin host acknowledge H-PRIVATE --reason <text> | --clear H-PRIVATE
+#                                     (with sudo) record that a host declared private isn't
+#                                     (only H-PRIVATE takes an acknowledgement)
+#   pmos-admin host attest local-gpu --owner-controls --reason <text> | local-gpu --clear
+#                                     (with sudo) record that the owner controls this GPU host,
+#                                     which real data under PMOS_MODEL_SOURCE=local needs
 #   pmos-admin lint                  pmos lint and pmos policy check on the content checkout
 #   pmos-admin pmos <args>            the pmos CLI on the checkout, e.g. `pmos bot add-personal …`
 #                                     (paths are relative to the checkout: --root content)
@@ -633,7 +644,9 @@ lock_env() {
         exit 1
       }
     fi
-    exec 9<"$DEPLOY/.env.lock" 2>/dev/null || {
+    # In braces: `exec 9<f 2>/dev/null` alone would send all of this script's later errors to
+    # /dev/null too (an exec with redirections applies them to the shell itself).
+    { exec 9<"$DEPLOY/.env.lock"; } 2>/dev/null || {
       say "couldn't open $DEPLOY/.env.lock for reading (the lock for deploy/.env): check its owner and mode" >&2
       exit 1
     }
@@ -1057,8 +1070,278 @@ host_names_apply() {
   fi
 }
 
+# --- The host preflight, the metadata block, acknowledgements (slice H1) --------------------
+# docs/openshell-any-host-spec.md §3.2. deploy/preflight.sh checks the host and changes nothing;
+# `up`, `restore` and `add-bot` run its `run` stage, `sandbox` and `resume` add the OpenShell
+# checks, and the worker unit runs its `quick` stage before every start (ExecStartPre).
+PREFLIGHT="$DEPLOY/preflight.sh"
+# What runs the preflight and refuses on a fail (exit 2), before anything starts. Warnings are
+# shown; a pass says so in one line.
+run_preflight() { # command-name preflight-arguments…
+  local what=$1 out code=0
+  shift
+  out=$("$PREFLIGHT" --env-file "$ENV" "$@" 2>&1) || code=$?
+  case "$code" in
+    0)
+      if grep -qE '^  [A-Z][A-Z-]+ +warn ' <<<"$out"; then
+        grep -A1 -E '^  [A-Z][A-Z-]+ +warn ' <<<"$out" | grep -v '^--$' >&2
+      fi
+      say "host preflight: pass"
+      ;;
+    1)
+      {
+        printf '%s\n' "$out"
+        say "pmos-admin $what: the host preflight failed (each fail above), so nothing was started or changed."
+        say "Fix each one, then run this again; deploy/pmos-admin preflight shows them."
+      } >&2
+      exit 2
+      ;;
+    *)
+      { printf '%s\n' "$out"; say "pmos-admin $what: the host preflight couldn't run (above)"; } >&2
+      exit 2
+      ;;
+  esac
+}
+
+# Where the host's own files are, for host-firewall, host acknowledge and host attest: the root
+# directory. Empty on a real host; scripts/test-pmos-admin.sh's copy of this script (and only that
+# copy) names a temporary directory here, as for HOSTS_FILE. No setting or argument changes it.
+readonly HOST_PREFIX=""
+BLOCK_SCRIPT=/usr/local/sbin/pmos-metadata-block
+BLOCK_CONF=/etc/pmos/metadata-block.conf
+BLOCK_STATUS=/run/pmos/metadata-block.status
+BLOCK_DROPIN=/etc/systemd/system/docker.service.d/pmos-metadata-block.conf
+BLOCK_SERVICE=/etc/systemd/system/pmos-metadata-block.service
+BLOCK_TIMER=/etc/systemd/system/pmos-metadata-block.timer
+# `-`: a failure of the block never stops Docker from starting; the timer applies it within a
+# minute, and H-METADATA fails meanwhile.
+BLOCK_DROPIN_TEXT='[Service]
+ExecStartPost=-/usr/local/sbin/pmos-metadata-block apply'
+BLOCK_SERVICE_TEXT='[Unit]
+Description=PM OS: keep containers from the cloud metadata services (deploy/pmos-admin host-firewall)
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pmos-metadata-block apply'
+BLOCK_TIMER_TEXT='[Unit]
+Description=PM OS: re-apply the metadata block every minute (deploy/pmos-admin host-firewall)
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=1min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target'
+ACK_LOG=/var/log/pmos/host-acknowledgements.log
+
+require_root() { # what to run with sudo
+  [ "$(id -u)" = 0 ] && return 0
+  say "$1 changes files only root may change: run it with sudo: sudo deploy/pmos-admin $1" >&2
+  exit 1
+}
+# Write standard input to a root-owned file with the given mode, by a rename.
+install_root_file() { # destination mode
+  local dest=$HOST_PREFIX$1 tmp
+  mkdir -p -- "$(dirname "$dest")"
+  tmp=$(mktemp "$(dirname "$dest")/.pmos.XXXXXX")
+  cat >"$tmp"
+  chmod "$2" "$tmp"
+  chown 0:0 "$tmp" || { rm -f -- "$tmp"; say "couldn't give $1 to root" >&2; exit 1; }
+  mv -f -- "$tmp" "$dest"
+}
+# Everything wrong with the block, one line each (check and status). The rules can be read only
+# as root; otherwise the status the timer's run writes every minute stands for them.
+host_firewall_problems() {
+  local P=$HOST_PREFIX st t now
+  if [ ! -f "$P$BLOCK_CONF" ]; then
+    echo "the block was never applied (no $BLOCK_CONF): sudo deploy/pmos-admin host-firewall apply"
+    return
+  fi
+  [ -x "$P$BLOCK_SCRIPT" ] || echo "$BLOCK_SCRIPT is missing"
+  if [ "$(id -u)" = 0 ]; then
+    if [ -x "$P$BLOCK_SCRIPT" ]; then "$P$BLOCK_SCRIPT" check || true; fi
+  else
+    st=$(cat -- "$P$BLOCK_STATUS" 2>/dev/null || true)
+    t=${st#ok }
+    now=$(date +%s)
+    if [[ "$st" != "ok "* ]] || ! [[ "$t" =~ ^[0-9]+$ ]] || [ $((now - t)) -gt 180 ]; then
+      echo "the rules weren't confirmed in the last 3 minutes ($BLOCK_STATUS: ${st:-missing}); sudo deploy/pmos-admin host-firewall check reads them"
+    fi
+  fi
+  [ "$(cat -- "$P$BLOCK_DROPIN" 2>/dev/null)" = "$BLOCK_DROPIN_TEXT" ] || echo "the docker.service drop-in $BLOCK_DROPIN is missing or changed"
+  [ "$(cat -- "$P$BLOCK_SERVICE" 2>/dev/null)" = "$BLOCK_SERVICE_TEXT" ] || echo "$BLOCK_SERVICE is missing or changed"
+  [ "$(cat -- "$P$BLOCK_TIMER" 2>/dev/null)" = "$BLOCK_TIMER_TEXT" ] || echo "$BLOCK_TIMER is missing or changed"
+  [ "$(systemctl is-enabled pmos-metadata-block.timer 2>/dev/null || true)" = enabled ] || echo "pmos-metadata-block.timer isn't enabled"
+  [ "$(systemctl is-active pmos-metadata-block.timer 2>/dev/null || true)" = active ] || echo "pmos-metadata-block.timer isn't active"
+}
+host_firewall_apply() {
+  local subnet
+  require_root "host-firewall apply"
+  network_settings_problems >&2 || exit 2
+  for t in iptables systemctl; do
+    command -v "$t" >/dev/null || { say "$t isn't installed: host-firewall needs it" >&2; exit 1; }
+  done
+  subnet=${PMOS_NETWORK_SUBNET:-$NETWORK_SUBNET_DEFAULT}
+  printf 'SUBNET=%s\n' "$subnet" | install_root_file "$BLOCK_CONF" 644
+  install_root_file "$BLOCK_SCRIPT" 755 <"$DEPLOY/pmos-metadata-block"
+  "$HOST_PREFIX$BLOCK_SCRIPT" apply
+  printf '%s\n' "$BLOCK_DROPIN_TEXT" | install_root_file "$BLOCK_DROPIN" 644
+  printf '%s\n' "$BLOCK_SERVICE_TEXT" | install_root_file "$BLOCK_SERVICE" 644
+  printf '%s\n' "$BLOCK_TIMER_TEXT" | install_root_file "$BLOCK_TIMER" 644
+  systemctl daemon-reload
+  systemctl enable --now pmos-metadata-block.timer
+  say "applied: the metadata block for $subnet (pmos0) and docker0, the docker.service drop-in and pmos-metadata-block.timer"
+}
+host_firewall_remove() {
+  local P=$HOST_PREFIX
+  require_root "host-firewall remove"
+  if [ -x "$P$BLOCK_SCRIPT" ] && [ -f "$P$BLOCK_CONF" ]; then "$P$BLOCK_SCRIPT" remove; fi
+  systemctl disable --now pmos-metadata-block.timer 2>/dev/null || true
+  rm -f -- "$P$BLOCK_TIMER" "$P$BLOCK_SERVICE" "$P$BLOCK_DROPIN" "$P$BLOCK_SCRIPT" "$P$BLOCK_CONF" "$P$BLOCK_STATUS"
+  rmdir -- "$(dirname "$P$BLOCK_DROPIN")" 2>/dev/null || true
+  systemctl daemon-reload
+  say "removed: the metadata block's rules, the drop-in, the timer and $BLOCK_SCRIPT. H-METADATA fails until the cloud's own setting keeps containers away (docs/openshell-any-host-spec.md §3.2)."
+}
+
+# Acknowledgements and attestations (§3.2): a deploy/.env line and a line in a root-owned,
+# append-only log, both written only here, with sudo. The log's lines are tab-separated:
+#   <time>\t<login>\t<check>\t<acknowledge|attest|clear>\t<what it saw>\t<fingerprint>\t<reason>
+# The fingerprint and what was seen come from the preflight (--fingerprint), the one place each is
+# measured.
+ack_login() {
+  local who=${SUDO_USER:-}
+  [ -n "$who" ] || who=$(id -un)
+  if ! [[ "$who" =~ ^[a-z_][a-z0-9_.-]{0,31}$ ]]; then
+    say "the login \"$who\" can't be recorded (it must match ^[a-z_][a-z0-9_.-]{0,31}\$): run this with sudo as a named user" >&2
+    exit 2
+  fi
+  printf '%s\n' "$who"
+}
+# A reason: 1 to 200 printable characters, no tab or line break (it is one field of one line).
+valid_reason() { (LC_ALL=C && [[ "$1" =~ ^[[:print:]]{1,200}$ ]] && [[ "$1" == *[![:space:]]* ]]); }
+ack_log() { # check action saw fingerprint reason
+  local logf=$HOST_PREFIX$ACK_LOG new=0 who
+  who=$(ack_login) || exit 2
+  mkdir -p -- "$(dirname "$logf")"
+  chmod 755 -- "$(dirname "$logf")"
+  [ -e "$logf" ] || new=1
+  (umask 022 && printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$who" "$1" "$2" "$3" "$4" "$5" >>"$logf") ||
+    { say "couldn't write $ACK_LOG; nothing was recorded" >&2; exit 1; }
+  if [ "$new" = 1 ]; then
+    chown 0:0 -- "$logf" 2>/dev/null || true
+    chmod 644 -- "$logf"
+    # Append-only where the filesystem supports it (ext4, xfs): not even root rewrites a line
+    # without first removing the attribute.
+    if command -v chattr >/dev/null; then
+      chattr +a -- "$logf" 2>/dev/null || say "note: $ACK_LOG couldn't be made append-only (chattr +a); its filesystem may not support it" >&2
+    fi
+  fi
+}
+# Remove KEY from deploy/.env (under the lock, by a rename, as set_env).
+unset_env() {
+  local tmp
+  only_chars "$1" "$ENV_KEY_CHARS" || exit 2
+  lock_env
+  tmp=$(mktemp "$DEPLOY/.env.XXXXXX")
+  ENV_TMP=$tmp
+  if awk -v k="$1" -F= '$1 != k' "$ENV" >"$tmp"; then
+    replace_env "$tmp"
+    ENV_TMP=""
+  else
+    rm -f "$tmp"
+    ENV_TMP=""
+    say "couldn't write deploy/.env; it is unchanged" >&2
+    exit 1
+  fi
+}
+# The preflight's measurement for an acknowledgement or an attestation: "<fingerprint>\t<saw>".
+measure_for() { # h-private|local-gpu
+  local out code=0
+  out=$("$PREFLIGHT" --env-file "$ENV" --fingerprint "$1") || code=$?
+  [ "$code" = 0 ] || exit "$code"
+  [[ "$out" =~ ^[0-9a-f]{64}$'\t' ]] || { say "the preflight measured nothing usable" >&2; exit 1; }
+  printf '%s\n' "$out"
+}
+host_cmd() {
+  local sub=${1:-} target reason="" clear=0 owner=0 m fp saw
+  host_usage() {
+    say "usage: sudo deploy/pmos-admin host acknowledge H-PRIVATE --reason <text> | host acknowledge --clear H-PRIVATE" >&2
+    say "       sudo deploy/pmos-admin host attest local-gpu --owner-controls --reason <text> | host attest local-gpu --clear" >&2
+    exit 2
+  }
+  [ $# -ge 1 ] && shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --reason) [ $# -ge 2 ] || host_usage; reason=$2; shift 2 ;;
+      --clear) clear=1; shift ;;
+      --owner-controls) owner=1; shift ;;
+      -*) host_usage ;;
+      *) [ -z "${target:-}" ] || host_usage; target=$1; shift ;;
+    esac
+  done
+  case "$sub" in
+    acknowledge)
+      # Only H-PRIVATE takes an acknowledgement: anything else is refused before anything is
+      # measured, written or logged (P-8).
+      if [ "${target:-}" != H-PRIVATE ]; then
+        say "pmos-admin host acknowledge: only H-PRIVATE takes an acknowledgement, not $(printf '%q' "${target:-}"); every other check must pass (docs/openshell-any-host-spec.md §3.2)" >&2
+        exit 2
+      fi
+      [ "$owner" = 0 ] || host_usage
+      require_root "host acknowledge"
+      if [ "$clear" = 1 ]; then
+        [ -z "$reason" ] || valid_reason "$reason" || { say "--reason: 1 to 200 printable characters, on one line" >&2; exit 2; }
+        ack_log H-PRIVATE clear "-" "-" "${reason:-cleared}"
+        unset_env PMOS_HOST_ACK_H_PRIVATE
+        say "cleared the acknowledgement of H-PRIVATE (logged in $ACK_LOG)"
+        return
+      fi
+      valid_reason "$reason" || { say "host acknowledge needs --reason: 1 to 200 printable characters on one line, saying why this host may be declared private" >&2; exit 2; }
+      if [ "${PMOS_EXPOSURE:-public}" != private ]; then
+        say "PMOS_EXPOSURE isn't private in deploy/.env: there is nothing to acknowledge" >&2
+        exit 2
+      fi
+      m=$(measure_for h-private)
+      fp=${m%%$'\t'*}
+      saw=${m#*$'\t'}
+      ack_log H-PRIVATE acknowledge "$saw" "$fp" "$reason"
+      set_env PMOS_HOST_ACK_H_PRIVATE "$fp"
+      say "acknowledged H-PRIVATE ($saw); logged in $ACK_LOG. status shows it every time; it lapses when the host shows something else."
+      ;;
+    attest)
+      [ "${target:-}" = local-gpu ] || { say "pmos-admin host attest: only local-gpu can be attested" >&2; exit 2; }
+      require_root "host attest"
+      if [ "$clear" = 1 ]; then
+        [ "$owner" = 0 ] || host_usage
+        [ -z "$reason" ] || valid_reason "$reason" || { say "--reason: 1 to 200 printable characters, on one line" >&2; exit 2; }
+        ack_log local-gpu clear "-" "-" "${reason:-cleared}"
+        unset_env PMOS_HOST_ATTEST_LOCAL_GPU
+        say "cleared the local-gpu attestation (logged in $ACK_LOG)"
+        return
+      fi
+      [ "$owner" = 1 ] || { say "host attest local-gpu needs --owner-controls: you state that the owner controls this GPU host (decision D1)" >&2; exit 2; }
+      valid_reason "$reason" || { say "host attest needs --reason: 1 to 200 printable characters on one line" >&2; exit 2; }
+      if [ "${PMOS_MODEL_SOURCE:-local}" != local ] || [ -z "${PMOS_MODEL_SOURCE:-}" ]; then
+        say "PMOS_MODEL_SOURCE isn't local in deploy/.env (set it explicitly): the attestation is for a local model on this host" >&2
+        exit 2
+      fi
+      m=$(measure_for local-gpu)
+      fp=${m%%$'\t'*}
+      saw=${m#*$'\t'}
+      ack_log local-gpu attest "$saw" "$fp" "$reason"
+      set_env PMOS_HOST_ATTEST_LOCAL_GPU "$fp"
+      say "attested: the owner controls this GPU host ($saw); logged in $ACK_LOG. It lapses on another machine or GPU."
+      ;;
+    *) host_usage ;;
+  esac
+}
+
 # --- Bots: names, tokens, sandboxes and their workers ---------------------------------------
 # docs/openshell-any-host-spec.md §3.7 (slice H0).
+# shellcheck source=deploy/sandbox-create.sh
+. "$DEPLOY/sandbox-create.sh"
 
 # PM OS's own rule for a bot name, the same as `valid_name` in crates/contract/src/bots.rs:
 # lowercase ASCII letters, digits and single hyphens, not starting or ending with one, 1 to 32
@@ -1159,10 +1442,17 @@ install_worker_unit() {
     say "the path of openshell, $(printf '%q' "$openshell"), has characters a unit file can't hold" >&2
     exit 1
   fi
+  # The quick preflight (slice H1) by its absolute path, with openshell's directory on its PATH
+  # (O-GATEWAY asks openshell where its gateway is).
+  if ! only_chars "$PREFLIGHT" "$PATH_CHARS"; then
+    say "the path of the preflight, $(printf '%q' "$PREFLIGHT"), has characters a unit file can't hold: move the checkout" >&2
+    exit 1
+  fi
   dir=$(user_unit_dir)
   mkdir -p "$dir"
-  OPENSHELL_PATH=$openshell awk '
+  OPENSHELL_PATH=$openshell PREFLIGHT_LINE="ExecStartPre=/usr/bin/env PATH=$(dirname "$openshell"):/usr/local/bin:/usr/bin:/bin $PREFLIGHT --stage quick" awk '
     index($0, "ExecStart=/usr/bin/openshell ") == 1 { print "ExecStart=" ENVIRON["OPENSHELL_PATH"] substr($0, length("ExecStart=/usr/bin/openshell") + 1); next }
+    $0 == "ExecStartPre=/opt/pmos/deploy/preflight.sh --stage quick" { print ENVIRON["PREFLIGHT_LINE"]; next }
     { print }
   ' "$WORKER_UNIT_TEMPLATE" >"$dir/.pmos-worker@.service.new"
   mv "$dir/.pmos-worker@.service.new" "$dir/pmos-worker@.service"
@@ -1210,7 +1500,7 @@ case "$cmd" in pause | host-names | help | -h | --help) ;; *)
   # (they talk to the running stack, or only stop or read it), so a PMOS_UID=0 left by an older
   # install must not stop `revoke` in the middle of an incident. Every other command, anything
   # that can create or recreate a container, keeps the check (`up` refuses).
-  case "$cmd" in status | logs | backup | reindex | revoke) ;; *) uid_checks ;; esac
+  case "$cmd" in status | logs | backup | reindex | revoke | preflight | host-firewall | host) ;; *) uid_checks ;; esac
   port_checks
   ;;
 esac
@@ -1251,6 +1541,12 @@ case "$cmd" in
     # The pinned addresses (slice H2): the settings hold them, and a network made earlier with
     # other settings is re-created first. Last, so the refusals above stay docker-free.
     network_checks || exit 2
+    # The host preflight (slice H1, docs/openshell-any-host-spec.md §3.2), every time, before
+    # anything starts: a kernel or Docker update can turn Landlock off or reset a firewall rule.
+    # H-LOCAL refuses live connectors or GitHub memory under `local` without the attestation.
+    pf=(--stage run --starting)
+    for arg in "$@"; do [ "$arg" != --web ] || pf+=(--web); done
+    run_preflight up "${pf[@]}"
     if [ -z "${PMOS_SLACK_APP_TOKEN:-}" ] || [ -z "${PMOS_SLACK_BOT_TOKEN:-}" ]; then
       say "note: the Slack bot is off until PMOS_SLACK_APP_TOKEN and PMOS_SLACK_BOT_TOKEN are set"
     fi
@@ -1288,6 +1584,36 @@ case "$cmd" in
       while IFS= read -r p; do row names ok "$p"; done < <(host_names_ok_lines)
     else
       while IFS= read -r p; do row names FAIL "$p"; done <<<"$problems"
+    fi
+    # The host preflight (slice H1): every check that doesn't pass, then each acknowledgement and
+    # attestation in force, on its own line every time (§3.2).
+    say "== host"
+    pf_code=0
+    pf_json=$("$PREFLIGHT" --env-file "$ENV" --stage run --json 2>/dev/null) || pf_code=$?
+    if [ "$pf_code" -ge 2 ] || [ -z "$pf_json" ]; then
+      row preflight FAIL "the host preflight couldn't run: deploy/pmos-admin preflight shows why"
+    else
+      python3 -I -c '
+import json, sys
+d = json.loads(sys.stdin.read())
+bad = [c for c in d["checks"] if c["status"] in ("fail", "warn")]
+for c in bad:
+    print("%-17s %-5s %s%s" % (c["id"], "FAIL" if c["status"] == "fail" else "WARN", c["measured"][:150],
+          ("; " + c["hint"][:150]) if c["hint"] else ""))
+if not bad:
+    print("%-17s %-5s %s" % ("preflight", "ok", "%d checks pass (deploy/pmos-admin preflight)" % len(d["checks"])))
+for a in d["acknowledgements"]:
+    print("host: PMOS_EXPOSURE=private acknowledged on %s by %s: %s; \"%s\"" % (a["at"], a["by"], a["saw"], a["reason"]))
+for a in d["attestations"]:
+    print("host: PMOS_MODEL_SOURCE=local attested (local-gpu) on %s by %s: %s; \"%s\"" % (a["at"], a["by"], a["saw"], a["reason"]))
+' <<<"$pf_json" | sed 's/^/  /' || row preflight FAIL "the host preflight's answer couldn't be read"
+    fi
+    # A worker whose unit failed, its quick preflight (ExecStartPre) included.
+    if [ "$(id -u)" != 0 ] && command -v systemctl >/dev/null; then
+      while read -r u _; do
+        [ -n "$u" ] || continue
+        row worker FAIL "$u failed (its ExecStartPre preflight or the worker): journalctl --user -u '$u'; then deploy/pmos-admin resume <bot>"
+      done < <(systemctl --user list-units 'pmos-worker@*' --state=failed --no-legend --plain 2>/dev/null || true)
     fi
     say "== readiness"
     if [ "${PMOS_MODEL_SOURCE:-local}" = hosted-test ]; then
@@ -1380,6 +1706,7 @@ case "$cmd" in
     # The `up` that follows starts the services from deploy/.env: check now that it will
     # start them with assertions as configured, before anything is stopped.
     assertion_checks || exit 2
+    run_preflight restore --stage run --starting
     say "This replaces every PM OS database with the backup in $dir."
     read -r -p "Type RESTORE to go on: " answer
     [ "$answer" = RESTORE ] || { say "stopped; nothing changed"; exit 1; }
@@ -1535,6 +1862,7 @@ for g in s["groups"]:
     # the console may be running against it. Checked before anything is written.
     assertion_checks || exit 2
     model_source_checks || exit 2
+    run_preflight add-bot --stage run --starting
     rt=$(openssl rand -hex 24)
     gw=$(openssl rand -hex 24)
     set_env PMOS_RT_WORKER_TOKENS "${PMOS_RT_WORKER_TOKENS:+$PMOS_RT_WORKER_TOKENS,}worker-$bot=$rt"
@@ -1597,6 +1925,9 @@ for g in s["groups"]:
       exit 2
     fi
     [ "$dry" = 1 ] || command -v openshell >/dev/null || { say "openshell is not installed" >&2; exit 1; }
+    # The host preflight with the OpenShell checks, two canary sandboxes included (slice H1).
+    # --dry-run creates nothing, so it runs the host checks only.
+    if [ "$dry" = 1 ]; then run_preflight sandbox --stage run; else run_preflight sandbox --stage run --openshell; fi
     spec="$PMOS_CONTENT_CHECKOUT/policies/bots/$bot.sandbox.yaml"
     policy="$PMOS_CONTENT_CHECKOUT/policies/bots/$bot.yaml"
     [ -f "$spec" ] && [ -f "$policy" ] || { say "no generated policy for $bot in the content checkout; run pmos policy generate and merge it" >&2; exit 1; }
@@ -1616,8 +1947,9 @@ for g in s["groups"]:
     while read -r from to; do
       uploads+=(--upload "$PMOS_CONTENT_CHECKOUT/content/$from:$to")
     done < <(awk '/^  - from: /{f=$3} /^    to: /{print f, $2}' "$spec")
-    create=(sandbox create --name "$sandbox" --from "pmos-worker:${PMOS_VERSION:-local}" --policy "$policy"
-      --provider "$sandbox-gateway" --provider "$sandbox-worker" "${uploads[@]}")
+    pmos_sandbox_create_cmd "$sandbox" "${PMOS_VERSION:-local}" "$policy" \
+      --provider "$sandbox-gateway" --provider "$sandbox-worker" "${uploads[@]}"
+    create=("${SANDBOX_CREATE[@]}")
     if [ "$dry" = 1 ]; then
       # What would run; the tokens are never printed.
       say "openshell provider get $sandbox-gateway: if it exists, openshell provider update $sandbox-gateway --credential PMOS_GATEWAY_TOKEN; else openshell provider create --name $sandbox-gateway --type pmos-gateway --credential PMOS_GATEWAY_TOKEN  (the token from deploy/.env, in the environment)"
@@ -1695,6 +2027,17 @@ for g in s["groups"]:
     require_bot_name resume "$1"
     command -v openshell >/dev/null || { say "openshell is not installed" >&2; exit 1; }
     worker_unit_checks
+    # The service names (slice H2's check, which resume skipped) and the rest of the host, with
+    # the OpenShell checks (slice H1).
+    if ! problems=$(host_names_problems); then
+      {
+        say "pmos-admin resume: the service names fail their check:"
+        sed 's/^/  /' <<<"$problems"
+        say "Fix it, then run this again: sudo deploy/pmos-admin host-names apply"
+      } >&2
+      exit 2
+    fi
+    run_preflight resume --stage run --openshell
     unit=$(worker_unit "$1")
     openshell sandbox start -n "pmos-$1"
     install_worker_unit
@@ -1722,6 +2065,42 @@ for g in s["groups"]:
         ;;
       *) hn_usage ;;
     esac
+    ;;
+
+  preflight)
+    # By hand: every argument goes to deploy/preflight.sh (see its --help); deploy/.env is this
+    # deployment's. Its exit status is the preflight's.
+    code=0
+    "$PREFLIGHT" --env-file "$ENV" "$@" || code=$?
+    exit "$code"
+    ;;
+
+  host-firewall)
+    hf_usage() { say "usage: sudo deploy/pmos-admin host-firewall apply|remove, or deploy/pmos-admin host-firewall check" >&2; exit 2; }
+    [ $# -eq 1 ] || hf_usage
+    case "$1" in
+      apply)
+        host_firewall_apply
+        if problems=$(host_firewall_problems) && [ -n "$problems" ]; then
+          sed 's/^/  FAIL  /' <<<"$problems" >&2
+          exit 1
+        fi
+        ;;
+      remove) host_firewall_remove ;;
+      check)
+        problems=$(host_firewall_problems)
+        if [ -n "$problems" ]; then
+          sed 's/^/  FAIL  /' <<<"$problems"
+          exit 1
+        fi
+        say "  ok    the metadata block's rules, the docker.service drop-in and pmos-metadata-block.timer are in place"
+        ;;
+      *) hf_usage ;;
+    esac
+    ;;
+
+  host)
+    host_cmd "$@"
     ;;
 
   lint)

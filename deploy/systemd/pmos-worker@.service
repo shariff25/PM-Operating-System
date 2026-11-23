@@ -28,8 +28,13 @@
 #   - that stopping this unit (which ends the `sandbox exec` client) stops the worker inside the
 #     sandbox; `pmos-admin pause` also stops the sandbox itself, so a pause holds either way;
 #   - the name of OpenShell's own user unit (`openshell-gateway.service` here).
-# Slice H1 adds `ExecStartPre=` the quick host preflight, so a host that lost Landlock or seccomp
-# stops the worker before it starts.
+#
+# ExecStartPre (slice H1) runs the quick host preflight (deploy/preflight.sh --stage quick: Landlock,
+# seccomp, Docker's seccomp profile, the service names and OpenShell's gateway) before every start
+# and at boot, so a host that lost Landlock or seccomp after an update doesn't start the worker;
+# StartLimit* then stops the retries and `pmos-admin status` lists the failed unit. pmos-admin
+# replaces this line with the checkout's own preflight path, run through /usr/bin/env with
+# openshell's directory on PATH.
 
 [Unit]
 Description=PM OS worker for bot %I (OpenShell sandbox pmos-%I)
@@ -43,6 +48,7 @@ StartLimitBurst=5
 
 [Service]
 Type=exec
+ExecStartPre=/opt/pmos/deploy/preflight.sh --stage quick
 ExecStart=/usr/bin/openshell sandbox exec -n pmos-%I --workdir /sandbox/workspace -- \
   env PMOS_BOTS_URL=http://bots.pmos.internal:8750 PMOS_WORKER_BOT=%I \
   PMOS_GATEWAY_URL=http://gateway.pmos.internal:8740/v1 \

@@ -23,6 +23,14 @@
 #   the caller can't read doesn't stop it (T2); a PMOS_UID or PMOS_GID of 0 is refused, and
 #   setup.sh refuses a root-owned checkout (T3); `pause` always tries the unit and names it when
 #   refusing root; without flock, deploy/.env is not changed; an interrupted write leaves deploy/.env as it was.
+# - slice H1: `up`, `restore` and `add-bot` run the host preflight's `run` stage, `sandbox` and
+#   `resume` add its OpenShell checks, and each refuses with exit 2 on a failing host, before
+#   anything starts or is written; `resume` checks the names; setup.sh runs the `install` stage
+#   first; the worker unit runs the `quick` stage (ExecStartPre); `host-firewall` applies, checks
+#   and removes the metadata block (rules on pmos0 and docker0, the docker.service drop-in, the
+#   timer); `host acknowledge` takes H-PRIVATE only, `host attest local-gpu` needs the owner's
+#   statement, each writes deploy/.env and the root-owned log; `status` shows them. The preflight
+#   itself is tested in scripts/test-preflight.sh; here it reads the fixture host in $WORK/pfroot.
 set -euo pipefail
 
 SRC="$(cd "$(dirname "$0")/.." && pwd)/deploy/pmos-admin"
@@ -38,12 +46,47 @@ bash -n "$SRC"
 # is how a test gets one; these checks often run as root, where /etc/hosts is writable.
 [ "$(grep -c '^readonly HOSTS_FILE=/etc/hosts$' "$SRC")" = 1 ] || fail "pmos-admin doesn't name /etc/hosts exactly once"
 [ "$(grep -c 'HOSTS_FILE=' "$SRC")" = 1 ] || fail "pmos-admin sets HOSTS_FILE somewhere else too"
+# Slice H1 in the same way: the host's own files (the metadata block, the acknowledgement log) are
+# under $WORK/pfroot in the copy (HOST_PREFIX), and the copy's preflight reads that directory as
+# its fixture host (HOST_ROOT_DEFAULT), a copy of deploy/test/preflight/ubuntu-24.04-amd64. The
+# copy's deploy/preflight.sh records its arguments (PF_LOG) and runs that copy.
+PFROOT="$WORK/pfroot"
+PF_FIXTURE="$(cd "$(dirname "$0")/.." && pwd)/deploy/test/preflight/ubuntu-24.04-amd64"
+[ "$(grep -c '^readonly HOST_PREFIX=""$' "$SRC")" = 1 ] && [ "$(grep -c 'HOST_PREFIX=' "$SRC")" = 1 ] ||
+  fail "pmos-admin doesn't set HOST_PREFIX exactly once, empty"
+good_host() { # the fixture host, as it passes every check (with this machine's clock)
+  rm -rf "$PFROOT"
+  cp -a "$PF_FIXTURE" "$PFROOT"
+  rm -f "$PFROOT/cmd/now"
+}
+good_host
+copy_preflight() { # deploy directory: a preflight reading $PFROOT, and what it sources
+  local d=$1 src
+  src="$(dirname "$SRC")"
+  sed "s|^readonly HOST_ROOT_DEFAULT=\"\"\$|readonly HOST_ROOT_DEFAULT=\"$PFROOT\"|" "$src/preflight.sh" >"$d/preflight-real.sh"
+  chmod 755 "$d/preflight-real.sh"
+  [ "$(grep -c "^readonly HOST_ROOT_DEFAULT=\"$PFROOT\"\$" "$d/preflight-real.sh")" = 1 ] ||
+    fail "the copy of the preflight in $d doesn't read the fixture host"
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >>"${PF_LOG:-/dev/null}"\nexec "$(dirname "$0")/preflight-real.sh" "$@"\n' >"$d/preflight.sh"
+  chmod 755 "$d/preflight.sh"
+  cp "$src/sandbox-create.sh" "$d/"
+  sed -e "s|^readonly CONF=/etc/pmos/metadata-block.conf\$|readonly CONF=$PFROOT/etc/pmos/metadata-block.conf|" \
+    -e "s|^readonly STATUS=/run/pmos/metadata-block.status\$|readonly STATUS=$PFROOT/run/pmos/metadata-block.status|" \
+    "$src/pmos-metadata-block" >"$d/pmos-metadata-block"
+  chmod 755 "$d/pmos-metadata-block"
+  [ "$(grep -c "^readonly \(CONF\|STATUS\)=$PFROOT/" "$d/pmos-metadata-block")" = 2 ] ||
+    fail "the copy of pmos-metadata-block in $d doesn't use the fixture host"
+}
 copy_admin() { # destination; the hosts file it uses is $WORK/hosts
-  sed "s|^readonly HOSTS_FILE=/etc/hosts\$|readonly HOSTS_FILE=$WORK/hosts|" "$SRC" >"$1"
+  sed -e "s|^readonly HOSTS_FILE=/etc/hosts\$|readonly HOSTS_FILE=$WORK/hosts|" \
+    -e "s|^readonly HOST_PREFIX=\"\"\$|readonly HOST_PREFIX=\"$PFROOT\"|" "$SRC" >"$1"
   chmod 755 "$1"
   [ "$(grep -c "^readonly HOSTS_FILE=$WORK/hosts\$" "$1")" = 1 ] && [ "$(grep -c 'HOSTS_FILE=' "$1")" = 1 ] ||
     fail "the copy of pmos-admin at $1 doesn't use the test's hosts file"
+  [ "$(grep -c "^readonly HOST_PREFIX=\"$PFROOT\"\$" "$1")" = 1 ] || fail "the copy of pmos-admin at $1 doesn't use the fixture host"
+  copy_preflight "$(dirname "$1")"
 }
+export PF_LOG="$WORK/preflight.log"
 # The managed block as pmos-admin writes it (docs/openshell-any-host-spec.md §3.3 step 4).
 GOOD_BLOCK='# BEGIN pmos (managed by pmos-admin)
 10.201.77.10 toolserver.pmos.internal
@@ -221,10 +264,16 @@ stack_env() { # mode [extra lines...]
     echo "PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=1"
     echo "PMOS_RT_WORKER_TOKENS="
     echo "PMOS_GW_BOT_TOKENS="
+    # Slice H1: the fixture host measures private (no public address, no metadata answer), and
+    # the local source has its model image named, so the preflight passes for these settings.
+    echo "PMOS_EXPOSURE=private"
+    echo "PMOS_VLLM_IMAGE=example.test/vllm:1"
     printf '%s\n' "$@"
   } >"$WORK/stack/deploy/.env"
   chmod 600 "$WORK/stack/deploy/.env"
   good_hosts
+  good_host
+  : >"$PF_LOG"
   : >"$DOCKER_LOG"
   : >"$DOCKER_ENV_LOG"
   : >"$CURL_LOG"
@@ -629,6 +678,7 @@ done
 # --- setup.sh writes only plain paths into deploy/.env (slice H0) ----------------------------
 mkdir -p "$WORK/setup/deploy"
 cp "$DEPLOY_SRC/setup.sh" "$WORK/setup/deploy/setup.sh"
+copy_preflight "$WORK/setup/deploy"
 for args in "--content /srv/x\$(touch $WORK/pwned5)" "--content relative/path" "--state /srv/a b" \
   "--state /srv/x\`id\`" "--content /srv/x#y" "--clone --upload-pack=touch"; do
   code=0
@@ -659,6 +709,8 @@ setup_run() { PATH="$ARGV_BIN:$WORK/bin:$PATH" bash "$WORK/setup/deploy/setup.sh
 : >"$ARGV_LOG"
 setup_run >/dev/null 2>&1 || fail "setup.sh failed: $(setup_run 2>&1 | tail -5)"
 senv="$WORK/setup/deploy/.env"
+# Slice H1: setup.sh ran the preflight's install stage first, before deploy/.env existed.
+grep -qx -- "--stage install --env-file $WORK/setup/deploy/.env" "$PF_LOG" || fail "setup.sh didn't run the install stage: $(cat "$PF_LOG")"
 [ "$(stat -c %a "$senv")" = 600 ] || fail "setup.sh's deploy/.env isn't 0600"
 # No secret it wrote reached a command line (T1): the vault key, the database passwords, every
 # token and assertion key went to awk (a value env.example has as `generated`) or printf only.
@@ -710,6 +762,7 @@ setup_run >/dev/null 2>&1 || fail "setup.sh failed after a stopped run"
 # stand-in stat gives the checkout's owner as root (uid, or gid).
 mkdir -p "$WORK/rootstat" "$WORK/setup2/deploy"
 cp "$DEPLOY_SRC/setup.sh" "$DEPLOY_SRC/env.example" "$WORK/setup2/deploy/"
+copy_preflight "$WORK/setup2/deploy"
 cat >"$WORK/rootstat/stat" <<EOF
 #!/bin/sh
 case "\$1 \$2 \$3" in
@@ -728,6 +781,15 @@ for owner in FAKE_OWNER_UID=0 FAKE_OWNER_GID=0; do
   [ ! -e "$WORK/setup2/deploy/.env" ] && [ ! -e "$WORK/setup2-state" ] ||
     fail "setup.sh with a root-owned checkout ($owner) wrote deploy/.env or the state"
 done
+# Slice H1: a host that fails the preflight (a 5.15 kernel) stops setup.sh first, before the
+# state directories or deploy/.env are made.
+cp "$PF_FIXTURE/../kernel-5.15/cmd/uname-r" "$PFROOT/cmd/uname-r"
+code=0
+out=$(PATH="$WORK/bin:$PATH" bash "$WORK/setup2/deploy/setup.sh" --content "$WORK/setup-content" --state "$WORK/setup2-state" 2>&1) || code=$?
+[ "$code" = 1 ] && [[ "$out" == *"H-KERNEL"*"fail"* && "$out" == *"setup.sh stops"* ]] ||
+  fail "setup.sh on a failing host wasn't stopped ($code): $out"
+[ ! -e "$WORK/setup2/deploy/.env" ] && [ ! -e "$WORK/setup2-state" ] || fail "setup.sh on a failing host wrote deploy/.env or the state"
+good_host
 # A PMOS_UID or PMOS_GID of 0 (or not a number) kept in deploy/.env from an earlier run: refused.
 cp "$senv" "$WORK/setup-env.good"
 for bad in PMOS_UID=0 PMOS_GID=0 PMOS_UID=000 PMOS_UID=x1 'PMOS_UID="0"'; do
@@ -757,6 +819,10 @@ EOF
 cat >"$SBIN/systemctl" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$SYSTEMCTL_LOG"
+case "$*" in
+  "is-enabled pmos-metadata-block.timer") echo "${FAKE_TIMER_ENABLED:-enabled}"; [ "${FAKE_TIMER_ENABLED:-enabled}" = enabled ]; exit ;;
+  "is-active pmos-metadata-block.timer") echo "${FAKE_TIMER_ACTIVE:-active}"; [ "${FAKE_TIMER_ACTIVE:-active}" = active ]; exit ;;
+esac
 [ "${FAKE_SYSTEMCTL_FAIL:-0}" != 1 ]
 EOF
 cat >"$SBIN/loginctl" <<'EOF'
@@ -855,8 +921,16 @@ grep -q '^args=sandbox create --name pmos-pm-ana --from pmos-worker:local ' "$OP
   fail "sandbox didn't start the unit: $(cat "$SYSTEMCTL_LOG")"
 # The installed unit: the template with only openshell's path changed.
 [ -f "$UNIT" ] || fail "sandbox didn't install the unit"
-[ "$(diff "$DEPLOY_SRC/systemd/pmos-worker@.service" "$UNIT" | grep -c '^[<>]')" = 2 ] ||
-  fail "the installed unit differs from the template in more than the ExecStart line"
+[ "$(diff "$DEPLOY_SRC/systemd/pmos-worker@.service" "$UNIT" | grep -c '^[<>]')" = 4 ] ||
+  fail "the installed unit differs from the template in more than the ExecStart and ExecStartPre lines"
+# Slice H1: the quick preflight before every start, by the checkout's path, openshell's directory
+# on its PATH; before ExecStart.
+grep -qxF "ExecStartPre=/usr/bin/env PATH=$SBIN:/usr/local/bin:/usr/bin:/bin $WORK/stack/deploy/preflight.sh --stage quick" "$UNIT" ||
+  fail "the unit's ExecStartPre isn't the quick preflight: $(grep ExecStartPre "$UNIT")"
+[ "$(grep -n '^ExecStartPre=' "$UNIT" | cut -d: -f1)" -lt "$(grep -n '^ExecStart=' "$UNIT" | cut -d: -f1)" ] ||
+  fail "ExecStartPre comes after ExecStart"
+grep -qxF 'ExecStartPre=/opt/pmos/deploy/preflight.sh --stage quick' "$DEPLOY_SRC/systemd/pmos-worker@.service" ||
+  fail "the template has no ExecStartPre placeholder"
 grep -qxF "ExecStart=$SBIN/openshell sandbox exec -n pmos-%I --workdir /sandbox/workspace -- \\" "$UNIT" ||
   fail "the unit's ExecStart isn't openshell's path and sandbox exec: $(grep ExecStart "$UNIT")"
 for want in 'PMOS_WORKER_BOT=%I' '/usr/local/bin/node /opt/pmos/harness/dist/main.js' 'Restart=on-failure' \
@@ -1623,6 +1697,370 @@ grep -qF 'extends: { service: toolserver }' "$WORK/cli-service" || fail "toolser
 grep -qF 'networks: !override [pmos]' "$WORK/cli-service" || fail "toolserver-cli keeps the pinned network settings"
 grep -qF 'ports: !reset []' "$WORK/cli-service" || fail "toolserver-cli keeps the published port"
 ! grep -q 'ipv4_address\|aliases' "$WORK/cli-service" || fail "toolserver-cli has a pinned address or an alias"
+# --- The host preflight at every start (slice H1) -----------------------------------------------
+# docs/openshell-any-host-spec.md §3.2: `up`, `restore` and `add-bot` run the `run` stage (with the
+# stack about to start), `sandbox` and `resume` add the OpenShell checks, `status` reads it as JSON;
+# each refuses with exit 2 on a failing host, before anything starts or is written.
+ENVP="$WORK/stack/deploy/.env"
+bot_env "PMOS_RT_WORKER_TOKENS=worker-pm-ana=rt-secret-1" "PMOS_GW_BOT_TOKENS=bot-pm-ana=gw-secret-1"
+run_stack up >/dev/null || fail "up on a good host failed"
+[ "$(cat "$PF_LOG")" = "--env-file $ENVP --stage run --starting" ] || fail "up ran the preflight as: $(cat "$PF_LOG")"
+: >"$PF_LOG"
+run_stack up --web >/dev/null || fail "up --web on a good host failed"
+[ "$(cat "$PF_LOG")" = "--env-file $ENVP --stage run --starting --web" ] || fail "up --web ran the preflight as: $(cat "$PF_LOG")"
+: >"$PF_LOG"
+run_bot add-bot scout >/dev/null || fail "add-bot on a good host failed"
+[ "$(cat "$PF_LOG")" = "--env-file $ENVP --stage run --starting" ] || fail "add-bot ran the preflight as: $(cat "$PF_LOG")"
+: >"$PF_LOG"
+run_stack restore "$WORK/backup" </dev/null >/dev/null 2>&1 || true # stops at the RESTORE question
+[ "$(cat "$PF_LOG")" = "--env-file $ENVP --stage run --starting" ] || fail "restore ran the preflight as: $(cat "$PF_LOG")"
+: >"$PF_LOG"
+run_bot sandbox pm-ana >/dev/null || fail "sandbox on a good host failed"
+[ "$(cat "$PF_LOG")" = "--env-file $ENVP --stage run --openshell" ] || fail "sandbox ran the preflight as: $(cat "$PF_LOG")"
+: >"$PF_LOG"
+run_bot sandbox pm-ana --dry-run >/dev/null || fail "sandbox --dry-run on a good host failed"
+[ "$(cat "$PF_LOG")" = "--env-file $ENVP --stage run" ] || fail "sandbox --dry-run ran the preflight as: $(cat "$PF_LOG")"
+: >"$PF_LOG"
+run_bot resume pm-ana >/dev/null || fail "resume on a good host failed"
+[ "$(cat "$PF_LOG")" = "--env-file $ENVP --stage run --openshell" ] || fail "resume ran the preflight as: $(cat "$PF_LOG")"
+: >"$PF_LOG"
+out=$(run_stack status 2>&1)
+[ "$(cat "$PF_LOG")" = "--env-file $ENVP --stage run --json" ] || fail "status ran the preflight as: $(cat "$PF_LOG")"
+[[ "$out" == *"== host"*"preflight"*"ok"*"checks pass"* ]] || fail "status doesn't show the preflight passing: $out"
+# A failing host (a 5.15 kernel): each refuses with exit 2, saying which check failed, and starts,
+# writes or creates nothing.
+fail_host() { cp "$PF_FIXTURE/../kernel-5.15/cmd/uname-r" "$PFROOT/cmd/uname-r"; }
+bot_env "PMOS_RT_WORKER_TOKENS=worker-pm-ana=rt-secret-1" "PMOS_GW_BOT_TOKENS=bot-pm-ana=gw-secret-1"
+fail_host
+cp "$ENVP" "$WORK/env.before"
+for cmd in "up" "up --web" "add-bot scout" "sandbox pm-ana" "resume pm-ana"; do
+  : >"$DOCKER_LOG"
+  : >"$OPENSHELL_LOG"
+  : >"$SYSTEMCTL_LOG"
+  rm -rf "$XDG_CONFIG_HOME"
+  code=0
+  # shellcheck disable=SC2086 # the command and its arguments
+  out=$(run_bot $cmd 2>&1) || code=$?
+  [ "$code" = 2 ] || fail "$cmd on a failing host exits $code, not 2: $out"
+  [[ "$out" == *"H-KERNEL"*"fail"*"5.15.0"* && "$out" == *"the host preflight failed"* ]] ||
+    fail "$cmd on a failing host doesn't name the check: $out"
+  ! grep -q ' up -d' "$DOCKER_LOG" || fail "$cmd on a failing host started something"
+  [ ! -s "$OPENSHELL_LOG" ] && [ ! -s "$SYSTEMCTL_LOG" ] && [ ! -e "$UNIT" ] || fail "$cmd on a failing host ran openshell or systemctl"
+  cmp -s "$WORK/env.before" "$ENVP" || fail "$cmd on a failing host changed deploy/.env"
+  [[ "$out" != *secret* ]] || fail "$cmd's refusal printed a token"
+done
+: >"$DOCKER_LOG"
+code=0
+run_stack restore "$WORK/backup" </dev/null >/dev/null 2>&1 || code=$?
+[ "$code" = 2 ] && [ ! -s "$DOCKER_LOG" ] || fail "restore on a failing host exits $code, or called docker"
+out=$(run_stack status 2>&1) || fail "status on a failing host exits non-zero"
+[[ "$out" == *"H-KERNEL"*"FAIL"*"5.15.0"* ]] || fail "status doesn't show the failed check: $out"
+# The OpenShell checks are run by sandbox and resume only: a canary that doesn't start refuses them.
+bot_env "PMOS_RT_WORKER_TOKENS=worker-pm-ana=rt-secret-1" "PMOS_GW_BOT_TOKENS=bot-pm-ana=gw-secret-1"
+for cmd in sandbox resume; do
+  code=0
+  out=$(FAKE_CANARY=nolandlock run_bot "$cmd" pm-ana 2>&1) || code=$?
+  [ "$code" = 2 ] && [[ "$out" == *"O-CANARY"*"fail"* ]] || fail "$cmd with Landlock not applied in the canary exits $code: $out"
+  [ ! -s "$OPENSHELL_LOG" ] || fail "$cmd went on after the canary failed"
+done
+FAKE_CANARY=nolandlock run_stack up >/dev/null || fail "up runs the OpenShell checks"
+# resume checks the service names first (H2 left it to H1).
+bot_env
+printf '127.0.0.1 localhost\n' >"$WORK/hosts"
+code=0
+out=$(run_bot resume pm-ana 2>&1) || code=$?
+[ "$code" = 2 ] && [[ "$out" == *"host-names apply"* ]] || fail "resume with no managed block exits $code: $out"
+[ ! -s "$OPENSHELL_LOG" ] && [ ! -s "$SYSTEMCTL_LOG" ] || fail "resume with no managed block ran something"
+# pause never runs it: an incident is never held up by the host (S2).
+bot_env
+fail_host
+run_bot pause pm-ana >/dev/null || fail "pause on a failing host failed"
+[ ! -s "$PF_LOG" ] || fail "pause ran the preflight"
+# `preflight` by hand: its arguments pass through, and its exit status is the preflight's.
+bot_env
+out=$(run_stack preflight --stage quick) || fail "preflight --stage quick by hand failed: $out"
+[ "$(cat "$PF_LOG")" = "--env-file $ENVP --stage quick" ] || fail "preflight by hand ran as: $(cat "$PF_LOG")"
+fail_host
+code=0
+run_stack preflight >/dev/null 2>&1 || code=$?
+[ "$code" = 1 ] || fail "preflight by hand on a failing host exits $code, not 1"
+
+# --- The metadata block: host-firewall apply, check, remove (slice H1) ----------------------------
+# Stand-ins: iptables and ip6tables keep their rules in files ($FW_DIR); chown (root-owned files
+# on a test machine that may not be root) and chattr record their arguments.
+FWBIN="$WORK/fwbin"
+export FW_DIR="$WORK/fw" CHATTR_LOG="$WORK/chattr.log"
+mkdir -p "$FWBIN" "$FW_DIR"
+cat >"$FWBIN/iptables" <<'EOF'
+#!/usr/bin/env bash
+tool=$(basename "$0")
+[ "$tool" != ip6tables ] || [ "${FAKE_IP6_CHAIN:-0}" = 1 ] || exit 1
+rules="$FW_DIR/$tool.rules"
+touch "$rules"
+args=("$@")
+[ "${args[0]}" != -w ] || args=("${args[@]:1}")
+op=${args[0]}
+[ "${args[1]:-}" = DOCKER-USER ] || exit 2
+rest="${args[*]:2}"
+case "$op" in
+  -S) [ -e "$FW_DIR/$tool.chain" ] || exit 1; sed 's/^/-A DOCKER-USER /' "$rules" ;;
+  -N) touch "$FW_DIR/$tool.chain" ;;
+  -C) grep -qxF -- "$rest" "$rules" ;;
+  -I) [ "${args[2]}" = 1 ] || exit 2; { printf '%s\n' "${args[*]:3}"; cat "$rules"; } >"$rules.t"; mv "$rules.t" "$rules" ;;
+  -D) awk -v r="$rest" '$0 == r && !d { d = 1; next } { print }' "$rules" >"$rules.t"; mv "$rules.t" "$rules" ;;
+  *) exit 2 ;;
+esac
+EOF
+cp "$FWBIN/iptables" "$FWBIN/ip6tables"
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" >>"$CHATTR_LOG"\n' >"$FWBIN/chattr"
+printf '#!/bin/sh\nexit 0\n' >"$FWBIN/chown"
+chmod +x "$FWBIN"/*
+fw_reset() { rm -rf "$FW_DIR"; mkdir -p "$FW_DIR"; touch "$FW_DIR/iptables.chain"; : >"$CHATTR_LOG"; }
+run_fw() { PATH="$FWBIN:$SBIN:$WORK/bin:$PATH" "${stack[@]}" "$@"; }
+bot_env
+fw_reset
+# Not root: refused, nothing written.
+code=0
+out=$(run_fw host-firewall apply 2>&1) || code=$?
+[ "$code" = 1 ] && [[ "$out" == *"sudo"* ]] || fail "host-firewall apply as a user exits $code: $out"
+[ ! -e "$PFROOT/etc/pmos/metadata-block.conf" ] && [ ! -s "$FW_DIR/iptables.rules" ] || fail "host-firewall apply as a user wrote something"
+# Anything but apply, check or remove alone: exit 2.
+for args in "" "apply extra" "bogus" "apply --subnet 10.0.0.0/8"; do
+  code=0
+  # shellcheck disable=SC2086
+  FAKE_UID=0 run_fw host-firewall $args >/dev/null 2>&1 || code=$?
+  [ "$code" = 2 ] || fail "host-firewall $args exits $code, not 2"
+done
+# As root: the rules for pmos0 (with the subnet) and docker0, to the three addresses; the
+# root-owned script and its subnet file; the drop-in, the service and the timer; daemon-reload and
+# the timer enabled. Then check passes, and the preflight's H-METADATA sees the block.
+: >"$SYSTEMCTL_LOG"
+out=$(FAKE_UID=0 run_fw host-firewall apply 2>&1) || fail "host-firewall apply failed: $out"
+want_rules=""
+for t in 100.100.100.200 168.63.129.16 169.254.169.254; do
+  want_rules+="-i docker0 -d $t/32 -m comment --comment pmos-metadata-block -j DROP"$'\n'
+  want_rules+="-i pmos0 -s 10.201.77.0/24 -d $t/32 -m comment --comment pmos-metadata-block -j DROP"$'\n'
+done
+[ "$(sort "$FW_DIR/iptables.rules")" = "$(printf '%s' "$want_rules" | sort)" ] || fail "the rules: $(cat "$FW_DIR/iptables.rules")"
+[ ! -s "$FW_DIR/ip6tables.rules" ] || fail "IPv6 rules without an ip6tables DOCKER-USER chain"
+[ "$(cat "$PFROOT/etc/pmos/metadata-block.conf")" = "SUBNET=10.201.77.0/24" ] || fail "the subnet file"
+[ "$(stat -c %a "$PFROOT/usr/local/sbin/pmos-metadata-block")" = 755 ] || fail "the script isn't 0755"
+cmp -s "$PFROOT/usr/local/sbin/pmos-metadata-block" "$WORK/stack/deploy/pmos-metadata-block" || fail "the installed script isn't the kit's"
+[ "$(cat "$PFROOT/etc/systemd/system/docker.service.d/pmos-metadata-block.conf")" = $'[Service]\nExecStartPost=-/usr/local/sbin/pmos-metadata-block apply' ] ||
+  fail "the docker.service drop-in"
+grep -qx 'ExecStart=/usr/local/sbin/pmos-metadata-block apply' "$PFROOT/etc/systemd/system/pmos-metadata-block.service" || fail "the service"
+grep -qx 'OnUnitActiveSec=1min' "$PFROOT/etc/systemd/system/pmos-metadata-block.timer" || fail "the timer doesn't run every minute"
+grep -qx 'daemon-reload' "$SYSTEMCTL_LOG" && grep -qx 'enable --now pmos-metadata-block.timer' "$SYSTEMCTL_LOG" || fail "the timer wasn't enabled: $(cat "$SYSTEMCTL_LOG")"
+[[ "$(cat "$PFROOT/run/pmos/metadata-block.status")" == "ok "* ]] || fail "apply recorded no status"
+if command -v systemd-analyze >/dev/null; then
+  for u in pmos-metadata-block.service pmos-metadata-block.timer; do
+    cp "$PFROOT/etc/systemd/system/$u" "$WORK/$u"
+  done
+  v=$(systemd-analyze verify "$WORK/pmos-metadata-block.timer" 2>&1 | grep -F 'pmos-metadata-block.timer' | grep -v 'is not executable\|No such file' || true)
+  [ -z "$v" ] || fail "systemd-analyze verify warned about the timer: $v"
+fi
+# Idempotent: a second apply adds nothing.
+FAKE_UID=0 run_fw host-firewall apply >/dev/null 2>&1 || fail "a second apply failed"
+[ "$(wc -l <"$FW_DIR/iptables.rules")" = 6 ] || fail "a second apply doubled rules: $(cat "$FW_DIR/iptables.rules")"
+out=$(FAKE_UID=0 run_fw host-firewall check 2>&1) || fail "host-firewall check fails after apply: $out"
+# The preflight (not root: the timer's status) sees the block in place and passes H-METADATA.
+printf 'enabled\n' >"$PFROOT/cmd/timer-enabled"
+printf 'active\n' >"$PFROOT/cmd/timer-active"
+out=$(run_stack preflight --only H-METADATA 2>&1) || fail "H-METADATA fails with the block in place: $out"
+# Each piece missing: check fails (and says which); the preflight fails H-METADATA.
+cp "$FW_DIR/iptables.rules" "$WORK/rules.good"
+sed -i '/-i docker0 -d 169.254.169.254/d' "$FW_DIR/iptables.rules"
+code=0
+out=$(FAKE_UID=0 run_fw host-firewall check 2>&1) || code=$?
+[ "$code" = 1 ] && [[ "$out" == *"missing: iptables -i docker0 -d 169.254.169.254/32"* ]] || fail "check with a rule missing exits $code: $out"
+cp "$WORK/rules.good" "$FW_DIR/iptables.rules"
+mv "$PFROOT/etc/systemd/system/docker.service.d/pmos-metadata-block.conf" "$WORK/dropin.aside"
+code=0
+out=$(FAKE_UID=0 run_fw host-firewall check 2>&1) || code=$?
+[ "$code" = 1 ] && [[ "$out" == *"drop-in"* ]] || fail "check with the drop-in missing exits $code: $out"
+code=0
+run_stack preflight --only H-METADATA >/dev/null 2>&1 || code=$?
+[ "$code" = 1 ] || fail "H-METADATA passes with the drop-in missing"
+mv "$WORK/dropin.aside" "$PFROOT/etc/systemd/system/docker.service.d/pmos-metadata-block.conf"
+code=0
+out=$(FAKE_TIMER_ACTIVE=inactive FAKE_UID=0 run_fw host-firewall check 2>&1) || code=$?
+[ "$code" = 1 ] && [[ "$out" == *"timer isn't active"* ]] || fail "check with the timer stopped exits $code: $out"
+rm "$PFROOT/etc/systemd/system/pmos-metadata-block.timer"
+code=0
+FAKE_UID=0 run_fw host-firewall check >/dev/null 2>&1 || code=$?
+[ "$code" = 1 ] || fail "check with the timer unit missing exits $code"
+FAKE_UID=0 run_fw host-firewall apply >/dev/null 2>&1 || fail "apply didn't put the timer back"
+# Not root, check reads the timer's status: a stale one fails.
+echo "ok 1000" >"$PFROOT/run/pmos/metadata-block.status"
+code=0
+out=$(run_fw host-firewall check 2>&1) || code=$?
+[ "$code" = 1 ] && [[ "$out" == *"weren't confirmed"* ]] || fail "check as a user with a stale status exits $code: $out"
+# With an ip6tables DOCKER-USER chain (Docker made one), the IPv6 rules too.
+touch "$FW_DIR/ip6tables.chain"
+FAKE_IP6_CHAIN=1 FAKE_UID=0 run_fw host-firewall apply >/dev/null 2>&1 || fail "apply with IPv6 failed"
+[ "$(sort "$FW_DIR/ip6tables.rules")" = "$(printf '%s\n' '-i docker0 -d fd00:ec2::254/128 -m comment --comment pmos-metadata-block -j DROP' '-i pmos0 -d fd00:ec2::254/128 -m comment --comment pmos-metadata-block -j DROP' | sort)" ] ||
+  fail "the IPv6 rules: $(cat "$FW_DIR/ip6tables.rules")"
+# remove takes all three away (and is refused as a user).
+code=0
+run_fw host-firewall remove >/dev/null 2>&1 || code=$?
+[ "$code" = 1 ] && [ -s "$FW_DIR/iptables.rules" ] || fail "remove as a user exits $code, or removed rules"
+: >"$SYSTEMCTL_LOG"
+FAKE_IP6_CHAIN=1 FAKE_UID=0 run_fw host-firewall remove >/dev/null 2>&1 || fail "remove failed"
+[ ! -s "$FW_DIR/iptables.rules" ] && [ ! -s "$FW_DIR/ip6tables.rules" ] || fail "remove left rules"
+for f in etc/pmos/metadata-block.conf usr/local/sbin/pmos-metadata-block etc/systemd/system/docker.service.d/pmos-metadata-block.conf \
+  etc/systemd/system/pmos-metadata-block.service etc/systemd/system/pmos-metadata-block.timer run/pmos/metadata-block.status; do
+  [ ! -e "$PFROOT/$f" ] || fail "remove left /$f"
+done
+grep -qx 'disable --now pmos-metadata-block.timer' "$SYSTEMCTL_LOG" || fail "remove didn't stop the timer"
+code=0
+out=$(FAKE_UID=0 run_fw host-firewall check 2>&1) || code=$?
+[ "$code" = 1 ] && [[ "$out" == *"never applied"* ]] || fail "check after remove exits $code: $out"
+# A subnet the network checks refuse isn't written into a rule.
+bot_env PMOS_NETWORK_SUBNET=10.0.0.0/8
+fw_reset
+code=0
+FAKE_UID=0 run_fw host-firewall apply >/dev/null 2>&1 || code=$?
+[ "$code" = 2 ] && [ ! -s "$FW_DIR/iptables.rules" ] || fail "apply with a /8 subnet exits $code, or wrote rules"
+
+# --- host acknowledge (H-PRIVATE only) and host attest local-gpu (slice H1) ------------------------
+ACKLOG="$PFROOT/var/log/pmos/host-acknowledgements.log"
+public_host() { # the fixture host with a public address
+  python3 -I -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+d[1]["addr_info"].append({"family": "inet", "local": "203.0.113.7", "prefixlen": 24})
+json.dump(d, open(sys.argv[1], "w"))
+' "$PFROOT/cmd/ip-addr"
+}
+bot_env PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=0
+fw_reset
+public_host
+cp "$ENVP" "$WORK/env.before"
+# Every check but H-PRIVATE: exit 2, nothing written or logged (P-8), even as root.
+for id in H-METADATA H-EXPOSURE H-DEVLOGIN h-private O-CANARY ""; do
+  code=0
+  SUDO_USER=ana FAKE_UID=0 run_fw host acknowledge "$id" --reason test >/dev/null 2>&1 || code=$?
+  [ "$code" = 2 ] || fail "host acknowledge '$id' exits $code, not 2"
+done
+cmp -s "$WORK/env.before" "$ENVP" && [ ! -e "$ACKLOG" ] || fail "a refused acknowledgement wrote or logged something"
+# Not root: refused; no reason, a reason with a line break or a tab: refused; not private: refused.
+code=0
+run_fw host acknowledge H-PRIVATE --reason test >/dev/null 2>&1 || code=$?
+[ "$code" = 1 ] || fail "host acknowledge as a user exits $code, not 1"
+for r in "" "   " $'two\nlines' $'a\ttab'; do
+  code=0
+  SUDO_USER=ana FAKE_UID=0 run_fw host acknowledge H-PRIVATE --reason "$r" >/dev/null 2>&1 || code=$?
+  [ "$code" = 2 ] || fail "host acknowledge with the reason $(printf '%q' "$r") exits $code, not 2"
+done
+code=0
+SUDO_USER=ana FAKE_UID=0 run_fw host acknowledge H-PRIVATE >/dev/null 2>&1 || code=$?
+[ "$code" = 2 ] || fail "host acknowledge without --reason exits $code, not 2"
+cmp -s "$WORK/env.before" "$ENVP" && [ ! -e "$ACKLOG" ] || fail "a refused acknowledgement wrote or logged something"
+# Before it: up refuses (H-PRIVATE fails on the public address).
+code=0
+out=$(run_stack up 2>&1) || code=$?
+[ "$code" = 2 ] && [[ "$out" == *"H-PRIVATE"*"fail"*"203.0.113.7"* ]] || fail "up on a private declaration with a public address exits $code: $out"
+# The acknowledgement: deploy/.env's line and the log's, with the login and what was seen.
+out=$(SUDO_USER=ana FAKE_UID=0 run_fw host acknowledge H-PRIVATE --reason "closed test, inbound blocked at the security group" 2>&1) ||
+  fail "host acknowledge H-PRIVATE failed: $out"
+fp=$(sed -n 's/^PMOS_HOST_ACK_H_PRIVATE=//p' "$ENVP")
+[[ "$fp" =~ ^[0-9a-f]{64}$ ]] || fail "no fingerprint in deploy/.env: $(grep HOST_ACK "$ENVP")"
+IFS=$'\t' read -r at who chk act saw lfp reason <"$ACKLOG"
+[[ "$at" =~ ^20[0-9-]+T[0-9:]+Z$ ]] && [ "$who" = ana ] && [ "$chk" = H-PRIVATE ] && [ "$act" = acknowledge ] &&
+  [[ "$saw" == *203.0.113.7* ]] && [ "$lfp" = "$fp" ] && [ "$reason" = "closed test, inbound blocked at the security group" ] ||
+  fail "the log line: $(cat "$ACKLOG")"
+[ "$(stat -c %a "$ACKLOG")" = 644 ] || fail "the log isn't 0644"
+grep -qx -- "+a -- $ACKLOG" "$CHATTR_LOG" || fail "the log wasn't made append-only: $(cat "$CHATTR_LOG")"
+# Now up starts (H-PRIVATE warns), and status prints the acknowledgement on its own line.
+out=$(run_stack up 2>&1) || fail "up with the acknowledgement was refused: $out"
+[[ "$out" == *"H-PRIVATE"*"warn"* ]] || fail "up doesn't show H-PRIVATE's warning: $out"
+out=$(run_stack status 2>&1)
+[[ "$out" == *'host: PMOS_EXPOSURE=private acknowledged on '*' by ana: public addresses: 203.0.113.7; metadata probe answered: no; "closed test, inbound blocked at the security group"'* ]] ||
+  fail "status doesn't print the acknowledgement: $out"
+# Development sign-in is then held to public strength.
+sed -i 's/^PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=0$/PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=1/' "$ENVP"
+code=0
+out=$(run_stack up 2>&1) || code=$?
+[ "$code" = 2 ] && [[ "$out" == *"H-DEVLOGIN"*"fail"* ]] || fail "dev sign-in on an acknowledged private host exits $code: $out"
+sed -i 's/^PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=1$/PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=0/' "$ENVP"
+# A hand-written acknowledgement for another check fails the preflight (P-8).
+echo "PMOS_HOST_ACK_H_EXPOSURE=$fp" >>"$ENVP"
+code=0
+out=$(run_stack up 2>&1) || code=$?
+[ "$code" = 2 ] && [[ "$out" == *"PMOS_HOST_ACK_H_EXPOSURE"* ]] || fail "a hand-written PMOS_HOST_ACK_H_EXPOSURE exits $code: $out"
+sed -i '/^PMOS_HOST_ACK_H_EXPOSURE=/d' "$ENVP"
+# --clear: the line goes, the log says so, and up refuses again.
+SUDO_USER=ana FAKE_UID=0 run_fw host acknowledge --clear H-PRIVATE >/dev/null 2>&1 || fail "host acknowledge --clear failed"
+! grep -q '^PMOS_HOST_ACK_H_PRIVATE=' "$ENVP" || fail "--clear left the deploy/.env line"
+[ "$(tail -1 "$ACKLOG" | cut -f3,4)" = $'H-PRIVATE\tclear' ] || fail "--clear wasn't logged: $(tail -1 "$ACKLOG")"
+code=0
+run_stack up >/dev/null 2>&1 || code=$?
+[ "$code" = 2 ] || fail "up after --clear exits $code, not 2"
+# Writing the deploy/.env line back by hand doesn't bring it back: the log's last word is a clear.
+echo "PMOS_HOST_ACK_H_PRIVATE=$fp" >>"$ENVP"
+code=0
+run_stack up >/dev/null 2>&1 || code=$?
+[ "$code" = 2 ] || fail "a hand-restored acknowledgement exits $code, not 2"
+sed -i '/^PMOS_HOST_ACK_H_PRIVATE=/d' "$ENVP"
+# A host that looks private: nothing to acknowledge, nothing written.
+cp "$PF_FIXTURE/cmd/ip-addr" "$PFROOT/cmd/ip-addr"
+cp "$ENVP" "$WORK/env.before"
+lines=$(wc -l <"$ACKLOG")
+code=0
+SUDO_USER=ana FAKE_UID=0 run_fw host acknowledge H-PRIVATE --reason test >/dev/null 2>&1 || code=$?
+[ "$code" = 1 ] && cmp -s "$WORK/env.before" "$ENVP" && [ "$(wc -l <"$ACKLOG")" = "$lines" ] ||
+  fail "acknowledging a private-looking host exits $code, or wrote something"
+# A public declaration: nothing to acknowledge.
+public_host
+sed -i 's/^PMOS_EXPOSURE=private$/PMOS_EXPOSURE=public/' "$ENVP"
+code=0
+SUDO_USER=ana FAKE_UID=0 run_fw host acknowledge H-PRIVATE --reason test >/dev/null 2>&1 || code=$?
+[ "$code" = 2 ] || fail "acknowledging on a public declaration exits $code, not 2"
+
+# host attest local-gpu: refused without --owner-controls, a reason, root, or PMOS_MODEL_SOURCE=local.
+bot_env PMOS_CONNECTORS=live
+fw_reset
+printf 'GPU 0: NVIDIA L4 (UUID: GPU-11111111-2222-3333-4444-555555555555)\n' >"$PFROOT/cmd/nvidia-smi-L"
+# Live connectors under local without the attestation: up refuses with exit 2 (H-LOCAL).
+code=0
+out=$(run_stack up 2>&1) || code=$?
+[ "$code" = 2 ] && [[ "$out" == *"H-LOCAL"*"fail"*"PMOS_CONNECTORS=live with no attestation"* ]] || fail "up with live connectors and no attestation exits $code: $out"
+! grep -q ' up -d' "$DOCKER_LOG" || fail "up with live connectors and no attestation started something"
+for args in "local-gpu --reason rack" "local-gpu --owner-controls" "local-gpu --owner-controls --reason ''" "other --owner-controls --reason rack" ""; do
+  code=0
+  eval "SUDO_USER=ana FAKE_UID=0 run_fw host attest $args" >/dev/null 2>&1 || code=$?
+  [ "$code" = 2 ] || fail "host attest $args exits $code, not 2"
+done
+code=0
+SUDO_USER=ana FAKE_UID=0 run_fw host attest local-gpu --owner-controls --reason rack >/dev/null 2>&1 || code=$?
+[ "$code" = 2 ] || fail "host attest without PMOS_MODEL_SOURCE=local in deploy/.env exits $code, not 2"
+echo PMOS_MODEL_SOURCE=hosted-test >>"$ENVP"
+code=0
+SUDO_USER=ana FAKE_UID=0 run_fw host attest local-gpu --owner-controls --reason rack >/dev/null 2>&1 || code=$?
+[ "$code" = 2 ] || fail "host attest under hosted-test exits $code, not 2"
+sed -i 's/^PMOS_MODEL_SOURCE=hosted-test$/PMOS_MODEL_SOURCE=local/' "$ENVP"
+code=0
+run_fw host attest local-gpu --owner-controls --reason rack >/dev/null 2>&1 || code=$?
+[ "$code" = 1 ] || fail "host attest as a user exits $code, not 1"
+[ ! -e "$ACKLOG" ] && ! grep -q '^PMOS_HOST_ATTEST' "$ENVP" || fail "a refused attestation wrote or logged something"
+out=$(SUDO_USER=ana FAKE_UID=0 run_fw host attest local-gpu --owner-controls --reason "the owner's own rack" 2>&1) || fail "host attest failed: $out"
+afp=$(sed -n 's/^PMOS_HOST_ATTEST_LOCAL_GPU=//p' "$ENVP")
+[[ "$afp" =~ ^[0-9a-f]{64}$ ]] || fail "no attestation in deploy/.env"
+[ "$(cut -f2-4,5 "$ACKLOG")" = $'ana\tlocal-gpu\tattest\t1x NVIDIA L4' ] || fail "the attestation's log line: $(cat "$ACKLOG")"
+out=$(run_stack up 2>&1) || fail "up with live connectors and the attestation was refused: $out"
+out=$(run_stack status 2>&1)
+[[ "$out" == *"host: PMOS_MODEL_SOURCE=local attested (local-gpu) on "*" by ana: 1x NVIDIA L4; \"the owner's own rack\""* ]] ||
+  fail "status doesn't print the attestation: $out"
+# Another GPU (or disk in another machine): the attestation no longer matches; up refuses.
+printf 'GPU 0: NVIDIA L4 (UUID: GPU-99999999-2222-3333-4444-555555555555)\n' >"$PFROOT/cmd/nvidia-smi-L"
+code=0
+out=$(run_stack up 2>&1) || code=$?
+[ "$code" = 2 ] && [[ "$out" == *"H-LOCAL"*"no longer matches"* ]] || fail "up with another GPU exits $code: $out"
+SUDO_USER=ana FAKE_UID=0 run_fw host attest local-gpu --clear >/dev/null 2>&1 || fail "host attest --clear failed"
+! grep -q '^PMOS_HOST_ATTEST_LOCAL_GPU=' "$ENVP" && [ "$(tail -1 "$ACKLOG" | cut -f3,4)" = $'local-gpu\tclear' ] ||
+  fail "--clear didn't remove and log the attestation"
+# No secret reached the log or a command line in all of this.
+! grep -q 'secret\|rt-web-\|ts-web-' "$ACKLOG" || fail "a token reached the acknowledgement log"
 
 # --- compose renders (C9, C14): without docker compose, say so and skip ---------------------
 if docker compose version >/dev/null 2>&1; then

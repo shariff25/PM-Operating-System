@@ -61,6 +61,17 @@ ok() { printf '  \033[32mok\033[0m   %s\n' "$1"; }
 warn() { printf '  \033[33mwarn\033[0m %s\n' "$1"; }
 fail() { printf '  \033[31mfail\033[0m %s\n' "$1"; exit 1; }
 
+# The host preflight first (docs/openshell-any-host-spec.md §3.2, slice H1): every host check,
+# before anything is installed or written; H-NAMES and H-METADATA can't be set yet and pass. A
+# fail stops here, with nothing changed. It reads deploy/.env when one exists (a second run).
+echo "== host preflight (deploy/preflight.sh --stage install)"
+pf_code=0
+"$DEPLOY/preflight.sh" --stage install --env-file "$ENV" || pf_code=$?
+if [ "$pf_code" != 0 ]; then
+  echo "setup.sh stops: the host preflight failed (each fail above). Nothing was changed." >&2
+  exit 1
+fi
+
 echo "== checking tools"
 command -v docker >/dev/null || fail "docker is not installed"
 docker compose version >/dev/null 2>&1 || fail "docker compose (v2) is not installed"
@@ -109,7 +120,8 @@ if command -v flock >/dev/null; then
   if [ ! -e "$DEPLOY/.env.lock" ]; then
     (umask 077 && : >>"$DEPLOY/.env.lock") 2>/dev/null || fail "couldn't create $DEPLOY/.env.lock (the lock for deploy/.env): check who owns deploy/"
   fi
-  exec 9<"$DEPLOY/.env.lock" 2>/dev/null || fail "couldn't open $DEPLOY/.env.lock for reading (the lock for deploy/.env): check its owner and mode"
+  # In braces, so only this exec's error is silenced, not every later one.
+  { exec 9<"$DEPLOY/.env.lock"; } 2>/dev/null || fail "couldn't open $DEPLOY/.env.lock for reading (the lock for deploy/.env): check its owner and mode"
   flock -w 60 9 || fail "another setup.sh or pmos-admin has been changing deploy/.env for a minute: try again"
 else
   fail "flock (util-linux) isn't installed: install it and run this again. deploy/.env is changed only under its lock."
