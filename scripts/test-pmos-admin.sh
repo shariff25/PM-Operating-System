@@ -32,8 +32,29 @@ fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 
 bash -n "$SRC"
 
+# Every copy of pmos-admin here reads and writes a hosts file under $WORK, never the machine's
+# /etc/hosts (slice H2): the one line that names the file is changed in the copy, and nothing
+# else. The script has no other way to point it elsewhere (no setting, no argument), so the copy
+# is how a test gets one; these checks often run as root, where /etc/hosts is writable.
+[ "$(grep -c '^readonly HOSTS_FILE=/etc/hosts$' "$SRC")" = 1 ] || fail "pmos-admin doesn't name /etc/hosts exactly once"
+[ "$(grep -c 'HOSTS_FILE=' "$SRC")" = 1 ] || fail "pmos-admin sets HOSTS_FILE somewhere else too"
+copy_admin() { # destination; the hosts file it uses is $WORK/hosts
+  sed "s|^readonly HOSTS_FILE=/etc/hosts\$|readonly HOSTS_FILE=$WORK/hosts|" "$SRC" >"$1"
+  chmod 755 "$1"
+  [ "$(grep -c "^readonly HOSTS_FILE=$WORK/hosts\$" "$1")" = 1 ] && [ "$(grep -c 'HOSTS_FILE=' "$1")" = 1 ] ||
+    fail "the copy of pmos-admin at $1 doesn't use the test's hosts file"
+}
+# The managed block as pmos-admin writes it (docs/openshell-any-host-spec.md §3.3 step 4).
+GOOD_BLOCK='# BEGIN pmos (managed by pmos-admin)
+10.201.77.10 toolserver.pmos.internal
+10.201.77.11 gateway.pmos.internal
+10.201.77.12 bots.pmos.internal
+# END pmos'
+good_hosts() { printf '127.0.0.1 localhost\n::1 localhost ip6-localhost\n%s\n' "$GOOD_BLOCK" >"$WORK/hosts"; }
+good_hosts
+
 mkdir -p "$WORK/repo/deploy" "$WORK/pr"
-cp "$SRC" "$WORK/repo/deploy/pmos-admin"
+copy_admin "$WORK/repo/deploy/pmos-admin"
 : >"$WORK/repo/deploy/.env"
 chmod 600 "$WORK/repo/deploy/.env"
 admin=("$WORK/repo/deploy/pmos-admin")
@@ -93,7 +114,7 @@ compose="$(dirname "$SRC")/compose.evals.yaml"
 DEPLOY_SRC="$(dirname "$SRC")"
 ROOT_SRC="$(dirname "$DEPLOY_SRC")"
 mkdir -p "$WORK/bin" "$WORK/stack/deploy/systemd"
-cp "$SRC" "$WORK/stack/deploy/pmos-admin"
+copy_admin "$WORK/stack/deploy/pmos-admin"
 cp "$DEPLOY_SRC/systemd/pmos-worker@.service" "$WORK/stack/deploy/systemd/"
 cat >"$WORK/bin/docker" <<'EOF'
 #!/usr/bin/env bash
@@ -103,8 +124,16 @@ for a in "$@"; do [ "$prev" = --env-file ] && envfile=$a; prev=$a; done
 filemode=$(grep -E '^PMOS_ASSERTION_MODE=' "$envfile" 2>/dev/null | cut -d= -f2-)
 printf 'mode=%s file=%s workers=%s args=%s\n' "${PMOS_ASSERTION_MODE:-}" "$filemode" \
   "${PMOS_RT_WORKER_TOKENS:-}" "$*" >>"$DOCKER_LOG"
-# `docker network inspect`: the pmos network's gateway, when the test gives one.
-if [ "${1:-}" = network ] && [ -n "${FAKE_GATEWAY:-}" ]; then echo "$FAKE_GATEWAY"; fi
+# `docker network inspect`: the whole network as slice H2's check reads it (subnet, gateway,
+# ip_range and bridge name) when the test gives one; otherwise the pmos network's gateway, when
+# the test gives one.
+if [ "${1:-}" = network ]; then
+  if [[ "$*" == *IPRange* ]]; then
+    [ -z "${FAKE_NETWORK:-}" ] || echo "$FAKE_NETWORK"
+  elif [ -n "${FAKE_GATEWAY:-}" ]; then
+    echo "$FAKE_GATEWAY"
+  fi
+fi
 # `compose … ps --services`: the running services, when the test gives them.
 if [[ " $* " == *" ps "*"--services"* ]] && [ -n "${FAKE_PS:-}" ]; then echo "$FAKE_PS"; fi
 # `compose … config --services`: the stack's services (logs and restart check against them).
@@ -142,6 +171,26 @@ case "$*" in
 esac
 EOF
 chmod +x "$WORK/bin/curl"
+# A stand-in `getent ahostsv4 <name>`: what the host's resolver answers, from the test's hosts
+# file as glibc's `files` source reads it (the first line naming it, any case, comments
+# dropped), or FAKE_GETENT_ANSWER when the test gives one (a resolver consulted before the file).
+cat >"$WORK/bin/getent" <<'EOF'
+#!/usr/bin/env bash
+[ "$1" = ahostsv4 ] && [ $# = 2 ] || exit 2
+if [ -n "${FAKE_GETENT_ANSWER:-}" ]; then
+  addr=$FAKE_GETENT_ANSWER
+else
+  addr=$(awk -v n="$2" '{ sub(/#.*/, "") } NF >= 2 && $1 ~ /^[0-9.]+$/ {
+    for (i = 2; i <= NF; i++) { h = tolower($i); sub(/\.$/, "", h); if (h == tolower(n)) { print $1; exit } } }' "$GETENT_HOSTS")
+fi
+[ -n "$addr" ] || exit 2
+# FAKE_GETENT_ANSWER may give several addresses, space-separated: each is answered.
+for a in $addr; do
+  for t in STREAM DGRAM RAW; do printf '%-15s %s %s\n' "$a" "$t" "$2"; done
+done
+EOF
+chmod +x "$WORK/bin/getent"
+export GETENT_HOSTS="$WORK/hosts"
 # Stand-ins for the tools pmos-admin and setup.sh run on deploy/.env and its values: each records
 # its arguments (ARGV_LOG, "<tool> <arguments>" per call), then runs the real one. Only on the
 # PATH of the runs that check them. No secret may be among those arguments (the review of
@@ -175,6 +224,7 @@ stack_env() { # mode [extra lines...]
     printf '%s\n' "$@"
   } >"$WORK/stack/deploy/.env"
   chmod 600 "$WORK/stack/deploy/.env"
+  good_hosts
   : >"$DOCKER_LOG"
   : >"$DOCKER_ENV_LOG"
   : >"$CURL_LOG"
@@ -382,10 +432,12 @@ done
 stack_env require
 run_stack up --bringup >/dev/null 2>&1 || fail "up --bringup without a personal bot failed"
 ! grep -q 'bringup-personal' "$DOCKER_LOG" || fail "the personal worker started without PMOS_BRINGUP_PERSONAL_BOT"
+# An overridden network that still holds the pinned addresses (slice H2: a /25 with its own
+# ip_range and gateway) starts; one that doesn't is refused in H2's checks below.
 stack_env require "PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=0" "PMOS_WEB_PASSWORD_LOGIN=1" \
-  "PMOS_NETWORK_SUBNET=10.50.0.0/24" "PMOS_NETWORK_GATEWAY=10.50.0.1" \
-  "PMOS_WEB_TRUSTED_PROXIES=10.50.0.1" "PMOS_WEB_PUBLIC_URL=https://pmos.example.com"
-FAKE_GATEWAY=10.50.0.1 run_stack up --web >/dev/null || fail "an overridden network was refused"
+  "PMOS_NETWORK_SUBNET=10.201.77.0/25" "PMOS_NETWORK_GATEWAY=10.201.77.126" "PMOS_NETWORK_IP_RANGE=10.201.77.64/26" \
+  "PMOS_WEB_TRUSTED_PROXIES=10.201.77.126" "PMOS_WEB_PUBLIC_URL=https://pmos.example.com"
+FAKE_GATEWAY=10.201.77.126 run_stack up --web >/dev/null || fail "an overridden network was refused"
 stack_env require "PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=0" "PMOS_WEB_PASSWORD_LOGIN=1" \
   "PMOS_WEB_TRUSTED_PROXIES=10.201.77.1" "PMOS_WEB_PUBLIC_URL=http://pmos.example.com"
 code=0
@@ -1275,6 +1327,295 @@ out=$(PATH="$WORK/bin:$NOFLOCK" bash "$WORK/setup/deploy/setup.sh" --content "$W
 [ "$code" != 0 ] && [[ "$out" == *"flock is not installed"* ]] || fail "setup.sh without flock exits $code: $out"
 cmp -s "$WORK/senv.before" "$senv" || fail "setup.sh without flock changed deploy/.env"
 
+# --- Pinned addresses and the managed host names (slice H2) ----------------------------------
+# docs/openshell-any-host-spec.md §3.3, §3.5 and §6 ("The managed hosts block", "Compose").
+# The literals: deploy/compose.yaml's five ipv4_address values, its ip_range default and bridge
+# name are the ones pmos-admin checks and writes, and deploy/env.example says the same.
+compose_src="$DEPLOY_SRC/compose.yaml"
+for pair in toolserver:10.201.77.10 gateway:10.201.77.11 bots:10.201.77.12 vllm-default:10.201.77.13 \
+  vllm-extraction:10.201.77.14; do
+  grep -qF "pmos: { aliases: [${pair%%:*}.pmos.internal], ipv4_address: ${pair#*:} }" "$compose_src" ||
+    fail "deploy/compose.yaml doesn't pin ${pair%%:*} at ${pair#*:}"
+done
+[ "$(grep -c 'ipv4_address:' "$compose_src")" = 5 ] || fail "deploy/compose.yaml pins other than the five addresses"
+grep -qxF 'PINNED_ADDRS=(10.201.77.10 10.201.77.11 10.201.77.12 10.201.77.13 10.201.77.14)' "$SRC" &&
+  grep -qxF 'PINNED_SERVICE_ADDRS=(10.201.77.10 10.201.77.11 10.201.77.12)' "$SRC" &&
+  grep -qxF 'PINNED_NAMES=(toolserver.pmos.internal gateway.pmos.internal bots.pmos.internal)' "$SRC" ||
+  fail "pmos-admin's pinned addresses aren't deploy/compose.yaml's"
+grep -qF 'ip_range: ${PMOS_NETWORK_IP_RANGE:-10.201.77.128/25}' "$compose_src" &&
+  grep -qxF 'NETWORK_IP_RANGE_DEFAULT=10.201.77.128/25' "$SRC" &&
+  grep -qxF 'PMOS_NETWORK_IP_RANGE=10.201.77.128/25' "$DEPLOY_SRC/env.example" ||
+  fail "the ip_range default differs between compose.yaml, pmos-admin and env.example"
+grep -qxF '      com.docker.network.bridge.name: pmos0' "$compose_src" && grep -qxF 'NETWORK_BRIDGE=pmos0' "$SRC" ||
+  fail "the bridge isn't named pmos0 in both compose.yaml and pmos-admin"
+grep -qF 'subnet: ${PMOS_NETWORK_SUBNET:-10.201.77.0/24}' "$compose_src" && grep -qxF 'NETWORK_SUBNET_DEFAULT=10.201.77.0/24' "$SRC" &&
+  grep -qF 'gateway: ${PMOS_NETWORK_GATEWAY:-10.201.77.1}' "$compose_src" && grep -qxF 'NETWORK_GATEWAY_DEFAULT=10.201.77.1' "$SRC" ||
+  fail "the subnet or gateway default differs between compose.yaml and pmos-admin"
+
+hn() { PATH="$WORK/bin:$PATH" "${stack[@]}" host-names "$@"; }
+# A good block: check passes, naming each address.
+good_hosts
+out=$(hn check) || fail "host-names check fails on a good block: $out"
+for want in 'toolserver.pmos.internal 10.201.77.10' 'gateway.pmos.internal 10.201.77.11' 'bots.pmos.internal 10.201.77.12'; do
+  [[ "$out" == *"ok"*"$want"* ]] || fail "host-names check doesn't show $want: $out"
+done
+# No override: anything but `apply` or `check` alone is refused with exit 2 and the file untouched.
+printf '127.0.0.1 localhost\n' >"$WORK/hosts"
+cp "$WORK/hosts" "$WORK/hosts.before"
+for args in "" "apply 10.201.77.99" "apply --force" "apply toolserver.pmos.internal=10.0.0.1" "check extra" \
+  "bogus" "apply apply" "--help"; do
+  code=0
+  # shellcheck disable=SC2086 # the words are the arguments
+  hn $args >/dev/null 2>&1 || code=$?
+  [ "$code" = 2 ] || fail "host-names $args exits $code, not 2"
+  cmp -s "$WORK/hosts" "$WORK/hosts.before" || fail "host-names $args changed the hosts file"
+done
+# Nor through the environment: the file is a constant, not a setting.
+good_hosts
+cp "$WORK/hosts" "$WORK/hosts.good"
+printf '127.0.0.1 localhost\n' >"$WORK/hosts"
+code=0
+HOSTS_FILE="$WORK/hosts.good" PMOS_HOSTS_FILE="$WORK/hosts.good" hn check >/dev/null 2>&1 || code=$?
+[ "$code" = 1 ] || fail "host-names check read another file from the environment ($code)"
+
+# apply on a file without a block: every other line kept, in order, the block added at the end;
+# then check passes. The file keeps its mode.
+printf '127.0.0.1 localhost\n# a comment\n\n192.0.2.7 printer.example.com printer\n10.1.2.3 other.pmos.internal' >"$WORK/hosts"
+chmod 644 "$WORK/hosts"
+out=$(hn apply) || fail "host-names apply failed: $out"
+[ "$(cat "$WORK/hosts")" = $'127.0.0.1 localhost\n# a comment\n\n192.0.2.7 printer.example.com printer\n10.1.2.3 other.pmos.internal\n'"$GOOD_BLOCK" ] ||
+  fail "apply didn't keep the other lines and add the block: $(cat "$WORK/hosts")"
+[ "$(stat -c %a "$WORK/hosts")" = 644 ] || fail "apply changed the hosts file's mode"
+hn check >/dev/null || fail "check fails after apply"
+# Idempotent: a second apply writes nothing (same content, same file).
+cp "$WORK/hosts" "$WORK/hosts.once"
+ino=$(stat -c %i "$WORK/hosts")
+out=$(hn apply) || fail "a second apply failed: $out"
+[[ "$out" == *"already up to date"* ]] || fail "a second apply doesn't say it changed nothing: $out"
+cmp -s "$WORK/hosts" "$WORK/hosts.once" && [ "$(stat -c %i "$WORK/hosts")" = "$ino" ] || fail "a second apply rewrote the file"
+[ -z "$(find "$WORK" -maxdepth 1 -name '.hosts.pmos.*')" ] || fail "apply left a temporary file behind"
+# A stale block (a wrong address, a hand-spaced marker, a loopback line inside) is replaced where
+# it stands; the lines around it are kept.
+for stale in $'10.201.77.99 toolserver.pmos.internal\n10.201.77.11 gateway.pmos.internal\n10.201.77.12 bots.pmos.internal' \
+  $'127.0.0.1 toolserver.pmos.internal gateway.pmos.internal bots.pmos.internal' \
+  $'10.201.77.10 toolserver.pmos.internal\n10.201.77.11 gateway.pmos.internal\n10.201.77.12 bots.pmos.internal\n10.0.0.9 evil.pmos.internal' \
+  $'10.201.77.11 toolserver.pmos.internal\n10.201.77.10 gateway.pmos.internal\n10.201.77.12 bots.pmos.internal'; do
+  for begin in '# BEGIN pmos (managed by pmos-admin)' '#BEGIN   pmos'; do
+    printf '127.0.0.1 localhost\n%s\n%s\n# END pmos\n192.0.2.7 printer\n' "$begin" "$stale" >"$WORK/hosts"
+    code=0
+    hn check >/dev/null 2>&1 || code=$?
+    [ "$code" = 1 ] || fail "check passes a stale block ($code): $(cat "$WORK/hosts")"
+    code=0
+    run_bot sandbox docs --dry-run >/dev/null 2>&1 || code=$?
+    [ "$code" = 2 ] || fail "sandbox --dry-run with a stale block exits $code, not 2"
+    hn apply >/dev/null || fail "apply didn't fix a stale block: $(cat "$WORK/hosts")"
+    [ "$(cat "$WORK/hosts")" = $'127.0.0.1 localhost\n'"$GOOD_BLOCK"$'\n192.0.2.7 printer' ] ||
+      fail "apply didn't replace the stale block in place: $(cat "$WORK/hosts")"
+  done
+done
+# Two blocks become one, where the first stood.
+printf '%s\n127.0.0.1 localhost\n%s\n' "$GOOD_BLOCK" "$GOOD_BLOCK" >"$WORK/hosts"
+code=0
+hn check >/dev/null 2>&1 || code=$?
+[ "$code" = 1 ] || fail "check passes two blocks"
+hn apply >/dev/null || fail "apply didn't fix two blocks"
+[ "$(cat "$WORK/hosts")" = "$GOOD_BLOCK"$'\n127.0.0.1 localhost' ] || fail "apply left two blocks: $(cat "$WORK/hosts")"
+# Markers that don't pair up: which lines are the block's isn't clear, so apply writes nothing
+# and exits 1; check fails.
+for broken in $'# BEGIN pmos (managed by pmos-admin)\n10.201.77.10 toolserver.pmos.internal\n192.0.2.7 printer' \
+  $'192.0.2.7 printer\n# END pmos' \
+  $'# BEGIN pmos (managed by pmos-admin)\n# BEGIN pmos (managed by pmos-admin)\n# END pmos'; do
+  printf '127.0.0.1 localhost\n%s\n' "$broken" >"$WORK/hosts"
+  cp "$WORK/hosts" "$WORK/hosts.before"
+  code=0
+  out=$(hn apply 2>&1) || code=$?
+  [ "$code" = 1 ] && [[ "$out" == *"broken pmos markers"* ]] || fail "apply on broken markers exits $code: $out"
+  cmp -s "$WORK/hosts" "$WORK/hosts.before" || fail "apply on broken markers changed the file"
+  code=0
+  hn check >/dev/null 2>&1 || code=$?
+  [ "$code" = 1 ] || fail "check passes broken markers"
+done
+# check fails on each wrong state outside the block too, naming it: the old install runbook's
+# loopback line, a second line for a name (any case, a trailing dot, IPv6), a missing block, a
+# resolver that answers elsewhere (consulted before the file) or not at all. apply keeps those
+# lines (they aren't its own) and so exits 1, saying what is left.
+for extra in '127.0.0.1 toolserver.pmos.internal gateway.pmos.internal bots.pmos.internal' \
+  '127.0.1.1 bots.pmos.internal' '::1 gateway.pmos.internal' '10.0.0.5 BOTS.pmos.internal.' \
+  '10.201.77.10 toolserver.pmos.internal # a copy by hand' 'fd00::5 toolserver.pmos.internal'; do
+  printf '127.0.0.1 localhost\n%s\n%s\n' "$extra" "$GOOD_BLOCK" >"$WORK/hosts"
+  code=0
+  out=$(hn check 2>&1) || code=$?
+  [ "$code" = 1 ] && [[ "$out" == *"outside the managed block"* ]] || fail "check passes the line $extra ($code): $out"
+  case "$extra" in 127.* | ::1*) [[ "$out" == *"to loopback"* ]] || fail "check doesn't call $extra loopback: $out" ;; esac
+  code=0
+  out=$(hn apply 2>&1) || code=$?
+  [ "$code" = 1 ] && [[ "$out" == *"still fails"* ]] || fail "apply with the line $extra exits $code: $out"
+  grep -qxF "$extra" "$WORK/hosts" || fail "apply removed a line that isn't its own: $extra"
+done
+printf '127.0.0.1 localhost\n' >"$WORK/hosts"
+code=0
+out=$(hn check 2>&1) || code=$?
+[ "$code" = 1 ] && [[ "$out" == *"no managed pmos block"* && "$out" == *"doesn't resolve"* ]] || fail "check passes no block ($code): $out"
+good_hosts
+code=0
+out=$(FAKE_GETENT_ANSWER=10.9.9.9 hn check 2>&1) || code=$?
+[ "$code" = 1 ] && [[ "$out" == *"resolves on this host to 10.9.9.9, not 10.201.77.10"* ]] ||
+  fail "check passes a resolver answering elsewhere ($code): $out"
+code=0
+FAKE_GETENT_ANSWER=127.0.0.1 hn check >/dev/null 2>&1 || code=$?
+[ "$code" = 1 ] || fail "check passes a resolver answering loopback"
+# Two answers, one of them the pinned address: fails, naming both.
+for two in "10.201.77.10 10.9.9.9" "10.9.9.9 10.201.77.10"; do
+  code=0
+  out=$(FAKE_GETENT_ANSWER="$two" hn check 2>&1) || code=$?
+  [ "$code" = 1 ] && [[ "$out" == *"toolserver.pmos.internal resolves on this host to 10.201.77.10 10.9.9.9, not 10.201.77.10"* ]] ||
+    fail "check passes two answers '$two' ($code): $out"
+done
+# A hosts file that is a symbolic link is never replaced; one this user can't write isn't
+# either, and apply says to use sudo.
+mv "$WORK/hosts" "$WORK/hosts.real"
+ln -s "$WORK/hosts.real" "$WORK/hosts"
+printf '127.0.0.1 localhost\n' >"$WORK/hosts.real"
+code=0
+out=$(hn apply 2>&1) || code=$?
+[ "$code" = 1 ] && [[ "$out" == *"isn't a regular file"* ]] || fail "apply on a symbolic link exits $code: $out"
+[ -L "$WORK/hosts" ] && [ "$(cat "$WORK/hosts.real")" = "127.0.0.1 localhost" ] || fail "apply replaced a symbolic link"
+rm -f "$WORK/hosts" "$WORK/hosts.real"
+printf '127.0.0.1 localhost\n' >"$WORK/hosts"
+chmod 644 "$WORK/hosts"
+code=0
+if [ "$(/usr/bin/id -u)" != 0 ]; then
+  chmod 444 "$WORK/hosts"
+  out=$(hn apply 2>&1) || code=$?
+  chmod 644 "$WORK/hosts"
+elif command -v setpriv >/dev/null; then
+  chmod 711 "$WORK" "$WORK/stack" "$WORK/stack/deploy"
+  chmod 755 "$WORK/bin"
+  out=$(PATH="$WORK/bin:$PATH" setpriv --reuid=65534 --regid=65534 --clear-groups "${stack[@]}" host-names apply 2>&1) || code=$?
+  chmod 700 "$WORK" "$WORK/stack" "$WORK/stack/deploy" "$WORK/bin"
+else
+  fail "these checks run as root and setpriv isn't installed to run apply as another user"
+fi
+[ "$code" = 1 ] && [[ "$out" == *"run it with sudo"* ]] || fail "apply without write access exits $code: $out"
+[ "$(cat "$WORK/hosts")" = "127.0.0.1 localhost" ] || fail "apply without write access changed the file"
+# host-names needs nothing from deploy/.env: it works with none (and never reads one).
+good_hosts
+mv "$WORK/stack/deploy/.env" "$WORK/env.aside"
+out=$(hn check 2>&1) || fail "host-names check needs deploy/.env: $out"
+mv "$WORK/env.aside" "$WORK/stack/deploy/.env"
+chmod 644 "$WORK/stack/deploy/.env"
+out=$(hn check 2>&1) || fail "host-names check refuses over deploy/.env's mode: $out"
+[[ "$out" != *"deploy/.env"* ]] || fail "host-names check looked at deploy/.env: $out"
+chmod 600 "$WORK/stack/deploy/.env"
+
+# `sandbox` refuses while the check fails (with --dry-run too), before openshell or systemctl;
+# after apply it goes on.
+bot_env "PMOS_RT_WORKER_TOKENS=worker-pm-ana=rt-secret-1" "PMOS_GW_BOT_TOKENS=bot-pm-ana=gw-secret-1"
+for state in none loopback stale resolver; do
+  good_hosts
+  case "$state" in
+    none) printf '127.0.0.1 localhost\n' >"$WORK/hosts" ;;
+    loopback) printf '127.0.0.1 localhost toolserver.pmos.internal\n%s\n' "$GOOD_BLOCK" >"$WORK/hosts" ;;
+    stale) sed -i 's/^10.201.77.12 /10.201.77.13 /' "$WORK/hosts" ;;
+  esac
+  for dry in "" --dry-run; do
+    code=0
+    # shellcheck disable=SC2086 # empty or one flag
+    out=$( { [ "$state" != resolver ] || export FAKE_GETENT_ANSWER=10.201.77.12; run_bot sandbox pm-ana $dry; } 2>&1) || code=$?
+    [ "$code" = 2 ] && [[ "$out" == *"host-names apply"* ]] || fail "sandbox $dry with names $state exits $code: $out"
+    [[ "$out" != *secret* ]] || fail "sandbox's refusal printed a token: $out"
+  done
+  [ ! -s "$OPENSHELL_LOG" ] && [ ! -s "$SYSTEMCTL_LOG" ] && [ ! -e "$UNIT" ] || fail "sandbox with names $state ran something"
+done
+good_hosts
+run_bot sandbox pm-ana >/dev/null || fail "sandbox with good names failed"
+grep -q '^args=sandbox create --name pmos-pm-ana ' "$OPENSHELL_LOG" || fail "sandbox with good names didn't create"
+
+# `up` and the network's settings (§3.3 step 2, §3.5): refused with exit 2, before anything
+# starts: a subnet shorter than a /24 (holding the pinned addresses or not), one that doesn't
+# hold them, a malformed one; a gateway outside the subnet or on a pinned address; an ip_range
+# outside the subnet or holding a pinned address (.10 or .13 included).
+net_refused=(
+  "PMOS_NETWORK_SUBNET=10.201.0.0/16|shorter than a /24"
+  "PMOS_NETWORK_SUBNET=10.0.0.0/8|shorter than a /24"
+  "PMOS_NETWORK_SUBNET=10.201.76.0/23|shorter than a /24"
+  "PMOS_NETWORK_SUBNET=10.50.0.0/24|POL-2"
+  "PMOS_NETWORK_SUBNET=10.201.77.0/29|doesn't hold 10.201.77.10"
+  "PMOS_NETWORK_SUBNET=10.201.77.5/24|host bits clear"
+  "PMOS_NETWORK_SUBNET=10.201.077.0/24|host bits clear"
+  "PMOS_NETWORK_SUBNET=10.201.77.0|host bits clear"
+  "PMOS_NETWORK_GATEWAY=10.201.78.1|isn't an address inside"
+  "PMOS_NETWORK_GATEWAY=10.201.77.10|is a pinned address"
+  "PMOS_NETWORK_GATEWAY=10.201.77.255|isn't an address inside"
+  "PMOS_NETWORK_IP_RANGE=10.201.77.0/24|holds 10.201.77.10"
+  "PMOS_NETWORK_IP_RANGE=10.201.77.0/25|holds 10.201.77.10"
+  "PMOS_NETWORK_IP_RANGE=10.201.77.12/30|holds 10.201.77.12"
+  "PMOS_NETWORK_IP_RANGE=10.201.77.13/32|holds 10.201.77.13"
+  "PMOS_NETWORK_IP_RANGE=10.201.78.128/25|isn't inside"
+  "PMOS_NETWORK_IP_RANGE=10.201.77.130/25|host bits clear"
+)
+for case_ in "${net_refused[@]}"; do
+  stack_env require "${case_%%|*}"
+  code=0
+  out=$(run_stack up 2>&1) || code=$?
+  [ "$code" = 2 ] && [[ "$out" == *"${case_#*|}"* ]] || fail "up with ${case_%%|*} exits $code, or doesn't say '${case_#*|}': $out"
+  ! grep -q ' up -d' "$DOCKER_LOG" || fail "up with ${case_%%|*} started something"
+done
+# Accepted: the defaults (blank or written out), and a longer prefix that holds the pinned
+# addresses with an ip_range that holds none of them.
+for ok in "" "PMOS_NETWORK_SUBNET=10.201.77.0/24 PMOS_NETWORK_GATEWAY=10.201.77.1 PMOS_NETWORK_IP_RANGE=10.201.77.128/25" \
+  "PMOS_NETWORK_SUBNET= PMOS_NETWORK_IP_RANGE=" \
+  "PMOS_NETWORK_SUBNET=10.201.77.0/25 PMOS_NETWORK_IP_RANGE=10.201.77.64/26" \
+  "PMOS_NETWORK_IP_RANGE=10.201.77.16/28"; do
+  # shellcheck disable=SC2086 # the words are deploy/.env lines
+  stack_env require $ok
+  out=$(run_stack up 2>&1) || fail "up with '$ok' was refused: $out"
+  grep -q ' up -d' "$DOCKER_LOG" || fail "up with '$ok' didn't start"
+done
+# The live network (§3.3 step 3): one made before H2 (no ip_range, Docker's bridge name) or with
+# other settings is refused with the fix; one as deploy/.env and compose.yaml say starts, and so
+# does none at all (Compose makes it). "invalid Prefix" is how Docker 29 prints a network with no
+# ip_range (seen on the test machine's own pre-H2 pmos_pmos network, 2026-11-23).
+stack_env require
+for live in "10.201.77.0/24 10.201.77.1 invalid Prefix;" "10.201.77.0/24 10.201.77.1 ;""10.201.77.0/24 10.201.77.1 ;pmos0" "10.201.77.0/24 10.201.77.1 10.201.77.128/25;" \
+  "10.201.77.0/24 10.201.77.1 10.201.77.0/25;pmos0" "10.201.0.0/16 10.201.77.1 10.201.77.128/25;pmos0" \
+  "10.201.77.0/24 10.201.77.1 10.201.77.128/25;pmos0;10.201.78.0/24 10.201.78.1 ;"; do
+  : >"$DOCKER_LOG"
+  code=0
+  out=$(FAKE_NETWORK="$live" run_stack up 2>&1) || code=$?
+  [ "$code" = 2 ] && [[ "$out" == *"deploy/pmos-admin down && deploy/pmos-admin up"* && "$out" == *"$live"* ]] ||
+    fail "up on the live network '$live' exits $code, or doesn't give the fix: $out"
+  ! grep -q ' up -d' "$DOCKER_LOG" || fail "up on the live network '$live' started something"
+done
+out=$(FAKE_NETWORK="10.201.77.0/24 10.201.77.1 10.201.77.128/25;pmos0" run_stack up 2>&1) || fail "up on a network as pinned was refused: $out"
+grep -q ' up -d' "$DOCKER_LOG" || fail "up on a network as pinned didn't start"
+grep -qF 'args=network inspect pmos_pmos --format {{range .IPAM.Config}}{{.Subnet}} {{.Gateway}} {{.IPRange}};{{end}}{{index .Options "com.docker.network.bridge.name"}}' "$DOCKER_LOG" ||
+  fail "up didn't inspect the live network: $(cat "$DOCKER_LOG")"
+stack_env require "PMOS_NETWORK_SUBNET=10.201.77.0/25" "PMOS_NETWORK_IP_RANGE=10.201.77.64/26"
+out=$(FAKE_NETWORK="10.201.77.0/25 10.201.77.1 10.201.77.64/26;pmos0" run_stack up 2>&1) || fail "up on an overridden network as set was refused: $out"
+code=0
+FAKE_NETWORK="10.201.77.0/24 10.201.77.1 10.201.77.128/25;pmos0" run_stack up >/dev/null 2>&1 || code=$?
+[ "$code" = 2 ] || fail "up on a network made before the override exits $code, not 2"
+# `status` shows the network and the names: ok rows when all is well, FAIL rows otherwise.
+stack_env require
+out=$(FAKE_NETWORK="10.201.77.0/24 10.201.77.1 10.201.77.128/25;pmos0" run_stack status 2>&1)
+[[ "$out" == *"network"*"ok"*"pmos_pmos: 10.201.77.0/24 10.201.77.1 10.201.77.128/25;pmos0"* ]] || fail "status doesn't show the network ok: $out"
+[[ "$out" == *"names"*"ok"*"toolserver.pmos.internal 10.201.77.10"* && "$out" == *"bots.pmos.internal 10.201.77.12"* ]] ||
+  fail "status doesn't show the names ok: $out"
+[[ "$out" != *FAIL* ]] || fail "status fails with a good network and names: $out"
+out=$(run_stack status 2>&1)
+[[ "$out" == *"network"*"not found"* ]] || fail "status doesn't say the network isn't made yet: $out"
+out=$(FAKE_NETWORK="10.201.77.0/24 10.201.77.1 ;" run_stack status 2>&1)
+[[ "$out" == *"network"*"FAIL"*"deploy/pmos-admin down && deploy/pmos-admin up"* ]] || fail "status doesn't fail a stale network: $out"
+printf '127.0.0.1 localhost toolserver.pmos.internal\n' >"$WORK/hosts"
+out=$(run_stack status 2>&1)
+[[ "$out" == *"names"*"FAIL"*"no managed pmos block"* && "$out" == *"names"*"FAIL"*"to loopback"* ]] ||
+  fail "status doesn't fail the names: $out"
+stack_env require "PMOS_NETWORK_IP_RANGE=10.201.77.0/25"
+out=$(run_stack status 2>&1)
+[[ "$out" == *"network"*"FAIL"*"holds 10.201.77.10"* ]] || fail "status doesn't fail an ip_range holding a pinned address: $out"
+good_hosts
+
 # --- compose renders (C9, C14): without docker compose, say so and skip ---------------------
 if docker compose version >/dev/null 2>&1; then
   mkdir -p "$WORK/checkout" "$WORK/state"
@@ -1301,14 +1642,40 @@ if docker compose version >/dev/null 2>&1; then
   done
   [[ "$full" == *'console=test-'* && "$full" == *'web=test-'* ]] ||
     fail "the runtime's tokens lack web= or console="
-  # M1: the pmos network's subnet and gateway are pinned, and can be overridden.
+  # M1: the pmos network's subnet and gateway are pinned, and can be overridden (within what
+  # slice H2 allows: a longer prefix that still holds the pinned addresses, which pmos-admin up
+  # checks; tested above).
   [[ "$full" == *'subnet: 10.201.77.0/24'* && "$full" == *'gateway: 10.201.77.1'* ]] ||
     fail "the pmos network's subnet and gateway aren't pinned"
-  sed -e 's|^PMOS_NETWORK_SUBNET=.*|PMOS_NETWORK_SUBNET=10.50.0.0/24|' \
-    -e 's|^PMOS_NETWORK_GATEWAY=.*|PMOS_NETWORK_GATEWAY=10.50.0.1|' "$WORK/full.env" >"$WORK/net.env"
+  sed -e 's|^PMOS_NETWORK_SUBNET=.*|PMOS_NETWORK_SUBNET=10.201.77.0/25|' \
+    -e 's|^PMOS_NETWORK_GATEWAY=.*|PMOS_NETWORK_GATEWAY=10.201.77.126|' \
+    -e 's|^PMOS_NETWORK_IP_RANGE=.*|PMOS_NETWORK_IP_RANGE=10.201.77.64/26|' "$WORK/full.env" >"$WORK/net.env"
   net=$(render "$WORK/net.env") || fail "compose doesn't render with another subnet"
-  [[ "$net" == *'subnet: 10.50.0.0/24'* && "$net" == *'gateway: 10.50.0.1'* ]] ||
-    fail "the pmos network's subnet and gateway can't be overridden"
+  [[ "$net" == *'subnet: 10.201.77.0/25'* && "$net" == *'gateway: 10.201.77.126'* && "$net" == *'ip_range: 10.201.77.64/26'* ]] ||
+    fail "the pmos network's subnet, gateway and ip_range can't be overridden"
+  # Slice H2: the five pinned addresses, the ip_range and the pmos0 bridge, with every profile;
+  # nothing else pinned; `config -q` accepts them.
+  docker compose --project-directory "$DEPLOY_SRC" -f "$DEPLOY_SRC/compose.yaml" --env-file "$WORK/full.env" \
+    --profile web --profile console --profile slack --profile models --profile bringup --profile bringup-personal \
+    config --format json >"$WORK/pinned.json" || fail "compose doesn't render every profile"
+  docker compose --project-directory "$DEPLOY_SRC" -f "$DEPLOY_SRC/compose.yaml" --env-file "$WORK/full.env" \
+    --profile models config -q || fail "compose config -q refused the pinned addresses"
+  python3 -I - "$WORK/pinned.json" <<'PY' || fail "the pinned addresses, ip_range or bridge render wrong"
+import json, sys
+c = json.load(open(sys.argv[1]))
+want = {"toolserver": "10.201.77.10", "gateway": "10.201.77.11", "bots": "10.201.77.12",
+        "vllm-default": "10.201.77.13", "vllm-extraction": "10.201.77.14"}
+for name, svc in c["services"].items():
+    got = ((svc.get("networks") or {}).get("pmos") or {}).get("ipv4_address")
+    assert got == want.get(name), (name, got)
+for name in want:
+    aliases = c["services"][name]["networks"]["pmos"]["aliases"]
+    assert aliases == [name + ".pmos.internal"], (name, aliases)
+net = c["networks"]["pmos"]
+assert net["driver_opts"] == {"com.docker.network.bridge.name": "pmos0"}, net
+assert net["ipam"]["config"] == [{"subnet": "10.201.77.0/24", "gateway": "10.201.77.1",
+                                  "ip_range": "10.201.77.128/25"}], net["ipam"]
+PY
   # The first Microsoft sign-in (U1): the tool server gets the web app's tenant and client id
   # (it validates the ID token itself), never its client secret.
   entra_env="$WORK/entra.env"

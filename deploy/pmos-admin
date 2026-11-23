@@ -27,7 +27,10 @@
 #                                     a systemd user unit (--dry-run: print what it would run)
 #   pmos-admin pause <bot> / resume <bot>
 #                                     stop or restart a bot's sandbox and its worker unit
-#   pmos-admin lint                   pmos lint and pmos policy check on the content checkout
+#   pmos-admin host-names apply       (with sudo) write the managed block in /etc/hosts that maps
+#                                     the three service names to their pinned addresses
+#   pmos-admin host-names check       do the three names resolve on this host as pinned?
+#   pmos-admin lint                  pmos lint and pmos policy check on the content checkout
 #   pmos-admin pmos <args>            the pmos CLI on the checkout, e.g. `pmos bot add-personal …`
 #                                     (paths are relative to the checkout: --root content)
 #   pmos-admin evals <args>           pmos-evals against the live stack (the load test)
@@ -52,9 +55,11 @@ cmd=${1:-help}
 # a new deploy/.env not yet renamed into place (set_env) and the
 # eval stack (eval_stack_up). A signal becomes an exit, so the EXIT trap runs for it too.
 ENV_TMP=""
+HOSTS_TMP=""
 EVAL_STACK_UP=0
 cleanup() {
   [ -z "$ENV_TMP" ] || rm -f -- "$ENV_TMP"
+  [ -z "$HOSTS_TMP" ] || rm -f -- "$HOSTS_TMP"
   [ "$EVAL_STACK_UP" = 0 ] || eval_stack_down
   return 0
 }
@@ -72,6 +77,11 @@ trap 'exit 143' TERM
 # `down` needs only what Docker Compose reads from it itself. Every other command stops.
 ENV_LENIENT=0
 case "$cmd" in pause | down) ENV_LENIENT=1 ;; esac
+# `host-names` needs nothing from deploy/.env (it writes and checks only the pinned addresses,
+# which are constants below, never settings), and `apply` runs with sudo: so it neither needs
+# the file to exist nor reads it, and root never loads its secrets for it (slice H2).
+ENV_UNUSED=0
+case "$cmd" in host-names) ENV_UNUSED=1 ;; esac
 env_problem() { # message: stop (exit 2), or for pause and down, warn and go on
   if [ "$ENV_LENIENT" = 1 ]; then
     say "WARNING: $*" >&2
@@ -86,7 +96,7 @@ down_advice() {
   say "Stop PM OS's containers directly (data is kept):" >&2
   say "  docker ps -q --filter label=com.docker.compose.project=pmos | xargs -r docker stop" >&2
 }
-if [ ! -f "$ENV" ]; then
+if [ "$ENV_UNUSED" = 0 ] && [ ! -f "$ENV" ]; then
   if [ "$cmd" = pause ]; then
     say "WARNING: there is no deploy/.env; pmos-admin pause goes on without it." >&2
   elif [ "$cmd" = down ]; then
@@ -139,7 +149,7 @@ env_file_checks() {
     say "WARNING: deploy/.env is owned by uid $owner, not by you (uid $me): whoever owns it decides every setting in it" >&2
   fi
 }
-env_file_checks
+[ "$ENV_UNUSED" = 1 ] || env_file_checks
 
 # deploy/.env is read as data, never run as shell (slice H0; docs/openshell-any-host-spec.md,
 # surprise 12). It used to be sourced (`set -a; . deploy/.env`), so a value holding `$(…)`, a
@@ -180,7 +190,7 @@ load_env() {
 # pause never reads it. down needs nothing pmos-admin reads from it (Compose reads the file
 # itself), so a deploy/.env the caller can't read is skipped here and `down` prints the manual
 # advice below when Compose can't read it either, instead of dying on the redirect.
-if [ "$cmd" != pause ] && [ -f "$ENV" ]; then
+if [ "$cmd" != pause ] && [ "$ENV_UNUSED" = 0 ] && [ -f "$ENV" ]; then
   if [ "$cmd" != down ] || [ -r "$ENV" ]; then
     load_env
   else
@@ -721,6 +731,332 @@ port_checks() {
   done
 }
 
+# --- The pmos network's pinned addresses and the host names (slice H2) ----------------------
+# docs/openshell-any-host-spec.md §3.3 and §3.5. A sandbox reaches the tool server, gateway and
+# runtime by name (the policy allows only `<name>.pmos.internal` on its own port), and loopback is
+# never an allowed destination, so each service has its own fixed address on the `pmos` network
+# and the host resolves the names to those addresses through a managed block in /etc/hosts.
+#
+# The addresses are reviewed code, never settings: literals in deploy/compose.yaml
+# (`ipv4_address`), repeated here and checked equal by scripts/test-pmos-admin.sh; from slice H3
+# also constants in the policy crate, which pins each name to its own /32 (`allowed_ips`).
+# Moving them is a code change under POL-2 review, not an edit of deploy/.env. The two vLLM
+# servers (.13, .14) are pinned too, because the gateway checks what their names resolve to
+# (slice H4); no sandbox reaches them, so they have no host name here.
+#
+# Verify on a real host (the acceptance run, §6 step 4; checks O-REACH and H-1): that OpenShell
+# resolves through the host's resolver, so this block is what a sandbox gets, and that its
+# supervisor reaches an address on the pmos bridge. host-names check shows only the host's view.
+# If a sandbox can't reach the services by these names, stop and report (§3.3 step 6): no
+# fallback is built.
+PINNED_NAMES=(toolserver.pmos.internal gateway.pmos.internal bots.pmos.internal)
+PINNED_SERVICE_ADDRS=(10.201.77.10 10.201.77.11 10.201.77.12)
+PINNED_ADDRS=(10.201.77.10 10.201.77.11 10.201.77.12 10.201.77.13 10.201.77.14)
+# The pmos network's bridge, named in deploy/compose.yaml so the host-side metadata block (slice
+# H1) can match it by name however often the network is made again.
+NETWORK_BRIDGE=pmos0
+NETWORK_NAME=pmos_pmos
+# The defaults, as deploy/compose.yaml has them for a blank setting.
+NETWORK_SUBNET_DEFAULT=10.201.77.0/24
+NETWORK_GATEWAY_DEFAULT=10.201.77.1
+NETWORK_IP_RANGE_DEFAULT=10.201.77.128/25
+
+# An IPv4 address as a number, written the plain way only: four decimal octets, no leading zero
+# (`010` would be octal to the shell and 10 to Docker, so the two would disagree).
+ipv4_strict() {
+  local IFS=. a b c d o
+  [[ "$1" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 1
+  read -r a b c d <<<"$1"
+  for o in "$a" "$b" "$c" "$d"; do
+    [[ "$o" =~ ^(0|[1-9][0-9]{0,2})$ ]] && [ "$o" -le 255 ] || return 1
+  done
+  echo $(((a << 24) | (b << 16) | (c << 8) | d))
+}
+# An IPv4 network a.b.c.d/n with its host bits clear, as "<network number> <prefix>".
+ipv4_cidr() {
+  local addr bits n
+  [[ "$1" == */* ]] || return 1
+  addr=${1%/*}
+  bits=${1#*/}
+  [[ "$bits" =~ ^(0|[1-9][0-9]?)$ ]] && [ "$bits" -le 32 ] || return 1
+  n=$(ipv4_strict "$addr") || return 1
+  [ $((n & ((0xffffffff << (32 - bits)) & 0xffffffff))) = "$n" ] || return 1
+  echo "$n $bits"
+}
+# Is the address number $1 inside the network "<number> <prefix>" ($2 $3)?
+ipv4_num_in() { [ $(($1 & ((0xffffffff << (32 - $3)) & 0xffffffff))) = "$2" ]; }
+
+# The network settings in deploy/.env against the pinned addresses (§3.3, §3.5): the subnet a
+# /24 or longer that holds every pinned address (a /8 or /16 would hold them and much else
+# besides); the gateway inside it and not a pinned address; the range Docker hands unpinned
+# containers (the eval stack's, H-METADATA's probe, an operator's `docker run`) inside the subnet
+# and holding none of them, or one of those could take a service's address and the service
+# couldn't start. Prints each problem; 1 when there is one. The subnet refusal against the policy
+# crate's constants is slice H3's; this compares against the same literals deploy/compose.yaml has.
+network_settings_problems() {
+  local subnet=${PMOS_NETWORK_SUBNET:-$NETWORK_SUBNET_DEFAULT} gw=${PMOS_NETWORK_GATEWAY:-$NETWORK_GATEWAY_DEFAULT}
+  local range=${PMOS_NETWORK_IP_RANGE:-$NETWORK_IP_RANGE_DEFAULT}
+  local sn sb rn rb g a an bcast bad=0 subnet_ok=0
+  if ! read -r sn sb < <(ipv4_cidr "$subnet"); then
+    say "PMOS_NETWORK_SUBNET=$(printf '%q' "$subnet") isn't an IPv4 network a.b.c.d/n with its host bits clear: use $NETWORK_SUBNET_DEFAULT"
+    bad=1
+  elif [ "$sb" -lt 24 ]; then
+    say "PMOS_NETWORK_SUBNET=$subnet is shorter than a /24: it would hold the pinned addresses and much else besides. Use $NETWORK_SUBNET_DEFAULT (docs/openshell-any-host-spec.md §3.3)"
+    bad=1
+  else
+    subnet_ok=1
+    bcast=$((sn | ((1 << (32 - sb)) - 1)))
+    for a in "${PINNED_ADDRS[@]}"; do
+      an=$(ipv4_strict "$a")
+      if ! ipv4_num_in "$an" "$sn" "$sb" || [ "$an" = "$sn" ] || [ "$an" = "$bcast" ]; then
+        say "PMOS_NETWORK_SUBNET=$subnet doesn't hold $a, which deploy/compose.yaml pins (the services' and model servers' addresses, 10.201.77.10 to .14). Those addresses are reviewed code, not settings: moving them is a code change to deploy/compose.yaml (and, from slice H3, to the policy crate's constants) under POL-2 review, never an edit of deploy/.env alone. Use $NETWORK_SUBNET_DEFAULT"
+        bad=1
+        break
+      fi
+    done
+  fi
+  if ! g=$(ipv4_strict "$gw"); then
+    say "PMOS_NETWORK_GATEWAY=$(printf '%q' "$gw") isn't an IPv4 address: use $NETWORK_GATEWAY_DEFAULT"
+    bad=1
+  else
+    for a in "${PINNED_ADDRS[@]}"; do
+      if [ "$gw" = "$a" ]; then
+        say "PMOS_NETWORK_GATEWAY=$gw is a pinned address (10.201.77.10 to .14): use $NETWORK_GATEWAY_DEFAULT"
+        bad=1
+      fi
+    done
+    if [ "$subnet_ok" = 1 ] && { ! ipv4_num_in "$g" "$sn" "$sb" || [ "$g" = "$sn" ] || [ "$g" = "$bcast" ]; }; then
+      say "PMOS_NETWORK_GATEWAY=$gw isn't an address inside PMOS_NETWORK_SUBNET=$subnet: use $NETWORK_GATEWAY_DEFAULT"
+      bad=1
+    fi
+  fi
+  if ! read -r rn rb < <(ipv4_cidr "$range"); then
+    say "PMOS_NETWORK_IP_RANGE=$(printf '%q' "$range") isn't an IPv4 network a.b.c.d/n with its host bits clear: use $NETWORK_IP_RANGE_DEFAULT"
+    bad=1
+  else
+    if [ "$subnet_ok" = 1 ] && { [ "$rb" -lt "$sb" ] || ! ipv4_num_in "$rn" "$sn" "$sb"; }; then
+      say "PMOS_NETWORK_IP_RANGE=$range isn't inside PMOS_NETWORK_SUBNET=$subnet: use $NETWORK_IP_RANGE_DEFAULT"
+      bad=1
+    fi
+    for a in "${PINNED_ADDRS[@]}"; do
+      if ipv4_num_in "$(ipv4_strict "$a")" "$rn" "$rb"; then
+        say "PMOS_NETWORK_IP_RANGE=$range holds $a, a pinned address: a container started without a pinned address could take it, and the service pinned there couldn't start. Use $NETWORK_IP_RANGE_DEFAULT (.128 to .254; .2 to .127 are for pinned addresses)"
+        bad=1
+        break
+      fi
+    done
+  fi
+  return $bad
+}
+
+# The pmos network as Docker has it, against deploy/.env and deploy/compose.yaml (§3.3 step 3):
+# Compose doesn't change the IPAM of a network that exists, so a network made before slice H2
+# (no ip_range, Docker's own bridge name) or with other settings stays as it was. Prints the
+# network's line ("<subnet> <gateway> <ip_range>;<bridge>"); nothing when there is no such network
+# yet (or docker can't be asked), which `up` then makes from compose.yaml as it should be. A
+# network with no ip_range shows it as "invalid Prefix" (Docker 29), never equal to the setting.
+NETWORK_INSPECT_FORMAT='{{range .IPAM.Config}}{{.Subnet}} {{.Gateway}} {{.IPRange}};{{end}}{{index .Options "com.docker.network.bridge.name"}}'
+live_network() { docker network inspect "$NETWORK_NAME" --format "$NETWORK_INSPECT_FORMAT" 2>/dev/null || true; }
+expected_network() {
+  printf '%s %s %s;%s\n' "${PMOS_NETWORK_SUBNET:-$NETWORK_SUBNET_DEFAULT}" "${PMOS_NETWORK_GATEWAY:-$NETWORK_GATEWAY_DEFAULT}" \
+    "${PMOS_NETWORK_IP_RANGE:-$NETWORK_IP_RANGE_DEFAULT}" "$NETWORK_BRIDGE"
+}
+# Says how the live network differs, if it does; 1 when it does.
+live_network_problems() {
+  local live want
+  live=$(live_network)
+  [ -n "$live" ] || return 0
+  want=$(expected_network)
+  [ "$live" != "$want" ] || return 0
+  say "The pmos network ($NETWORK_NAME) was made with other settings than deploy/.env and deploy/compose.yaml give:"
+  say "  it has (subnet gateway ip_range;bridge):   $live"
+  say "  they say:                                  $want"
+  say "Compose doesn't change a network that exists. Re-create it (no eval stack may be running):"
+  say "  deploy/pmos-admin down && deploy/pmos-admin up"
+  return 1
+}
+# Everything `up` checks about the network before anything starts.
+network_checks() {
+  local bad=0
+  network_settings_problems >&2 || bad=1
+  live_network_problems >&2 || bad=1
+  return $bad
+}
+
+# The managed block in /etc/hosts (§3.3 step 4). The path is a constant, not a setting: there is
+# no override of the file, the names or the addresses (the red-team check RT-13b writes its own
+# temporary line, and host-names check fails while it is there).
+readonly HOSTS_FILE=/etc/hosts
+HOSTS_BEGIN='# BEGIN pmos (managed by pmos-admin)'
+HOSTS_END='# END pmos'
+# A line that starts either marker, however it is spaced: a hand-edited one is treated as the
+# block's (stale, so apply rewrites it), never as some other line.
+HOSTS_BEGIN_RE='^#[[:space:]]*BEGIN[[:space:]]+pmos([[:space:]]|$)'
+HOSTS_END_RE='^#[[:space:]]*END[[:space:]]+pmos([[:space:]]|$)'
+hosts_block() {
+  local i
+  printf '%s\n' "$HOSTS_BEGIN"
+  for i in "${!PINNED_NAMES[@]}"; do printf '%s %s\n' "${PINNED_SERVICE_ADDRS[$i]}" "${PINNED_NAMES[$i]}"; done
+  printf '%s\n' "$HOSTS_END"
+}
+# Reads the hosts file into: HP_OUTSIDE (the lines outside any block), HP_BLOCKS (how many blocks),
+# HP_BLOCK (the first block, markers included, one "\n" after each line) and HP_AT (how many
+# outside lines come before it; -1 without a block). 1, with HP_MALFORMED saying why, when the
+# markers don't pair up (a BEGIN inside a block, an END outside one, a BEGIN never ended).
+hosts_parse() {
+  local line in=0 cur="" n=0
+  HP_OUTSIDE=() HP_BLOCKS=0 HP_BLOCK="" HP_AT=-1 HP_MALFORMED=""
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    if [[ "$line" =~ $HOSTS_BEGIN_RE ]]; then
+      [ "$in" = 0 ] || { HP_MALFORMED="line $n starts a block inside another"; return 1; }
+      in=1
+      cur="$line"$'\n'
+    elif [[ "$line" =~ $HOSTS_END_RE ]]; then
+      [ "$in" = 1 ] || { HP_MALFORMED="line $n ends a block that never started"; return 1; }
+      in=0
+      cur+="$line"$'\n'
+      HP_BLOCKS=$((HP_BLOCKS + 1))
+      if [ "$HP_BLOCKS" = 1 ]; then
+        HP_BLOCK=$cur
+        HP_AT=${#HP_OUTSIDE[@]}
+      fi
+    elif [ "$in" = 1 ]; then
+      cur+="$line"$'\n'
+    else
+      HP_OUTSIDE+=("$line")
+    fi
+  done <"$HOSTS_FILE"
+  [ "$in" = 0 ] || { HP_MALFORMED="a block starts and never ends"; return 1; }
+}
+is_pinned_name() { # name, lowercased, without a trailing dot
+  local n
+  for n in "${PINNED_NAMES[@]}"; do [ "$1" = "$n" ] && return 0; done
+  return 1
+}
+# Everything wrong with the three names on this host: the block missing, stale (anything but
+# exactly the pinned addresses) or doubled; any line outside it that names one of them (a
+# loopback one said so, as the old install runbook's 127.0.0.1 line did); and what the host's
+# resolver answers (`getent ahostsv4`, which also catches a resolver consulted before the file).
+# Prints each problem; 1 when there is one.
+host_names_problems() {
+  local bad=0 line l f name addr i ans want
+  if [ ! -r "$HOSTS_FILE" ] || [ ! -f "$HOSTS_FILE" ]; then
+    say "$HOSTS_FILE is missing or can't be read"
+    return 1
+  fi
+  if ! hosts_parse; then
+    say "$HOSTS_FILE has broken pmos markers ($HP_MALFORMED): remove the lines from '# BEGIN pmos' to '# END pmos' (and nothing else), then run sudo deploy/pmos-admin host-names apply"
+    return 1
+  fi
+  if [ "$HP_BLOCKS" = 0 ]; then
+    say "no managed pmos block in $HOSTS_FILE: run sudo deploy/pmos-admin host-names apply"
+    bad=1
+  elif [ "$HP_BLOCKS" != 1 ]; then
+    say "$HOSTS_FILE has $HP_BLOCKS managed pmos blocks: run sudo deploy/pmos-admin host-names apply"
+    bad=1
+  elif [ "$HP_BLOCK" != "$(hosts_block)"$'\n' ]; then
+    say "the managed pmos block in $HOSTS_FILE is stale (not exactly the pinned addresses): run sudo deploy/pmos-admin host-names apply"
+    bad=1
+  fi
+  for line in "${HP_OUTSIDE[@]}"; do
+    l=${line%%#*}
+    read -r -a f <<<"$l" || true
+    [ ${#f[@]} -ge 2 ] || continue
+    addr=${f[0]}
+    for name in "${f[@]:1}"; do
+      name=${name,,}
+      name=${name%.}
+      is_pinned_name "$name" || continue
+      case "$addr" in
+        127.* | ::1 | 0:0:0:0:0:0:0:1 | 0.0.0.0 | ::)
+          say "$HOSTS_FILE maps $name to loopback ($addr) outside the managed block: remove that line ($(printf '%q' "$line"))" ;;
+        *)
+          say "$HOSTS_FILE has a second line for $name outside the managed block ($addr): remove it ($(printf '%q' "$line"))" ;;
+      esac
+      bad=1
+    done
+  done
+  if ! command -v getent >/dev/null; then
+    say "getent isn't installed, so what the names resolve to on this host can't be checked"
+    return 1
+  fi
+  for i in "${!PINNED_NAMES[@]}"; do
+    name=${PINNED_NAMES[$i]}
+    want=${PINNED_SERVICE_ADDRS[$i]}
+    ans=$(getent ahostsv4 "$name" 2>/dev/null | awk '{ print $1 }' | sort -u | tr '\n' ' ' || true)
+    ans=${ans% }
+    if [ -z "$ans" ]; then
+      say "$name doesn't resolve on this host (it should be $want)"
+      bad=1
+    elif [ "$ans" != "$want" ]; then
+      say "$name resolves on this host to $ans, not $want"
+      bad=1
+    fi
+  done
+  return $bad
+}
+# `host-names check` and `status`: one line per name when all is well.
+host_names_ok_lines() {
+  local i
+  for i in "${!PINNED_NAMES[@]}"; do printf '%s %s\n' "${PINNED_NAMES[$i]}" "${PINNED_SERVICE_ADDRS[$i]}"; done
+}
+
+# `host-names apply`: the block replaces the file's own block (the first one, where it stands;
+# any later one is removed) or, without one, is added at the end. Every other line is kept as it
+# is. Idempotent: an up-to-date file isn't written at all. The new file is written beside the old
+# one and renamed over it, so no reader sees half a file, with the old file's mode and owner.
+host_names_apply() {
+  local dir tmp i out
+  if [ -L "$HOSTS_FILE" ] || [ ! -f "$HOSTS_FILE" ]; then
+    say "$HOSTS_FILE isn't a regular file (a symbolic link, or missing): host-names apply only rewrites a regular file. Fix it by hand." >&2
+    exit 1
+  fi
+  dir=$(dirname "$HOSTS_FILE")
+  if [ ! -w "$HOSTS_FILE" ] || [ ! -w "$dir" ]; then
+    say "host-names apply writes $HOSTS_FILE: run it with sudo: sudo deploy/pmos-admin host-names apply" >&2
+    exit 1
+  fi
+  command -v flock >/dev/null || { say "flock (util-linux) isn't installed: install it and run this again" >&2; exit 1; }
+  exec 8<"$HOSTS_FILE"
+  flock -w 30 8 || { say "someone else has been changing $HOSTS_FILE for 30 seconds: try again" >&2; exit 1; }
+  if ! hosts_parse; then
+    say "$HOSTS_FILE has broken pmos markers ($HP_MALFORMED), so which lines are the block's isn't clear and nothing was written. Remove the lines from '# BEGIN pmos' to '# END pmos' by hand (and nothing else), then run this again." >&2
+    exit 1
+  fi
+  tmp=$(mktemp "$dir/.hosts.pmos.XXXXXX")
+  HOSTS_TMP=$tmp
+  {
+    for i in "${!HP_OUTSIDE[@]}"; do
+      [ "$i" != "$HP_AT" ] || hosts_block
+      printf '%s\n' "${HP_OUTSIDE[$i]}"
+    done
+    if [ "$HP_AT" = -1 ] || [ "$HP_AT" = "${#HP_OUTSIDE[@]}" ]; then hosts_block; fi
+  } >"$tmp"
+  if cmp -s -- "$tmp" "$HOSTS_FILE"; then
+    rm -f -- "$tmp"
+    HOSTS_TMP=""
+    say "the managed block in $HOSTS_FILE is already up to date"
+  else
+    chmod --reference="$HOSTS_FILE" -- "$tmp"
+    chown --reference="$HOSTS_FILE" -- "$tmp" 2>/dev/null || true
+    # Where SELinux labels files, the new file takes the old one's label.
+    if command -v chcon >/dev/null && [ -e /sys/fs/selinux/enforce ]; then
+      chcon --reference="$HOSTS_FILE" -- "$tmp" 2>/dev/null || say "WARNING: couldn't copy $HOSTS_FILE's SELinux label" >&2
+    fi
+    mv -f -- "$tmp" "$HOSTS_FILE"
+    HOSTS_TMP=""
+    say "wrote the managed block in $HOSTS_FILE"
+  fi
+  if out=$(host_names_problems); then
+    host_names_ok_lines | sed 's/^/  ok  /'
+  else
+    say "host-names check still fails (apply changes only its own block):" >&2
+    sed 's/^/  /' <<<"$out" >&2
+    exit 1
+  fi
+}
+
 # --- Bots: names, tokens, sandboxes and their workers ---------------------------------------
 # docs/openshell-any-host-spec.md §3.7 (slice H0).
 
@@ -867,8 +1203,9 @@ provider_upsert() { # name type variable
 
 cmd=${1:-help}
 shift || true
-# pause never reads deploy/.env (above); help runs nothing. down only warns (env_problem).
-case "$cmd" in pause | help | -h | --help) ;; *)
+# pause and host-names never read deploy/.env (above); help runs nothing. down only warns
+# (env_problem).
+case "$cmd" in pause | host-names | help | -h | --help) ;; *)
   # The uid check is for commands that start a container as PMOS_UID:PMOS_GID. These don't
   # (they talk to the running stack, or only stop or read it), so a PMOS_UID=0 left by an older
   # install must not stop `revoke` in the middle of an incident. Every other command, anything
@@ -911,6 +1248,9 @@ case "$cmd" in
     assertion_checks || exit 2
     model_source_checks || exit 2
     if [[ " ${prof[*]} " == *" bringup-personal "* ]]; then bringup_personal || exit 2; fi
+    # The pinned addresses (slice H2): the settings hold them, and a network made earlier with
+    # other settings is re-created first. Last, so the refusals above stay docker-free.
+    network_checks || exit 2
     if [ -z "${PMOS_SLACK_APP_TOKEN:-}" ] || [ -z "${PMOS_SLACK_BOT_TOKEN:-}" ]; then
       say "note: the Slack bot is off until PMOS_SLACK_APP_TOKEN and PMOS_SLACK_BOT_TOKEN are set"
     fi
@@ -930,6 +1270,25 @@ case "$cmd" in
     say "== containers"
     compose "${ALL_PROFILES[@]}" ps \
       --format 'table {{.Service}}\t{{.Status}}'
+    # The pinned addresses and the host names (slice H2): what sandboxes reach.
+    say "== network and host names"
+    if problems=$(network_settings_problems); then
+      live=$(live_network)
+      if [ -z "$live" ]; then
+        row network "-" "$NETWORK_NAME not found (not made yet, or docker can't be asked); up makes it"
+      elif [ "$live" = "$(expected_network)" ]; then
+        row network ok "$NETWORK_NAME: $live (subnet gateway ip_range;bridge)"
+      else
+        row network FAIL "$NETWORK_NAME is $live, deploy/.env says $(expected_network): deploy/pmos-admin down && deploy/pmos-admin up"
+      fi
+    else
+      while IFS= read -r p; do row network FAIL "$p"; done <<<"$problems"
+    fi
+    if problems=$(host_names_problems); then
+      while IFS= read -r p; do row names ok "$p"; done < <(host_names_ok_lines)
+    else
+      while IFS= read -r p; do row names FAIL "$p"; done <<<"$problems"
+    fi
     say "== readiness"
     if [ "${PMOS_MODEL_SOURCE:-local}" = hosted-test ]; then
       row model WARN "PMOS_MODEL_SOURCE=hosted-test: TESTING ONLY, prompts leave this host (fake data only)"
@@ -1224,6 +1583,18 @@ for g in s["groups"]:
     [ ${#names[@]} -eq 1 ] || sandbox_usage
     bot=${names[0]}
     require_bot_name sandbox "$bot"
+    # Slice H2 (docs/openshell-any-host-spec.md §3.3): no sandbox starts while the three names
+    # don't resolve on this host to their pinned addresses (a missing, stale or loopback entry,
+    # or the red team's temporary line, RT-13b), with --dry-run too, which shows what would run.
+    if ! problems=$(host_names_problems); then
+      {
+        say "pmos-admin sandbox: the service names fail their check, so the sandbox couldn't reach"
+        say "the services by them, or would reach something else:"
+        sed 's/^/  /' <<<"$problems"
+        say "Fix it, then run this again: sudo deploy/pmos-admin host-names apply"
+      } >&2
+      exit 2
+    fi
     [ "$dry" = 1 ] || command -v openshell >/dev/null || { say "openshell is not installed" >&2; exit 1; }
     spec="$PMOS_CONTENT_CHECKOUT/policies/bots/$bot.sandbox.yaml"
     policy="$PMOS_CONTENT_CHECKOUT/policies/bots/$bot.yaml"
@@ -1331,6 +1702,25 @@ for g in s["groups"]:
     systemctl --user reset-failed "$unit" 2>/dev/null || true
     systemctl --user enable --now "$unit"
     say "pmos-$1 started; its worker runs as the user unit $unit"
+    ;;
+
+  host-names)
+    # Slice H2 (docs/openshell-any-host-spec.md §3.3 step 4). No argument beyond the action: the
+    # block always holds the pinned addresses, and there is no override of them or of the file.
+    hn_usage() { say "usage: sudo deploy/pmos-admin host-names apply, or deploy/pmos-admin host-names check (nothing else: the block always holds the pinned addresses)" >&2; exit 2; }
+    [ $# -eq 1 ] || hn_usage
+    case "$1" in
+      apply) host_names_apply ;;
+      check)
+        if problems=$(host_names_problems); then
+          host_names_ok_lines | sed 's/^/  ok    /'
+        else
+          sed 's/^/  FAIL  /' <<<"$problems"
+          exit 1
+        fi
+        ;;
+      *) hn_usage ;;
+    esac
     ;;
 
   lint)
