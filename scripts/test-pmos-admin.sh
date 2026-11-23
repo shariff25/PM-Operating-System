@@ -134,9 +134,9 @@ if [ "$config" = 1 ]; then cat >>"${CURL_CONFIG_LOG:-/dev/null}"; fi
 case "$*" in
   *8740/readyz*) printf '%s\n200' "${FAKE_GW_READYZ:-${FAKE_READYZ:-{\}}}" ;;
   *readyz* | *healthz*) printf '%s\n200' "${FAKE_READYZ:-{\}}" ;;
-  *"-X POST http://127.0.0.1:8750/v1/tasks "*) echo '{"id":"tsk_0abc12","status":"queued"}' ;;
-  *8750/v1/tasks/*/events*) echo '[{"kind":"answer","text":"see the getting started page"}]' ;;
-  *8750/v1/tasks/*) echo '{"id":"tsk_0abc12","status":"done"}' ;;
+  *"-X POST http://127.0.0.1:"*"/v1/tasks "*) echo '{"id":"tsk_0abc12","status":"queued"}' ;;
+  *750/v1/tasks/*/events*) echo '[{"kind":"answer","text":"see the getting started page"}]' ;;
+  *750/v1/tasks/*) echo '{"id":"tsk_0abc12","status":"done"}' ;;
   *) echo '{}' ;;
 esac
 EOF
@@ -286,6 +286,77 @@ out=$(FAKE_GW_READYZ='{"class":"test","ready":true,"running":0,"stub":true,"wait
 out=$(FAKE_GW_READYZ="${gw_up/production/test}" run_stack status 2>&1)
 [[ "$out" == *"gateway"*"WARN"*"not a production-class gateway"* ]] || fail "status doesn't warn about a test-class gateway: $out"
 [[ "$out" != *"STUB"* ]] || fail "status calls a test-class gateway the stub: $out"
+# The published ports (first deployment run, 2026-11-23: a test stack on the same host already
+# listened on 8710 to 8770): `status` and `smoke` follow PMOS_*_PORT; a value that isn't a port
+# number stops pmos-admin.
+stack_env require "PMOS_TOOLSERVER_PORT=18710" "PMOS_GATEWAY_PORT=18740" "PMOS_BOTS_PORT=18750" \
+  "PMOS_WEB_PORT=18770" "PMOS_RT_SLACK_TOKEN=rt-slack-0123456789abcdef0123456789ab"
+FAKE_PS=web run_stack status >/dev/null 2>&1 || fail "status with other ports failed"
+for u in 127.0.0.1:18710/readyz 127.0.0.1:18740/readyz 127.0.0.1:18750/readyz 127.0.0.1:18770/readyz; do
+  grep -q "$u" "$CURL_LOG" || fail "status didn't call $u: $(cat "$CURL_LOG")"
+done
+! grep -qE '127\.0\.0\.1:87[0-9]0' "$CURL_LOG" || fail "status still called a default port: $(cat "$CURL_LOG")"
+: >"$CURL_LOG"
+run_stack smoke ana >/dev/null 2>&1 || fail "smoke with another runtime port failed"
+grep -q '127.0.0.1:18750/v1/tasks' "$CURL_LOG" || fail "smoke didn't use PMOS_BOTS_PORT: $(cat "$CURL_LOG")"
+! grep -q '127.0.0.1:8750' "$CURL_LOG" || fail "smoke still called 8750"
+for bad in 0 70000 87x0 "8750 8751"; do
+  stack_env require "PMOS_BOTS_PORT=$bad"
+  code=0
+  run_stack status >/dev/null 2>&1 || code=$?
+  [ "$code" = 2 ] || fail "PMOS_BOTS_PORT=$bad exits $code, not 2"
+done
+# PMOS_MODEL_SOURCE=hosted-test (the gateway's part of H4): the overlay is added to every compose
+# call, the gateway's test config is written outside the repo with every role behind the label,
+# live connectors and a missing key are refused, Slack stays off, and a run-time CA is taken
+# only with hosted-test.
+mkdir -p "$WORK/state"
+ht=("PMOS_STATE_DIR=$WORK/state" "PMOS_MODEL_SOURCE=hosted-test"
+  "PMOS_HOSTED_TEST_URL=https://models.example.test/v1/" "PMOS_HOSTED_TEST_MODEL=example-model-1"
+  "PMOS_GATEWAY_REMOTE_KEY=proxy-injected")
+stack_env require "${ht[@]}" "PMOS_SLACK_APP_TOKEN=xapp-test" "PMOS_SLACK_BOT_TOKEN=xoxb-test"
+out=$(run_stack up --web 2>&1) || fail "up with hosted-test failed: $out"
+grep -q 'args=compose .*-f [^ ]*/compose.yaml -f [^ ]*/compose.hosted-test.yaml .* up -d' "$DOCKER_LOG" ||
+  fail "up with hosted-test didn't add the overlay: $(cat "$DOCKER_LOG")"
+! grep -q 'compose.gateway-ca.yaml' "$DOCKER_LOG" || fail "the CA overlay was added without PMOS_GATEWAY_CA_FILE"
+! grep -q -- '--profile slack' "$DOCKER_LOG" || fail "hosted-test started the Slack bot"
+[[ "$out" == *"Slack bot stays off"* ]] || fail "up doesn't say why Slack is off: $out"
+cfg="$WORK/state/gateway.hosted-test.yaml"
+[ -f "$cfg" ] || fail "up with hosted-test wrote no gateway config"
+grep -qx '  remote: "openai+https://models.example.test/v1"' "$cfg" || fail "the upstream isn't the URL: $(cat "$cfg")"
+[ "$(grep -c 'model: "example-model-1", label: "hosted-model-a"' "$cfg")" = 3 ] || fail "not every role has the label: $(cat "$cfg")"
+! grep -q '^class:' "$cfg" || fail "the hosted-test config sets a class (it must be a test gateway)"
+! grep -q 'proxy-injected' "$cfg" || fail "the key reached the gateway config"
+: >"$DOCKER_LOG"
+run_stack status >/dev/null 2>&1
+grep -q 'compose.hosted-test.yaml .* ps' "$DOCKER_LOG" || fail "status doesn't see the hosted-test stack: $(cat "$DOCKER_LOG")"
+for broken in "PMOS_CONNECTORS=live" "PMOS_GATEWAY_REMOTE_KEY=" "PMOS_HOSTED_TEST_URL=http://models.example.test/v1" \
+  "PMOS_HOSTED_TEST_MODEL=" "PMOS_HOSTED_TEST_LABEL=bad label" "PMOS_GATEWAY_CA_FILE=relative/ca.crt"; do
+  stack_env require "${ht[@]}" "$broken"
+  code=0
+  run_stack up >/dev/null 2>&1 || code=$?
+  [ "$code" = 2 ] || fail "hosted-test with $broken exits $code, not 2"
+  ! grep -q ' up -d' "$DOCKER_LOG" || fail "hosted-test with $broken started something"
+done
+printf 'fake CA\n' >"$WORK/ca.crt"
+stack_env require "${ht[@]}" "PMOS_GATEWAY_CA_FILE=$WORK/ca.crt"
+run_stack up >/dev/null 2>&1 || fail "hosted-test with a CA file failed"
+grep -q 'compose.hosted-test.yaml -f [^ ]*/compose.gateway-ca.yaml .* up -d' "$DOCKER_LOG" ||
+  fail "the CA overlay wasn't added: $(cat "$DOCKER_LOG")"
+stack_env require "PMOS_STATE_DIR=$WORK/state" "PMOS_GATEWAY_CA_FILE=$WORK/ca.crt"
+code=0
+run_stack up >/dev/null 2>&1 || code=$?
+[ "$code" = 2 ] || fail "a run-time CA with the local source exits $code, not 2"
+for src in hosted bogus; do
+  stack_env require "PMOS_MODEL_SOURCE=$src"
+  code=0
+  run_stack up >/dev/null 2>&1 || code=$?
+  [ "$code" = 2 ] || fail "PMOS_MODEL_SOURCE=$src exits $code, not 2"
+done
+stack_env require "${ht[@]}"
+code=0
+run_stack up --models >/dev/null 2>&1 || code=$?
+[ "$code" = 2 ] || fail "up --models with hosted-test exits $code, not 2"
 stack_env require "PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=0" "PMOS_WEB_PASSWORD_LOGIN=1" \
   "PMOS_NETWORK_SUBNET=10.50.0.0/24" "PMOS_NETWORK_GATEWAY=10.50.0.1" \
   "PMOS_WEB_TRUSTED_PROXIES=10.50.0.1" "PMOS_WEB_PUBLIC_URL=https://pmos.example.com"
@@ -1167,6 +1238,32 @@ if docker compose version >/dev/null 2>&1; then
   for unwanted in 'web=' 'console=' 'web:bots:' 'console:bots:' 'web:toolserver:' 'console:toolserver:'; do
     [[ "$core" != *"$unwanted"* ]] || fail "the default profile without web settings still has $unwanted"
   done
+  # The published ports follow PMOS_*_PORT; the hosted-test overlays give only the gateway the
+  # remote key, the proxy, the test config and (with its overlay) the CA bundle.
+  ports=$(render "$WORK/core.env" --profile web) || fail "compose doesn't render the default ports"
+  [[ "$ports" == *'host_ip: 127.0.0.1'*'published: "8770"'* ]] || fail "the web app isn't on 127.0.0.1:8770 by default"
+  { cat "$WORK/full.env"; echo "PMOS_WEB_PORT=18770"; echo "PMOS_GATEWAY_REMOTE_KEY=remote-key-for-the-render-check"; echo "PMOS_GATEWAY_CA_FILE=$WORK/ca.crt"; } >"$WORK/ht.env"
+  ht_render=$(docker compose --project-directory "$DEPLOY_SRC" -f "$DEPLOY_SRC/compose.yaml" \
+    -f "$DEPLOY_SRC/compose.hosted-test.yaml" -f "$DEPLOY_SRC/compose.gateway-ca.yaml" \
+    --env-file "$WORK/ht.env" --profile web config --format json) || fail "the hosted-test overlays don't render"
+  printf '%s\n' "$ht_render" >"$WORK/ht.json"
+  python3 -I - "$WORK/ht.json" "$WORK/ca.crt" "$WORK/state" <<'PY' || fail "the hosted-test overlays render wrong"
+import json, sys
+c = json.load(open(sys.argv[1]))["services"]
+ca, state = sys.argv[2], sys.argv[3]
+gw = c["gateway"]
+assert gw["environment"]["PMOS_GATEWAY_CLOUD_TEST"] == "1"
+assert gw["environment"]["SSL_CERT_FILE"] == "/etc/pmos/ca-bundle.crt"
+vols = {v["target"]: v["source"] for v in gw["volumes"]}
+assert vols["/etc/pmos/gateway.yaml"] == state + "/gateway.hosted-test.yaml", vols
+assert vols["/etc/pmos/ca-bundle.crt"] == ca, vols
+for name, svc in c.items():
+    env = json.dumps(svc.get("environment", {}))
+    if name != "gateway":
+        assert "remote-key-for-the-render-check" not in env, name
+        assert "SSL_CERT_FILE" not in env, name
+assert c["web"]["ports"][0]["published"] == "18770" and c["web"]["ports"][0]["host_ip"] == "127.0.0.1"
+PY
   echo "compose renders checked"
 else
   echo "compose renders skipped: no docker compose here (CI's deploy job has it)"

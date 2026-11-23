@@ -85,7 +85,7 @@ services:
     command: ["pmos-toolserver"]
     networks:
       pmos: { aliases: [toolserver.pmos.internal] }
-    ports: ["127.0.0.1:8710:8710"]
+    ports: ["127.0.0.1:${PMOS_TOOLSERVER_PORT:-8710}:8710"]
     env_file:
       - path: ./live.env
         required: false
@@ -146,7 +146,7 @@ services:
     command: ["pmos-gateway"]
     networks:
       pmos: { aliases: [gateway.pmos.internal] }
-    ports: ["127.0.0.1:8740:8740"]
+    ports: ["127.0.0.1:${PMOS_GATEWAY_PORT:-8740}:8740"]
     environment:
       PMOS_GATEWAY_BIND: 0.0.0.0:8740
       PMOS_GATEWAY_CONFIG: /etc/pmos/gateway.yaml
@@ -166,7 +166,7 @@ services:
     command: ["pmos-bots"]
     networks:
       pmos: { aliases: [bots.pmos.internal] }
-    ports: ["127.0.0.1:8750:8750"]
+    ports: ["127.0.0.1:${PMOS_BOTS_PORT:-8750}:8750"]
     environment:
       PMOS_BOTS_BIND: 0.0.0.0:8750
       PMOS_BOTS_DATABASE_URL: postgresql://pmos_bots:${PMOS_DB_BOTS_PASSWORD}@postgres/pmos_bots
@@ -244,7 +244,7 @@ services:
   console:
     <<: *service
     command: ["pmos-console"]
-    ports: ["127.0.0.1:8760:8760"]
+    ports: ["127.0.0.1:${PMOS_CONSOLE_PORT:-8760}:8760"]
     environment:
       PMOS_CONSOLE_BIND: 0.0.0.0:8760
       PMOS_BOTS_URL: http://bots.pmos.internal:8750
@@ -287,7 +287,7 @@ services:
     command: ["pmos-web"]
     networks:
       pmos: { aliases: [web.pmos.internal] }
-    ports: ["127.0.0.1:8770:8770"]
+    ports: ["127.0.0.1:${PMOS_WEB_PORT:-8770}:8770"]
     environment:
       # Entra sign-in reaches login.microsoftonline.com through the Spark's proxy, if it has one.
       <<: *proxy
