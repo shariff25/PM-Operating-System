@@ -1,0 +1,6 @@
+Name:	bash
+Umask:	0022
+State:	R (running)
+NoNewPrivs:	0
+Seccomp:	0
+Seccomp_filters:	0

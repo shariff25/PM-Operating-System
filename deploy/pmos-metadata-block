@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# PM OS: keep PM OS's containers away from the cloud metadata services (docs/openshell-any-host-spec.md
+# §3.2, "The block"; slice H1). Installed by `sudo deploy/pmos-admin host-firewall apply` as a
+# root-owned copy at /usr/local/sbin/pmos-metadata-block, and run as root from there by
+#   - the docker.service drop-in (ExecStartPost), after every Docker start, since a daemon restart
+#     rebuilds Docker's chains;
+#   - pmos-metadata-block.timer, every minute, for a firewall reload that doesn't restart Docker.
+#
+#   pmos-metadata-block apply    add any missing rule (idempotent), then record "ok <time>"
+#   pmos-metadata-block check    exit 1, naming each, when a rule is missing
+#   pmos-metadata-block remove   take every rule away
+#
+# The rules, in Docker's DOCKER-USER chain, each tagged with the comment pmos-metadata-block:
+#   - from the pmos network (input interface pmos0, source the subnet in the root-owned
+#     /etc/pmos/metadata-block.conf, written at apply; never deploy/.env) and
+#   - from Docker's default bridge (input interface docker0, any source: an operator's plain
+#     `docker run` and H-METADATA's probe before the pmos network exists use it)
+# to 169.254.169.254, 168.63.129.16 and 100.100.100.200 are dropped; and, where ip6tables has a
+# DOCKER-USER chain, the same two interfaces to fd00:ec2::254. The host itself is not affected, so
+# the cloud's own agent keeps working.
+#
+# Verify on a real host (RT-16): that the drop-in runs after Docker has made DOCKER-USER, that the
+# rules hold after `systemctl restart docker` and a flush of DOCKER-USER, and which answer a GCP or
+# Azure VM gives without them.
+set -euo pipefail
+
+readonly CONF=/etc/pmos/metadata-block.conf
+readonly STATUS=/run/pmos/metadata-block.status
+TAG=pmos-metadata-block
+TARGETS4=(169.254.169.254 168.63.129.16 100.100.100.200)
+TARGET6=fd00:ec2::254
+
+[ "$(id -u)" = 0 ] || { echo "pmos-metadata-block runs as root" >&2; exit 2; }
+command -v iptables >/dev/null || { echo "iptables isn't installed" >&2; exit 1; }
+[ -f "$CONF" ] || { echo "$CONF is missing: run sudo deploy/pmos-admin host-firewall apply" >&2; exit 1; }
+subnet=$(sed -n 's/^SUBNET=//p' "$CONF" | head -1)
+[[ "$subnet" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}/[0-9]{1,2}$ ]] || { echo "$CONF holds no valid SUBNET=a.b.c.d/n" >&2; exit 1; }
+
+rules4() {
+  local t
+  for t in "${TARGETS4[@]}"; do
+    printf '%s\n' "-i pmos0 -s $subnet -d $t/32 -m comment --comment $TAG -j DROP"
+    printf '%s\n' "-i docker0 -d $t/32 -m comment --comment $TAG -j DROP"
+  done
+}
+rules6() {
+  printf '%s\n' "-i pmos0 -d $TARGET6/128 -m comment --comment $TAG -j DROP"
+  printf '%s\n' "-i docker0 -d $TARGET6/128 -m comment --comment $TAG -j DROP"
+}
+have6() { command -v ip6tables >/dev/null && ip6tables -w -S DOCKER-USER >/dev/null 2>&1; }
+
+case "${1:-}" in
+  apply)
+    iptables -w -S DOCKER-USER >/dev/null 2>&1 || iptables -w -N DOCKER-USER
+    while read -r -a r; do
+      iptables -w -C DOCKER-USER "${r[@]}" 2>/dev/null || iptables -w -I DOCKER-USER 1 "${r[@]}"
+    done < <(rules4)
+    if have6; then
+      while read -r -a r; do
+        ip6tables -w -C DOCKER-USER "${r[@]}" 2>/dev/null || ip6tables -w -I DOCKER-USER 1 "${r[@]}"
+      done < <(rules6)
+    fi
+    mkdir -p "$(dirname "$STATUS")"
+    printf 'ok %s\n' "$(date +%s)" >"$STATUS.new"
+    chmod 644 "$STATUS.new"
+    mv -f "$STATUS.new" "$STATUS"
+    ;;
+  check)
+    missing=0
+    while read -r -a r; do
+      iptables -w -C DOCKER-USER "${r[@]}" 2>/dev/null || { echo "missing: iptables ${r[*]}"; missing=1; }
+    done < <(rules4)
+    if have6; then
+      while read -r -a r; do
+        ip6tables -w -C DOCKER-USER "${r[@]}" 2>/dev/null || { echo "missing: ip6tables ${r[*]}"; missing=1; }
+      done < <(rules6)
+    fi
+    exit "$missing"
+    ;;
+  remove)
+    while read -r -a r; do
+      while iptables -w -C DOCKER-USER "${r[@]}" 2>/dev/null; do iptables -w -D DOCKER-USER "${r[@]}"; done
+    done < <(rules4)
+    if have6; then
+      while read -r -a r; do
+        while ip6tables -w -C DOCKER-USER "${r[@]}" 2>/dev/null; do ip6tables -w -D DOCKER-USER "${r[@]}"; done
+      done < <(rules6)
+    fi
+    rm -f "$STATUS"
+    ;;
+  *) echo "usage: pmos-metadata-block apply|check|remove" >&2; exit 2 ;;
+esac
