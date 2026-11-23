@@ -1,6 +1,8 @@
 export {
   CONTENT_MOUNT,
   MODEL_ALIASES,
+  ModelSourceChangedError,
+  ModelSourceGuard,
   READ_ONLY_CONTENT_DIRS,
   REVIEW_SKILL,
   createPmosAgent,
@@ -29,10 +31,13 @@ export {
   type TraceEntry,
 } from "./runtime-client.js";
 export {
+  MODEL_SOURCE_CHANGED,
+  MODEL_SOURCE_MISSING,
   botSystemPrompt,
   createWorker,
   gatewayHeaders,
   pmReason,
+  taskModelSource,
   type Worker,
   type WorkerConfig,
 } from "./worker.js";

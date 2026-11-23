@@ -79,6 +79,18 @@ export const ClaimSchema = z.object({
       title: z.string().min(1),
     })
     .nullish(),
+  /**
+   * What the runtime says about the gateway for this task: the model role and the headers it
+   * expects on every call, among them `X-Pmos-Model-Source`, the source the task was first
+   * claimed under (slice H4). A claim without that source runs no model call
+   * (`taskModelSource`).
+   */
+  gateway: z
+    .object({
+      model: z.string().optional(),
+      headers: z.record(z.string(), z.unknown()).default({}),
+    })
+    .optional(),
 });
 
 export type Claim = z.infer<typeof ClaimSchema>;

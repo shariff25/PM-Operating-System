@@ -20,6 +20,7 @@ import {
   MODEL_ALIASES,
   MissingSkillError,
   type ModelRole,
+  ModelSourceGuard,
   createPmosAgent,
   gatewayModel,
 } from "./agent.js";
@@ -102,12 +103,39 @@ export function gatewayBaseUrl(url: string): string {
   return /\/v1$/.test(trimmed) ? trimmed : `${trimmed}/v1`;
 }
 
-/** Headers the gateway uses for fair sharing and its usage log (docs/gateway.md). */
+/** What the worker says when the model source changed while a task ran (slice H4). */
+export const MODEL_SOURCE_CHANGED =
+  "The model PM OS uses changed while I was working on this (model source changed), so I stopped without sending it anything more. Please ask again.";
+
+/** What the worker says when a claim doesn't say which model source the task runs on. */
+export const MODEL_SOURCE_MISSING =
+  "The bot runtime didn't say which model source this task runs on, so I didn't call the model. A platform owner needs to update the bot runtime.";
+
+const SOURCE = /^(local|hosted-test|stub|hosted:[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?)$/;
+
+/**
+ * The model source this task runs on: the one the runtime recorded at its first claim and
+ * passes in the claim's gateway headers (slice H4, X4). Throws a `PmFacingError` when the claim
+ * has none: the worker never calls the model without it.
+ */
+export function taskModelSource(claim: Claim): string {
+  const source = claim.gateway?.headers?.["X-Pmos-Model-Source"];
+  if (typeof source !== "string" || !SOURCE.test(source)) {
+    throw new PmFacingError(MODEL_SOURCE_MISSING);
+  }
+  return source;
+}
+
+/**
+ * Headers the gateway uses for fair sharing and its usage log (docs/gateway.md), and the model
+ * source every call of the task expects (X4: the gateway refuses another before forwarding).
+ */
 export function gatewayHeaders(claim: Claim): Record<string, string> {
   return {
     "X-Pmos-User": claim.task.requested_by,
     "X-Pmos-Run": claim.task.id,
     "X-Pmos-Priority": claim.task.priority,
+    "X-Pmos-Model-Source": taskModelSource(claim),
   };
 }
 
@@ -501,6 +529,8 @@ export function createWorker(config: WorkerConfig): Worker {
       );
     }
 
+    // Slice H4: before anything else, the source every model call of the task names.
+    const sourceGuard = new ModelSourceGuard(taskModelSource(claim));
     const stagingRoot = mkdtempSync(join(tmpdir(), `pmos-task-${task.id}-`));
     let toolset: McpToolSet | undefined;
     try {
@@ -530,6 +560,7 @@ export function createWorker(config: WorkerConfig): Worker {
           role: role.model as ModelRole,
           apiKey: config.gatewayToken,
           headers,
+          sourceGuard,
         });
       // A personal bot reads as its owner, so it gets that PM's own master context; a team
       // bot gets the team context only.
@@ -563,10 +594,20 @@ export function createWorker(config: WorkerConfig): Worker {
         throw error;
       }
       const tracer = new TaskTracer((entry) => reporter.trace(entry), progress, toolKind);
-      const result = await raceAbort(
-        agent.invoke({ messages: taskMessages(claim) }, { signal, callbacks: [tracer], recursionLimit: maxSteps }),
-        signal,
-      );
+      let result: Awaited<ReturnType<typeof agent.invoke>>;
+      try {
+        result = await raceAbort(
+          agent.invoke({ messages: taskMessages(claim) }, { signal, callbacks: [tracer], recursionLimit: maxSteps }),
+          signal,
+        );
+      } catch (error) {
+        // The gateway's source changed mid-task: the task ends, and is never retried under
+        // the new source (the runtime gets a failure, not a lost lease).
+        if (sourceGuard.changed) {
+          throw new PmFacingError(MODEL_SOURCE_CHANGED, { cause: error });
+        }
+        throw error;
+      }
       const answer = finalAnswer(result.messages);
       if (!answer) {
         throw new PmFacingError(
