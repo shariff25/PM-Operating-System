@@ -225,6 +225,9 @@ NETWORK_INSPECT_FORMAT='{{range .IPAM.Config}}{{.Subnet}} {{.Gateway}} {{.IPRang
 # port_checks reads them; the admin listener (8772, slice H10) and OpenShell's gateway (17670).
 PORT_KEYS=(TOOLSERVER:8710 GATEWAY:8740 BOTS:8750 CONSOLE:8760 WEB:8770)
 ADMIN_PORT=8772
+# The web app's internal listener (PMOS_WEB_INTERNAL_BIND, slice H9): on the `pmos` network only,
+# never published, so no listener on the host may hold it.
+INTERNAL_PORT=8771
 OPENSHELL_PORT=17670
 PORTS=() PORT_PROBLEMS=()
 read_ports() {
@@ -788,7 +791,11 @@ c_exposure() {
   while read -r addr port; do
     [ -n "$port" ] || continue
     ok=1
-    if [ "$port" = "$OPENSHELL_PORT" ]; then
+    if [ "$port" = "$INTERNAL_PORT" ]; then
+      # Not published (deploy/compose.yaml): a host listener here, on any address, loopback
+      # included, means the internal route was published or something else took the port.
+      ok=0
+    elif [ "$port" = "$OPENSHELL_PORT" ]; then
       # OpenShell's gateway: loopback, or the host's address on docker0 (which one it binds is
       # verify on a real host).
       is_loopback "$addr" || { [ -n "$d0" ] && [ "$addr" = "$d0" ]; } || ok=0
@@ -802,9 +809,9 @@ c_exposure() {
     [ "$ok" = 1 ] || probs+=("$addr:$port")
   done <<<"$lst"
   if [ ${#probs[@]} -eq 0 ]; then
-    res H-EXPOSURE pass "${PORTS[*]} and $ADMIN_PORT on loopback only; $OPENSHELL_PORT on loopback${d0:+ or $d0}" "nothing of PM OS listens outside loopback but the reverse proxy"
+    res H-EXPOSURE pass "${PORTS[*]} and $ADMIN_PORT on loopback only; $INTERNAL_PORT not published; $OPENSHELL_PORT on loopback${d0:+ or $d0}" "nothing of PM OS listens outside loopback but the reverse proxy"
   else
-    res H-EXPOSURE fail "listening outside loopback: ${probs[*]}" "nothing of PM OS listens outside loopback but the reverse proxy" "publish every PM OS port on 127.0.0.1 only (deploy/compose.yaml) and keep OpenShell's gateway local"
+    res H-EXPOSURE fail "listening outside loopback: ${probs[*]}" "nothing of PM OS listens outside loopback but the reverse proxy" "publish every PM OS port on 127.0.0.1 only and never $INTERNAL_PORT (deploy/compose.yaml), and keep OpenShell's gateway local"
   fi
 }
 ACK_PRIVATE=0 # 1 when H-PRIVATE passes on its acknowledgement

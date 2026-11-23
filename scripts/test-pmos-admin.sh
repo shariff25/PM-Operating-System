@@ -2182,6 +2182,34 @@ for name, svc in c.items():
         assert "SSL_CERT_FILE" not in env, name
 assert c["web"]["ports"][0]["published"] == "18770" and c["web"]["ports"][0]["host_ip"] == "127.0.0.1"
 PY
+  # The internal route (H9): the web app's second listener is set, on 8771, and nothing publishes
+  # it; the Slack service's brief URL is the kit's own, from deploy/.env, and it is not the
+  # browser-facing port by default.
+  internal=$(docker compose --project-directory "$DEPLOY_SRC" -f "$DEPLOY_SRC/compose.yaml" \
+    --env-file "$WORK/full.env" --profile web --profile slack config --format json) ||
+    fail "compose doesn't render the web app's internal listener"
+  printf '%s\n' "$internal" >"$WORK/internal.json"
+  python3 -I - "$WORK/internal.json" <<'PY' || fail "the web app's internal listener renders wrong"
+import json, sys
+c = json.load(open(sys.argv[1]))["services"]
+web = c["web"]
+assert web["environment"]["PMOS_WEB_BIND"] == "0.0.0.0:8770", web["environment"]
+assert web["environment"]["PMOS_WEB_INTERNAL_BIND"] == "0.0.0.0:8771", web["environment"]
+assert len(web["ports"]) == 1 and web["ports"][0]["target"] == 8770 and web["ports"][0]["host_ip"] == "127.0.0.1", web["ports"]
+for name, svc in c.items():
+    for p in svc.get("ports", []):
+        assert p["target"] != 8771 and str(p.get("published")) != "8771", (name, p)
+    if name != "web":
+        assert "PMOS_WEB_INTERNAL_BIND" not in svc.get("environment", {}), name
+assert "web.pmos.internal" in web["networks"]["pmos"]["aliases"], web["networks"]
+PY
+  # PMOS_WEB_BRIEF_URL reaches the Slack service as PMOS_WEB_URL, unchanged.
+  sed -i 's|^PMOS_WEB_BRIEF_URL=.*|PMOS_WEB_BRIEF_URL=http://web.pmos.internal:8771|' "$WORK/full.env"
+  brief=$(render "$WORK/full.env" --profile web --profile slack) || fail "compose doesn't render with the brief URL"
+  [[ "$brief" == *'PMOS_WEB_URL: http://web.pmos.internal:8771'* ]] || fail "the Slack service doesn't get PMOS_WEB_BRIEF_URL as PMOS_WEB_URL"
+  # env.example documents 8771 as the brief URL and 8770 only as the route that answers 404.
+  grep -qF 'PMOS_WEB_BRIEF_URL=http://web.pmos.internal:8771' "$DEPLOY_SRC/env.example" || fail "env.example doesn't document the brief URL on 8771"
+  ! grep -qF 'PMOS_WEB_BRIEF_URL=http://web.pmos.internal:8770' "$DEPLOY_SRC/env.example" || fail "env.example still documents the brief URL on 8770"
   echo "compose renders checked"
 else
   echo "compose renders skipped: no docker compose here (CI's deploy job has it)"
