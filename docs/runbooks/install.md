@@ -131,6 +131,22 @@ the bot, or an admin's invite in the web app.
 5. **Check the served names.** Confirm them in `deploy/gateway.yaml`: they must match each
    server's `--served-model-name`.
 
+### Without a GPU: a hosted test model (testing only)
+
+On a host with no GPU, the gateway can send every role to a hosted OpenAI-compatible model
+instead (`PMOS_MODEL_SOURCE=hosted-test` in `deploy/.env`, with `PMOS_HOSTED_TEST_URL`,
+`PMOS_HOSTED_TEST_MODEL`, `PMOS_HOSTED_TEST_LABEL` and `PMOS_GATEWAY_REMOTE_KEY`; see
+`deploy/env.example`). Prompts then leave the host, so it is for **fake data only**: `pmos-admin
+up` refuses live connectors and keeps the Slack bot off, and `status` says so on every run. Set
+`PMOS_GATEWAY_STUB=0`, then `deploy/pmos-admin up` (never `--models`). Behind a proxy that
+re-signs TLS, also set `PMOS_GATEWAY_CA_FILE` to the proxy's whole CA bundle. The gateway reports
+and logs only the label. This is the gateway's part of slice H4; `hosted` (an approved provider)
+is slice H12.
+
+If another stack on the host already listens on 127.0.0.1:8710 to 8770, set
+`PMOS_TOOLSERVER_PORT`, `PMOS_GATEWAY_PORT`, `PMOS_BOTS_PORT`, `PMOS_CONSOLE_PORT` and
+`PMOS_WEB_PORT` in `deploy/.env`; `pmos-admin` follows them.
+
 ## Stage 4: Sandboxes (OpenShell)
 
 The bring-up worker isn't isolated. Replace it with the Docs bot's real sandbox.

@@ -90,7 +90,16 @@ if [ ! -f "$ENV" ]; then
   fi
 fi
 
-compose() { docker compose --project-directory "$DEPLOY" -f "$DEPLOY/compose.yaml" --env-file "$ENV" "$@"; }
+# Every call uses the same files, so `status`, `logs` and `down` see the stack `up` started: with
+# PMOS_MODEL_SOURCE=hosted-test, the gateway's testing-only overlay (and its CA, when set).
+compose() {
+  local files=(-f "$DEPLOY/compose.yaml")
+  if [ "${PMOS_MODEL_SOURCE:-local}" = hosted-test ]; then
+    files+=(-f "$DEPLOY/compose.hosted-test.yaml")
+    [ -z "${PMOS_GATEWAY_CA_FILE:-}" ] || files+=(-f "$DEPLOY/compose.gateway-ca.yaml")
+  fi
+  docker compose --project-directory "$DEPLOY" "${files[@]}" --env-file "$ENV" "$@"
+}
 
 # deploy/.env holds the vault key and every service token, so (the security review of 6bb806f):
 # - a file every account may read or write, or its group may write, is refused (only warned
@@ -361,14 +370,110 @@ entra_configured() {
     [ -n "${PMOS_WEB_ENTRA_CLIENT_SECRET:-}" ] && [ -n "${PMOS_WEB_PUBLIC_URL:-}" ]
 }
 
+# Where the gateway's model comes from (docs/openshell-any-host-spec.md §3.6): `local` (the
+# default: deploy/gateway.yaml and the vLLM servers) or `hosted-test`, TESTING ONLY: every role on
+# a hosted OpenAI-compatible model nobody approved, so prompts leave this host and the stack takes
+# fake data only. This is the gateway's part of slice H4, built ahead of it for a first run on a
+# host without a GPU; `hosted` (an approved provider) is slice H12 and isn't built. With
+# hosted-test this checks the settings, refuses live connectors and writes the gateway's config to
+# $PMOS_STATE_DIR/gateway.hosted-test.yaml (outside the repo: it names the provider's URL and
+# model id, which no committed file may), with every role behind PMOS_HOSTED_TEST_LABEL so the
+# gateway reports and logs only the label (docs/gateway.md, "Hiding the model behind a label").
+# `-` last in each set, so it is never read as a range.
+LABEL_CHARS=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-
+MODEL_ID_CHARS=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:/-
+model_source_checks() {
+  local source=${PMOS_MODEL_SOURCE:-local} url model label bad=0 cfg
+  case "$source" in
+    local)
+      if [ -n "${PMOS_GATEWAY_CA_FILE:-}" ]; then
+        say "PMOS_GATEWAY_CA_FILE is for PMOS_MODEL_SOURCE=hosted-test only: the production sources take no run-time CA (docs/openshell-any-host-spec.md §3.6, Egress). Clear it." >&2
+        return 1
+      fi
+      return 0
+      ;;
+    hosted-test) ;;
+    hosted) say "PMOS_MODEL_SOURCE=hosted (an approved provider) isn't built yet (slice H12): use local, or hosted-test with fake data only" >&2; return 1 ;;
+    *) say "PMOS_MODEL_SOURCE=$(printf '%q' "$source") in deploy/.env: use local or hosted-test" >&2; return 1 ;;
+  esac
+  url=${PMOS_HOSTED_TEST_URL:-}
+  model=${PMOS_HOSTED_TEST_MODEL:-}
+  label=${PMOS_HOSTED_TEST_LABEL:-hosted-model-a}
+  if ! [[ "$url" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$ ]]; then
+    say "PMOS_MODEL_SOURCE=hosted-test needs PMOS_HOSTED_TEST_URL, the provider's OpenAI-compatible base URL (https://<host>/<path>, plain characters)" >&2
+    bad=1
+  fi
+  if [ -z "$model" ] || [ ${#model} -gt 128 ] || ! only_chars "$model" "$MODEL_ID_CHARS"; then
+    say "PMOS_MODEL_SOURCE=hosted-test needs PMOS_HOSTED_TEST_MODEL, the model id (letters, digits, . _ - : /)" >&2
+    bad=1
+  fi
+  if [ ${#label} -gt 64 ] || ! only_chars "$label" "$LABEL_CHARS"; then
+    say "PMOS_HOSTED_TEST_LABEL=$(printf '%q' "$label"): 1 to 64 letters, digits, . _ and -" >&2
+    bad=1
+  fi
+  if ! is_set PMOS_GATEWAY_REMOTE_KEY; then
+    say "PMOS_MODEL_SOURCE=hosted-test needs PMOS_GATEWAY_REMOTE_KEY in deploy/.env (the provider's key, or the placeholder your egress proxy replaces)" >&2
+    bad=1
+  fi
+  if [ "${PMOS_CONNECTORS:-fake}" != fake ]; then
+    say "PMOS_MODEL_SOURCE=hosted-test sends prompts to an endpoint nobody approved, so it allows fake data only: PMOS_CONNECTORS must be fake (it is ${PMOS_CONNECTORS})" >&2
+    bad=1
+  fi
+  if [ -n "${PMOS_GATEWAY_CA_FILE:-}" ] && { [[ "$PMOS_GATEWAY_CA_FILE" != /* ]] || ! [ -f "$PMOS_GATEWAY_CA_FILE" ] || ! [ -r "$PMOS_GATEWAY_CA_FILE" ]; }; then
+    say "PMOS_GATEWAY_CA_FILE=$(printf '%q' "$PMOS_GATEWAY_CA_FILE") isn't a readable file given by its absolute path" >&2
+    bad=1
+  fi
+  [ "$bad" = 0 ] || return 1
+  [ -d "${PMOS_STATE_DIR:-}" ] || { say "PMOS_STATE_DIR isn't a directory: run deploy/setup.sh" >&2; return 1; }
+  cfg="$PMOS_STATE_DIR/gateway.hosted-test.yaml"
+  # Limits and clients as deploy/gateway.yaml's; no `class:`, so it is a `test` gateway, the only
+  # kind that takes a remote test upstream, and its eval runs never count.
+  (umask 022 && cat >"$cfg.new" <<EOF
+# TESTING ONLY, written by deploy/pmos-admin from deploy/.env (PMOS_MODEL_SOURCE=hosted-test):
+# every role on a hosted model nobody approved, so prompts leave this host. Fake data only.
+upstreams:
+  remote: "openai+${url%/}"
+roles:
+  default: {upstream: remote, model: "$model", label: "$label"}
+  reasoning: {upstream: remote, model: "$model", label: "$label"}
+  extraction: {upstream: remote, model: "$model", label: "$label"}
+limits:
+  max-in-flight: 4
+  per-user: 2
+  max-queue: 64
+  queue-wait-secs: 300
+  stream-max-secs: 900
+  max-answer-bytes: 16777216
+  per-user-queue: 4
+clients:
+  runtime: {trusted: true, max-in-flight: 2}
+  bot-pm-*: {trusted: true, max-in-flight: 3, user: from-name}
+  bot-*: {trusted: true, max-in-flight: 3}
+  evals: {max-in-flight: 1, priority: personal}
+EOF
+  ) && mv -f "$cfg.new" "$cfg" || { say "couldn't write $cfg" >&2; return 1; }
+  say "model source: hosted-test, every role as $label (TESTING ONLY: prompts leave this host; fake data only)"
+}
+
 profiles() {
   local p=()
   if [ -n "${PMOS_SLACK_APP_TOKEN:-}" ] && [ -n "${PMOS_SLACK_BOT_TOKEN:-}" ]; then
-    p+=(--profile slack)
+    if [ "${PMOS_MODEL_SOURCE:-local}" = hosted-test ]; then
+      # A test workspace can't be told apart from a real one, so Slack stays off in fake-data
+      # mode (docs/openshell-any-host-spec.md §3.6, "hosted-test, and fake-data mode").
+      say "note: the Slack bot stays off with PMOS_MODEL_SOURCE=hosted-test (fake data only; a real workspace can't be told apart)" >&2
+    else
+      p+=(--profile slack)
+    fi
   fi
   for arg in "$@"; do
     case "$arg" in
-      --models) p+=(--profile models) ;;
+      --models)
+        if [ "${PMOS_MODEL_SOURCE:-local}" = hosted-test ]; then
+          say "--models starts the local model servers, which PMOS_MODEL_SOURCE=hosted-test doesn't use" >&2
+          exit 2
+        fi
+        p+=(--profile models) ;;
       --console) p+=(--profile console) ;;
       --web)
         if [ "${PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY:-0}" != 1 ] && ! entra_configured &&
@@ -384,7 +489,9 @@ profiles() {
           exit 2
         fi
         p+=(--profile web) ;;
-      --bringup) p+=(--profile bringup) ;;
+      --bringup)
+        p+=(--profile bringup)
+        [ -z "${PMOS_BRINGUP_PERSONAL_BOT:-}" ] || p+=(--profile bringup-personal) ;;
       *) say "unknown option $arg" >&2; exit 2 ;;
     esac
   done
@@ -411,7 +518,7 @@ bearer_config() { # name of the variable holding the token (checked with token_o
 internal() { # method path [json]
   token_ok PMOS_SERVICE_TOKEN || exit 2
   bearer_config PMOS_SERVICE_TOKEN |
-    curl --config - -fsS --noproxy '*' -X "$1" "http://127.0.0.1:8710$2" \
+    curl --config - -fsS --noproxy '*' -X "$1" "http://127.0.0.1:$PMOS_TOOLSERVER_PORT$2" \
       -H 'content-type: application/json' ${3:+-d "$3"}
 }
 
@@ -433,7 +540,7 @@ eval_stack_up() { # checkout
   local checkout
   checkout=$(cd "$1" && pwd)
   [ -f "$checkout/content/tools.yaml" ] || { say "$checkout has no content/tools.yaml" >&2; exit 2; }
-  if ! curl -fsS --noproxy '*' -m 5 http://127.0.0.1:8740/healthz >/dev/null 2>&1; then
+  if ! curl -fsS --noproxy '*' -m 5 "http://127.0.0.1:$PMOS_GATEWAY_PORT/healthz" >/dev/null 2>&1; then
     say "the gateway isn't running: start the stack first (deploy/pmos-admin up --models)" >&2
     exit 2
   fi
@@ -565,6 +672,27 @@ uid_checks() {
   done
 }
 
+# The host ports the services are published on, on 127.0.0.1 only (deploy/compose.yaml):
+# PMOS_TOOLSERVER_PORT, PMOS_GATEWAY_PORT, PMOS_BOTS_PORT, PMOS_CONSOLE_PORT and PMOS_WEB_PORT in
+# deploy/.env, for a host where another stack (a test stack, say) already listens on the
+# defaults, 8710, 8740, 8750, 8760 and 8770. Blank means the default; anything but a port number
+# is refused. `status`, `smoke`, `reindex`, `revoke`, `ledger` and the eval stack call these.
+port_checks() {
+  local k d v
+  for k in TOOLSERVER:8710 GATEWAY:8740 BOTS:8750 CONSOLE:8760 WEB:8770; do
+    d=${k#*:}
+    k=PMOS_${k%%:*}_PORT
+    v=${!k:-}
+    if [ -z "$v" ]; then
+      v=$d
+    elif ! only_chars "$v" 0123456789 || [ ${#v} -gt 5 ] || [ $((10#$v)) -lt 1 ] || [ $((10#$v)) -gt 65535 ]; then
+      env_problem "$k=$(printf '%q' "$v") in deploy/.env isn't a port number (1 to 65535); blank means $d"
+      v=$d
+    fi
+    printf -v "$k" '%s' $((10#$v))
+  done
+}
+
 # --- Bots: names, tokens, sandboxes and their workers ---------------------------------------
 # docs/openshell-any-host-spec.md §3.7 (slice H0).
 
@@ -599,9 +727,30 @@ require_handle() { # command handle
   exit 2
 }
 
+# The bring-up personal worker (deploy/compose.yaml, worker-personal): one PM's personal bot as a
+# plain container, NOT isolated, for a host without OpenShell and fake data only. Its two tokens
+# are found by exact key in deploy/.env's lists (add-bot made them) and reach Compose through
+# this process's environment, never a command line.
+bringup_personal() {
+  local bot=${PMOS_BRINGUP_PERSONAL_BOT:-} rt gw
+  [ -n "$bot" ] || return 0
+  if ! valid_bot_name "$bot" || [ "$bot" = docs ]; then
+    say "PMOS_BRINGUP_PERSONAL_BOT=$(printf '%q' "$bot"): name one personal bot, such as pm-<handle> (the Docs bot has worker-docs)" >&2
+    return 1
+  fi
+  rt=$(list_value "${PMOS_RT_WORKER_TOKENS:-}" "worker-$bot")
+  gw=$(list_value "${PMOS_GW_BOT_TOKENS:-}" "bot-$bot")
+  if [ -z "$rt" ] || [ -z "$gw" ]; then
+    say "PMOS_BRINGUP_PERSONAL_BOT=$bot has no tokens yet: run deploy/pmos-admin add-bot $bot first" >&2
+    return 1
+  fi
+  export PMOS_BRINGUP_PERSONAL_RT_TOKEN=$rt PMOS_BRINGUP_PERSONAL_GW_TOKEN=$gw
+  say "bring-up worker for $bot (NOT isolated: fake data only)"
+}
+
 # The stack's services, as Docker Compose lists them from deploy/compose.yaml with every
 # profile. `logs` and `restart` take only one of these (never an option, never anything else).
-ALL_PROFILES=(--profile slack --profile console --profile web --profile models --profile bringup)
+ALL_PROFILES=(--profile slack --profile console --profile web --profile models --profile bringup --profile bringup-personal)
 require_service() { # command service
   local list
   case "$2" in
@@ -691,7 +840,7 @@ provider_upsert() { # name type variable
 cmd=${1:-help}
 shift || true
 # pause never reads deploy/.env (above); help runs nothing. down only warns (env_problem).
-case "$cmd" in pause | help | -h | --help) ;; *) uid_checks ;; esac
+case "$cmd" in pause | help | -h | --help) ;; *) uid_checks; port_checks ;; esac
 case "$cmd" in
   build)
     # The proxy settings by name only: Docker takes each value from this environment, so a proxy
@@ -724,6 +873,8 @@ case "$cmd" in
     prof=()
     [ -z "$profile_lines" ] || mapfile -t prof <<<"$profile_lines"
     assertion_checks || exit 2
+    model_source_checks || exit 2
+    if [[ " ${prof[*]} " == *" bringup-personal "* ]]; then bringup_personal || exit 2; fi
     if [ -z "${PMOS_SLACK_APP_TOKEN:-}" ] || [ -z "${PMOS_SLACK_BOT_TOKEN:-}" ]; then
       say "note: the Slack bot is off until PMOS_SLACK_APP_TOKEN and PMOS_SLACK_BOT_TOKEN are set"
     fi
@@ -732,7 +883,7 @@ case "$cmd" in
     ;;
 
   down)
-    compose --profile slack --profile console --profile web --profile models --profile bringup down || {
+    compose "${ALL_PROFILES[@]}" down || {
       say "docker compose couldn't stop the stack (it may not be able to read deploy/.env either)." >&2
       say "Stop PM OS's containers directly (data is kept):" >&2
       say "  docker ps -q --filter label=com.docker.compose.project=pmos | xargs -r docker stop" >&2
@@ -742,9 +893,12 @@ case "$cmd" in
 
   status)
     say "== containers"
-    compose --profile slack --profile console --profile web --profile models --profile bringup ps \
+    compose "${ALL_PROFILES[@]}" ps \
       --format 'table {{.Service}}\t{{.Status}}'
     say "== readiness"
+    if [ "${PMOS_MODEL_SOURCE:-local}" = hosted-test ]; then
+      row model WARN "PMOS_MODEL_SOURCE=hosted-test: TESTING ONLY, prompts leave this host (fake data only)"
+    fi
     check() { # name url
       local body code
       body=$(curl -sS --noproxy '*' -m 5 -w '\n%{http_code}' "$2" 2>/dev/null) || { row "$1" DOWN "no answer from $2"; return; }
@@ -763,23 +917,23 @@ case "$cmd" in
         fi
       fi
     }
-    check toolserver http://127.0.0.1:8710/readyz
-    check gateway http://127.0.0.1:8740/readyz
+    check toolserver "http://127.0.0.1:$PMOS_TOOLSERVER_PORT/readyz"
+    check gateway "http://127.0.0.1:$PMOS_GATEWAY_PORT/readyz"
     # G2: the gateway's /readyz says its class and whether the stub model is on.
-    gw=$(curl -sS --noproxy '*' -m 5 http://127.0.0.1:8740/readyz 2>/dev/null) || gw=""
+    gw=$(curl -sS --noproxy '*' -m 5 "http://127.0.0.1:$PMOS_GATEWAY_PORT/readyz" 2>/dev/null) || gw=""
     if [[ "$gw" == *'"stub":true'* ]]; then
       row gateway WARN "the STUB model answers every call (PMOS_GATEWAY_STUB=1): set it to 0 once the model servers are up (docs/runbooks/install.md)"
     elif [[ "$gw" == *'"class":"'* && "$gw" != *'"class":"production"'* ]]; then
       row gateway WARN "not a production-class gateway: its eval runs don't count (deploy/gateway.yaml has class: production; docs/gateway.md)"
     fi
-    check bots http://127.0.0.1:8750/readyz
+    check bots "http://127.0.0.1:$PMOS_BOTS_PORT/readyz"
     if compose --profile console ps --status running --services 2>/dev/null | grep -qx console; then
-      check console http://127.0.0.1:8760/healthz
+      check console "http://127.0.0.1:$PMOS_CONSOLE_PORT/healthz"
     fi
     if compose --profile web ps --status running --services 2>/dev/null | grep -qx web; then
       # /readyz: with Entra sign-in on it includes `entra_link`, whether the tool server
       # validates first-link tokens for the same tenant and client id (docs/entra-sign-in.md).
-      check web http://127.0.0.1:8770/readyz
+      check web "http://127.0.0.1:$PMOS_WEB_PORT/readyz"
     fi
     if compose exec -T docs curl -fsS -m 5 http://127.0.0.1:8730/readyz >/dev/null 2>&1; then
       row docs ok "ready"
@@ -835,7 +989,7 @@ case "$cmd" in
     say "This replaces every PM OS database with the backup in $dir."
     read -r -p "Type RESTORE to go on: " answer
     [ "$answer" = RESTORE ] || { say "stopped; nothing changed"; exit 1; }
-    compose --profile slack --profile console --profile web --profile bringup stop docs toolserver gateway bots slack console web worker-docs 2>/dev/null || true
+    compose --profile slack --profile console --profile web --profile bringup --profile bringup-personal stop docs toolserver gateway bots slack console web worker-docs worker-personal 2>/dev/null || true
     compose up -d postgres
     until compose exec -T postgres pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
     for db in toolserver bots docs; do
@@ -985,6 +1139,7 @@ for g in s["groups"]:
     # The runtime is recreated with deploy/.env as it is, assertions included: the web app and
     # the console may be running against it. Checked before anything is written.
     assertion_checks || exit 2
+    model_source_checks || exit 2
     rt=$(openssl rand -hex 24)
     gw=$(openssl rand -hex 24)
     set_env PMOS_RT_WORKER_TOKENS "${PMOS_RT_WORKER_TOKENS:+$PMOS_RT_WORKER_TOKENS,}worker-$bot=$rt"
@@ -1255,17 +1410,17 @@ print(json.dumps({"bot": "docs", "requested_by": sys.argv[1],
       say "smoke needs jq or python3 to write the task's JSON" >&2
       exit 1
     fi
-    task=$(rt_curl -X POST http://127.0.0.1:8750/v1/tasks -H 'content-type: application/json' -d "$body")
+    task=$(rt_curl -X POST "http://127.0.0.1:$PMOS_BOTS_PORT/v1/tasks" -H 'content-type: application/json' -d "$body")
     id=$(sed -n 's/.*"id":"\(tsk_[0-9a-f]*\)".*/\1/p' <<<"$task")
     [ -n "$id" ] || { say "the runtime refused the task: $task" >&2; exit 1; }
     say "task $id queued; waiting up to 3 minutes for a worker"
     status=queued
     for _ in $(seq 1 90); do
-      status=$(rt_curl "http://127.0.0.1:8750/v1/tasks/$id" | sed -n 's/.*"status":"\([a-z_]*\)".*/\1/p')
+      status=$(rt_curl "http://127.0.0.1:$PMOS_BOTS_PORT/v1/tasks/$id" | sed -n 's/.*"status":"\([a-z_]*\)".*/\1/p')
       case "$status" in done|failed|cancelled|needs_approval) break ;; esac
       sleep 2
     done
-    rt_curl "http://127.0.0.1:8750/v1/tasks/$id/events" | tr '{' '\n' | sed -n 's/.*"kind":"\([a-z_]*\)".*"text":"\([^"]*\)".*/  \1: \2/p'
+    rt_curl "http://127.0.0.1:$PMOS_BOTS_PORT/v1/tasks/$id/events" | tr '{' '\n' | sed -n 's/.*"kind":"\([a-z_]*\)".*"text":"\([^"]*\)".*/  \1: \2/p'
     echo
     if [ "$status" = done ]; then say "smoke test passed"; else say "smoke test ended as: $status" >&2; exit 1; fi
     ;;
