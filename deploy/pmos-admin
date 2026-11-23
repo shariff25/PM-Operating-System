@@ -751,9 +751,11 @@ port_checks() {
 # and the host resolves the names to those addresses through a managed block in /etc/hosts.
 #
 # The addresses are reviewed code, never settings: literals in deploy/compose.yaml
-# (`ipv4_address`), repeated here and checked equal by scripts/test-pmos-admin.sh; from slice H3
-# also constants in the policy crate, which pins each name to its own /32 (`allowed_ips`).
-# Moving them is a code change under POL-2 review, not an edit of deploy/.env. The two vLLM
+# (`ipv4_address`), repeated here and checked equal by scripts/test-pmos-admin.sh; the three
+# services' are also the policy crate's constants (TOOLSERVER_ADDR, GATEWAY_ADDR, BOTS_ADDR in
+# crates/policy/src/lib.rs, slice H3), which pin each name to its own /32 in every bot's policy
+# (`allowed_ips`); crates/policy/tests/policies.rs checks PINNED_NAMES and PINNED_SERVICE_ADDRS
+# against them. Moving them is a code change under POL-2 review, not an edit of deploy/.env. The two vLLM
 # servers (.13, .14) are pinned too, because the gateway checks what their names resolve to
 # (slice H4); no sandbox reaches them, so they have no host name here.
 #
@@ -798,18 +800,26 @@ ipv4_cidr() {
 }
 # Is the address number $1 inside the network "<number> <prefix>" ($2 $3)?
 ipv4_num_in() { [ $(($1 & ((0xffffffff << (32 - $3)) & 0xffffffff))) = "$2" ]; }
+# Is the address $1 a host of the network "<number> <prefix>" ($2 $3): inside it, and neither its
+# network nor its broadcast address?
+ipv4_host_in() {
+  local n
+  n=$(ipv4_strict "$1") || return 1
+  ipv4_num_in "$n" "$2" "$3" && [ "$n" != "$2" ] && [ "$n" != $(($2 | ((1 << (32 - $3)) - 1))) ]
+}
 
 # The network settings in deploy/.env against the pinned addresses (§3.3, §3.5): the subnet a
 # /24 or longer that holds every pinned address (a /8 or /16 would hold them and much else
 # besides); the gateway inside it and not a pinned address; the range Docker hands unpinned
 # containers (the eval stack's, H-METADATA's probe, an operator's `docker run`) inside the subnet
 # and holding none of them, or one of those could take a service's address and the service
-# couldn't start. Prints each problem; 1 when there is one. The subnet refusal against the policy
-# crate's constants is slice H3's; this compares against the same literals deploy/compose.yaml has.
+# couldn't start. Prints each problem; 1 when there is one. The three services' addresses are
+# checked first, as the policy crate's constants (slice H3): a subnet without them would leave
+# every sandbox's policy refusing every connection, since each name is allowed only at its own /32.
 network_settings_problems() {
   local subnet=${PMOS_NETWORK_SUBNET:-$NETWORK_SUBNET_DEFAULT} gw=${PMOS_NETWORK_GATEWAY:-$NETWORK_GATEWAY_DEFAULT}
   local range=${PMOS_NETWORK_IP_RANGE:-$NETWORK_IP_RANGE_DEFAULT}
-  local sn sb rn rb g a an bcast bad=0 subnet_ok=0
+  local sn sb rn rb g a i bcast bad=0 subnet_ok=0
   if ! read -r sn sb < <(ipv4_cidr "$subnet"); then
     say "PMOS_NETWORK_SUBNET=$(printf '%q' "$subnet") isn't an IPv4 network a.b.c.d/n with its host bits clear: use $NETWORK_SUBNET_DEFAULT"
     bad=1
@@ -819,14 +829,23 @@ network_settings_problems() {
   else
     subnet_ok=1
     bcast=$((sn | ((1 << (32 - sb)) - 1)))
-    for a in "${PINNED_ADDRS[@]}"; do
-      an=$(ipv4_strict "$a")
-      if ! ipv4_num_in "$an" "$sn" "$sb" || [ "$an" = "$sn" ] || [ "$an" = "$bcast" ]; then
-        say "PMOS_NETWORK_SUBNET=$subnet doesn't hold $a, which deploy/compose.yaml pins (the services' and model servers' addresses, 10.201.77.10 to .14). Those addresses are reviewed code, not settings: moving them is a code change to deploy/compose.yaml (and, from slice H3, to the policy crate's constants) under POL-2 review, never an edit of deploy/.env alone. Use $NETWORK_SUBNET_DEFAULT"
+    for i in "${!PINNED_SERVICE_ADDRS[@]}"; do
+      a=${PINNED_SERVICE_ADDRS[$i]}
+      if ! ipv4_host_in "$a" "$sn" "$sb"; then
+        say "PMOS_NETWORK_SUBNET=$subnet doesn't hold $a, the address every bot's sandbox policy allows ${PINNED_NAMES[$i]} at (allowed_ips $a/32, from the policy crate's constants TOOLSERVER_ADDR, GATEWAY_ADDR and BOTS_ADDR in crates/policy/src/lib.rs): on this network every sandbox's connections would be refused. Those addresses are reviewed code, not settings: moving them is a code change to the policy crate's constants and deploy/compose.yaml, with the policies regenerated, under POL-2 review (policies/README.md), never an edit of deploy/.env alone. Use $NETWORK_SUBNET_DEFAULT"
         bad=1
         break
       fi
     done
+    if [ "$bad" = 0 ]; then
+      for a in "${PINNED_ADDRS[@]}"; do
+        if ! ipv4_host_in "$a" "$sn" "$sb"; then
+          say "PMOS_NETWORK_SUBNET=$subnet doesn't hold $a, which deploy/compose.yaml pins (the services' and model servers' addresses, 10.201.77.10 to .14). Those addresses are reviewed code, not settings: moving them is a code change to deploy/compose.yaml (and, for the three services, to the policy crate's constants) under POL-2 review, never an edit of deploy/.env alone. Use $NETWORK_SUBNET_DEFAULT"
+          bad=1
+          break
+        fi
+      done
+    fi
   fi
   if ! g=$(ipv4_strict "$gw"); then
     say "PMOS_NETWORK_GATEWAY=$(printf '%q' "$gw") isn't an IPv4 address: use $NETWORK_GATEWAY_DEFAULT"

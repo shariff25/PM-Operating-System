@@ -16,7 +16,7 @@
 //!   widen them), so a persona shows up here only as uploads.
 //!
 //! Those inputs are the [`PolicySpec`] the admin edits. Everything else (the three hosts and
-//! ports, the REST routes, the MCP methods and revisions, the worker binary, the system paths,
+//! ports, each host's pinned address (`allowed_ips`), the REST routes, the MCP methods and revisions, the worker binary, the system paths,
 //! the non-root identity, Landlock) is fixed in `crates/policy/src/lib.rs` and changes only
 //! with code; [`fixed`] shows it.
 
@@ -159,6 +159,7 @@ pub fn fixed() -> Value {
                 "rule": s.rule_name(),
                 "host": s.host(),
                 "port": s.port(),
+                "allowed_ips": s.allowed_ips(),
                 "protocol": s.protocol(),
                 "routes": s.routes().map(|r| r.iter().map(|(m, p)| format!("{m} {p}")).collect::<Vec<_>>()),
                 "credential_profile": s.credential().map(|c| c.profile),
@@ -201,9 +202,15 @@ pub struct NetworkAllowance {
     pub service: Option<&'static str>,
     pub host: Option<String>,
     pub port: Option<u16>,
-    /// Extra ports, and IP ranges: always empty in a generated policy.
+    /// Extra ports: always empty in a generated policy.
     pub ports: Vec<u16>,
+    /// The addresses the host must resolve to. A generated policy has exactly the service's
+    /// own pinned `/32` here (decision O6); see `pinned`.
     pub allowed_ips: Vec<String>,
+    /// `true` when `service` is known and `allowed_ips` is exactly its own pinned address, as
+    /// generated. Anything else (no list, another address, a range, a second entry) is a hand
+    /// edit, and `pmos policy check` fails it (`net-allowed-ips`).
+    pub pinned: bool,
     pub protocol: Option<String>,
     pub enforcement: Option<String>,
     pub tls: Option<String>,
@@ -276,12 +283,14 @@ pub fn allowances(policy: &Policy, launch: Option<&SandboxSpec>) -> Allowances {
             }
             tools.sort();
             tools.dedup();
+            let known = match (&e.host, e.port) {
+                (Some(h), Some(p)) => Service::at(h, p),
+                _ => None,
+            };
             network.push(NetworkAllowance {
                 rule: key.clone(),
-                service: match (&e.host, e.port) {
-                    (Some(h), Some(p)) => Service::at(h, p).map(service_name),
-                    _ => None,
-                },
+                service: known.map(service_name),
+                pinned: known.is_some_and(|s| e.allowed_ips == s.allowed_ips()),
                 host: e.host.clone(),
                 port: e.port,
                 ports: e.ports.clone(),
@@ -373,8 +382,31 @@ fn summary(a: &Allowances) -> Vec<String> {
         if let Some(c) = &n.credential {
             out.push(format!("Uses the credential {c} on {dest}."));
         }
-        if !n.allowed_ips.is_empty() || !n.ports.is_empty() {
-            out.push(format!("Also allows extra ports or IP ranges on {dest}."));
+        if n.pinned {
+            out.push(format!(
+                "Only where {} resolves to its own address, {}.",
+                n.host.as_deref().unwrap_or("?"),
+                n.allowed_ips.join(", ")
+            ));
+        } else if n.service.is_some() {
+            out.push(if n.allowed_ips.is_empty() {
+                format!(
+                    "Not pinned to its own address: {dest} is reached wherever its name resolves."
+                )
+            } else {
+                format!(
+                    "Not pinned to its own address: {dest} is allowed at {}.",
+                    n.allowed_ips.join(", ")
+                )
+            });
+        } else if !n.allowed_ips.is_empty() {
+            out.push(format!(
+                "Also allows IP ranges on {dest}: {}.",
+                n.allowed_ips.join(", ")
+            ));
+        }
+        if !n.ports.is_empty() {
+            out.push(format!("Also allows extra ports on {dest}."));
         }
     }
     if !a.network_middlewares.is_empty() {
@@ -423,8 +455,11 @@ fn summary(a: &Allowances) -> Vec<String> {
 /// (added: wider; removed: narrower); `value`s of scalar kinds compare by equality (changed).
 type Atom = (&'static str, String, String);
 
-/// Scalar kinds: any change is flagged as widening for review.
-const SCALAR_KINDS: [&str; 8] = [
+/// Scalar kinds: any change is flagged as widening for review. `allowed_ips` is one: on an
+/// endpoint with a host it narrows where the host may resolve, so dropping or changing an entry
+/// can widen, and is never shown as narrowing.
+const SCALAR_KINDS: [&str; 9] = [
+    "network.allowed_ips",
     "network.protocol",
     "network.enforcement",
     "network.tls",
@@ -454,13 +489,6 @@ fn atoms(a: &Allowances) -> BTreeSet<Atom> {
                 String::new(),
             );
         }
-        for ip in &n.allowed_ips {
-            put(
-                "network.destination",
-                format!("{dest} ip {ip}"),
-                String::new(),
-            );
-        }
         for b in &n.binaries {
             put("network.binary", format!("{dest} {b}"), String::new());
         }
@@ -477,6 +505,17 @@ fn atoms(a: &Allowances) -> BTreeSet<Atom> {
             put("network.mcp_version", format!("{dest} {v}"), String::new());
         }
         let opt = |v: &Option<String>| v.clone().unwrap_or_else(|| "(none)".into());
+        let mut ips = n.allowed_ips.clone();
+        ips.sort();
+        put(
+            "network.allowed_ips",
+            dest.clone(),
+            if ips.is_empty() {
+                "(none)".into()
+            } else {
+                ips.join(", ")
+            },
+        );
         put("network.protocol", dest.clone(), opt(&n.protocol));
         put("network.enforcement", dest.clone(), opt(&n.enforcement));
         put("network.tls", dest.clone(), opt(&n.tls));
@@ -1269,6 +1308,82 @@ mod tests {
 
     const BOT: &str = "---\nname: docs\nrole: docs-helper\nscope: team\nowner: \"TODO\"\ndescription: x\n---\n\n# Docs\n";
     const SKILL: &str = "---\nname: docs\ndescription: d\nmetadata:\n  owner: \"TODO\"\n  tools: \"docs.search docs.read\"\n  track: \"Everyday\"\n---\n\nBody\n";
+
+    fn docs_allowances(edit: impl FnOnce(&mut Policy)) -> Allowances {
+        let mut p = crate::generate::tests::docs().policy();
+        edit(&mut p);
+        allowances(&p, None)
+    }
+
+    fn endpoint<'a>(p: &'a mut Policy, rule: &str) -> &'a mut openshell::Endpoint {
+        &mut p.network_policies.get_mut(rule).unwrap().endpoints[0]
+    }
+
+    #[test]
+    fn the_fixed_facts_and_allowances_show_each_services_own_address() {
+        let f = fixed();
+        let pins: Vec<(&str, &Value)> = f["services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| (s["host"].as_str().unwrap(), &s["allowed_ips"]))
+            .collect();
+        assert_eq!(
+            pins,
+            [
+                ("toolserver.pmos.internal", &json!(["10.201.77.10/32"])),
+                ("gateway.pmos.internal", &json!(["10.201.77.11/32"])),
+                ("bots.pmos.internal", &json!(["10.201.77.12/32"])),
+            ]
+        );
+        let a = docs_allowances(|_| {});
+        assert!(a.network.iter().all(|n| n.pinned), "{:?}", a.network);
+        assert!(a.summary.contains(
+            &"Only where gateway.pmos.internal resolves to its own address, 10.201.77.11/32."
+                .to_string()
+        ));
+        assert!(!a.summary.iter().any(|l| l.contains("Not pinned")));
+    }
+
+    #[test]
+    fn an_unpinned_or_repinned_service_is_not_pinned_and_is_reviewed_as_widening() {
+        let before = BTreeMap::from([("docs".to_string(), docs_allowances(|_| {}))]);
+        for (edit, says) in [
+            (vec![], "reached wherever its name resolves"),
+            (vec!["10.201.77.0/24"], "allowed at 10.201.77.0/24"),
+            (
+                vec!["10.201.77.11/32", "10.201.77.12/32"],
+                "allowed at 10.201.77.11/32, 10.201.77.12/32",
+            ),
+        ] {
+            let after_a = docs_allowances(|p| {
+                endpoint(p, "pmos_runtime").allowed_ips =
+                    edit.iter().map(|s| s.to_string()).collect()
+            });
+            let rt = after_a
+                .network
+                .iter()
+                .find(|n| n.rule == "pmos_runtime")
+                .unwrap();
+            assert!(!rt.pinned);
+            assert!(
+                after_a.summary.iter().any(|l| l.contains(says)),
+                "{:?}",
+                after_a.summary
+            );
+            let after = BTreeMap::from([("docs".to_string(), after_a)]);
+            let changes = diff_allowances(&before, &after);
+            assert_eq!(changes.len(), 1, "{changes:#?}");
+            assert_eq!(changes[0].kind, "network.allowed_ips");
+            assert_eq!(changes[0].item, "bots.pmos.internal:8750");
+            assert_eq!(changes[0].direction, "changed");
+            assert!(changes[0].widening);
+            // The other way round (pinning again) is still a change to review, never hidden.
+            let back = diff_allowances(&after, &before);
+            assert_eq!(back.len(), 1);
+            assert!(back[0].widening);
+        }
+    }
 
     #[test]
     fn front_matter_values_are_set_in_place() {

@@ -5,8 +5,9 @@ const B = copy.admin.policy.bots;
 
 /**
  * Everything in a bot's checked-in policy that PM OS would never generate: a destination it does
- * not know, extra ports or IP ranges, logging instead of enforcing, TLS passed through, an access
- * preset, a middleware, or a writable working directory. Each is a hand edit to look at.
+ * not know, extra ports or IP ranges, a service not pinned to its own address, logging instead of
+ * enforcing, TLS passed through, an access preset, a middleware, or a writable working directory.
+ * Each is a hand edit to look at.
  */
 export function handEdits(a: Allowances): string[] {
   const out: string[] = [];
@@ -14,7 +15,8 @@ export function handEdits(a: Allowances): string[] {
     const where = `${n.host ?? '?'}:${n.port ?? '?'}`;
     if (n.service === null) out.push(B.unknownDest(where));
     if (n.ports.length) out.push(`${where}: ${B.extraPorts(n.ports.join(', '))}`);
-    if (n.allowed_ips.length) out.push(`${where}: ${B.ipRanges(n.allowed_ips.join(', '))}`);
+    if (n.service !== null && !n.pinned) out.push(`${where}: ${B.notPinned(n.allowed_ips.join(', '))}`);
+    else if (n.service === null && n.allowed_ips.length) out.push(`${where}: ${B.ipRanges(n.allowed_ips.join(', '))}`);
     if (n.enforcement !== 'enforce') out.push(`${where}: ${B.logsOnly}`);
     if (n.tls !== null) out.push(`${where}: ${B.tlsSkip}`);
     if (n.access !== null) out.push(`${where}: ${B.accessPreset(n.access)}`);

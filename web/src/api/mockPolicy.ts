@@ -286,14 +286,14 @@ function allowancesOf(spec: PolicySpec, bot: string): Allowances {
   const content = [...masters.map((m) => `/sandbox/${m}`), '/sandbox/playbooks', '/sandbox/reviewers', ...skills.map((s) => `/sandbox/skills/${s}`), '/sandbox/templates', '/sandbox/tools.yaml'];
   const read_only = [...new Set([...SYSTEM_RO, ...content])].sort();
   const read_write = ['/dev/null', '/sandbox/workspace', '/tmp'];
-  const base = { ports: [], allowed_ips: [], enforcement: 'enforce', tls: null, access: null, binaries: [WORKER] };
+  const base = { ports: [], pinned: true, enforcement: 'enforce', tls: null, access: null, binaries: [WORKER] };
   const uploads = [...masters.map((m) => `${m} -> /sandbox/${m}`), ...skills.map((s) => `skills/${s} -> /sandbox/skills/${s}`), 'tools.yaml -> /sandbox/tools.yaml'];
   const contentReads = content.filter((p) => !['/sandbox/playbooks', '/sandbox/reviewers', '/sandbox/templates'].includes(p));
   return {
     network: [
-      { ...base, rule: 'pmos_gateway', service: 'gateway', host: 'gateway.pmos.internal', port: 8740, protocol: 'rest', credential: `pmos-${bot}-gateway`, routes: ['POST /v1/chat/completions'], mcp_methods: [], mcp_tools: [], mcp_versions: [] },
-      { ...base, rule: 'pmos_runtime', service: 'runtime', host: 'bots.pmos.internal', port: 8750, protocol: 'rest', credential: `pmos-${bot}-worker`, routes: RUNTIME_ROUTES, mcp_methods: [], mcp_tools: [], mcp_versions: [] },
-      { ...base, rule: 'pmos_toolserver', service: 'toolserver', host: 'toolserver.pmos.internal', port: 8710, protocol: 'mcp', credential: null, routes: [], mcp_methods: MCP_METHODS, mcp_tools: tools, mcp_versions: MCP_VERSIONS },
+      { ...base, rule: 'pmos_gateway', service: 'gateway', host: 'gateway.pmos.internal', port: 8740, allowed_ips: ['10.201.77.11/32'], protocol: 'rest', credential: `pmos-${bot}-gateway`, routes: ['POST /v1/chat/completions'], mcp_methods: [], mcp_tools: [], mcp_versions: [] },
+      { ...base, rule: 'pmos_runtime', service: 'runtime', host: 'bots.pmos.internal', port: 8750, allowed_ips: ['10.201.77.12/32'], protocol: 'rest', credential: `pmos-${bot}-worker`, routes: RUNTIME_ROUTES, mcp_methods: [], mcp_tools: [], mcp_versions: [] },
+      { ...base, rule: 'pmos_toolserver', service: 'toolserver', host: 'toolserver.pmos.internal', port: 8710, allowed_ips: ['10.201.77.10/32'], protocol: 'mcp', credential: null, routes: [], mcp_methods: MCP_METHODS, mcp_tools: tools, mcp_versions: MCP_VERSIONS },
     ],
     network_middlewares: [],
     filesystem: { include_workdir: false, read_only, read_write },
@@ -318,7 +318,7 @@ function allowancesOf(spec: PolicySpec, bot: string): Allowances {
 function handEdited(a: Allowances): Allowances {
   const out = structuredClone(a);
   out.network.push({
-    rule: 'extra_egress', service: null, host: 'api.example.com', port: 443, ports: [], allowed_ips: ['203.0.113.0/24'], protocol: null,
+    rule: 'extra_egress', service: null, host: 'api.example.com', port: 443, ports: [], allowed_ips: ['203.0.113.0/24'], pinned: false, protocol: null,
     enforcement: 'audit', tls: 'skip', access: null, binaries: [WORKER], credential: null, routes: [], mcp_methods: [], mcp_tools: [], mcp_versions: [],
   });
   out.summary.splice(4, 0, `May connect to api.example.com:443 (not inspected, audit) from ${WORKER}. This destination is not a PM OS service.`);
@@ -339,7 +339,9 @@ function policyYaml(bot: string, a: Allowances): string {
     'network_policies:',
   ];
   for (const n of a.network) {
-    lines.push(`  ${n.rule}:`, `    name: ${n.rule}`, '    endpoints:', `      - host: ${n.host}`, `        port: ${n.port}`, `        protocol: ${n.protocol}`, `        enforcement: ${n.enforcement}`);
+    lines.push(`  ${n.rule}:`, `    name: ${n.rule}`, '    endpoints:', `      - host: ${n.host}`, `        port: ${n.port}`);
+    if (n.allowed_ips.length) lines.push('        allowed_ips:', ...n.allowed_ips.map((ip) => `          - ${ip}`));
+    lines.push(`        protocol: ${n.protocol}`, `        enforcement: ${n.enforcement}`);
     if (n.routes.length) lines.push('        rules:', ...n.routes.map((r) => `          - allow: { method: ${r.split(' ')[0]}, path: "${r.split(' ')[1]}" }`));
     if (n.mcp_tools.length || n.protocol === 'mcp') {
       lines.push('        mcp:', '          tools:', '            call:', '              any:', ...n.mcp_tools.map((t) => `                - ${t}`));
@@ -763,9 +765,9 @@ export function createMockPolicy(now: number, options: MockPolicyOptions): MockP
         spec_sources: { bots: 'content/bots/<bot>/BOT.md', roles: 'content/roles/<role>/ROLE.md', skills: 'content/skills/<skill>/SKILL.md' },
         fixed: {
           services: [
-            { service: 'toolserver', rule: 'pmos_toolserver', host: 'toolserver.pmos.internal', port: 8710, protocol: 'mcp', routes: null, credential_profile: null },
-            { service: 'gateway', rule: 'pmos_gateway', host: 'gateway.pmos.internal', port: 8740, protocol: 'rest', routes: ['POST /v1/chat/completions'], credential_profile: 'pmos-gateway' },
-            { service: 'runtime', rule: 'pmos_runtime', host: 'bots.pmos.internal', port: 8750, protocol: 'rest', routes: RUNTIME_ROUTES, credential_profile: 'pmos-worker' },
+            { service: 'toolserver', rule: 'pmos_toolserver', host: 'toolserver.pmos.internal', port: 8710, allowed_ips: ['10.201.77.10/32'], protocol: 'mcp', routes: null, credential_profile: null },
+            { service: 'gateway', rule: 'pmos_gateway', host: 'gateway.pmos.internal', port: 8740, allowed_ips: ['10.201.77.11/32'], protocol: 'rest', routes: ['POST /v1/chat/completions'], credential_profile: 'pmos-gateway' },
+            { service: 'runtime', rule: 'pmos_runtime', host: 'bots.pmos.internal', port: 8750, allowed_ips: ['10.201.77.12/32'], protocol: 'rest', routes: RUNTIME_ROUTES, credential_profile: 'pmos-worker' },
           ],
           mcp_path: '/mcp', mcp_methods: MCP_METHODS, mcp_versions: MCP_VERSIONS, worker_binary: WORKER, workspace: '/sandbox/workspace',
           content_mount: '/sandbox', shared_content: ['templates', 'reviewers', 'playbooks'], system_read_only: SYSTEM_RO, system_read_write: SYSTEM_RW,

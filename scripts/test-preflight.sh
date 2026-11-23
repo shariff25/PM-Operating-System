@@ -315,6 +315,15 @@ for bad in PMOS_NETWORK_SUBNET=10.0.0.0/8 PMOS_NETWORK_SUBNET=10.201.0.0/16 PMOS
   pf
   expect H-SUBNET fail 1 "$bad"
 done
+# A subnet without the services' addresses is refused as the policy's constants (slice H3).
+for case_ in "PMOS_NETWORK_SUBNET=10.201.78.0/24|allows toolserver.pmos.internal (allowed_ips 10.201.77.10/32" \
+  "PMOS_NETWORK_SUBNET=10.201.77.8/30 PMOS_NETWORK_GATEWAY=10.201.77.9 PMOS_NETWORK_IP_RANGE=10.201.77.8/31|allows gateway.pmos.internal (allowed_ips 10.201.77.11/32"; do
+  # shellcheck disable=SC2086 # the words are deploy/.env lines
+  env_lines ${case_%%|*}
+  pf
+  expect H-SUBNET fail 1 "${case_%%|*}"
+  [[ "$(field H-SUBNET measured)" == *"${case_#*|}"* ]] || fail "${case_%%|*}: H-SUBNET doesn't say '${case_#*|}': $(field H-SUBNET measured)"
+done
 env_lines PMOS_NETWORK_SUBNET=10.201.77.0/25 PMOS_NETWORK_GATEWAY=10.201.77.126 PMOS_NETWORK_IP_RANGE=10.201.77.64/26
 pf
 expect H-SUBNET pass 0 "a /25 that holds the pinned addresses"
@@ -682,6 +691,14 @@ n=$OPENSHELL_FIXTURE_POLICIES/pmos-preflight-net.yaml
 for hp in toolserver.pmos.internal:8710 gateway.pmos.internal:8740 bots.pmos.internal:8750; do
   grep -qx "        host: ${hp%%:*}" "$n" && grep -qx "        port: ${hp#*:}" "$n" || fail "the reach canary misses $hp"
 done
+# ... each name only at its own pinned address, as in every bot's policy (slice H3).
+for hp in toolserver.pmos.internal:10.201.77.10 gateway.pmos.internal:10.201.77.11 bots.pmos.internal:10.201.77.12; do
+  grep -A2 -x "      - allowed_ips:" "$n" | grep -A1 -x "          - \"${hp#*:}/32\"" | grep -qx "        enforcement: enforce" &&
+    [ "$(grep -B3 -x "        host: ${hp%%:*}" "$n" | head -1)" = "      - allowed_ips:" ] &&
+    [ "$(grep -B2 -x "        host: ${hp%%:*}" "$n" | head -1)" = "          - \"${hp#*:}/32\"" ] ||
+    fail "the reach canary doesn't pin ${hp%%:*} to ${hp#*:}/32: $(cat "$n")"
+done
+[ "$(grep -c '^          - "10\.201\.77\.[0-9]*/32"$' "$n")" = 3 ] || fail "the reach canary pins other than three addresses: $(cat "$n")"
 for case in nostart nonode nolandlock; do
   FAKE_CANARY=$case pf --openshell
   expect O-CANARY fail 1 "canary $case"

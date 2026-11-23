@@ -119,6 +119,25 @@ describe('hand edits in a checked-in policy', () => {
     const docs = mock.policy(true).bots.find((b) => b.bot === 'docs')!;
     expect(handEdits(docs.allowances!)).toEqual([]);
   });
+
+  it('takes each service pinned to its own address as generated, and flags one that is not', () => {
+    const mock = createMockPolicy(Date.now(), {});
+    const docs = mock.policy(true).bots.find((b) => b.bot === 'docs')!;
+    const a = docs.allowances!;
+    expect(a.network.every((n) => n.pinned && n.allowed_ips.length === 1)).toBe(true);
+    expect(handEdits(a)).toEqual([]);
+    const B = copy.admin.policy.bots;
+    const unpinned = structuredClone(a);
+    const rt = unpinned.network.find((n) => n.service === 'runtime')!;
+    rt.allowed_ips = [];
+    rt.pinned = false;
+    expect(handEdits(unpinned)).toEqual([`bots.pmos.internal:8750: ${B.notPinned('')}`]);
+    const swapped = structuredClone(a);
+    const gw = swapped.network.find((n) => n.service === 'gateway')!;
+    gw.allowed_ips = ['10.201.77.12/32'];
+    gw.pinned = false;
+    expect(handEdits(swapped).join('\n')).toContain('not pinned to its own address (allows 10.201.77.12/32)');
+  });
 });
 
 describe('unified diffs', () => {

@@ -1416,6 +1416,14 @@ grep -qxF 'PINNED_ADDRS=(10.201.77.10 10.201.77.11 10.201.77.12 10.201.77.13 10.
   grep -qxF 'PINNED_SERVICE_ADDRS=(10.201.77.10 10.201.77.11 10.201.77.12)' "$SRC" &&
   grep -qxF 'PINNED_NAMES=(toolserver.pmos.internal gateway.pmos.internal bots.pmos.internal)' "$SRC" ||
   fail "pmos-admin's pinned addresses aren't deploy/compose.yaml's"
+# ... and the policy crate's constants, which every bot's policy pins each name to (slice H3;
+# crates/policy/tests/policies.rs checks the same from the Rust side).
+policy_lib="$DEPLOY_SRC/../crates/policy/src/lib.rs"
+for pair in TOOLSERVER_ADDR:10.201.77.10 GATEWAY_ADDR:10.201.77.11 BOTS_ADDR:10.201.77.12; do
+  pin_a=${pair#*:}
+  grep -qxF "pub const ${pair%%:*}: Ipv4Addr = Ipv4Addr::new(${pin_a//./, });" "$policy_lib" ||
+    fail "the policy crate's ${pair%%:*} isn't $pin_a, pmos-admin's pinned address"
+done
 grep -qF 'ip_range: ${PMOS_NETWORK_IP_RANGE:-10.201.77.128/25}' "$compose_src" &&
   grep -qxF 'NETWORK_IP_RANGE_DEFAULT=10.201.77.128/25' "$SRC" &&
   grep -qxF 'PMOS_NETWORK_IP_RANGE=10.201.77.128/25' "$DEPLOY_SRC/env.example" ||
@@ -1608,12 +1616,17 @@ grep -q '^args=sandbox create --name pmos-pm-ana ' "$OPENSHELL_LOG" || fail "san
 # `up` and the network's settings (§3.3 step 2, §3.5): refused with exit 2, before anything
 # starts: a subnet shorter than a /24 (holding the pinned addresses or not), one that doesn't
 # hold them, a malformed one; a gateway outside the subnet or on a pinned address; an ip_range
-# outside the subnet or holding a pinned address (.10 or .13 included).
+# outside the subnet or holding a pinned address (.10 or .13 included). A subnet without the
+# three services' addresses is refused as the policy crate's constants (slice H3): the message
+# names the service, its allowed_ips and the code change under POL-2.
 net_refused=(
   "PMOS_NETWORK_SUBNET=10.201.0.0/16|shorter than a /24"
   "PMOS_NETWORK_SUBNET=10.0.0.0/8|shorter than a /24"
   "PMOS_NETWORK_SUBNET=10.201.76.0/23|shorter than a /24"
   "PMOS_NETWORK_SUBNET=10.50.0.0/24|POL-2"
+  "PMOS_NETWORK_SUBNET=10.50.0.0/24|allows toolserver.pmos.internal at (allowed_ips 10.201.77.10/32, from the policy crate's constants TOOLSERVER_ADDR"
+  "PMOS_NETWORK_SUBNET=10.201.77.8/30|allows gateway.pmos.internal at (allowed_ips 10.201.77.11/32"
+  "PMOS_NETWORK_SUBNET=10.201.77.0/29|allows toolserver.pmos.internal at"
   "PMOS_NETWORK_SUBNET=10.201.77.0/29|doesn't hold 10.201.77.10"
   "PMOS_NETWORK_SUBNET=10.201.77.5/24|host bits clear"
   "PMOS_NETWORK_SUBNET=10.201.077.0/24|host bits clear"

@@ -37,7 +37,10 @@ proposal, not on this screen; the bots' facts list the uploaded skills, personas
 Everything else in a policy is fixed in `crates/policy/src/lib.rs` and shown as `fixed`: egress
 only to the tool server (`toolserver.pmos.internal:8710`, MCP on `/mcp`), the gateway
 (`gateway.pmos.internal:8740`, `POST /v1/chat/completions`) and the bot runtime
-(`bots.pmos.internal:8750`, the worker routes); the four MCP methods and three MCP revisions; the
+(`bots.pmos.internal:8750`, the worker routes); each of those names only at its own pinned
+address (`allowed_ips`: `10.201.77.10/32`, `10.201.77.11/32` and `10.201.77.12/32`, the
+constants `TOOLSERVER_ADDR`, `GATEWAY_ADDR` and `BOTS_ADDR`, equal to the `ipv4_address`
+literals in `deploy/compose.yaml`); the four MCP methods and three MCP revisions; the
 worker binary (`/usr/local/bin/node`); the read-only system paths, the writable workspace,
 `/tmp` and `/dev/null`; the `sandbox` identity; Landlock `hard_requirement`; per-bot gateway and
 worker providers, and none for the tool server. None of that can be changed from the web app:
@@ -47,9 +50,11 @@ For each bot the screen shows **allowances**, read field by field from the check
 file (or, when the server has no policies root, from what the content generates): every
 destination, route, MCP method and tool, binary and credential; the read-only and writable
 paths; Landlock and the process identity; the launch spec's providers and uploads; and the same
-in sentences. A destination PM OS doesn't know (`service: null`), extra ports or IP ranges, a
-`tls` or `access` setting, or middleware can only come from a hand edit, and the drift section
-names the rule it breaks.
+in sentences. Each destination says whether it is `pinned`: its `allowed_ips` exactly its own
+service's address, as generated. A destination PM OS doesn't know (`service: null`), extra
+ports, a destination that isn't pinned (no `allowed_ips`, another address, a range or a second
+entry), a `tls` or `access` setting, or middleware can only come from a hand edit, and the
+drift section names the rule it breaks (`net-allowed-ips` for the pin).
 
 **Drift** compares every generated file with the checked-in one (`same`, `differs`, `missing`,
 `orphan`) and runs the policy crate's own rule checks (`check_policy`, `check_spec`: the rules of
@@ -69,8 +74,10 @@ changes) takes any part of the spec. The server:
 3. regenerates every policy from the copy and runs the policy crate's rules on the result;
 4. compares the new files with the checked-in ones: a text diff per file, and a structured
    diff of allowances per bot. Every addition is `wider`, every removal `narrower`, and a
-   changed setting (enforcement, protocol, credential binding, Landlock, identity) `changed`;
-   `wider` and `changed` are both marked `widening`.
+   changed setting (enforcement, protocol, credential binding, `allowed_ips`, Landlock,
+   identity) `changed`; `wider` and `changed` are both marked `widening`. `allowed_ips` is a
+   setting, not a set: on an endpoint with a host it narrows where the host may resolve, so
+   removing an address could widen, and any change to it is reviewed as one.
 
 Nothing is saved. `POST /api/admin/policy/proposals` does the same again and sends the change to
 the tool server, which opens the pull request.

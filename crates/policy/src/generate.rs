@@ -199,6 +199,7 @@ impl BotContext {
         let base = Endpoint {
             host: Some(service.host().into()),
             port: Some(service.port()),
+            allowed_ips: service.allowed_ips(),
             protocol: Some(service.protocol().into()),
             enforcement: Some("enforce".into()),
             credential_binding: provider_name(&self.bot, service)
@@ -296,9 +297,9 @@ impl BotContext {
              # Do not edit by hand: change the bot or its role, regenerate, and commit both.\n\
              # `pmos policy check` fails on any difference. A network change needs a second\n\
              # platform-owner PM's review (POL-2); see policies/README.md.\n\
-             # Format: NVIDIA OpenShell sandbox policy, version 1. Values still to verify on the\n\
-             # Spark (worker binary path, /sandbox layout, MCP revisions) are listed in\n\
-             # docs/sandbox-policies.md. Launch flags are in {bot}.sandbox.yaml.\n",
+             # Format: NVIDIA OpenShell sandbox policy, version 1. Values still to verify on a\n\
+             # real host (worker binary path, /sandbox layout, MCP revisions, allowed_ips) are\n\
+             # listed in docs/sandbox-policies.md. Launch flags are in {bot}.sandbox.yaml.\n",
             sources = self.sources(),
             bot = self.bot,
         );
@@ -379,7 +380,7 @@ pub fn provider_profiles() -> BTreeMap<String, String> {
                 "{GENERATED_MARKER}. NVIDIA OpenShell provider profile.\n\
                  # Endpointless on purpose: a credential resolves only where a bot's own policy\n\
                  # binds its own instance (`credential_binding.provider: pmos-<bot>-...`).\n\
-                 # Import once on the Spark (verify the command there):\n\
+                 # Import once on PM OS's host (verify the command there):\n\
                  #   openshell provider profile lint -f policies/providers/{id}.yaml\n\
                  #   openshell provider profile import -f policies/providers/{id}.yaml --global\n"
             );
@@ -554,6 +555,24 @@ pub(crate) mod tests {
             ]
         );
         assert!(p.network_middlewares.is_empty());
+        // Each name only where it resolves to its own pinned address (decision O6).
+        let pins: Vec<(&str, Vec<String>)> = p
+            .network_policies
+            .values()
+            .flat_map(|r| &r.endpoints)
+            .map(|e| (e.host.as_deref().unwrap(), e.allowed_ips.clone()))
+            .collect();
+        assert_eq!(
+            pins,
+            vec![
+                ("gateway.pmos.internal", vec!["10.201.77.11/32".to_string()]),
+                ("bots.pmos.internal", vec!["10.201.77.12/32".to_string()]),
+                (
+                    "toolserver.pmos.internal",
+                    vec!["10.201.77.10/32".to_string()]
+                ),
+            ]
+        );
         for rule in p.network_policies.values() {
             assert_eq!(
                 rule.binaries,
@@ -563,7 +582,7 @@ pub(crate) mod tests {
             );
             for e in &rule.endpoints {
                 assert_eq!(e.enforcement.as_deref(), Some("enforce"));
-                assert!(e.tls.is_none() && e.access.is_none() && e.allowed_ips.is_empty());
+                assert!(e.tls.is_none() && e.access.is_none() && e.ports.is_empty());
             }
         }
     }

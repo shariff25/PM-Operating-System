@@ -265,6 +265,7 @@ function FixedSection({ data }: { data: PolicyView }) {
                 <li key={s.rule}>
                   <strong>{B.services[s.service] ?? s.service}</strong>{' '}
                   <span className="mono-val">{s.host}:{s.port}</span>{' '}
+                  <span className="mono-val muted">{F.pinnedAt(s.allowed_ips.join(', '))}</span>{' '}
                   <span className="mono-val muted">{s.protocol}{s.routes ? `, ${F.routes(s.routes.length)}` : ''}, {s.credential_profile ?? F.noCredential}</span>
                 </li>
               ))}
