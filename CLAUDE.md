@@ -178,6 +178,13 @@ follow-up tracking.
   `docs/history/commit-map-2026-11-24.txt` maps old to new. The owner merges pull request #10
   with a normal merge; GitHub shows the activity only once it is on `main`.
 
+- **Pull request #10 merged (owner, 2026-11-24):** asked whether to merge it, the owner said
+  "merge it". The conductor marked it ready and merged it into `main` with a normal merge, on
+  that one instruction. The rule "never merge a pull request" still stands for every other pull
+  request unless the owner says so again. What was merged had not been security reviewed since
+  the gate passed on 2026-11-22; that review, and the gate, are still owed before real data or
+  a pilot.
+
 ## Where the build stands (2026-11-23)
 
 - Pushed and checked: `claude/web-app` (draft pull request #10).
