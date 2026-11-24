@@ -31,6 +31,11 @@ pmos-runtime.workspace = true
 pulldown-cmark.workspace = true
 reqwest.workspace = true
 rmcp = { version = "3.10", features = ["server", "transport-streamable-http-server", "client", "transport-streamable-http-client-reqwest"] }
+# The MCP client's server identity (docs/mcp-servers-spec.md §2.3): the platform's roots plus a
+# pinned public-key hash where a server record gives one. The same versions reqwest uses.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rustls-platform-verifier = "0.7"
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["alloc"] }
 serde.workspace = true
 serde_json.workspace = true
 serde_norway.workspace = true

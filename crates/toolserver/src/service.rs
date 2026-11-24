@@ -838,6 +838,7 @@ impl ToolService {
     /// Record an audit event. A failure is logged at error level: the audit log is a
     /// control, so a platform owner needs to see it, but it never undoes the call itself.
     pub async fn audit(&self, event: AuditEvent) {
+        let event = self.with_route(event);
         if let Err(e) = self.stores.audit.record(event.clone()).await {
             tracing::error!(
                 error = %e,
@@ -846,6 +847,41 @@ impl ToolService {
                 outcome = ?event.outcome,
                 "AUDIT EVENT NOT RECORDED"
             );
+        }
+    }
+
+    /// An event about a registry tool served by an MCP server names the server and the
+    /// approved definition digest in its detail (`docs/mcp-servers-spec.md` §2.9): metadata
+    /// only, so Admins and Auditors see it as they see the rest of the event. Events about
+    /// built-in connectors are unchanged.
+    fn with_route(&self, mut event: AuditEvent) -> AuditEvent {
+        let Some((system, action)) = event.tool.split_once('.') else {
+            return event;
+        };
+        let Some(route) = self.connectors.get(system).and_then(|c| c.route(action)) else {
+            return event;
+        };
+        let via = format!("via mcp server {}, tool {}", route.server, route.digest);
+        event.detail = Some(match event.detail.take() {
+            Some(d) => format!("{d} ({via})"),
+            None => via,
+        });
+        event
+    }
+
+    /// Which backend serves `system`: `builtin`, `fake`, or the MCP server's id (the ledger's
+    /// `served_by`, `docs/mcp-servers-spec.md` §2.9).
+    pub fn served_by(&self, tool: &str) -> String {
+        let Some((system, action)) = tool.split_once('.') else {
+            return "builtin".into();
+        };
+        match self.connectors.get(system) {
+            Some(c) => match c.route(action) {
+                Some(r) => r.server,
+                None if c.mode() == "fake" => "fake".into(),
+                None => "builtin".into(),
+            },
+            None => "builtin".into(),
         }
     }
 
@@ -1316,8 +1352,8 @@ impl ToolService {
                     .collect();
                 event.source_titles = items.iter().filter_map(recorded_title).collect();
                 if !items.is_empty() {
-                    self.note_read(session, Some(connector_class(system)))
-                        .await?;
+                    let class = connector.data_class().unwrap_or(connector_class(system));
+                    self.note_read(session, Some(class)).await?;
                 }
                 Ok(json!({ "results": items.iter().map(untrusted).collect::<Vec<_>>() }))
             }
@@ -1654,7 +1690,7 @@ impl ToolService {
                 detail: Some("approved in the harness; writing".into()),
                 ..event.clone()
             };
-            if let Err(e) = self.stores.audit.record(started).await {
+            if let Err(e) = self.stores.audit.record(self.with_route(started)).await {
                 tracing::error!(error = %e, tool = %spec.name, "AUDIT UNAVAILABLE: approved write not run");
                 // The grant was used up; put it back so the PM needn't approve again.
                 let _ = self
@@ -3032,7 +3068,7 @@ impl ToolService {
             detail: Some("approved in the inbox; writing".into()),
             ..event.clone()
         };
-        if let Err(e) = self.stores.audit.record(started).await {
+        if let Err(e) = self.stores.audit.record(self.with_route(started)).await {
             tracing::error!(error = %e, id = %item.id, "AUDIT UNAVAILABLE: approved write not run");
             let _ = finish(Err("PM OS couldn't record the write in the audit log, so it didn't run. Approve it again shortly.".into())).await;
             return Err(DecisionError::Decide(DecideError::Store(e)));

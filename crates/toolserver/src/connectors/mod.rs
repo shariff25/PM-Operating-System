@@ -233,6 +233,16 @@ impl From<crate::oauth::TokenError> for ConnectorError {
     }
 }
 
+/// Which MCP server and approved tool definition served a call (`docs/mcp-servers-spec.md`
+/// §2.9): metadata, recorded in the call's audit event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Route {
+    /// The server record's id.
+    pub server: String,
+    /// The approved definition digest of the upstream tool.
+    pub digest: String,
+}
+
 #[async_trait]
 pub trait Connector: Send + Sync {
     /// The registry system this connector serves, such as `jira`.
@@ -242,6 +252,18 @@ pub trait Connector: Send + Sync {
     /// admins (`GET /internal/admin/connectors`).
     fn mode(&self) -> &'static str {
         "live"
+    }
+
+    /// The data class this connector's reads count as, when it says (an MCP server's record
+    /// does: its `data_class`). `None`: the built-in rule (`docs` public, the rest internal).
+    fn data_class(&self) -> Option<pmos_contract::Sensitivity> {
+        None
+    }
+
+    /// For a system served by an MCP server: which server and approved tool serve `action`.
+    fn route(&self, action: &str) -> Option<Route> {
+        let _ = action;
+        None
     }
 
     /// Run a read action (the part of the tool name after the system).

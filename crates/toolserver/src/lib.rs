@@ -20,6 +20,7 @@ pub mod github;
 pub mod github_memory;
 pub mod ledger;
 pub mod mcp;
+pub mod mcp_client;
 pub mod members;
 pub mod memory;
 pub mod memory_repo;
