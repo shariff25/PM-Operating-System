@@ -127,6 +127,57 @@ function Retention({ data }: { data: AdminOverviewData }) {
   );
 }
 
+/** OpenShell's own record of what each sandbox was refused (spec §B.5): counts and the collector's state. */
+function SandboxDenials({ data }: { data: AdminOverviewData }) {
+  const s = copy.admin.overview.sandbox;
+  const sb = data.sandbox;
+  if (!sb) return null;
+  const c = sb.collector;
+  const state = !sb.configured
+    ? s.off
+    : c.silent_since
+      ? s.silent(shortDay(c.silent_since))
+      : c.receiving
+        ? s.receiving
+        : c.last_seen_at
+          ? s.silent(shortDay(c.last_seen_at))
+          : s.never;
+  return (
+    <section className="card" aria-labelledby="admin-sandbox">
+      <div className="card-head">
+        <h2 id="admin-sandbox">{s.title}</h2>
+      </div>
+      <ul className="rows retention-rows" aria-label={s.listLabel}>
+        <li className="row">
+          <Icon name={sb.configured && c.receiving && !c.silent_since ? 'activity' : 'alert'} size={16} />
+          <span className="row-main"><span className="row-title">{state}</span></span>
+        </li>
+        {sb.configured && sb.denials_24h.length === 0 && (
+          <li className="row">
+            <Icon name="check" size={16} />
+            <span className="row-main"><span className="row-meta">{s.none}</span></span>
+          </li>
+        )}
+        {sb.denials_24h.map((d) => (
+          <li className="row" key={d.bot}>
+            <Icon name="shield" size={16} />
+            <span className="row-main"><span className="row-meta mono-val">{s.bot(d.bot, d.count)}</span></span>
+          </li>
+        ))}
+        {sb.denials_24h_capped && (
+          <li className="row"><span className="row-main"><span className="row-meta">{s.capped}</span></span></li>
+        )}
+        {c.last_gap_at && (
+          <li className="row">
+            <Icon name="clock" size={16} />
+            <span className="row-main"><span className="row-meta">{s.gap(shortDay(c.last_gap_at))}</span></span>
+          </li>
+        )}
+      </ul>
+    </section>
+  );
+}
+
 const P = copy.admin.overview.people;
 const N = copy.admin.overview.notices;
 
@@ -295,6 +346,7 @@ export function AdminOverview() {
           </section>
           {data.users && <PeopleFlags users={data.users} linkable={canSee(me, 'team')} />}
           <Retention data={data} />
+          <SandboxDenials data={data} />
           {canSee(me, 'audit') && (
             <div className="recent-grid">
               <RecentEvents outcome="denied" title={R.denied} empty={R.noDenied} />

@@ -289,6 +289,15 @@ export function createMockAdmin(now: number, options: MockAdminOptions, pendingD
         last_purge: { at: new Date(now - 9 * 60 * MIN).toISOString(), deleted: 1200 },
         held_drafts: down ? null : 1,
         users: down ? null : users.overview(),
+        // OpenShell's sandbox decisions (docs/openshell-prover-and-sandbox-audit-spec.md §B.5).
+        sandbox: down
+          ? null
+          : {
+              configured: true,
+              collector: { receiving: true, last_seen_at: new Date(now - MIN).toISOString(), silent_since: null, last_gap_at: new Date(now - 26 * 60 * MIN).toISOString() },
+              denials_24h: [{ bot: 'pm-ben', count: 3 }],
+              denials_24h_capped: false,
+            },
       };
     },
     audit(q) {

@@ -274,6 +274,82 @@ pub async fn sandbox_gaps_since(
         .await
 }
 
+/// The deny count a row stands for: one, or a summary's held count.
+fn denies_in(row: &SandboxRow) -> u64 {
+    if row.event.tool == "sandbox.deny_summary" {
+        row.event
+            .detail
+            .as_deref()
+            .and_then(|d| d.strip_prefix("held "))
+            .and_then(|d| d.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(1)
+    } else {
+        1
+    }
+}
+
+/// The admin overview's sandbox block (spec §B.5): whether the collector is configured, its
+/// state (`receiving`, silent since, the last gap), and each bot's denials in the last 24 hours
+/// (a summary counts its held denies). Counts only: no destination.
+pub async fn overview(svc: &ToolService, now: DateTime<Utc>) -> StoreResult<serde_json::Value> {
+    let configured = svc.sandbox_audit_token().is_some();
+    let state = svc.openshell().collector_state(now).await?;
+    let rows = svc
+        .openshell()
+        .sandbox_rows(&SandboxQuery {
+            since: Some(now - chrono::Duration::hours(24)),
+            tools: vec![
+                "sandbox.deny".into(),
+                "sandbox.deny_summary".into(),
+                "sandbox.finding".into(),
+            ],
+            limit: 1000,
+            ..SandboxQuery::default()
+        })
+        .await?;
+    let mut by_bot: std::collections::BTreeMap<String, u64> = Default::default();
+    for r in &rows {
+        let key = r
+            .event
+            .bot
+            .clone()
+            .unwrap_or_else(|| "(unknown sandbox)".into());
+        *by_bot.entry(key).or_insert(0) += denies_in(r);
+    }
+    Ok(serde_json::json!({
+        "configured": configured,
+        "collector": state,
+        "denials_24h": by_bot
+            .into_iter()
+            .map(|(bot, count)| serde_json::json!({"bot": bot, "count": count}))
+            .collect::<Vec<_>>(),
+        // At most 1,000 rows are read: past that the counts are a floor.
+        "denials_24h_capped": rows.len() >= 1000,
+    }))
+}
+
+/// A sandbox row as the Admin's and Auditor's views show it: the event's metadata and the
+/// sandbox columns, an Auditor's without host, address, path or process (spec §B.7).
+pub fn row_json(r: &SandboxRow, admin: bool) -> serde_json::Value {
+    let mut v = serde_json::json!({
+        "id": format!("ev_{}", r.id),
+        "at": r.event.at,
+        "action": r.event.tool,
+        "outcome": r.event.outcome.as_str(),
+        "bot": r.event.bot,
+        "actor": r.event.user,
+        "task_id": r.event.run_id,
+        "detail": r.event.detail.as_deref().filter(|d| sandbox::is_safe_detail(d)),
+    });
+    v["sandbox"] = if admin {
+        sandbox::fields_json(&r.fields)
+    } else {
+        sandbox::auditor_fields_json(&r.fields)
+    };
+    v
+}
+
 /// Run the silence check every minute while the collector is configured.
 pub fn spawn_watchdog(
     svc: Arc<ToolService>,

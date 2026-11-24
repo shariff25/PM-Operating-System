@@ -156,6 +156,29 @@ pub struct AuditRow {
     /// served as `null`.
     #[serde(default, deserialize_with = "persona_key")]
     pub persona: Option<String>,
+    /// A sandbox decision's own columns (`docs/openshell-prover-and-sandbox-audit-spec.md`
+    /// §B.3), as the tool server projects them for the viewer: an Auditor's carry no host,
+    /// address, path or process (§B.7). Left out for every other event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<SandboxCols>,
+}
+
+/// The sandbox columns pmos-web serves, re-picked field by field.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SandboxCols {
+    pub decision: Option<String>,
+    pub sandbox: Option<String>,
+    pub rule: Option<String>,
+    pub reason: Option<String>,
+    pub dest_class: Option<String>,
+    pub dest_host: Option<String>,
+    pub dest_ip: Option<String>,
+    pub dest_port: Option<u32>,
+    pub http_method: Option<String>,
+    pub http_path: Option<String>,
+    pub process: Option<String>,
+    pub allow_count: Option<u64>,
 }
 
 fn persona_key<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
@@ -535,6 +558,36 @@ struct OverviewReply {
     /// The user database's flags (slice U5a); `null` from an older server.
     #[serde(default)]
     users: Option<UsersFlags>,
+    /// OpenShell's sandbox decisions (`docs/openshell-prover-and-sandbox-audit-spec.md` §B.5):
+    /// the collector's state and each bot's denials in the last 24 hours, counts only. Left out
+    /// by an older server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sandbox: Option<SandboxOverview>,
+}
+
+#[derive(Deserialize, Serialize, Default)]
+#[serde(default)]
+struct SandboxOverview {
+    configured: bool,
+    collector: CollectorView,
+    denials_24h: Vec<BotCount>,
+    denials_24h_capped: bool,
+}
+
+#[derive(Deserialize, Serialize, Default)]
+#[serde(default)]
+struct CollectorView {
+    receiving: bool,
+    last_seen_at: Option<String>,
+    silent_since: Option<String>,
+    last_gap_at: Option<String>,
+}
+
+#[derive(Deserialize, Serialize, Default)]
+#[serde(default)]
+struct BotCount {
+    bot: String,
+    count: u64,
 }
 
 /// The overview's user database flags (`docs/web-api.md`, `GET /api/admin/overview`): handles

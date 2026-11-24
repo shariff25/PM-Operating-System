@@ -7,7 +7,7 @@ import { applySpecPatch, parseRawPatch, patchSize, specPatch, splitTools, stable
 import { unifiedDiff } from '../../admin/unified';
 import { useLoad } from '../../admin/useLoad';
 import { useProposalFlow } from '../../admin/useProposalFlow';
-import type { Issue, PolicyBot, PolicySpec, PolicyView, ProverRow, SpecPatch } from '../../api';
+import type { Issue, PolicyBot, PolicySpec, PolicyView, ProverRow, SandboxAuditState, SandboxDenial, SpecPatch } from '../../api';
 import { useApp } from '../../app-context';
 import { Empty, ErrorNote, Skeleton, systemTone } from '../../components/bits';
 import { Icon } from '../../components/icons';
@@ -125,11 +125,54 @@ function ProverFact({ bot, notProved }: { bot: PolicyBot; notProved: string[] })
   );
 }
 
+/** Where a denial went: the host and port for an admin, the destination class for an auditor. */
+export function denialDest(d: SandboxDenial): string {
+  const where = d.dest_host ?? d.dest_class ?? 'unknown destination';
+  const port = d.dest_port !== null && d.dest_port !== undefined ? `:${d.dest_port}` : '';
+  const path = d.http_method && d.http_path ? ` (${d.http_method} ${d.http_path})` : '';
+  return `${where}${port}${path}`;
+}
+
+/** The sandbox's latest denials OpenShell recorded (spec §B.5): rule, destination, time. */
+function DenialsFact({ bot, audit }: { bot: PolicyBot; audit: SandboxAuditState | undefined }) {
+  const list = bot.sandbox_denials ?? [];
+  const note = !audit || !audit.available
+    ? P.denialsUnknown
+    : !audit.configured
+      ? P.denialsOff
+      : audit.silent_since
+        ? P.denialsSilent(new Date(audit.silent_since).toLocaleString())
+        : list.length === 0
+          ? P.denialsNone
+          : null;
+  return (
+    <div className="bot-fact bot-fact-wide bot-denials">
+      <dt>{P.denialsLabel}</dt>
+      <dd>
+        {note && <span className="fact-quiet small">{note}</span>}
+        {list.length > 0 && (
+          <ul className="path-list" aria-label={`${P.denialsLabel}, ${bot.bot}`}>
+            {list.map((d) => (
+              <li key={`${d.at}-${d.action}-${d.rule ?? ''}-${denialDest(d)}`}>
+                <span className="mono-val">
+                  {d.action === 'sandbox.deny_summary' ? P.denialSummary : d.action === 'sandbox.finding' ? P.denialFinding : P.denialLine(d.rule ?? '-', denialDest(d))}
+                </span>{' '}
+                <span className="fact-quiet small">{new Date(d.at).toLocaleString()}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </dd>
+    </div>
+  );
+}
+
 function BotCard({
   bot,
   owner,
   violations,
   notProved,
+  sandboxAudit,
   open,
   onToggle,
 }: {
@@ -137,6 +180,7 @@ function BotCard({
   owner: string | null;
   violations: Issue[];
   notProved: string[];
+  sandboxAudit: SandboxAuditState | undefined;
   open: boolean;
   onToggle: () => void;
 }) {
@@ -195,6 +239,7 @@ function BotCard({
           <dd>{bot.tools.length ? <Chips items={bot.tools} mono tone label={`${B.tools}, ${bot.bot}`} /> : <span className="fact-quiet">{B.toolsNone}</span>}</dd>
         </div>
         <ProverFact bot={bot} notProved={notProved} />
+        <DenialsFact bot={bot} audit={sandboxAudit} />
       </dl>
       {!a && <p className="bot-missing"><Icon name="alert" size={14} /> {B.noAllowances}</p>}
       {a && (
@@ -314,6 +359,7 @@ function BotsSection({ data }: { data: PolicyView }) {
               owner={data.spec.bots[b.bot]?.owner ?? null}
               violations={violationsOf(b, data.drift.violations)}
               notProved={data.prover_notes?.not_proved ?? NOT_PROVED_FALLBACK}
+              sandboxAudit={data.sandbox_audit}
               open={isOpen(b)}
               onToggle={() => setChosen((c) => ({ ...c, [b.bot]: !isOpen(b) }))}
             />

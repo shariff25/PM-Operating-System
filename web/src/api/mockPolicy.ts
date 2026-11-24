@@ -24,6 +24,7 @@ import type {
   Protection,
   ProverNotes,
   ProverRow,
+  SandboxDenial,
   SpecPatch,
   Validation,
 } from './policyTypes';
@@ -55,6 +56,12 @@ const MOCK_PROVER: Record<string, ProverRow> = {
   'pm-ben': { state: 'exceeds', passed: false, status: 'exceeds', stale: false, at: '2026-11-24T09:00:00Z', counterexample: 'network_l4 api.example.com:443', coverage: ALL_DOMAINS, prover_version: '0.1.9' },
   triage: { state: 'not_available', passed: false, status: 'not_available', stale: false, at: '2026-11-24T09:00:00Z', reason_code: 'no_binary', reason: 'no prover binary at the given path' },
 };
+
+/** OpenShell's record of what pm-ben's sandbox was refused (the hand edit's destination). */
+const MOCK_DENIALS: SandboxDenial[] = [
+  { at: '2026-11-24T08:40:00Z', action: 'sandbox.deny', detail: 'attributed', task_id: 'tsk_ben_1', rule: '-', reason: 'no_matching_policy', dest_class: 'public', dest_host: 'api.example.com', dest_port: 443, http_method: null, http_path: null },
+  { at: '2026-11-24T08:41:00Z', action: 'sandbox.deny_summary', detail: 'held 12 denies past 100 a minute; attributed', task_id: 'tsk_ben_1', rule: '-', reason: null, dest_class: 'unknown', dest_port: null },
+];
 
 const MOCK_PROVER_NOTES: ProverNotes = {
   not_proved: [
@@ -773,6 +780,7 @@ export function createMockPolicy(now: number, options: MockPolicyOptions): MockP
         policy_file: `policies/bots/${bot}.yaml`, launch_spec_file: `policies/bots/${bot}.sandbox.yaml`,
         allowances_from: 'checked_in', allowances: bot === 'pm-ben' ? handEdited(allowances) : allowances,
         prover: MOCK_PROVER[bot] ?? { state: 'missing', passed: false },
+        sandbox_denials: bot === 'pm-ben' ? MOCK_DENIALS : [],
       };
     });
 
@@ -815,6 +823,7 @@ export function createMockPolicy(now: number, options: MockPolicyOptions): MockP
         proposals_configured: configured,
         protection: protection(),
         prover_notes: MOCK_PROVER_NOTES,
+        sandbox_audit: { available: true, configured: true, receiving: true, silent_since: null, last_gap_at: null },
       };
     },
 

@@ -125,6 +125,31 @@ export interface PolicyBot {
   policy_sha256?: string | null;
   /** OpenShell's prover on this bot's running sandbox (docs/openshell-prover-and-sandbox-audit-spec.md §A.5). */
   prover?: ProverRow;
+  /** The sandbox's latest denials OpenShell recorded (spec §B.5), newest first; untrusted text. */
+  sandbox_denials?: SandboxDenial[];
+}
+
+export interface SandboxDenial {
+  at: string;
+  action: string;
+  detail: string | null;
+  task_id: string | null;
+  rule: string | null;
+  reason: string | null;
+  /** What an auditor sees instead of the host and path. */
+  dest_class: string | null;
+  dest_host?: string | null;
+  dest_port: number | null;
+  http_method?: string | null;
+  http_path?: string | null;
+}
+
+export interface SandboxAuditState {
+  available: boolean;
+  configured?: boolean;
+  receiving?: boolean;
+  silent_since?: string | null;
+  last_gap_at?: string | null;
 }
 
 /**
@@ -185,6 +210,8 @@ export interface PolicyView {
   protection: Protection;
   /** The prover's fixed notes: what a proof never covers, and that it doesn't run here. */
   prover_notes?: ProverNotes;
+  /** The sandbox-audit collector's state, for the denials list. */
+  sandbox_audit?: SandboxAuditState;
 }
 
 export interface FileDiff {

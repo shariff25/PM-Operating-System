@@ -67,7 +67,7 @@ async fn read(State(state): State<AppState>, signed: Signed) -> ApiResult {
     let edit = signed.member.allows(Permission::EditContent);
     // The branch-protection check and the host proofs (tool server calls) run beside the
     // file-system work.
-    let (protection, proofs, body) = tokio::join!(
+    let (protection, proofs, sandbox, body) = tokio::join!(
         proposal::protection(&state, &signed),
         async {
             signed
@@ -75,6 +75,14 @@ async fn read(State(state): State<AppState>, signed: Signed) -> ApiResult {
                 .policy_proofs(&signed.member.handle)
                 .await
                 .map_err(|e| tracing::warn!(error = ?e, "policy proofs unknown"))
+                .ok()
+        },
+        async {
+            signed
+                .toolserver(&state)
+                .admin(&signed.member.handle, "sandbox", &[])
+                .await
+                .map_err(|e| tracing::warn!(error = ?e, "sandbox denials unknown"))
                 .ok()
         },
         blocking(move || {
@@ -158,7 +166,56 @@ async fn read(State(state): State<AppState>, signed: Signed) -> ApiResult {
     body["proposals_configured"] = json!(configured);
     body["protection"] = protection;
     with_prover(&mut body, proofs.as_ref());
+    with_denials(&mut body, sandbox.as_ref());
     Ok(Json(body).into_response())
+}
+
+/// The most recent sandbox denials shown per bot.
+pub const DENIALS_SHOWN: usize = 5;
+
+/// Add each bot's latest sandbox denials (`sandbox_denials`: rule, destination, time; spec
+/// §B.5) and the collector's state (`sandbox_audit`) to a policy read, from the tool server's
+/// `GET /internal/admin/sandbox`, which already projected them for the viewer (an Auditor gets
+/// a destination class, not the host or path). `None` (it didn't answer): `available: false`.
+fn with_denials(body: &mut Value, sandbox: Option<&Value>) {
+    let pick = |r: &Value| {
+        let s = &r["sandbox"];
+        json!({
+            "at": r.get("at"),
+            "action": r.get("action"),
+            "detail": r.get("detail"),
+            "task_id": r.get("task_id"),
+            "rule": s.get("rule"),
+            "reason": s.get("reason"),
+            "dest_class": s.get("dest_class"),
+            "dest_host": s.get("dest_host"),
+            "dest_port": s.get("dest_port"),
+            "http_method": s.get("http_method"),
+            "http_path": s.get("http_path"),
+        })
+    };
+    if let Some(bots) = body.get_mut("bots").and_then(Value::as_array_mut) {
+        for b in bots {
+            let name = b.get("bot").and_then(Value::as_str).unwrap_or_default();
+            let rows: Vec<Value> = sandbox
+                .and_then(|s| s.get("denials"))
+                .and_then(|d| d.get(name))
+                .and_then(Value::as_array)
+                .map(|rows| rows.iter().take(DENIALS_SHOWN).map(pick).collect())
+                .unwrap_or_default();
+            b["sandbox_denials"] = json!(rows);
+        }
+    }
+    body["sandbox_audit"] = match sandbox {
+        None => json!({"available": false}),
+        Some(s) => json!({
+            "available": true,
+            "configured": s.get("configured").and_then(Value::as_bool).unwrap_or(false),
+            "receiving": s["collector"].get("receiving").and_then(Value::as_bool).unwrap_or(false),
+            "silent_since": s["collector"].get("silent_since"),
+            "last_gap_at": s["collector"].get("last_gap_at"),
+        }),
+    };
 }
 
 /// What Policy Admin says of the prover on validate and proposals: it never runs here.
@@ -309,6 +366,34 @@ mod tests {
         }
         let v = prover_view(true, Some(&proof("passed", &sha, at)), Some(&sha), None);
         assert_eq!(v["state"], "error", "an unknown status is never a pass");
+    }
+
+    #[test]
+    fn every_bot_gets_its_latest_denials_and_the_collectors_state() {
+        let rows: Vec<Value> = (0..8)
+            .map(|i| {
+                json!({"at": format!("2026-11-24T10:0{i}:00Z"), "action": "sandbox.deny",
+                            "detail": "no task", "task_id": "sandbox", "actor": "x",
+                            "sandbox": {"rule": "-", "reason": "no_matching_policy",
+                                        "dest_class": "public", "dest_port": 443}})
+            })
+            .collect();
+        let sandbox = json!({"configured": true, "collector": {"receiving": true},
+                             "denials": {"docs": rows}});
+        let mut body = json!({"bots": [{"bot": "docs"}, {"bot": "pm-ana"}]});
+        with_denials(&mut body, Some(&sandbox));
+        let d = body["bots"][0]["sandbox_denials"].as_array().unwrap();
+        assert_eq!(d.len(), DENIALS_SHOWN);
+        assert_eq!(d[0]["dest_class"], "public");
+        assert!(
+            d[0].get("actor").is_none(),
+            "re-picked: only the listed fields"
+        );
+        assert_eq!(body["bots"][1]["sandbox_denials"], json!([]));
+        assert_eq!(body["sandbox_audit"]["receiving"], true);
+        let mut body = json!({"bots": [{"bot": "docs"}]});
+        with_denials(&mut body, None);
+        assert_eq!(body["sandbox_audit"]["available"], false);
     }
 
     #[test]

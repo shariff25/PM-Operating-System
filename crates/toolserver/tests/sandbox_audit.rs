@@ -685,3 +685,90 @@ fn what_the_collector_sends_is_what_the_batch_route_takes() {
     let hb: Heartbeat = serde_json::from_str(&hb).unwrap();
     assert_eq!(hb.acked_seq, 7);
 }
+
+// Slice B5: the Admin's and the Auditor's views (spec §B.5, §B.7; SBA-11).
+
+async fn views(postgres: bool) {
+    let Some(s) = start(postgres, true).await else {
+        return;
+    };
+    let mut d = deny(1, "pmos-docs", at(50));
+    d.dest_host = Some("customer-secret.example".into());
+    d.dest_ip = Some("8.8.8.8".into());
+    d.http_path = Some("/accounts/12345".into());
+    d.http_method = Some("GET".into());
+    let mut loaded = deny(2, "pmos-docs", at(51));
+    loaded.kind = Some(Kind::PolicyLoaded);
+    loaded.os_event_uid = Some("load-1".into());
+    loaded.policy_hash = Some("sha256:abc".into());
+    ingest(&s, "run-aaaaaaaa", vec![d, loaded]).await;
+    let get = |path: String| {
+        let s = &s;
+        async move { s.send(Method::GET, &path, Some(SERVICE_TOKEN), None).await }
+    };
+    // The Policy Admin and overview read.
+    let (status, admin) = get("/internal/admin/sandbox?user=ada".into()).await;
+    assert_eq!(status, 200, "{admin}");
+    let row = &admin["denials"]["docs"][0];
+    assert_eq!(row["sandbox"]["dest_host"], "customer-secret.example");
+    assert_eq!(row["sandbox"]["http_path"], "/accounts/12345");
+    assert_eq!(row["sandbox"]["dest_class"], "public");
+    assert!(admin["policy_loads"]["docs"].is_string());
+    assert_eq!(admin["configured"], true);
+    let (status, aud) = get("/internal/admin/sandbox?user=aud".into()).await;
+    assert_eq!(status, 200);
+    let text = aud.to_string();
+    for hidden in [
+        "customer-secret.example",
+        "8.8.8.8",
+        "/accounts/12345",
+        "curl",
+    ] {
+        assert!(!text.contains(hidden), "the Auditor saw {hidden}: {text}");
+    }
+    assert_eq!(aud["denials"]["docs"][0]["sandbox"]["dest_class"], "public");
+    assert_eq!(aud["denials"]["docs"][0]["sandbox"]["dest_port"], 443);
+    let (status, _) = get("/internal/admin/sandbox?user=ana".into()).await;
+    assert_eq!(status, 403, "a PM sees none of it");
+    let (status, _) = get("/internal/admin/sandbox?user=ada&bot=../x".into()).await;
+    assert_eq!(status, 400);
+    // The overview's counts.
+    let (status, ov) = get("/internal/admin/overview?user=ada".into()).await;
+    assert_eq!(status, 200, "{ov}");
+    assert_eq!(ov["sandbox"]["denials_24h"][0]["bot"], "docs");
+    assert_eq!(ov["sandbox"]["denials_24h"][0]["count"], 1);
+    assert_eq!(ov["sandbox"]["collector"]["receiving"], true);
+    // The proofs read carries the policy load, for Policy Admin's stale check.
+    let (_, proofs) = get("/internal/admin/policy/proofs?user=aud".into()).await;
+    assert!(proofs["policy_loads"]["docs"].is_string(), "{proofs}");
+    if postgres {
+        // The audit list filters on the new actions and shows each view its own columns.
+        let (status, list) = get("/internal/admin/audit?user=ada&action=sandbox.deny".into()).await;
+        assert_eq!(status, 200, "{list}");
+        let e = &list["events"][0];
+        assert_eq!(e["action"], "sandbox.deny");
+        assert_eq!(e["client"], "sandbox_audit");
+        assert_eq!(e["sandbox"]["dest_host"], "customer-secret.example");
+        assert_eq!(e["detail"], "no task");
+        let (_, list) = get("/internal/admin/audit?user=aud&action=sandbox.deny".into()).await;
+        let text = list.to_string();
+        for hidden in ["customer-secret.example", "8.8.8.8", "/accounts/12345"] {
+            assert!(
+                !text.contains(hidden),
+                "the Auditor's audit list showed {hidden}"
+            );
+        }
+        assert_eq!(list["events"][0]["sandbox"]["dest_class"], "public");
+    }
+    s.stop().await;
+}
+
+#[tokio::test]
+async fn in_memory_the_admin_and_auditor_views_differ() {
+    views(false).await;
+}
+
+#[tokio::test]
+async fn in_postgres_the_admin_and_auditor_views_differ() {
+    views(true).await;
+}

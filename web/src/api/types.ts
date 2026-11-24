@@ -536,6 +536,35 @@ export interface AuditEvent {
   task_id: string;
   /** The marketplace bot of the event, by key; null for Nudge and events of no bot. An older server leaves it out. */
   persona?: string | null;
+  /**
+   * A sandbox decision's own columns (OpenShell's record, docs/openshell-prover-and-sandbox-audit-spec.md
+   * §B.3). Present only on `sandbox.*` events. An auditor's carry no host, address, path or process:
+   * a destination class instead. All are untrusted text: render as plain text only.
+   */
+  sandbox?: SandboxCols;
+}
+
+export interface SandboxCols {
+  decision?: string | null;
+  sandbox?: string | null;
+  rule?: string | null;
+  reason?: string | null;
+  dest_class?: string | null;
+  dest_host?: string | null;
+  dest_ip?: string | null;
+  dest_port?: number | null;
+  http_method?: string | null;
+  http_path?: string | null;
+  process?: string | null;
+  allow_count?: number | null;
+}
+
+/** The overview's sandbox block: counts and the collector's state only. */
+export interface SandboxOverview {
+  configured: boolean;
+  collector: { receiving: boolean; last_seen_at: string | null; silent_since: string | null; last_gap_at: string | null };
+  denials_24h: { bot: string; count: number }[];
+  denials_24h_capped: boolean;
 }
 
 /** The query the audit routes take. `before` is the opaque cursor from the page before. */
@@ -708,6 +737,8 @@ export interface AdminOverview {
   retention_days?: number | null;
   oldest_event_at?: string | null;
   last_purge?: { at: string; deleted: number } | null;
+  /** OpenShell's sandbox decisions (spec §B.5). Missing from an older tool server. */
+  sandbox?: SandboxOverview | null;
 }
 
 // ---- Admin: users and roles (docs/web-api.md, "Admin: users and roles") ----
