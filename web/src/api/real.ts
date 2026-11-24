@@ -109,7 +109,14 @@ export function createRealClient(opts: RealOptions = {}): Api {
     if (res.status === 401 && !PASSWORD_STEP_REFUSALS.has(code)) {
       csrf = null;
       opts.onSignedOut?.();
-      code = 'signed_out';
+      // A sensitive admin action on an older admin-door sign-in (slice H10): through sign-in
+      // again, keeping the code so the screen can say why.
+      if (code !== 'reauth_required') code = 'signed_out';
+    }
+    // The admin door ended this session: its person is neither an Admin nor an Auditor now.
+    if (res.status === 403 && code === 'admin_door_not_allowed') {
+      csrf = null;
+      opts.onSignedOut?.();
     }
     const wait = Number(res.headers.get('Retry-After') ?? NaN);
     throw new ApiError(res.status, code, message, details, Number.isFinite(wait) && wait >= 0 ? wait : null);

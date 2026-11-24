@@ -22,6 +22,7 @@ import { useTheme } from './theme';
 import { withCleanTasks } from './briefBlock';
 import { withCleanDrafts } from './citations';
 import { isSetupPath, parseRoute, signedOutReason } from './url';
+import { adminDoorHref, adminHere, onAdminDoor } from './door';
 import type { Route } from './url';
 
 // The whole Admin area (its pages, editors and diff code) is its own chunk: it is fetched the first
@@ -70,10 +71,40 @@ export interface AppProps {
   pollMs?: number;
 }
 
+/**
+ * On the public door, for an Admin or an Auditor (slice H10): the admin screens live at the admin
+ * door's own address, so this says so and links there.
+ */
+function AdminElsewhere() {
+  const { me } = useApp();
+  const href = adminDoorHref(me);
+  return (
+    <div className="page">
+      <h1>{copy.door.elsewhereTitle}</h1>
+      <p>{copy.door.elsewhereBody}</p>
+      {href && (
+        <p>
+          <a href={href}>{copy.door.elsewhereLink}</a>
+        </p>
+      )}
+    </div>
+  );
+}
+
 /** The page for a route. Follow-ups exist only when the brief is built; otherwise it is home. */
 function Page({ route }: { route: Route }) {
   const { briefState } = useData();
   const { me } = useApp();
+  // The admin door (slice H10) serves only the admin and audit screens: any other route is the
+  // admin overview there.
+  if (onAdminDoor(me)) {
+    const r = route.name === 'admin' ? route : { section: 'overview' as const, search: '', sub: undefined };
+    return (
+      <Suspense fallback={<AdminLoading />}>
+        <AdminPage section={r.section} search={r.search} sub={r.sub} />
+      </Suspense>
+    );
+  }
   switch (route.name) {
     // Only someone who may ask has a team; for anyone else these are the home page.
     case 'bots':
@@ -116,6 +147,7 @@ function Page({ route }: { route: Route }) {
         </Suspense>
       );
     case 'admin':
+      if (!adminHere(me)) return <AdminElsewhere />;
       return (
         <Suspense fallback={<AdminLoading />}>
           <AdminPage section={route.section} search={route.search} sub={route.sub} />

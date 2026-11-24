@@ -59,6 +59,14 @@ export interface MockOptions extends MockAdminOptions, MockPolicyOptions, MockPa
   /** Start with "Show Nudge" set this way (default on). */
   mascot?: boolean;
   /**
+   * Which front door the page pretends to be on (slice H10): `public` (an Admin or Auditor gets
+   * `adminUrl` as the admin screens' address) or `admin` (only the admin and audit screens).
+   * Unset: no door named, as an older server, with every screen on one door.
+   */
+  door?: 'public' | 'admin';
+  /** The admin door's address on the public door. */
+  adminUrl?: string;
+  /**
    * Keep each person's settings (hints seen, nudges, Show Nudge, first visit) in sessionStorage,
    * so a reload of the dev server keeps them, as the real server does. Off in unit tests.
    */
@@ -449,7 +457,15 @@ export function createMockClient(options: MockOptions = {}): Api {
         .at(-1) ?? null,
   });
   /** `Me` as pmos-web answers it: the settings, and the team fields worked out from them. */
-  const view = (): Me => clone({ ...me, ...team.meFields(me) });
+  const doorFields = (): Partial<Me> => {
+    if (options.door === 'admin') return { door: 'admin', public_url: 'http://127.0.0.1:5191' };
+    if (options.door === 'public') {
+      const staff = me.roles.includes('admin') || me.roles.includes('auditor');
+      return staff && options.adminUrl ? { door: 'public', admin_url: options.adminUrl } : { door: 'public' };
+    }
+    return {};
+  };
+  const view = (): Me => clone({ ...me, ...team.meFields(me), ...doorFields() });
   const withOffered = (t: Task): Task => ({ ...t, persona: t.persona ?? null, persona_offered: team.offered(t.persona) });
   const failedOnce = new Set<string>();
 

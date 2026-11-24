@@ -973,6 +973,10 @@ say nothing was sent, and should reload the draft to see where it stands.
 | `403` | `bad_origin` | A write from another origin, or with neither `Origin` nor `Referer`. | Yes |
 | `403` | `bad_csrf` | A write without the session's CSRF token. | Yes |
 | `403` | `proxy_not_trusted` | Password sign-in: a request that carries a forwarded header (`X-Forwarded-For`, `Forwarded`, `X-Real-IP`) while `pmos-web` trusts no proxy (`PMOS_WEB_DIRECT=1`), or from a peer not in `PMOS_WEB_TRUSTED_PROXIES`, or from a trusted proxy that names no client: the proxy setting doesn't match the deployment. | Yes |
+| `403` | `password_sign_in_not_from_here` | Password sign-in (`/api/auth/password/*`) from a client address outside `PMOS_WEB_PASSWORD_CLIENTS` (decision D2 (a); required on `PMOS_EXPOSURE=public`), checked before the tool server is asked. Microsoft sign-in is unaffected. | Yes |
+| `403` | `admin_door_not_allowed` | The admin door (slice H10, **The admin door**): someone who is neither an Admin nor an Auditor, at sign-in (no session or cookie is made) or on any later request (the session ends). | Yes |
+| `401` | `reauth_required` | A sensitive admin action (a role change, an invitation, a deactivation, an unlinked identity, a setup or reset code, a policy or content proposal, the audit export) on an admin-door sign-in older than 5 minutes. Sign in again and retry. | Yes |
+| `503` | `sign_in_stopped` | `PMOS_EXPOSURE=private` and the public URL has started resolving to a public address: every sign-in route on both doors is stopped until it resolves privately again. | Yes |
 | `403` | `not_a_member` | Not (or no longer) an active user in the user database; every session of theirs ends. Also when the tool server doesn't count them a member on a decision. | Yes |
 | `403` | `not_allowed` | Their role doesn't allow drafts, tasks or asking (also the Bots page and team changes: **Bots**). | Yes |
 | `403` | `forbidden` | Admin and auditor routes their role doesn't allow; the reviewer routes for someone who isn't an active reviewer; the producer route called like a browser. | Yes |

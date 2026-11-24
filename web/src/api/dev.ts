@@ -19,6 +19,12 @@ function mockBrief(): 'today' | 'stale' | 'never' | undefined {
   return raw === 'never' || raw === 'stale' || raw === 'today' ? raw : undefined;
 }
 
+/** Slice H10: which front door the dev server pretends to be (`VITE_MOCK_DOOR`). Unset: none named. */
+function mockDoor(): 'public' | 'admin' | undefined {
+  const raw = import.meta.env.VITE_MOCK_DOOR;
+  return raw === 'admin' || raw === 'public' ? raw : undefined;
+}
+
 /**
  * Policy and content admin on the dev server: `?mock_proposal=<error code>` refuses every proposal
  * with that code, `?mock_protection=unverified|no_reviews|not_linked` sets what branch protection
@@ -97,6 +103,10 @@ export function devApiFactory(): (onSignedOut: () => void) => Api {
       // `?mock_held=1` adds a draft by a withdrawn bot, on hold until an admin releases it.
       heldDraft: new URLSearchParams(window.location.search).get('mock_held') === '1',
       briefBuilt: import.meta.env.VITE_MOCK_BRIEF !== 'off',
+      // `VITE_MOCK_DOOR=admin` serves the page as the admin door would (slice H10); `public` as the
+      // public door, with the admin door's address for an Admin or an Auditor.
+      door: mockDoor(),
+      adminUrl: 'http://pmos-test.localhost:5194',
       hostile: import.meta.env.VITE_MOCK_HOSTILE === 'on',
       toolServerDown: new URLSearchParams(window.location.search).get('mock_admin') === 'degraded',
       // `?mock_reviews=<error code>` answers every recommendation with that code (`unknown_outcome` records it first).
