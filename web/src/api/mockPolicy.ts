@@ -77,7 +77,7 @@ const MOCK_PROVER_NOTES: ProverNotes = {
     'what a running sandbox enforces',
   ],
   domains: ['filesystem', 'network_l4', 'network_rest', 'process', 'landlock'],
-  view: 'proved on the network view (MCP rules removed, which only widens)',
+  view: 'proved on the network view (MCP rules removed, which only widens; credential bindings removed, which the prover doesn\'t model)',
   not_run_here: 'The prover runs on the pull request (CI check `policy-prover`). Not run here.',
 };
 

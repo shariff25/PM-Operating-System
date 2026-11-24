@@ -2825,7 +2825,9 @@ for g in s["groups"]:
     #      equals the checked-in one for PM OS's endpointless providers);
     #   2. `pmos policy prove --candidate …` in the pmos image, as this user, with no network, the
     #      checkout, the candidate, the prover and the pin mounted read-only: it checks the prover's
-    #      SHA-256 and version against deploy/openshell-prover.lock, builds the network view and
+    #      SHA-256 (against PMOS_PROVER_BUILD_RECORD, the record of a build of the pinned source
+    #      commit, or a hash in the lock) and version against deploy/openshell-prover.lock, builds
+    #      the network view and
     #      classifies the answer (only `proved` passes). The prover runs with an empty environment
     #      and holds no provider token; no sandbox and no service is involved;
     #   3. `pmos-toolserver policy-proof record` in a one-off tool server container records the
@@ -2871,6 +2873,17 @@ for g in s["groups"]:
     else
       say "no prover on this host (set PMOS_PROVER, or install openshell-prover): every bot is recorded not_available" >&2
     fi
+    # A prover built on this host from the pinned source (scripts/build-openshell-prover.sh) has
+    # no SHA-256 in the lock: its build record (PMOS_PROVER_BUILD_RECORD) names the commit, the
+    # version and the binary's SHA-256, and `pmos policy prove` checks all three against the pin.
+    record=${PMOS_PROVER_BUILD_RECORD:-}
+    record_args=()
+    case "$record" in *:*) say "PMOS_PROVER_BUILD_RECORD can't contain ':'" >&2; exit 2 ;; esac
+    if [ -n "$record" ]; then
+      [ -f "$record" ] || { say "PMOS_PROVER_BUILD_RECORD names no file: $record" >&2; exit 2; }
+      mounts+=(-v "$record:/run/pmos-prover-record/build.record:ro")
+      record_args=(--build-record /run/pmos-prover-record/build.record)
+    fi
     failed=0
     for bot in "${bots[@]}"; do
       if ! (umask 077 && openshell sandbox get "pmos-$bot" --policy-only >"$PROVE_TMP/$bot.yaml"); then
@@ -2881,7 +2894,7 @@ for g in s["groups"]:
       docker run --rm --network none --user "$(id -u):$(id -g)" "${mounts[@]}" -w /srv/content-repo \
         "pmos:${PMOS_VERSION:-local}" pmos policy prove --root content \
         --boundary policies/boundary/pmos-bot.yaml --prover /run/pmos-prover/openshell-prover \
-        --lock /run/pmos-prove-lock/openshell-prover.lock --candidate "/run/pmos-prove/$bot.yaml" \
+        --lock /run/pmos-prove-lock/openshell-prover.lock "${record_args[@]}" --candidate "/run/pmos-prove/$bot.yaml" \
         --bot "$bot" --format json >"$PROVE_TMP/$bot.json" || code=$?
       if [ "$code" -gt 1 ] || ! [ -s "$PROVE_TMP/$bot.json" ]; then
         say "pmos policy prove couldn't run for $bot (exit $code): nothing recorded for it" >&2

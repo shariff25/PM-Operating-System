@@ -2506,6 +2506,22 @@ grep -q 'policy-proof record' "$DOCKER_LOG" || fail "an unreadable sandbox polic
 code=0
 FAKE_PROVE_JSON="$WORK/prove.json" FAKE_PROVE_EXIT=2 run_bot policy prove docs >/dev/null 2>&1 || code=$?
 [ "$code" = 1 ] && ! grep -q 'policy-proof record' "$DOCKER_LOG" || fail "policy prove recorded a run that couldn't happen ($code)"
+# A prover built on the host from the pinned source: its build record is mounted read-only and
+# given to `pmos policy prove --build-record`; a record that isn't there stops before anything runs.
+printf 'PROVER_VERSION=0.1.10\n' >"$WORK/build.record"
+bot_env "PMOS_PROVER=$WORK/fake-prover" "PMOS_PROVER_BUILD_RECORD=$WORK/build.record"
+: >"$DOCKER_LOG"
+FAKE_PROVE_JSON="$WORK/prove.json" FAKE_PROVE_EXIT=1 run_bot policy prove docs >/dev/null 2>&1 || true
+line=$(grep 'pmos policy prove' "$DOCKER_LOG" | head -1)
+[[ "$line" == *"$WORK/build.record:/run/pmos-prover-record/build.record:ro"* && "$line" == *"--build-record /run/pmos-prover-record/build.record"* ]] ||
+  fail "policy prove didn't pass the host's build record: $line"
+bot_env "PMOS_PROVER=$WORK/fake-prover" "PMOS_PROVER_BUILD_RECORD=$WORK/no-such.record"
+: >"$DOCKER_LOG"
+code=0
+out=$(FAKE_PROVE_JSON="$WORK/prove.json" run_bot policy prove docs 2>&1) || code=$?
+[ "$code" = 2 ] && [[ "$out" == *"PMOS_PROVER_BUILD_RECORD names no file"* ]] && [ ! -s "$DOCKER_LOG" ] ||
+  fail "a missing build record wasn't refused before anything ran ($code): $out"
+bot_env
 echo "policy prove checks passed"
 
 # --- sandbox-audit configure, check and up (slice B3) ----------------------------------------

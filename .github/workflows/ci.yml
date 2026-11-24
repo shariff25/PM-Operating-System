@@ -59,20 +59,56 @@ jobs:
   # OpenShell's policy prover beside `pmos policy check` (docs/openshell-prover-and-sandbox-audit-
   # spec.md, slice A2). Every bot's policy is proved against the base branch's hand-written
   # boundary with the prover pinned in deploy/openshell-prover.lock; a change to the boundary must
-  # come alone. Until the owner pins a prover this job FAILS with "prover not available": a proof
-  # that didn't run is never a pass. No secrets, no write token.
+  # come alone. The prover is built from the pinned SOURCE commit (the job fails if the fetched
+  # tag is any other commit) with Z3 vendored (built from the z3-src crate that the source's
+  # Cargo.lock pins by checksum; prebuilt-z3 would download an unpinned Z3 inside a build script).
+  # The build runs offline with an empty environment; the job has no secrets and no write token,
+  # and the checkout keeps no credentials. If the prover can't be fetched, built or checked, every
+  # bot is `not_available` and the job FAILS with "prover not available": a proof that didn't run
+  # is never a pass. The Cargo target of the build is cached by the pinned commit, so the long Z3
+  # build runs once per commit and runner image.
   policy-prover:
     name: Policy prover (OpenShell, pinned)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    # A cold build compiles Z3 from C++ (about 10 to 25 minutes on a hosted runner, unverified).
+    timeout-minutes: 75
+    permissions:
+      contents: read
     steps:
+      # Where the prover is built and the proof record written (the runner's temp directory; the
+      # `runner` context isn't available in a job's `env`).
+      - name: Work directories
+        run: |
+          echo "PMOS_PROVER_DIR=$RUNNER_TEMP/openshell-prover" >>"$GITHUB_ENV"
+          echo "PMOS_PROOF_RECORD=$RUNNER_TEMP/policy-proof.json" >>"$GITHUB_ENV"
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: The job's own checks (stand-in prover)
+      - name: The pinned prover source (deploy/openshell-prover.lock)
+        id: pin
+        run: |
+          commit=$(awk -F= '$1 == "PROVER_SOURCE_COMMIT" { print $2; exit }' deploy/openshell-prover.lock)
+          feature=$(awk -F= '$1 == "PROVER_Z3_FEATURE" { print $2; exit }' deploy/openshell-prover.lock)
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || commit=none
+          [[ "$feature" =~ ^[a-z0-9-]+$ ]] || feature=none
+          image=${ImageOS:-unknown}
+          [[ "$image" =~ ^[A-Za-z0-9._-]+$ ]] || image=unknown
+          echo "commit=$commit" >>"$GITHUB_OUTPUT"
+          echo "feature=$feature" >>"$GITHUB_OUTPUT"
+          echo "image=$image" >>"$GITHUB_OUTPUT"
+      # The key holds the commit, which fixes the Rust toolchain too (its rust-toolchain.toml).
+      - name: Restore the prover build (by commit, Z3 feature and runner image)
+        id: prover-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.PMOS_PROVER_DIR }}/new/target
+          key: openshell-prover-${{ runner.os }}-${{ steps.pin.outputs.image }}-${{ runner.arch }}-${{ steps.pin.outputs.commit }}-${{ steps.pin.outputs.feature }}-v1
+      - name: The job's own checks (stand-in prover and stand-in builds)
         run: scripts/test-policy-prover-ci.sh
-      - name: Prove every bot's policy
+      - name: Build the pinned prover and prove every bot's policy
         env:
           BASE_REF: ${{ github.base_ref }}
         run: |
@@ -82,6 +118,20 @@ jobs:
           else
             scripts/policy-prover-ci.sh
           fi
+      # Saved even when the proof fails, so a failing pull request doesn't rebuild Z3 every run.
+      - name: Save the prover build
+        if: always() && steps.pin.outputs.commit != 'none' && steps.prover-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.PMOS_PROVER_DIR }}/new/target
+          key: ${{ steps.prover-cache.outputs.cache-primary-key }}
+      - name: The proof record (prover version, SHA-256, source commit, every result)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: policy-proof
+          path: ${{ env.PMOS_PROOF_RECORD }}
+          if-no-files-found: warn
 
   harness:
     name: Harness (typecheck, test)
@@ -141,7 +191,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Scripts parse
-        run: for f in deploy/setup.sh deploy/pmos-admin deploy/postgres-init.sh deploy/preflight.sh deploy/pmos-metadata-block deploy/sandbox-create.sh scripts/claude-test-stack.sh scripts/test-pmos-admin.sh scripts/test-preflight.sh policies/redteam/lib.sh policies/redteam/isolation.sh policies/redteam/exposure.sh policies/redteam/stack.sh scripts/test-redteam.sh scripts/check-nginx-examples.sh scripts/policy-prover-ci.sh scripts/test-policy-prover-ci.sh deploy/test/stand-ins/openshell-prover; do bash -n "$f"; done
+        run: for f in deploy/setup.sh deploy/pmos-admin deploy/postgres-init.sh deploy/preflight.sh deploy/pmos-metadata-block deploy/sandbox-create.sh scripts/claude-test-stack.sh scripts/test-pmos-admin.sh scripts/test-preflight.sh policies/redteam/lib.sh policies/redteam/isolation.sh policies/redteam/exposure.sh policies/redteam/stack.sh scripts/test-redteam.sh scripts/check-nginx-examples.sh scripts/policy-prover-ci.sh scripts/test-policy-prover-ci.sh scripts/build-openshell-prover.sh deploy/test/stand-ins/openshell-prover; do bash -n "$f"; done
       - name: pmos-admin checks (the eval gate's arguments; the checkout stays data)
         run: scripts/test-pmos-admin.sh
       # docs/openshell-any-host-spec.md §5 (slice H7): the red-team scripts' dry runs, refusals,

@@ -244,6 +244,20 @@ reaching the default branch without someone else's review.
 
 Built before review (owner's instruction of 2026-11-24); design and status in
 `docs/openshell-prover-and-sandbox-audit-spec.md`. Nothing here has run against a real OpenShell.
+The prover has: it is pinned by source in `deploy/openshell-prover.lock` (OpenShell `v0.1.10`,
+commit `152c59d3`), and on 2026-11-24 a build of that commit proved the Docs bot's policy
+(5 of 5 domains) and refused every planted widening.
+
+- **CI check `policy-prover`:** builds the prover from the pinned commit
+  (`scripts/build-openshell-prover.sh`; it fails unless the tag is that commit, builds offline
+  with an empty environment, caches the build by commit) and runs `pmos policy prove` with the
+  build's record (the commit, the version, the binary's SHA-256), which the binary must match.
+  It logs the binary's SHA-256 and `--version` and uploads the proof record (`policy-proof`).
+  A prover that can't be fetched, built or checked fails the check as "prover not available".
+- **On the host:** build the prover the same way
+  (`scripts/build-openshell-prover.sh --lock deploy/openshell-prover.lock --out <dir>`), then set
+  `PMOS_PROVER=<dir>/bin/openshell-prover` and `PMOS_PROVER_BUILD_RECORD=<dir>/bin/build.record`
+  in `deploy/.env` before `deploy/pmos-admin policy prove`.
 
 - **Prover row**, on every bot card: the newest proof `deploy/pmos-admin policy prove` recorded
   on the host for that bot's running sandbox (`GET /internal/admin/policy/proofs`, admins and
@@ -254,9 +268,10 @@ Built before review (owner's instruction of 2026-11-24); design and status in
   **Not checked: inconclusive**, **Prover error**, **Prover not available on the host**,
   **Prover version too old (or different)**, or that no proof is recorded, or that the tool
   server didn't answer. None of them is a pass. A proof is of the **network view** (the
-  tool-server endpoint's MCP rules removed, which only widens), and every card lists what a
-  proof never covers (readable paths, the MCP tool allowlist, credentials, uploads, name
-  resolution, what a running sandbox enforces).
+  tool-server endpoint's MCP rules removed, which only widens, and every endpoint's credential
+  binding removed, which the prover refuses and which allows no other destination), and every
+  card lists what a proof never covers (readable paths, the MCP tool allowlist, credentials,
+  uploads, name resolution, what a running sandbox enforces).
 - **Not run here:** `pmos-web` runs no prover; the propose and proposals parts say "The prover
   runs on the pull request (CI check `policy-prover`). Not run here." Reading that check into
   the proposals list (slice A6) needs the GitHub App's **Checks: read** and is not built.

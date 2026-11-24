@@ -2,7 +2,7 @@
 //! (`docs/openshell-prover-and-sandbox-audit-spec.md`, Part A, slices A1 and A2).
 //!
 //! For every bot's policy it builds the **network view** ([`network_view`]), runs the pinned
-//! `openshell-prover check <view> --boundary <boundary> --output json --timeout 60`, kills it at
+//! `openshell-prover check <view> --boundary <boundary> --output json --timeout 60s`, kills it at
 //! 90 seconds, and classifies the answer ([`classify`]). Only [`Status::Proved`] passes: exit
 //! status 0, `result: within_boundary` and every one of the five [`DOMAINS`] in
 //! `coverage.domains`. Everything else (exceeds, unsupported, inconclusive, an error, a
@@ -13,12 +13,14 @@
 //! with a bot's credentials: the prover is started with an **empty environment** (only a fixed
 //! `PATH`), so no token in the caller's environment reaches it.
 //!
-//! Every statement about the prover's command line and JSON here is from OpenShell's
-//! documentation (v0.1.9, read 2026-11-24), not from a run. **Verify with the real pinned
-//! prover (slice A2):** the `--version` flag and its output; the JSON field names `result`,
-//! `reason_code`, `reason`, `coverage.domains` and the counterexample's key (read here as
-//! `counterexample`, a string or an object); that `--timeout 60` is enough; that PM OS's policy
-//! files parse with `credential_binding` and `mcp` present.
+//! The command line and JSON here were checked against the real prover, built from source at
+//! OpenShell v0.1.10 (commit 152c59d3) on 2026-11-24: `--version` prints `openshell-prover
+//! <version>`; `--timeout` needs a unit (`60s`; a bare `60` is a usage error, exit 2); the JSON
+//! has `schema_version` (1), `prover_version`, `check`, `coverage.domains` (always the five),
+//! `result`, `exit_code`, `inputs`, `counterexample` (an object tagged by `domain`, read by
+//! `counterexample_text`), `reason_code` and `reason`; exits 0, 1, 2, 3 as documented. PM OS's
+//! policies parse, but both `credential_binding` and `mcp` make a policy `unsupported`, which is
+//! why the view removes both (each proof took well under a second).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -78,8 +80,17 @@ pub const MAX_REASON: usize = 256;
 /// the boundary means the real policy is too.
 pub const VIEW_REMOVED_KEYS: [&str; 5] = ["protocol", "mcp", "rules", "path", "enforcement"];
 
+/// The keys the network view removes from **every** endpoint: what the real prover refuses as
+/// "authority outside the initial model" (`unsupported`; verified at v0.1.10, 2026-11-24, where a
+/// `credential_binding` on the gateway and runtime endpoints made every PM OS policy
+/// `unsupported`). A credential binding says which provider's credential is injected on that
+/// endpoint; it allows no other host, port, address, route or binary, so removing it leaves what
+/// the endpoint can reach unchanged. What it removes is not proved: credential bindings are in
+/// [`NOT_PROVED`], and `pmos policy check`'s `cred-binding` and `cred-providers` rules cover them.
+pub const VIEW_UNMODELLED_KEYS: [&str; 1] = ["credential_binding"];
+
 /// What the screen and the report say when a proof ran on the view rather than the policy.
-pub const VIEW_NOTE: &str = "proved on the network view (MCP rules removed, which only widens)";
+pub const VIEW_NOTE: &str = "proved on the network view (MCP rules removed, which only widens; credential bindings removed, which the prover doesn't model)";
 
 /// What a prover pass never covers (spec §A.2). Always shown with a result, pass or not.
 pub const NOT_PROVED: [&str; 6] = [
@@ -198,6 +209,65 @@ fn text_of(v: &Value) -> Option<String> {
     }
 }
 
+/// The counterexample as one line whose first word names the domain, so [`exceeds_domain`] can
+/// read it after cleaning and capping. The real prover (verified at v0.1.10) writes an object
+/// tagged by `domain`: `filesystem` (`access`, `path`), `process` (`field`, `boundary`,
+/// `candidate`), `landlock` (`boundary`, `candidate`) or `network` (`protocol` `l4` or `rest`,
+/// `binary`, `host`, `port`, `destination_ip`, and `method` and `path` for REST). These become
+/// `filesystem write /sandbox`, `process run_as_user boundary=sandbox candidate=root`,
+/// `landlock boundary=hard_requirement candidate=best_effort` and `network_l4 binary=… host=…:443
+/// destination_ip=…`. Any other object is kept as compact JSON (its domain then can't be told,
+/// and every domain's rules are compared); a string is kept as it is.
+fn counterexample_text(v: &Value) -> Option<String> {
+    let Value::Object(map) = v else {
+        return text_of(v);
+    };
+    let field = |k: &str| map.get(k).and_then(text_of);
+    let known = || -> Option<String> {
+        match map.get("domain").and_then(Value::as_str)? {
+            "filesystem" => Some(format!(
+                "filesystem {} {}",
+                field("access")?,
+                field("path")?
+            )),
+            "process" => Some(format!(
+                "process {} boundary={} candidate={}",
+                field("field")?,
+                field("boundary")?,
+                field("candidate")?
+            )),
+            "landlock" => Some(format!(
+                "landlock boundary={} candidate={}",
+                field("boundary")?,
+                field("candidate")?
+            )),
+            "network" => {
+                let domain = match map.get("protocol").and_then(Value::as_str)? {
+                    "l4" => "network_l4",
+                    "rest" => "network_rest",
+                    _ => return None,
+                };
+                let mut s = format!(
+                    "{domain} binary={} host={}:{} destination_ip={}",
+                    field("binary").unwrap_or_else(|| "-".into()),
+                    field("host")?,
+                    field("port")?,
+                    field("destination_ip").unwrap_or_else(|| "-".into()),
+                );
+                if let Some(m) = field("method") {
+                    s.push_str(&format!(" method={m}"));
+                }
+                if let Some(p) = field("path") {
+                    s.push_str(&format!(" path={p}"));
+                }
+                Some(s)
+            }
+            _ => None,
+        }
+    };
+    Some(known().unwrap_or_else(|| v.to_string()))
+}
+
 /// Classify one run of the prover: its exit code (`None` when it was killed or died by a
 /// signal), whether PM OS killed it at [`KILL_AFTER`], and its standard output. Only exit 0
 /// with `result: within_boundary` and all five domains is [`Status::Proved`] (PRV-3).
@@ -254,7 +324,7 @@ pub fn classify(exit: Option<i32>, timed_out: bool, stdout: &[u8]) -> Outcome {
     coverage.dedup();
     let counterexample = parsed
         .get("counterexample")
-        .and_then(text_of)
+        .and_then(counterexample_text)
         .map(|s| clean(&s, MAX_COUNTEREXAMPLE));
     let base = |status: Status| Outcome {
         status,
@@ -320,16 +390,35 @@ pub fn classify(exit: Option<i32>, timed_out: bool, stdout: &[u8]) -> Outcome {
 /// `deploy/openshell-prover.lock`: what CI and `pmos-admin` may run (spec §A.7). One
 /// `KEY=value` per line; `#` starts a comment. An empty value means not pinned yet, and
 /// nothing then runs: every bot is [`Status::NotAvailable`].
+///
+/// The prover is pinned by its **source** (`PROVER_SOURCE_REPO`, `PROVER_SOURCE_TAG`,
+/// `PROVER_SOURCE_COMMIT`): CI checks out exactly that commit and builds it. A source build's
+/// SHA-256 isn't known ahead of time, so the binary's hash comes from a **build record** written
+/// by the build itself (same format, [`Lock::parse`]; [`Prover::build_record`]): it names the
+/// commit it was built from, the version and the binary's SHA-256, and must agree with this pin.
+/// `PROVER_BINARY_SHA256_<ARCH>` here is the other way: a binary whose hash was recorded in the
+/// repository (a reviewed release archive's binary, `PROVER_RELEASE_TAG` and
+/// `PROVER_ARCHIVE_SHA256_<ARCH>`; optional, empty until someone verifies a release).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Lock {
-    /// `PROVER_VERSION`, such as `0.1.9`.
+    /// `PROVER_VERSION`, such as `0.1.10`: what `openshell-prover --version` must print.
     pub version: String,
-    /// `PROVER_RELEASE_TAG`: the GitHub release CI downloads the archive from.
+    /// `PROVER_SOURCE_REPO`: the git repository the prover is built from (an `https://` URL).
+    pub source_repo: String,
+    /// `PROVER_SOURCE_TAG`: the tag pinned, such as `v0.1.10` (for people; the commit decides).
+    pub source_tag: String,
+    /// `PROVER_SOURCE_COMMIT`: the full commit SHA the tag named when it was pinned; CI fails if
+    /// the fetched commit is any other.
+    pub source_commit: String,
+    /// `PROVER_Z3_FEATURE`: the prover's Cargo feature that supplies Z3 (`vendored-z3`).
+    pub z3_feature: String,
+    /// `PROVER_RELEASE_TAG`: a GitHub release whose archive may be used instead (optional).
     pub release_tag: String,
-    /// `PROVER_BINARY_SHA256_<ARCH>`: the extracted `openshell-prover` binary, by architecture
-    /// (`x86_64`, `aarch64`).
+    /// `PROVER_BINARY_SHA256_<ARCH>`: the `openshell-prover` binary, by architecture
+    /// (`x86_64`, `aarch64`). In the lock: a release archive's binary (optional). In a build
+    /// record: the binary just built.
     pub binary_sha256: BTreeMap<String, String>,
-    /// `PROVER_ARCHIVE_SHA256_<ARCH>`: the release archive CI downloads.
+    /// `PROVER_ARCHIVE_SHA256_<ARCH>`: the release archive (optional).
     pub archive_sha256: BTreeMap<String, String>,
     /// `OPENSHELL_FORMAT_VERIFIED`: the OpenShell version the OCSF format was last verified on
     /// (spec §B.8); empty until a host run (slice B6).
@@ -348,6 +437,24 @@ impl Lock {
                 return Err(format!("line {}: not KEY=value", i + 1));
             };
             let value = value.trim();
+            let key = key.trim();
+            if key == "PROVER_SOURCE_REPO" {
+                // The only value with `:` and `/`: an https URL of plain characters, no query,
+                // no credentials, no spaces.
+                let ok = value.is_empty()
+                    || (value.starts_with("https://")
+                        && value["https://".len()..].chars().all(|c| {
+                            c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '/')
+                        }));
+                if !ok {
+                    return Err(format!(
+                        "line {}: `{key}` is not a plain https:// URL",
+                        i + 1
+                    ));
+                }
+                lock.source_repo = value.to_string();
+                continue;
+            }
             if !value
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
@@ -357,8 +464,18 @@ impl Lock {
                     i + 1
                 ));
             }
-            match key.trim() {
+            match key {
                 "PROVER_VERSION" => lock.version = value.to_string(),
+                "PROVER_SOURCE_TAG" => lock.source_tag = value.to_string(),
+                "PROVER_SOURCE_COMMIT" => {
+                    if !value.is_empty()
+                        && !(value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit()))
+                    {
+                        return Err(format!("line {}: `{key}` is not a full commit SHA", i + 1));
+                    }
+                    lock.source_commit = value.to_ascii_lowercase();
+                }
+                "PROVER_Z3_FEATURE" => lock.z3_feature = value.to_string(),
                 "PROVER_RELEASE_TAG" => lock.release_tag = value.to_string(),
                 "OPENSHELL_FORMAT_VERIFIED" => lock.openshell_format_verified = value.to_string(),
                 k => {
@@ -452,6 +569,11 @@ pub struct ProverFacts {
     /// The version it reported, if it ran.
     pub version: Option<String>,
     pub sha256: Option<String>,
+    /// The source commit pinned in the lock (`PROVER_SOURCE_COMMIT`), when one is.
+    pub source_commit: Option<String>,
+    /// Where the expected SHA-256 came from: `build_record` (a source build's own record, which
+    /// named the pinned commit) or `lock` (a hash committed in the lock).
+    pub sha256_pinned_by: Option<&'static str>,
 }
 
 /// How to reach the prover.
@@ -459,6 +581,10 @@ pub struct ProverFacts {
 pub struct Prover {
     pub path: PathBuf,
     pub lock: Lock,
+    /// The record a source build wrote (`--build-record`): the commit it built, the version and
+    /// the binary's SHA-256. When given, its hash is the one the binary must have, and its commit
+    /// and version must be the lock's.
+    pub build_record: Option<Lock>,
     /// The architecture whose pin applies (`std::env::consts::ARCH`).
     pub arch: String,
     pub kill_after: Duration,
@@ -469,17 +595,79 @@ impl Prover {
         Self {
             path,
             lock,
+            build_record: None,
             arch: std::env::consts::ARCH.to_string(),
             kill_after: KILL_AFTER,
         }
     }
 
-    /// Check the binary before any proof: present, pinned, the pinned SHA-256, the pinned
-    /// version. `Err` is the outcome every bot gets (PRV-7).
+    /// The SHA-256 the binary must have, and where it came from; `Err` when there is none or the
+    /// build record doesn't match the pin.
+    fn expected_sha256(&self) -> Result<(String, &'static str), Outcome> {
+        let Some(record) = &self.build_record else {
+            return match self.lock.binary_for(&self.arch) {
+                Some(h) => Ok((h.to_string(), "lock")),
+                None => Err(Outcome::of(
+                    Status::NotAvailable,
+                    "not_pinned",
+                    format!(
+                        "no binary SHA-256 for {} in {LOCK_PATH}, and no build record of the pinned source",
+                        self.arch
+                    ),
+                )),
+            };
+        };
+        let mismatch = |what: String| {
+            Err(Outcome::of(
+                Status::NotAvailable,
+                "build_record_mismatch",
+                what,
+            ))
+        };
+        if self.lock.source_commit.is_empty() {
+            return mismatch(format!(
+                "a build record was given but {LOCK_PATH} pins no source commit"
+            ));
+        }
+        if record.source_commit != self.lock.source_commit {
+            return mismatch(format!(
+                "the build record is of commit {}, not the pinned {}",
+                if record.source_commit.is_empty() {
+                    "(none)"
+                } else {
+                    &record.source_commit
+                },
+                self.lock.source_commit
+            ));
+        }
+        if record.version != self.lock.version {
+            return mismatch(format!(
+                "the build record is of version {}, not the pinned {}",
+                if record.version.is_empty() {
+                    "(none)"
+                } else {
+                    &record.version
+                },
+                self.lock.version
+            ));
+        }
+        match record.binary_for(&self.arch) {
+            Some(h) => Ok((h.to_string(), "build_record")),
+            None => mismatch(format!(
+                "the build record has no binary SHA-256 for {}",
+                self.arch
+            )),
+        }
+    }
+
+    /// Check the binary before any proof: present, pinned, the expected SHA-256 (from the lock,
+    /// or from the build record of the pinned source commit), the pinned version. `Err` is the
+    /// outcome every bot gets (PRV-7).
     pub fn verify(&self) -> (ProverFacts, Result<(), Outcome>) {
         let mut facts = ProverFacts {
             path: self.path.display().to_string(),
             pinned_version: self.lock.version.clone(),
+            source_commit: Some(self.lock.source_commit.clone()).filter(|s| !s.is_empty()),
             ..ProverFacts::default()
         };
         if self.lock.version.is_empty() {
@@ -492,18 +680,12 @@ impl Prover {
                 )),
             );
         }
-        let Some(pinned) = self.lock.binary_for(&self.arch) else {
-            return (
-                facts,
-                Err(Outcome::of(
-                    Status::NotAvailable,
-                    "not_pinned",
-                    format!(
-                        "no binary SHA-256 is pinned for {} in {LOCK_PATH}",
-                        self.arch
-                    ),
-                )),
-            );
+        let pinned = match self.expected_sha256() {
+            Ok((h, from)) => {
+                facts.sha256_pinned_by = Some(from);
+                h
+            }
+            Err(o) => return (facts, Err(o)),
         };
         let bytes = match fs::read(&self.path) {
             Ok(b) => b,
@@ -577,7 +759,8 @@ impl Prover {
 
     /// One proof of `view` against `boundary`.
     pub fn check(&self, view: &Path, boundary: &Path) -> Outcome {
-        let timeout = PROVER_TIMEOUT_SECS.to_string();
+        // The real CLI takes a duration with its unit (`60s`); a bare `60` is a usage error.
+        let timeout = format!("{PROVER_TIMEOUT_SECS}s");
         let view = view.to_string_lossy();
         let boundary = boundary.to_string_lossy();
         let run = run_bounded(
@@ -667,11 +850,14 @@ fn run_bounded(program: &Path, args: &[&str], kill_after: Duration) -> Run {
 
 /// The network view of a policy (spec §A.2, PRV-4): a copy in which every endpoint whose
 /// `protocol` is `mcp` loses exactly [`VIEW_REMOVED_KEYS`] (`protocol`, `mcp`, `rules`,
-/// `path`, `enforcement`) and keeps everything else (`host`, `port`, `ports`, `allowed_ips`, its
-/// rule's binaries, any other key). Nothing is added or changed. The prover reports an MCP
-/// endpoint `unsupported`; removing its request rules only widens what it allows, so a view
-/// within the boundary means the real policy is too. The MCP rules themselves are not proved
-/// (`net-tools` covers them). Returns the view and whether anything was removed.
+/// `path`, `enforcement`), every endpoint loses [`VIEW_UNMODELLED_KEYS`]
+/// (`credential_binding`), and everything else is kept (`host`, `port`, `ports`, `allowed_ips`,
+/// its rule's binaries, any other key). Nothing is added or changed. The prover reports an MCP
+/// endpoint, and a credential binding, `unsupported`; removing request rules only widens what an
+/// endpoint allows, and removing a credential binding leaves what it can reach unchanged, so a
+/// view within the boundary means the real policy reaches nothing more. Neither the MCP rules
+/// (`net-tools`) nor the credential bindings (`cred-binding`) are proved. Returns the view and
+/// whether anything was removed.
 pub fn network_view(policy: &Value) -> (Value, bool) {
     let mut view = policy.clone();
     let mut changed = false;
@@ -684,6 +870,9 @@ pub fn network_view(policy: &Value) -> (Value, bool) {
                 let Value::Object(map) = endpoint else {
                     continue;
                 };
+                for key in VIEW_UNMODELLED_KEYS {
+                    changed |= map.remove(key).is_some();
+                }
                 if map.get("protocol").and_then(Value::as_str) != Some("mcp") {
                     continue;
                 }
@@ -826,7 +1015,7 @@ pub struct BotResult {
     pub candidate_sha256: String,
     /// SHA-256 of the view's text, when one was built.
     pub view_sha256: Option<String>,
-    /// [`VIEW_NOTE`] when the view removed MCP rules.
+    /// [`VIEW_NOTE`] when the view removed anything (MCP rules or credential bindings).
     pub view: Option<&'static str>,
     #[serde(flatten)]
     pub outcome: Outcome,
@@ -969,6 +1158,12 @@ pub fn render_text(report: &Report) -> String {
         report.boundary,
         report.boundary_sha256.as_deref().unwrap_or("-"),
     ));
+    if let Some(commit) = &report.prover.source_commit {
+        out.push_str(&format!(
+            "prover source commit {commit}; binary SHA-256 pinned by {}\n",
+            report.prover.sha256_pinned_by.unwrap_or("nothing")
+        ));
+    }
     for r in &report.results {
         let mut line = format!("{}: {}", r.bot, r.outcome.status.as_str());
         if let Some(code) = &r.outcome.reason_code {
@@ -1131,6 +1326,84 @@ mod tests {
         let obj = json!({"result": "exceeds_boundary", "counterexample": {"domain": "network_l4", "host": "evil.example"}});
         let o = classify(Some(1), false, obj.to_string().as_bytes());
         assert!(o.counterexample.unwrap().contains("evil.example"));
+    }
+
+    #[test]
+    fn the_real_provers_counterexample_objects_name_their_domain() {
+        // The shapes `openshell-prover check --output json` printed at v0.1.10 (2026-11-24).
+        let cases = [
+            (
+                json!({"domain": "filesystem", "access": "write", "path": "/sandbox"}),
+                "filesystem write /sandbox",
+                Some("filesystem"),
+            ),
+            (
+                json!({"domain": "process", "field": "run_as_user", "boundary": "sandbox", "candidate": "root"}),
+                "process run_as_user boundary=sandbox candidate=root",
+                Some("process"),
+            ),
+            (
+                json!({"domain": "landlock", "boundary": "hard_requirement", "candidate": "best_effort"}),
+                "landlock boundary=hard_requirement candidate=best_effort",
+                Some("landlock"),
+            ),
+            (
+                json!({"domain": "network", "binary": "/usr/local/bin/node", "ancestor_binary": null,
+                       "binary_identity_required": true, "host": "planted.example",
+                       "destination_ip": "0.0.0.0", "trusted_gateway": false, "port": 443,
+                       "protocol": "l4", "method": null, "path": null}),
+                "network_l4 binary=/usr/local/bin/node host=planted.example:443 destination_ip=0.0.0.0",
+                Some("network_l4"),
+            ),
+            (
+                json!({"domain": "network", "binary": "/usr/local/bin/node", "host": "gateway.pmos.internal",
+                       "destination_ip": "10.201.77.11", "port": 8740, "protocol": "rest",
+                       "method": "GET", "path": "/v1/models"}),
+                "network_rest binary=/usr/local/bin/node host=gateway.pmos.internal:8740 destination_ip=10.201.77.11 method=GET path=/v1/models",
+                Some("network_rest"),
+            ),
+        ];
+        for (cx, text, domain) in cases {
+            let body = json!({"schema_version": 1, "prover_version": "0.1.10", "check": "boundary",
+                "result": "exceeds_boundary", "exit_code": 1, "counterexample": cx,
+                "coverage": {"domains": DOMAINS}});
+            let o = classify(Some(1), false, body.to_string().as_bytes());
+            assert_eq!(o.status, Status::Exceeds);
+            assert_eq!(o.counterexample.as_deref(), Some(text));
+            assert_eq!(exceeds_domain(text), domain, "{text}");
+        }
+        // A network counterexample with a protocol PM OS doesn't know: kept whole, domain unknown
+        // (every domain's rules are then compared).
+        let odd = json!({"domain": "network", "protocol": "grpc", "host": "x", "port": 1});
+        let body = json!({"result": "exceeds_boundary", "counterexample": odd});
+        let o = classify(Some(1), false, body.to_string().as_bytes());
+        assert_eq!(exceeds_domain(o.counterexample.as_deref().unwrap()), None);
+    }
+
+    #[test]
+    fn the_lock_pins_a_source_commit_and_refuses_odd_values() {
+        let lock = Lock::parse(
+            "PROVER_VERSION=0.1.10\nPROVER_SOURCE_REPO=https://github.com/NVIDIA/OpenShell\nPROVER_SOURCE_TAG=v0.1.10\nPROVER_SOURCE_COMMIT=152C59D3178039E3FBB4A5595F9FFF7216A6BE92\nPROVER_Z3_FEATURE=vendored-z3\n",
+        )
+        .unwrap();
+        assert_eq!(lock.source_repo, "https://github.com/NVIDIA/OpenShell");
+        assert_eq!(lock.source_tag, "v0.1.10");
+        assert_eq!(
+            lock.source_commit,
+            "152c59d3178039e3fbb4a5595f9fff7216a6be92"
+        );
+        assert_eq!(lock.z3_feature, "vendored-z3");
+        for bad in [
+            "PROVER_SOURCE_REPO=http://github.com/NVIDIA/OpenShell",
+            "PROVER_SOURCE_REPO=https://user:pw@github.com/x",
+            "PROVER_SOURCE_REPO=https://github.com/x?y=1",
+            "PROVER_SOURCE_REPO=https://github.com/$(id)",
+            "PROVER_SOURCE_COMMIT=152c59d",
+            "PROVER_SOURCE_COMMIT=zz2c59d3178039e3fbb4a5595f9fff7216a6be92",
+            "PROVER_SOURCE_TAG=v0.1.10;id",
+        ] {
+            assert!(Lock::parse(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

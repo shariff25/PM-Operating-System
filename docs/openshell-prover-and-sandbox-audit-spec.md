@@ -5,19 +5,37 @@
 > been read by the security reviewer; all of it goes to the reviewer, and the gate (no open High
 > or Critical) applies before real data or a pilot. Not built: A5 and B6 (need a real host), A6
 > and B4 (need their own review and the owner's answer on GitHub permissions and the canary).
-> Nothing here has run against a real OpenShell or a real prover: every statement about either
-> is still from the documentation, marked "verify on a real host" (or "with the real pinned
-> prover") in the code, and §5 stands as written.
+> Nothing here has run against a real OpenShell. **Part A has run against the real prover**
+> (2026-11-24, below); Part B's statements are still from the documentation, and §5's host list
+> stands as written.
+>
+> **The real prover, 2026-11-24 (branch `fix/pin-real-prover`).** Pinned by source: OpenShell
+> `v0.1.10`, commit `152c59d3178039e3fbb4a5595f9fff7216a6be92` (`deploy/openshell-prover.lock`).
+> Built here with `vendored-z3` and Rust 1.95.0 (the source's own pin) in 17.5 minutes cold on
+> 3 jobs, 14 seconds warm; `openshell-prover --version` prints `openshell-prover 0.1.10` once the
+> version is stamped as OpenShell's release build stamps it (unstamped it prints `0.0.0`). Run
+> against PM OS's real inputs, with `pmos policy prove` end to end: the Docs bot's policy is
+> **proved** (5 of 5 domains) on the network view; the planted widenings are refused (a fourth
+> host, a `/24`, a new gateway route, `best_effort`, root: `exceeds`; a writable `/sandbox`:
+> `unsupported`, `unresolved_filesystem_path`). What differed from the documentation and was
+> changed (§5 has the full list): `--timeout` needs a unit (`60s`); the counterexample is an
+> object tagged by `domain` (network ones say `l4` or `rest`); **a `credential_binding` makes a
+> policy `unsupported`** just as MCP does, so the view now also removes credential bindings
+> (§A.2); a write path the boundary doesn't list is `unsupported`, not `exceeds` (§A.8). CI now
+> builds the prover from the pinned commit (§A.7); the job has not yet run on GitHub.
 >
 > - **A1** `policies/boundary/pmos-bot.yaml` (hand-written), `crates/policy/src/prove.rs`
 >   (classifier, network view, pin, comparison with the check, boundary-alone rule),
 >   `pmos policy prove` and `pmos policy boundary-alone`, the stand-in
 >   `deploy/test/stand-ins/openshell-prover`. The prover runs with an empty environment (only a
 >   fixed `PATH`) and is killed at 90 seconds.
-> - **A2** CI job `policy-prover` (`scripts/policy-prover-ci.sh`, checked by
->   `scripts/test-policy-prover-ci.sh`). **`deploy/openshell-prover.lock` pins nothing yet, so the
->   job fails with "prover not available" on every run until the owner pins a release** (version,
->   release tag, the SHA-256 of each archive and of each extracted binary). It is never a pass.
+> - **A2** CI job `policy-prover` (`scripts/policy-prover-ci.sh` and
+>   `scripts/build-openshell-prover.sh`, checked by `scripts/test-policy-prover-ci.sh`). The lock
+>   pins the prover's source; the job fetches the tag, fails unless it is the pinned commit,
+>   builds it (cached by commit) and proves every bot. If the prover can't be fetched, built or
+>   checked, every bot is `not_available` and the job fails with "prover not available"; it is
+>   never a pass. Ran locally end to end against the real build on 2026-11-24 (passed, with and
+>   without `--base`); not yet on GitHub's runner.
 >   When the base branch has no boundary (the pull request that adds it) the job proves against
 >   the checked-out one and says "BOOTSTRAP"; the boundary-alone rule applies from the next change.
 > - **A3** migration `0033_policy_proofs.sql`, `pmos-toolserver
@@ -158,10 +176,10 @@ never inside a sandbox, never with a bot's credentials, and never in `pmos-web` 
 server (neither shells out; `pmos-web` holds no GitHub token, `docs/policy-admin.md`).
 
 1. **CI, on every pull request** (the gate). A new job `policy-prover` in `.github/workflows/ci.yml`
-   downloads the pinned archive, checks its SHA-256 against the value committed in
-   `deploy/openshell-prover.lock` (not only against the release's own checksum file), and runs
-   `pmos policy prove` (A.3) over every `policies/bots/*.yaml`. The job has no secrets and no
-   write token.
+   builds the prover from the source commit pinned in `deploy/openshell-prover.lock` (A.7) and
+   runs `pmos policy prove` (A.3) over every `policies/bots/*.yaml`. The job has no secrets and
+   no write token; the checkout keeps no credentials, and the third-party build runs offline with
+   an empty environment.
 2. **The host, after a policy is applied** (what is enforced). `pmos-admin policy prove [<bot> |
    --all]`, run as the OpenShell gateway's user (the same user `pmos-admin sandbox` requires),
    refuses root. It saves each sandbox's effective policy with `openshell sandbox get pmos-<bot>
@@ -199,12 +217,26 @@ under POL-2 (`crates/policy/`): it may only delete those five keys from an endpo
 "proved on the network view (MCP rules removed, which only widens)". When a pinned prover lists an
 `mcp` domain in `coverage.domains`, the view is dropped in its own slice.
 
+**Credential bindings (found with the real prover, v0.1.10, 2026-11-24).** The prover also
+refuses `credential_binding` as "authority outside the initial model": with it, every PM OS policy
+is `unsupported` (on `pmos_gateway`, before it reaches the MCP endpoint). So the view also removes
+`credential_binding` from **every** endpoint, and nothing else. A credential binding names which
+provider's credential is injected on that endpoint; it allows no other host, port, address, route
+or binary, so the view reaches exactly what the policy reaches. It does remove something the proof
+then doesn't see, so credential bindings stay in the "not proved" list (`cred-binding`,
+`cred-providers` cover them), and the note reads "proved on the network view (MCP rules removed,
+which only widens; credential bindings removed, which the prover doesn't model)". CI checks the
+premise on every run: the unmodified policy is `unsupported`, and with only its credential
+bindings removed it is still `unsupported`, naming the MCP endpoint. For the reviewer: this is a
+change to the view made after the real run, not yet read.
+
 ### A.3 `pmos policy prove`
 
 `pmos policy prove [--policies policies] [--boundary policies/boundary/pmos-bot.yaml]
-[--prover <path>] [--candidate <file>] [--format text|json]` (crate `pmos-policy`, new module
-`prove.rs`). For each candidate: build the view, run `<prover> check <view> --boundary <b>
---output json --timeout 60`, kill it at 90 seconds, and classify:
+[--prover <path>] [--lock <file>] [--build-record <file>] [--candidate <file>] [--format
+text|json]` (crate `pmos-policy`, new module `prove.rs`). For each candidate: build the view, run
+`<prover> check <view> --boundary <b> --output json --timeout 60s`, kill it at 90 seconds, and
+classify:
 
 | PM OS status | When |
 | --- | --- |
@@ -290,8 +322,48 @@ pull request exists, and opening one writes nothing to the default branch. So:
 
 ### A.7 Version pinning
 
-`deploy/openshell-prover.lock` holds the version and the SHA-256 of each Linux archive. CI and
-`pmos-admin` use only that version. A bump is its own pull request under CODEOWNERS; on it CI runs
+**Revised 2026-11-24: pinned by source.** OpenShell's release downloads couldn't be reached to
+verify (HTTP 403 from where this was pinned), so nothing depends on them.
+`deploy/openshell-prover.lock` pins `PROVER_SOURCE_REPO`, `PROVER_SOURCE_TAG`,
+`PROVER_SOURCE_COMMIT` (the full SHA), `PROVER_VERSION` and `PROVER_Z3_FEATURE`
+(`vendored-z3` only). `scripts/build-openshell-prover.sh`:
+
+1. fetches the tag shallowly and **fails unless it is the pinned commit** (a moved tag is never
+   built);
+2. installs the Rust toolchain the source pins (`rust-toolchain.toml`) and runs
+   `cargo fetch --locked` (the source's own `Cargo.lock`, checksums included, which also pins Z3's
+   sources through the `z3-src` crate);
+3. stamps `PROVER_VERSION` into the workspace's `0.0.0` lines of `Cargo.toml` and `Cargo.lock`,
+   as OpenShell's release build does with sed;
+4. builds `openshell-prover` `--locked --offline` with an **empty environment** (only `PATH`,
+   `HOME`, the Rust homes, the target directory), so no token reaches the third-party build
+   scripts;
+5. writes a **build record** beside the binary: `PROVER_VERSION`, `PROVER_SOURCE_COMMIT`,
+   `PROVER_BINARY_SHA256_<ARCH>` of the binary just built; and logs the SHA-256, `--version` and
+   `rustc --version`.
+
+**What `pmos policy prove` checks for a source-built binary** (`--build-record <file>`): the
+record names the lock's commit and version (else `not_available`, `build_record_mismatch`); the
+binary's SHA-256 is the record's (else `not_available`, `hash_mismatch`); `--version` prints the
+pinned version (else `version_mismatch`; an unstamped build's `0.0.0` is "too old"). The record is
+written by the same CI job that proves, so it binds the binary to the pinned commit for that run;
+it is not a reproducible-build claim (the SHA-256 can differ between runner images). On a host,
+`PMOS_PROVER_BUILD_RECORD` in `deploy/.env` names the record of the host's own build. Without a
+record, the lock's `PROVER_BINARY_SHA256_<ARCH>` is used (the optional release path:
+`PROVER_RELEASE_TAG` and `PROVER_ARCHIVE_SHA256_<ARCH>`, empty and unverified, used by CI only when
+no source commit is pinned). The proof record (the JSON report, with the prover's path, version,
+SHA-256, source commit and every result) is printed in the job's log and uploaded as the
+`policy-proof` artifact.
+
+**CI** caches the build's Cargo target directory under a key of the commit, the Z3 feature, the
+runner image (`ImageOS`) and architecture (the commit fixes the toolchain), restored before and
+saved after the run even when the proof fails, so the cold Z3 build (about 17 minutes on 3 cores
+here) runs once per commit and image; a warm build relinks in seconds. Z3 is vendored because
+`prebuilt-z3` downloads a Z3 release inside a build script (not pinned by `Cargo.lock`, and not
+possible offline) and no feature links whatever `libz3` the runner has. The job's timeout is 75
+minutes.
+
+CI and `pmos-admin` use only the pinned version. A bump (another tag and commit) is its own pull request under CODEOWNERS; on it CI runs
 the old and the new prover and fails if any bot's status differs, so a change in OpenShell's model
 is reviewed, not absorbed. A newer prover on the host gives `version_mismatch` until the pin
 moves; an older one gives `version_mismatch` with "too old". If a release changes the JSON fields,
@@ -314,8 +386,17 @@ the parser returns `error`, never `proved`.
   refuses root; records one row per bot; a missing prover records `not_available`; a stale row
   shows `Stale` in the web tests.
 - **With the real pinned prover, in CI (slice A2):** every checked-in policy's view is `proved`;
-  the unmodified policy is `unsupported` (MCP); planted widenings (a fourth host, a `/24`, a
-  writable `/sandbox`, `best_effort`, root) are each `exceeds`.
+  the unmodified policy is `unsupported` (credential bindings), and still `unsupported` for the
+  MCP endpoint with its credential bindings removed; planted widenings (a fourth host, a `/24`, a
+  new gateway route, `best_effort`, root) are each `exceeds`, and a writable `/sandbox` is
+  `unsupported` with `unresolved_filesystem_path`. (Revised after the real run: the prover
+  compares write paths exactly and won't decide a path the boundary doesn't list, because
+  Landlock resolves paths inside the sandbox; it says `exceeds` for a write only against a
+  boundary with no writable path at all. Either answer fails; neither is `proved`.)
+- **Source build** (`scripts/test-policy-prover-ci.sh`, a fixture repository and a stand-in
+  cargo): the pinned tag is built and proved with its build record; the tag at another commit, a
+  failing build and a build that leaves no binary each end "prover not available" and fail the
+  job; a build record of another commit is refused.
 
 ## 3. Part B: sandbox decisions in the audit log
 
@@ -493,18 +574,35 @@ count a redelivered record twice, which the screen states.
 | People over-trust a prover pass | The screen lists what is not proved; only `proved` passes; never "passed" when it did not run; stale proofs marked | web tests |
 | A widening slips past via the boundary | Base-branch boundary; a boundary change comes alone, under CODEOWNERS and POL-2 | the boundary fixture |
 | The network view hides a widening | It may only delete five keys of the MCP endpoint; `net-tools` still required | property tests |
-| A tampered or drifted prover binary | SHA-256 pinned in the repository; exact version required; a bump compares results | stand-in hash and version tests |
+| A tampered or drifted prover binary | Source commit pinned in the repository and the fetched tag must be it; crates by the source's `Cargo.lock`; offline build with an empty environment; the binary must have its build record's SHA-256, the record the pinned commit and version; exact version required; a bump compares results | stand-in hash, version and build-record tests; the source-build fixtures |
+| The prover build cache is poisoned | The cache is keyed by commit and image and written only by this job; GitHub scopes a pull request's caches to it; the build record is recomputed from the binary on every run (a poisoned target directory remains a residual risk, for review) | none (GitHub's behaviour) |
 | The prover runs where it shouldn't | Only in CI and as the host's gateway user; refuses root; never `sandbox exec`; no provider tokens | `test-pmos-admin.sh` |
 
 ## 5. What must be verified
 
-**With the real pinned prover, in CI (no OpenShell host needed):** the JSON field names
-(`result`, `reason_code`, `coverage.domains`, the counterexample's key); a version flag; that
-PM OS's policy files parse with `credential_binding` and `mcp` present; that the unmodified
-policy is `unsupported`; that the view is `within_boundary`; that `read_only: [/]` covers the
-skill paths; that `include_workdir: false` does not make the result depend on the working
-directory; that the runtime's `*` route globs compare; that 60 seconds is enough; that
-`credential_binding` is ignored rather than refused; the prover's stability tier.
+**Verified against the real prover built from source at `v0.1.10` (commit `152c59d3`) on
+2026-11-24** (no OpenShell host needed), with what was found:
+
+| Assumed (from the v0.1.9 docs) | Real | Changed |
+| --- | --- | --- |
+| `--version` prints the version | `openshell-prover 0.1.10`; a plain source build prints `0.0.0` (the workspace version; releases stamp it) | the build stamps it as releases do |
+| `--timeout 60` | needs a unit: `60s` (a bare `60` is a usage error, exit 2) | `60s` |
+| JSON `result`, `reason_code`, `reason`, `coverage.domains` | as assumed, plus `schema_version` (1), `prover_version`, `check`, `exit_code`, `inputs` | no |
+| five domains | always exactly `filesystem`, `network_l4`, `network_rest`, `process`, `landlock` | no |
+| `counterexample`, a string such as `filesystem write /tmp` | an object tagged by `domain`: `filesystem` (`access`, `path`), `process`, `landlock`, `network` (`protocol` `l4`/`rest`, `host`, `port`, `destination_ip`, `binary`, REST `method`/`path`) | read into one line whose first word is the domain |
+| exit codes 0, 1, 2, 3, 130 | as assumed | no |
+| MCP rules are `unsupported` | yes (`unsupported_policy_shape`, "authority outside the initial model") | no |
+| `credential_binding` is ignored | **refused** the same way: every PM OS policy was `unsupported` | the view also removes `credential_binding` (§A.2) |
+| the hand-written boundary is valid input | yes; it is `within_boundary` of itself | no |
+| `read_only: [/]` covers the skill paths | yes | no |
+| `include_workdir: false` doesn't depend on the working directory | the same answer from two working directories | no |
+| the runtime's `*` route globs compare | yes (the Docs view is within the boundary) | no |
+| 60 seconds is enough | each proof took well under a second | no |
+| a writable `/sandbox` is `exceeds` | `unsupported`, `unresolved_filesystem_path` | the acceptance check expects that |
+| the Docs policy's view is `within_boundary` | **proved**, 5 of 5 domains | no |
+
+Still unverified: the prover's stability tier (not documented); that the job builds and passes on
+GitHub's hosted runner (cold build time, cache behaviour, `rustup` there).
 
 **On a real host with OpenShell:** that `openshell sandbox get <name> --policy-only` prints a
 policy the prover reads, and that it equals the base policy for PM OS's endpointless providers;

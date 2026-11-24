@@ -128,9 +128,14 @@ enum PolicyCommand {
         /// The prover binary. Default: `openshell-prover` on PATH.
         #[arg(long)]
         prover: Option<PathBuf>,
-        /// The pin: version and SHA-256s.
+        /// The pin: the source commit, the version, and optional release SHA-256s.
         #[arg(long, default_value = pmos_policy::prove::LOCK_PATH)]
         lock: PathBuf,
+        /// The build record a source build of the pinned commit wrote (the commit, the version
+        /// and the binary's SHA-256; spec §A.7). Its commit and version must be the lock's, and
+        /// the binary must have its SHA-256.
+        #[arg(long)]
+        build_record: Option<PathBuf>,
         /// Prove this one file instead (a sandbox's effective policy on the host); needs --bot.
         #[arg(long, requires = "bot")]
         candidate: Option<PathBuf>,
@@ -202,6 +207,7 @@ fn main() -> Result<ExitCode> {
                     boundary,
                     prover,
                     lock,
+                    build_record,
                     candidate,
                     bot,
                     format,
@@ -212,6 +218,7 @@ fn main() -> Result<ExitCode> {
             boundary,
             prover,
             lock,
+            build_record,
             candidate: candidate.zip(bot),
             format,
         })),
@@ -376,6 +383,7 @@ struct ProveArgs {
     boundary: PathBuf,
     prover: Option<PathBuf>,
     lock: PathBuf,
+    build_record: Option<PathBuf>,
     candidate: Option<(PathBuf, String)>,
     format: Format,
 }
@@ -401,6 +409,16 @@ fn policy_prove(a: &ProveArgs) -> ExitCode {
             eprintln!("error: the prover pin can't be read: {e}");
             return ExitCode::from(2);
         }
+    };
+    let build_record = match &a.build_record {
+        None => None,
+        Some(path) => match Lock::read(path) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                eprintln!("error: the prover's build record can't be read: {e}");
+                return ExitCode::from(2);
+            }
+        },
     };
     if !a.boundary.is_file() {
         eprintln!("error: no boundary at {}", a.boundary.display());
@@ -483,7 +501,8 @@ fn policy_prove(a: &ProveArgs) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let prover = Prover::new(a.prover.clone().unwrap_or_else(prover_on_path), lock);
+    let mut prover = Prover::new(a.prover.clone().unwrap_or_else(prover_on_path), lock);
+    prover.build_record = build_record;
     let report = prove::prove_all(&prover, &a.boundary, &candidates, scratch.path());
     match a.format {
         Format::Json => match serde_json::to_string_pretty(&report) {

@@ -1,69 +1,87 @@
 #!/usr/bin/env bash
 # A stand-in for OpenShell's `openshell-prover` (docs/openshell-prover-and-sandbox-audit-spec.md
-# §A.8), for tests only: it proves nothing. It answers as the real prover's documentation says it
-# would (v0.1.9: JSON with `result`, `reason_code`, `reason`, `coverage.domains`,
-# `counterexample`; exit 0, 1, 2 or 3), with an answer chosen by the SHA-256 of the candidate
-# file: the file `answers` beside this script holds lines `<sha256> <answer>`; a candidate not
-# listed gets `within`, unless it still has an MCP rule (`protocol: mcp`), which is `unsupported`
-# as the documentation says of the real one. The real prover's field names and version flag are
-# to verify (slice A2).
+# §A.8), for tests only: it proves nothing. It answers in the real prover's format (verified
+# against the prover built from source at v0.1.10 on 2026-11-24: JSON with `schema_version`,
+# `prover_version`, `check`, `coverage.domains`, `result`, `exit_code`, `inputs`,
+# `counterexample` (an object tagged by `domain`), `reason_code`, `reason`; exit 0, 1, 2 or 3;
+# `--timeout` takes a unit, `60s`), with an answer chosen by the SHA-256 of the candidate file:
+# the file `answers` beside this script holds lines `<sha256> <answer>`; a candidate not listed
+# gets `within`, unless it has a credential binding or an MCP rule, which the real prover reports
+# `unsupported` ("authority outside the initial model").
 #
 # Answers: within, exceeds, unsupported, inconclusive, exit2, exit0-exceeds, exit1-within,
 # missing-domain, not-json, hang. `--version` prints `openshell-prover <version>`, the version
 # in the file `version` beside this script (default 0.1.9).
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
+v=0.1.9
+[ -f "$here/version" ] && v=$(cat "$here/version")
 all='"coverage":{"domains":["filesystem","network_l4","network_rest","process","landlock"]}'
 if [ "${1:-}" = --version ]; then
-  v=0.1.9
-  [ -f "$here/version" ] && v=$(cat "$here/version")
   printf 'openshell-prover %s\n' "$v"
   exit 0
 fi
-[ "${1:-}" = check ] || { echo "usage: openshell-prover check <candidate> --boundary <boundary> [--output json] [--timeout N]" >&2; exit 2; }
+[ "${1:-}" = check ] || { echo "usage: openshell-prover check <candidate> --boundary <boundary> [--output json] [--timeout 60s]" >&2; exit 2; }
 candidate=${2:-}
-[ -f "$candidate" ] || { printf '{"result":"error","reason":"no candidate"}\n'; exit 2; }
 shift 2
 boundary=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --boundary) boundary=${2:-}; shift 2 ;;
-    --output | --timeout) shift 2 ;;
-    *) printf '{"result":"error","reason":"unknown argument"}\n'; exit 2 ;;
+    --output) shift 2 ;;
+    --timeout)
+      [[ "${2:-}" =~ ^[0-9]+(ms|s|m)$ ]] || { echo "error: invalid value '${2:-}' for '--timeout <TIMEOUT>': duration must end in ms, s, or m" >&2; exit 2; }
+      shift 2 ;;
+    *) echo "error: unexpected argument '$1' found" >&2; exit 2 ;;
   esac
 done
-[ -f "$boundary" ] || { printf '{"result":"error","reason":"no boundary"}\n'; exit 2; }
+envelope() { # result exit counterexample-json reason-code reason [coverage]
+  local cov=${6-$all}
+  printf '{"schema_version":1,"prover_version":"%s","check":"boundary",%s"result":"%s","exit_code":%s,"inputs":{"candidate":"c","boundary":"b"},"counterexample":%s,"reason_code":%s,"reason":%s}\n' \
+    "$v" "${cov:+$cov,}" "$1" "$2" "$3" "$4" "$5"
+}
+[ -f "$candidate" ] || { envelope error 2 null '"invalid_input"' '"cannot open the candidate"' ""; exit 2; }
+[ -f "$boundary" ] || { envelope error 2 null '"invalid_input"' '"cannot open the boundary"' ""; exit 2; }
 sum=$(sha256sum "$candidate" | cut -d' ' -f1)
 answer=within
 if [ -f "$here/answers" ]; then
   found=$(awk -v s="$sum" '$1 == s { print $2; exit }' "$here/answers")
   [ -n "$found" ] && answer=$found
 fi
-if [ "$answer" = within ] && grep -q 'protocol: mcp' "$candidate"; then answer=unsupported; fi
-# The planted widenings of scripts/policy-prover-ci.sh, as the real prover should see them.
-planted=""
+if [ "$answer" = within ] && grep -qE 'credential_binding|protocol: mcp' "$candidate"; then answer=unsupported; fi
+# The planted widenings of scripts/policy-prover-ci.sh, as the real prover answers them.
 if [ "$answer" = within ]; then
-  if grep -q 'planted\.example' "$candidate"; then planted="network_l4 planted.example:443"
-  elif grep -q '10\.201\.77\.0/24' "$candidate"; then planted="network_l4 10.201.77.0/24"
-  elif grep -qx '    - /sandbox' "$candidate"; then planted="filesystem write /sandbox"
-  elif grep -q 'best_effort' "$candidate"; then planted="landlock best_effort"
-  elif grep -q 'run_as_user: root' "$candidate"; then planted="process run_as_user root"
+  cx=""
+  if grep -q 'planted\.example' "$candidate"; then
+    cx='{"domain":"network","binary":null,"ancestor_binary":null,"binary_identity_required":false,"host":"planted.example","destination_ip":"8.8.8.8","trusted_gateway":false,"port":443,"protocol":"l4","method":null,"path":null}'
+  elif grep -q '10\.201\.77\.0/24' "$candidate"; then
+    cx='{"domain":"network","binary":null,"ancestor_binary":null,"binary_identity_required":false,"host":"gateway.pmos.internal","destination_ip":"10.201.77.0","trusted_gateway":false,"port":8740,"protocol":"rest","method":"POST","path":"/v1/chat/completions"}'
+  elif grep -q 'path: /v1/models' "$candidate"; then
+    cx='{"domain":"network","binary":null,"ancestor_binary":null,"binary_identity_required":false,"host":"gateway.pmos.internal","destination_ip":"10.201.77.11","trusted_gateway":false,"port":8740,"protocol":"rest","method":"POST","path":"/v1/models"}'
+  elif grep -qx '    - /sandbox' "$candidate"; then
+    envelope unsupported 3 null '"unresolved_filesystem_path"' "\"filesystem write containment for '/sandbox' depends on sandbox path resolution; use matching paths in candidate and boundary\""
+    exit 3
+  elif grep -q 'best_effort' "$candidate"; then
+    cx='{"domain":"landlock","boundary":"hard_requirement","candidate":"best_effort"}'
+  elif grep -q 'run_as_user: root' "$candidate"; then
+    cx='{"domain":"process","field":"run_as_user","boundary":"sandbox","candidate":"root"}'
+  fi
+  if [ -n "$cx" ]; then
+    envelope exceeds_boundary 1 "$cx" null null
+    exit 1
   fi
 fi
-if [ -n "$planted" ]; then
-  printf '{"result":"exceeds_boundary","counterexample":"%s",%s}\n' "$planted" "$all"
-  exit 1
-fi
+fsx='{"domain":"filesystem","access":"write","path":"/sandbox"}'
 case "$answer" in
-  within) printf '{"result":"within_boundary",%s}\n' "$all"; exit 0 ;;
-  exceeds) printf '{"result":"exceeds_boundary","counterexample":"filesystem write /sandbox",%s}\n' "$all"; exit 1 ;;
-  unsupported) printf '{"result":"unsupported","reason_code":"unsupported_policy_shape","reason":"the policy uses MCP rules"}\n'; exit 3 ;;
-  inconclusive) printf '{"result":"inconclusive","reason_code":"resource_limit","reason":"too many endpoints"}\n'; exit 3 ;;
-  exit2) printf '{"result":"error","reason":"could not parse the candidate"}\n'; exit 2 ;;
-  exit0-exceeds) printf '{"result":"exceeds_boundary","counterexample":"process run_as_user root",%s}\n' "$all"; exit 0 ;;
-  exit1-within) printf '{"result":"within_boundary",%s}\n' "$all"; exit 1 ;;
-  missing-domain) printf '{"result":"within_boundary","coverage":{"domains":["filesystem","network_l4","process","landlock"]}}\n'; exit 0 ;;
-  not-json) printf 'within_boundary (text, not JSON)\n'; exit 0 ;;
+  within) envelope within_boundary 0 null null null; exit 0 ;;
+  exceeds) envelope exceeds_boundary 1 "$fsx" null null; exit 1 ;;
+  unsupported) envelope unsupported 3 null '"unsupported_policy_shape"' "\"candidate policy rule 'pmos_toolserver' uses authority outside the initial model\""; exit 3 ;;
+  inconclusive) envelope inconclusive 3 null '"resource_limit"' '"too many endpoints"'; exit 3 ;;
+  exit2) envelope error 2 null '"invalid_input"' '"invalid candidate policy"' ""; exit 2 ;;
+  exit0-exceeds) envelope exceeds_boundary 0 '{"domain":"process","field":"run_as_user","boundary":"sandbox","candidate":"root"}' null null; exit 0 ;;
+  exit1-within) envelope within_boundary 1 null null null; exit 1 ;;
+  missing-domain) envelope within_boundary 0 null null null '"coverage":{"domains":["filesystem","network_l4","process","landlock"]}'; exit 0 ;;
+  not-json) printf 'result: within_boundary\n'; exit 0 ;;
   hang) exec sleep 600 ;;
-  *) printf '{"result":"error","reason":"unknown canned answer"}\n'; exit 2 ;;
+  *) envelope error 2 null '"invalid_input"' '"unknown canned answer"' ""; exit 2 ;;
 esac
