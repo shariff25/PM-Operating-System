@@ -110,6 +110,11 @@ pub struct ProductionModels {
     /// §4.10): its production model is the route's primary, and a report counts only if it
     /// recorded which models answered its calls ([`crate::report::Report::route`]).
     pub routed: bool,
+    /// The production config serves the approved hosted model (slice H12, spec §3.6,
+    /// "Benchmarks under `hosted`"): every role on its `hosted:<name>` upstream, so a report
+    /// counts only when every role was served by the `hosted` kind (never `local`), and each
+    /// role's model hash is the approved entry's one `model_sha256`.
+    pub hosted: bool,
 }
 
 impl From<BTreeMap<String, String>> for ProductionModels {
@@ -119,7 +124,51 @@ impl From<BTreeMap<String, String>> for ProductionModels {
             roles,
             model_sha256: BTreeMap::new(),
             routed: false,
+            hosted: false,
         }
+    }
+}
+
+/// A `hosted:<name>` production config's model hash (slice H12): the approved entry's one
+/// `model_sha256`, from the list the gateway compiles in (`crates/gateway/approved-hosted.yaml`,
+/// beside `evals/`). The committed config names no model id (`host:<ref>`), so this is the only
+/// committed pin. Refused: no entry of that name (the list ships empty), or an entry that pins
+/// several ids (which role uses which isn't in a committed file).
+fn hosted_model_sha(evals_root: &Path, name: &str) -> Result<String, String> {
+    let path = evals_root.join("../crates/gateway/approved-hosted.yaml");
+    let text = std::fs::read_to_string(&path).map_err(|e| {
+        format!(
+            "{}: can't read the approved hosted list: {e}",
+            path.display()
+        )
+    })?;
+    let list: Vec<serde_norway::Value> = if text
+        .lines()
+        .any(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+    {
+        serde_norway::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?
+    } else {
+        Vec::new()
+    };
+    let entry = list
+        .iter()
+        .find(|e| e.get("name").and_then(|n| n.as_str()) == Some(name))
+        .ok_or_else(|| {
+            format!(
+                "the production gateway serves `hosted:{name}`, which has no approved entry \
+                 (the list ships empty; the first entry is the owner's slice H13)"
+            )
+        })?;
+    let shas: Vec<&str> = entry
+        .get("model_sha256")
+        .and_then(|m| m.as_sequence())
+        .map(|s| s.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    match shas.as_slice() {
+        [one] if crate::report::is_sha256_hex(one) => Ok(one.to_string()),
+        _ => Err(format!(
+            "the approved entry `{name}` must pin exactly one model id for its runs to count"
+        )),
     }
 }
 
@@ -176,7 +225,49 @@ pub fn production_models(evals_root: &Path) -> Result<ProductionModels, String> 
         .and_then(|r| r.as_mapping())
         .ok_or_else(|| format!("{}: no `roles`", path.display()))?;
     let mut out = ProductionModels::default();
+    // Slice H12: the `hosted:<name>` upstreams of the config, by key.
+    let hosted_upstreams: BTreeMap<String, String> = v
+        .get("upstreams")
+        .and_then(|u| u.as_mapping())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, u)| {
+                    let url = u
+                        .as_str()
+                        .or_else(|| u.get("url").and_then(|x| x.as_str()))?;
+                    let name = url.strip_prefix("hosted:")?;
+                    Some((k.as_str()?.to_string(), name.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     for (name, role) in roles {
+        if let Some(entry) = role
+            .get("upstream")
+            .and_then(|u| u.as_str())
+            .and_then(|u| hosted_upstreams.get(u))
+        {
+            let (Some(name), Some(label)) =
+                (name.as_str(), role.get("label").and_then(|l| l.as_str()))
+            else {
+                return Err(format!(
+                    "{}: a hosted role without a name or a `label`",
+                    path.display()
+                ));
+            };
+            out.hosted = true;
+            out.roles.insert(name.to_string(), label.to_string());
+            out.model_sha256
+                .insert(name.to_string(), hosted_model_sha(evals_root, entry)?);
+            continue;
+        }
+        if !hosted_upstreams.is_empty() {
+            return Err(format!(
+                "{}: a role isn't on the `hosted:<name>` upstream; a hosted production config \
+                 serves every role from it",
+                path.display()
+            ));
+        }
         let mut label = role.get("label").and_then(|l| l.as_str());
         let mut model = role.get("model").and_then(|m| m.as_str());
         // A routed role (slice MP6): its production model is the route's primary, the first
@@ -379,7 +470,15 @@ pub fn counts(
     if m.cloud_test {
         return Err("a testing-only upstream was on".into());
     }
-    if m.upstreams.values().any(|u| u != "local") {
+    // Slice H12: a hosted production config's runs count only from the `hosted` kind; a local
+    // one's only from `local`.
+    if production.hosted {
+        if m.upstreams.values().any(|u| u != "hosted") {
+            return Err(
+                "a role was served by an upstream that isn't the approved hosted model".into(),
+            );
+        }
+    } else if m.upstreams.values().any(|u| u != "local") {
         return Err("a role was served by an upstream that isn't local".into());
     }
     // Slice MP6 (§4.10): a claim holds for the model that produced it. Every call of the run
