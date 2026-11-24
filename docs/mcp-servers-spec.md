@@ -1,6 +1,6 @@
 # MCP servers in place of the built-in connectors
 
-Status: **design spec; not built.** Revision r1, 2026-11-24, written from `claude/web-app` at
+Status: **M1 to M7 built before review** (see "Status of the build" below). Revision r1, 2026-11-24, written from `claude/web-app` at
 `0e1316b`. The independent security reviewer reads it before any slice starts (CLAUDE.md, "How
 to work"). No connector code is removed or written until the reviewer has answered.
 
@@ -11,6 +11,58 @@ spec. Which MCP servers the pilot uses is still the owner's choice (§10).
 
 Line numbers are not cited; file paths are. Where this spec is unsure of a fact it says
 "to be confirmed".
+
+## Status of the build (2026-11-24)
+
+**Slices M1 to M7 built before review (owner's instruction of 2026-11-24)**, on branch
+`build/mcp-servers`, one commit per slice; the reviewer has read none of it. Not built: M8
+(Confluence, Slack), M9 (the eval run), M11, and every removal (R-jira, R-confluence, R-slack:
+each needs the owner's go-ahead). The switch is off by default (`PMOS_MCP_SYSTEMS` empty): every
+system stays on its built-in connector. Everything ran against fakes on loopback only; no real
+MCP server, authorization server or model was contacted, and no real server's product facts
+are assumed (§10's are still to be confirmed). How it works: `docs/toolserver.md`, "MCP servers".
+
+- **M1** the client layer: the record format and its lint rules (`crates/contract/src/mcp.rs`),
+  digests, the mapping, transport and identity rules, the refusing client handler, discovery and
+  revocation, caps and deadlines, `McpConnector`; threats 1, 2, 3, 9, 10, 11 tested.
+- **M2** `pmos-fake-mcp` (in process), the fake records, the spec's `fake-mcp` mode spelled
+  `PMOS_CONNECTORS=fake` with `PMOS_MCP_SYSTEMS=jira`, and the parity test: every fixture read
+  on Jira, Confluence and Slack, for a PM and three team-bot scopes, gives the same items, sources
+  and error kinds; Jira's write the same reference.
+- **M3** the docs on the generic layer, from a deployment's `pmos-docs` record; the built-in
+  docs client stays the default (below); `pmos-toolserver mcp digests`.
+- **M4** per-PM OAuth (PKCE, `resource`, pinned metadata, the identity check, sealed tokens in
+  `mcp_credentials`, migration 0030, refresh, scopes); threats 4, 6, 7, 12 tested.
+- **M5** the code allowlist, `/readyz`'s `mcp` section, the host preflight's H-MCP, Policy
+  Admin's read (`GET /internal/admin/mcp`, and `mcp` in `pmos-web`'s `GET /api/admin/policy`).
+- **M6** Jira on its approved record behind the switch: the same Jira calls through the whole
+  tool service answer and audit as the built-in fake.
+- **M7** side by side (`PMOS_MCP_COMPARE=jira`, fake connectors only). **The comparison on the
+  fixtures: 32 Jira reads compared, 0 differed.** It shows agreement on the fixtures only.
+
+Where this build differs from the text above, or chose the more refusing reading:
+- `PMOS_CONNECTORS` keeps its two values (the runtime and `pmos-web` read it); `fake-mcp` is
+  fake connectors with `PMOS_MCP_SYSTEMS=jira`.
+- `docs.rs` is not replaced: `pmos-docs` names each deployment's site and products in its tool
+  definitions, so no digest committed here could approve them for CI's stack, the test stack and
+  `docs_e2e.rs` at once. Docs move onto the layer per deployment, with that deployment's record.
+- The digest also covers `title`. Each tool carries its own `approved_by`. `oauth.resource`
+  must be the server's URL. Every requested scope must be needed by an approved tool. A write
+  must name its marker argument. Unmapped arguments are refused. A re-list never restores a tool.
+- Every `third_party` record is refused at start until the owner decides where an approval is
+  kept; in fake-data mode every record but a `pmos-docs`-shaped one is refused.
+- The audit's `server` and `tool_digest` are in the event's `detail`, not new columns, so the
+  audit schema and every event stay as they are. The ledger's `served_by` and the items'
+  `upstream_args_hash` are not built (they need fields on structs existing tests construct).
+- A team bot's scoped Slack search asks the server for 50 and cuts to its limit after dropping
+  out-of-scope results.
+
+Not verified: any real MCP server or authorization server; the SPKI pin against a live TLS server
+(unit-tested on the verifier only); the public-address resolver against real DNS; the 256 KiB cap
+on a plain JSON answer (rmcp parses up to 16 MiB first; streamed events are capped before
+parsing); H-MCP on a real stack (fixture-tested only); the `jira-draft` and `docs-qa` evals with
+the switch on (M9); the policy page's screen (its API carries the data; the page doesn't show it).
+MCP credentials of a deactivated person are refused at use but not deleted after the grace.
 
 ## Owner's decisions of 2026-11-24
 

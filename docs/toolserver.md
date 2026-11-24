@@ -1760,6 +1760,93 @@ Tokens are sealed with AES-256-GCM before any store sees them (`src/vault.rs`, t
   their person and use (`pmos-vault|<handle>|password|totp`), and re-sealed under the newest
   key when next used (`docs/password-sign-in.md`).
 
+## MCP servers
+
+Built before review (owner's instruction of 2026-11-24), slices M1 to M7 of
+`docs/mcp-servers-spec.md`. Off by default: with `PMOS_MCP_SYSTEMS` unset every system stays on
+its built-in connector, and nothing below changes CI's stack, the test stack or the eval tasks.
+No built-in connector is removed (each removal needs the owner's go-ahead).
+
+The tool server is an MCP **client** of external servers (`src/mcp_client/`); a sandboxed bot
+still reaches only the tool server, and the sandbox policy is unchanged. A server is a backend
+behind the `Connector` trait (`McpConnector`), so the policy checks, the approval gate, the
+audit event and the ledger row happen exactly as for a connector.
+
+**The server record** (`content/mcp/<id>.yaml`, format in `crates/contract/src/mcp.rs`, checked
+by the content lint): `id`, `operator` (`pmos`, `system_vendor`, `third_party`), `transport`
+(`streamable_http` only; `stdio` and `sse` are refused), `url` (`https://` at a DNS name, or
+`http://<name>.pmos.internal:<port>` for a server PM OS runs), `identity` (`host`, optional
+`spki_sha256` pins; `address` for an internal server), `auth` (`oauth_per_user`,
+`service_token` with `secret_env`, `none` for public data only), `oauth` (a pre-registered
+client id, issuer, endpoints, exact scopes, `resource` = the URL), `identity_check` (an approved
+"who am I" tool and the path of its email), `data_class`, `systems`, `tools`, `approved_by` and
+`pull`, and `owner_approval` for `third_party`. Each tool maps one registry name to one upstream
+tool by exact name and `digest`, with `class` (absent is a write), its `scopes`, `approved_by`,
+and the declarative `args`, `result`, `errors` (and `adapter: jira_rollup`). A record is added by
+a pull request like any content; at start the tool server refuses one whose `approved_by` (on the
+record or any tool) isn't an active Admin, every `third_party` record (until the owner decides
+where an approval of one is kept), and in fake-data mode every record but a `pmos-docs`-shaped one.
+
+**The definition digest:** `sha256:` of the canonical JSON (keys sorted) of the tool's `name`,
+`title`, `description`, `inputSchema`, `outputSchema` and `annotations`. Unlisted tools are
+ignored. On every connection, after `notifications/tools/list_changed` and every 10 minutes
+the server's tools are listed again; an approved tool whose digest differs or that is gone is
+revoked for the life of the process: calls answer
+`tool_changed: <server>.<tool>: this tool changed at its server and needs an Admin's review`,
+audited `denied`, plus an `mcp.tool_changed` event. `pmos-toolserver mcp digests <record.yaml>`
+lists a server's digests for an Admin preparing an approval (it never prints the token).
+
+**What the model sees:** PM OS's own names, schemas and descriptions; never the server's.
+Upstream arguments are a pure function of the approved arguments, fixed values and the
+"Drafted with PM OS · run <id>" marker (`args.marker`); an argument the mapping doesn't name is
+refused. Results: at most 256 KiB, 1,000 items; ids shape-checked, links kept only if `https://`,
+bodies clipped at 12,000 characters, lists at 50; wrapped as untrusted like every connector item;
+a server's error text clipped and marked as the server's.
+
+**What the client refuses:** it declares no capabilities; `sampling/createMessage`, `roots/list`,
+`elicitation/create`, custom requests and an `input_required` or task answer are refused and
+audited as `mcp.server_request_refused` (the method name only); resources and prompts are never
+called; their notifications and log messages are dropped and counted.
+
+**Limits:** 3 s to connect, 10 s a read (retried once on a fresh connection), 30 s a write
+(never retried: one that breaks "may or may not have happened"), 8 calls in flight per server,
+60 a minute per user per server; past a cap the call answers "rate limited" without reaching the
+server. No redirects; a remote name must resolve to a public address; an internal server is
+reached only at its pinned address, never through the proxy.
+
+**Per-PM OAuth** (`oauth_per_user`, live connectors): `GET /internal/mcp/oauth/{server}/start?user=`,
+`GET /internal/mcp/links?user=` and the public `GET /oauth/mcp/{server}/callback`. Before each
+link the server's protected-resource metadata and its authorization server's metadata must match
+the record (nothing they name is fetched; no dynamic client registration). PKCE S256, the
+record's exact scopes and `resource`; a signed, single-use, 10-minute `state`. The tokens are
+sealed only if the record's identity tool names the PM's sign-in name or Atlassian email; they
+are stored sealed in `mcp_credentials` (migration 0030), bound to (user, `mcp:<server>`, field),
+refreshed under a per-(user, server) lock, unlinked only on `invalid_grant`, and never given to a
+person who isn't active. A tool needing a scope the grant lacks answers "reconnect". A rotated
+vault key re-seals these tokens only when they are next refreshed.
+
+**Audit and ledger:** the call's event is the connector's, with `via mcp server <id>, tool
+sha256:…` in its detail (metadata, so Auditors see it); `mcp.connect`, `mcp.tool_changed`,
+`mcp.server_request_refused`, `mcp.link` and `mcp.compare` are the client's own events, fixed
+text and ids only. Ledger rows are as for a connector write.
+
+**Settings** (the tool server only):
+- `PMOS_MCP_SYSTEMS` (default empty): `jira` and `docs`; `confluence` and `slack` are refused
+  until slice M8. With live connectors each system named is served by its record. With
+  `PMOS_CONNECTORS=fake`, `jira` is the spec's `fake-mcp` mode: Jira through the fake MCP server
+  (`pmos-fake-mcp`, in this process on a loopback port with a fresh random token), serving the
+  same fixtures. `docs` is served by the deployment's `pmos-docs` record (`secret_env:
+  PMOS_DOCS_TOKEN`); `pmos-docs` names the site in its tool descriptions, so each deployment
+  approves its own digests (and a site configured later changes them).
+- `PMOS_MCP_COMPARE=jira` (fake connectors only, not with Jira switched): each Jira read runs on
+  the fake and on the fake MCP server; the caller gets the fake's answer, and `mcp.compare`
+  records `same` or `differ` with counts, ids and field names only.
+
+**Operators:** `/readyz` has an `mcp` section when a system is on MCP (per server `ok`,
+`changed`, `down` or `per_user`, and its hosts), which the host preflight's H-MCP reads; Policy
+Admin's read is `GET /internal/admin/mcp` (Admins and Auditors), served by `pmos-web` in
+`GET /api/admin/policy` as `mcp`.
+
 ## Storage
 
 Every store sits behind an async trait (`crates/toolserver/src/store.rs`). Each has an in-memory
