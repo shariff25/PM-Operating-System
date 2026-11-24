@@ -352,7 +352,10 @@ impl Lock {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
             {
-                return Err(format!("line {}: `{key}` has an unexpected character", i + 1));
+                return Err(format!(
+                    "line {}: `{key}` has an unexpected character",
+                    i + 1
+                ));
             }
             match key.trim() {
                 "PROVER_VERSION" => lock.version = value.to_string(),
@@ -631,9 +634,7 @@ fn run_bounded(program: &Path, args: &[&str], kill_after: Duration) -> Run {
     if let Some(mut out) = child.stdout.take() {
         std::thread::spawn(move || {
             let mut buf = Vec::new();
-            let _ = (&mut out)
-                .take(MAX_OUTPUT as u64 + 1)
-                .read_to_end(&mut buf);
+            let _ = (&mut out).take(MAX_OUTPUT as u64 + 1).read_to_end(&mut buf);
             let _ = tx.send(buf);
         });
     }
@@ -1034,7 +1035,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const ALL: &str = r#""coverage":{"domains":["filesystem","network_l4","network_rest","process","landlock"]}"#;
+    const ALL: &str =
+        r#""coverage":{"domains":["filesystem","network_l4","network_rest","process","landlock"]}"#;
 
     fn out(s: &str) -> Vec<u8> {
         s.as_bytes().to_vec()
@@ -1052,13 +1054,17 @@ mod tests {
             classify(Some(1), false, &out(&within)).status,
             Status::Error
         );
-        let exceeds = r#"{"result":"exceeds_boundary","counterexample":"filesystem write /sandbox"}"#;
+        let exceeds =
+            r#"{"result":"exceeds_boundary","counterexample":"filesystem write /sandbox"}"#;
         let o = classify(Some(0), false, &out(exceeds));
         assert_eq!(o.status, Status::Error);
         assert_eq!(o.reason_code.as_deref(), Some("exit_code_mismatch"));
         let o = classify(Some(1), false, &out(exceeds));
         assert_eq!(o.status, Status::Exceeds);
-        assert_eq!(o.counterexample.as_deref(), Some("filesystem write /sandbox"));
+        assert_eq!(
+            o.counterexample.as_deref(),
+            Some("filesystem write /sandbox")
+        );
         // A missing domain.
         let partial = r#"{"result":"within_boundary","coverage":{"domains":["filesystem","network_l4","process","landlock"]}}"#;
         let o = classify(Some(0), false, &out(partial));
@@ -1086,7 +1092,11 @@ mod tests {
                 Status::Inconclusive,
             ),
             (Some(3), r#"{"result":"within_boundary"}"#, Status::Error),
-            (Some(2), r#"{"result":"error","reason":"bad yaml"}"#, Status::Error),
+            (
+                Some(2),
+                r#"{"result":"error","reason":"bad yaml"}"#,
+                Status::Error,
+            ),
             (Some(2), "not json", Status::Error),
             (Some(0), "not json", Status::Error),
             (Some(0), "[1,2]", Status::Error),
@@ -1203,11 +1213,8 @@ mod tests {
         assert!(boundary_alone(&["policies/boundary/pmos-bot.yaml"]).is_ok());
         assert!(boundary_alone(&["policies/bots/docs.yaml", "crates/policy/src/lib.rs"]).is_ok());
         assert!(boundary_alone(&[]).is_ok());
-        let err = boundary_alone(&[
-            "policies/boundary/pmos-bot.yaml",
-            "policies/bots/docs.yaml",
-        ])
-        .unwrap_err();
+        let err = boundary_alone(&["policies/boundary/pmos-bot.yaml", "policies/bots/docs.yaml"])
+            .unwrap_err();
         assert!(err.contains("policies/bots/docs.yaml"), "{err}");
         assert!(boundary_alone(&["policies/boundary/pmos-bot.yaml", "  ", ""]).is_ok());
     }

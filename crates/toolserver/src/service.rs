@@ -519,6 +519,9 @@ pub struct ToolService {
     /// tool call (`crate::model_source`). `main` always sets it; `None` (tests that run no
     /// gateway) checks nothing.
     model_source: Option<Arc<crate::model_source::SourceGuard>>,
+    /// The host's policy proofs and the sandboxes' own decisions (`crate::openshell`). In
+    /// memory unless `main` gives it the database ([`ToolService::with_openshell`]).
+    openshell: Arc<dyn crate::openshell::OpenShellStore>,
 }
 
 /// The most (kind, person) marks [`ToolService::first_in_window`] keeps.
@@ -560,7 +563,11 @@ impl ToolService {
                 ));
             }
         }
+        let openshell: Arc<dyn crate::openshell::OpenShellStore> = Arc::new(
+            crate::openshell::MemoryOpenShell::new(Some(stores.audit.clone())),
+        );
         Ok(Self {
+            openshell,
             roster: RwLock::new(Arc::new(catalog.roster().clone())),
             content_sha: RwLock::new(catalog.content_sha().map(String::from)),
             catalog,
@@ -579,6 +586,17 @@ impl ToolService {
             quiet_marks: Mutex::default(),
             model_source: None,
         })
+    }
+
+    /// Keep proofs and sandbox decisions in `store` (Postgres in a deployment).
+    pub fn with_openshell(mut self, store: Arc<dyn crate::openshell::OpenShellStore>) -> Self {
+        self.openshell = store;
+        self
+    }
+
+    /// The host's policy proofs and the sandboxes' own decisions.
+    pub fn openshell(&self) -> &Arc<dyn crate::openshell::OpenShellStore> {
+        &self.openshell
     }
 
     /// Check the model gateway's source at every session open and tool call (slice H4).

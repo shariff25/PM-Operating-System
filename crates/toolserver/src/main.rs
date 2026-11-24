@@ -34,6 +34,11 @@ async fn main() -> Result<()> {
     if args.first().map(String::as_str) == Some("users") {
         std::process::exit(pmos_toolserver::users::host::main(args[1..].to_vec()).await);
     }
+    // `pmos-toolserver policy-proof record`: the host's prover results (`pmos-admin policy
+    // prove`, docs/openshell-prover-and-sandbox-audit-spec.md §A.5), not the server.
+    if args.first().map(String::as_str) == Some("policy-proof") {
+        std::process::exit(pmos_toolserver::openshell::proofs::host_main(args[1..].to_vec()).await);
+    }
 
     tracing_subscriber::fmt()
         .json()
@@ -61,6 +66,8 @@ async fn main() -> Result<()> {
         Catalog::load(&config.content_root, Utc::now().date_naive()).context("loading content")?;
     let cancel = CancellationToken::new();
 
+    // The policy proofs and sandbox decisions (crate::openshell) live in the same database.
+    let mut openshell_pg: Option<PgStore> = None;
     let mut stores = match &config.database_url {
         Some(url) => {
             let pg = PgStore::connect(url)
@@ -84,6 +91,7 @@ async fn main() -> Result<()> {
                 "context indexed"
             );
             spawn_pruner(pg.clone(), cancel.clone());
+            openshell_pg = Some(pg.clone());
             pg.with_deactivation_cap(config.users_deactivations_per_hour)
                 .stores()
         }
@@ -258,6 +266,9 @@ async fn main() -> Result<()> {
             config.model_source,
             &config.gateway_url,
         )));
+    if let Some(pg) = openshell_pg {
+        svc = svc.with_openshell(Arc::new(pg));
+    }
     // Password sign-in (docs/password-sign-in.md): on when the vault has a key to seal
     // authenticator secrets with; its routes also need assertion `require`.
     match &config.password_keys {

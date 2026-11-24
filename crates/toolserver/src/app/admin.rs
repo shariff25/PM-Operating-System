@@ -72,6 +72,7 @@ pub(super) fn routes(state: AppState) -> Router<AppState> {
             axum::routing::post(open_proposal).layer(DefaultBodyLimit::max(MAX_PROPOSAL_BODY)),
         )
         .route("/admin/protection", get(protection))
+        .route("/admin/policy/proofs", get(policy_proofs))
         .route("/admin/actions", axum::routing::post(record_action))
         .route("/admin/events", axum::routing::post(sign_in_event))
         .layer(middleware::from_fn_with_state(state, identify_admin_client))
@@ -1264,6 +1265,45 @@ async fn protection(
         );
     }
     crate::proposals::protection(state.onboarding.oauth(), state.onboarding.proposals(), user).await
+}
+
+/// `GET /internal/admin/policy/proofs?user=<viewer>`: the newest host proof of each bot
+/// (`docs/openshell-prover-and-sandbox-audit-spec.md` §A.5), for Policy Admin's Prover row.
+/// `view-policies` (admins and auditors): a proof holds only policy terms (a status, a reason
+/// code, a counterexample naming a path, host, port or route of the policy, hashes). Not
+/// recorded when allowed (Policy Admin asks on every load, as for `protection`); a refusal is.
+/// The tool server runs no prover: these are what `pmos-admin policy prove` recorded.
+async fn policy_proofs(
+    State(state): State<AppState>,
+    Extension(client): Extension<Client>,
+    Query(q): Query<ViewerParams>,
+) -> Response {
+    let user = match named(q.user.as_deref()) {
+        Ok(u) => u,
+        Err(r) => return *r,
+    };
+    let allowed = match state.svc.people().user(user).await {
+        Ok(u) => u.is_some_and(|m| permits(&m, Permission::ViewPolicies)),
+        Err(e) => return unavailable(e),
+    };
+    if !allowed {
+        record(&state, client, user, "admin.policy_proofs", Outcome::Denied).await;
+        return coded(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "this person's role doesn't allow this",
+        );
+    }
+    let proofs = match state.svc.openshell().latest_proofs().await {
+        Ok(p) => p,
+        Err(e) => return unavailable(e),
+    };
+    Json(json!({
+        "proofs": proofs,
+        "not_proved": pmos_policy::prove::NOT_PROVED,
+        "domains": pmos_policy::prove::DOMAINS,
+    }))
+    .into_response()
 }
 
 /// The actions `pmos-web` may record ([`record_action`]).

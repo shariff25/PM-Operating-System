@@ -9,14 +9,42 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use pmos_policy::prove::{
-    self, network_view, network_view_text, prove_all, sha256_hex, Candidate, Finding, Lock,
-    Prover, Status, VIEW_NOTE, VIEW_REMOVED_KEYS,
+    self, network_view, network_view_text, prove_all, sha256_hex, Candidate, Finding, Lock, Prover,
+    Status, VIEW_NOTE, VIEW_REMOVED_KEYS,
 };
 use pmos_policy::{openshell, Service};
 use serde_json::{json, Value};
 
 fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+#[test]
+fn neither_the_web_app_nor_the_tool_server_can_run_the_prover() {
+    // PRV-1: the prover runs only in CI and on the host as the gateway's user. A code search,
+    // as the spec's acceptance check: no service crate starts it or names its binary.
+    let services = [
+        "crates/web/src",
+        "crates/toolserver/src",
+        "crates/runtime/src",
+        "crates/gateway/src",
+    ];
+    for krate in services {
+        for entry in walkdir::WalkDir::new(repo().join(krate)) {
+            let entry = entry.unwrap();
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let text = fs::read_to_string(entry.path()).unwrap_or_default();
+            for needle in ["Prover::new", "prove_all", "openshell-prover\"", "Prover {"] {
+                assert!(
+                    !text.contains(needle),
+                    "{} names `{needle}`: the prover never runs in a service",
+                    entry.path().display()
+                );
+            }
+        }
+    }
 }
 
 fn docs_policy() -> String {
@@ -191,7 +219,10 @@ fn another_version_is_a_mismatch_older_says_too_old() {
         assert_eq!(r.outcome.reason_code.as_deref(), Some(code), "{v}");
         if v == "0.1.8" {
             let reason = r.outcome.reason.unwrap();
-            assert!(reason.contains("too old") && reason.contains("pinned 0.1.9"), "{reason}");
+            assert!(
+                reason.contains("too old") && reason.contains("pinned 0.1.9"),
+                "{reason}"
+            );
         }
     }
 }
@@ -405,8 +436,8 @@ fn the_view_only_ever_deletes_five_keys_of_mcp_endpoints() {
                 [parts[4].parse::<usize>().unwrap()];
             assert_eq!(endpoint["protocol"], "mcp", "case {case}: {p} wasn't MCP");
             // Deleted, never changed: the view has no such key.
-            let v_endpoint =
-                &view["network_policies"][parts[2]]["endpoints"][parts[4].parse::<usize>().unwrap()];
+            let v_endpoint = &view["network_policies"][parts[2]]["endpoints"]
+                [parts[4].parse::<usize>().unwrap()];
             assert!(v_endpoint.get(parts[5]).is_none());
         }
         // The tool server's destination survives whatever it became.
@@ -446,7 +477,10 @@ fn the_boundary_parses_as_a_policy_and_states_the_pinned_services() {
     assert!(!fs.include_workdir);
     assert_eq!(fs.read_only, ["/"]);
     assert_eq!(fs.read_write, ["/dev/null", "/sandbox/workspace", "/tmp"]);
-    assert_eq!(b.landlock.as_ref().unwrap().compatibility, "hard_requirement");
+    assert_eq!(
+        b.landlock.as_ref().unwrap().compatibility,
+        "hard_requirement"
+    );
     let p = b.process.as_ref().unwrap();
     assert_eq!(p.run_as_user.as_deref(), Some(pmos_policy::RUN_AS));
     assert_eq!(p.run_as_group.as_deref(), Some(pmos_policy::RUN_AS));

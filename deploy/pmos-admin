@@ -25,6 +25,9 @@
 #   pmos-admin sandbox <bot> [--dry-run]
 #                                     create the bot's OpenShell sandbox and start its worker as
 #                                     a systemd user unit (--dry-run: print what it would run)
+#   pmos-admin policy prove <bot> | --all
+#                                     OpenShell's pinned policy prover on each sandbox's effective
+#                                     policy, recorded for Policy Admin (as the gateway's user)
 #   pmos-admin pause <bot> / resume <bot>
 #                                     stop or restart a bot's sandbox and its worker unit
 #   pmos-admin host-names apply       (with sudo) write the managed block in /etc/hosts that maps
@@ -78,9 +81,11 @@ cmd=${1:-help}
 ENV_TMP=""
 HOSTS_TMP=""
 EVAL_STACK_UP=0
+PROVE_TMP=""
 cleanup() {
   [ -z "$ENV_TMP" ] || rm -f -- "$ENV_TMP"
   [ -z "$HOSTS_TMP" ] || rm -f -- "$HOSTS_TMP"
+  [ -z "$PROVE_TMP" ] || rm -rf -- "$PROVE_TMP"
   [ "$EVAL_STACK_UP" = 0 ] || eval_stack_down
   return 0
 }
@@ -2398,6 +2403,7 @@ for g in s["groups"]:
     systemctl --user enable --now "$unit"
     say "sandbox $sandbox created; its worker runs as the user unit $unit"
     say "check it with: systemctl --user status '$unit'"
+    say "next: deploy/pmos-admin policy prove $bot (OpenShell's prover on the policy the sandbox enforces)"
     ;;
 
   pause)
@@ -2476,6 +2482,87 @@ for g in s["groups"]:
     systemctl --user reset-failed "$unit" 2>/dev/null || true
     systemctl --user enable --now "$unit"
     say "pmos-$1 started; its worker runs as the user unit $unit"
+    say "next: deploy/pmos-admin policy prove $1 (OpenShell's prover on the policy the sandbox now enforces)"
+    ;;
+
+  policy)
+    # OpenShell's policy prover on what each sandbox enforces (slice A3;
+    # docs/openshell-prover-and-sandbox-audit-spec.md §A.1 and §A.5). Run as the user whose
+    # OpenShell gateway runs (as `sandbox` requires), never as root. For each bot:
+    #   1. `openshell sandbox get pmos-<bot> --policy-only` into a mode-600 file in a mode-700
+    #      directory (verify on a real host: that it prints a policy the prover reads, and that it
+    #      equals the checked-in one for PM OS's endpointless providers);
+    #   2. `pmos policy prove --candidate …` in the pmos image, as this user, with no network, the
+    #      checkout, the candidate, the prover and the pin mounted read-only: it checks the prover's
+    #      SHA-256 and version against deploy/openshell-prover.lock, builds the network view and
+    #      classifies the answer (only `proved` passes). The prover runs with an empty environment
+    #      and holds no provider token; no sandbox and no service is involved;
+    #   3. `pmos-toolserver policy-proof record` in a one-off tool server container records the
+    #      result with PMOS_HOST_USER (table policy_proofs and an audit event policy.prove).
+    # No prover on this host (PMOS_PROVER in deploy/.env, else openshell-prover on PATH) is
+    # recorded as `not_available`, never skipped.
+    policy_usage() { say "usage: pmos-admin policy prove <bot> | --all" >&2; exit 2; }
+    [ $# -eq 2 ] && [ "$1" = prove ] || policy_usage
+    if [ "$(id -u)" = 0 ]; then
+      say "run policy prove as the user whose OpenShell gateway runs, not as root or with sudo: the prover never runs as root" >&2
+      exit 2
+    fi
+    host_user=$(id -un)
+    if ! [[ "$host_user" =~ ^[a-z_][a-z0-9_.-]{0,31}$ ]]; then
+      say "the OS user \"$host_user\" can't be recorded (it must match ^[a-z_][a-z0-9_.-]{0,31}\$): run this as a named user" >&2
+      exit 2
+    fi
+    bots=()
+    if [ "$2" = --all ]; then
+      for f in "$PMOS_CONTENT_CHECKOUT"/policies/bots/*.yaml; do
+        [ -f "$f" ] || continue
+        b=$(basename "$f" .yaml)
+        case "$b" in *.sandbox) continue ;; esac
+        if valid_bot_name "$b"; then bots+=("$b"); else say "skipping $(printf '%q' "$b"): not a bot name" >&2; fi
+      done
+      [ ${#bots[@]} -gt 0 ] || { say "no bot policies under $PMOS_CONTENT_CHECKOUT/policies/bots" >&2; exit 1; }
+    else
+      require_bot_name "policy prove" "$2"
+      bots=("$2")
+    fi
+    [ -f "$PMOS_CONTENT_CHECKOUT/policies/boundary/pmos-bot.yaml" ] ||
+      { say "no boundary at $PMOS_CONTENT_CHECKOUT/policies/boundary/pmos-bot.yaml" >&2; exit 1; }
+    command -v openshell >/dev/null || { say "openshell is not installed" >&2; exit 1; }
+    prover=${PMOS_PROVER:-}
+    [ -n "$prover" ] || prover=$(command -v openshell-prover || true)
+    case "$prover" in *:*) say "PMOS_PROVER can't contain ':'" >&2; exit 2 ;; esac
+    PROVE_TMP=$(umask 077 && mktemp -d "${TMPDIR:-/tmp}/pmos-prove.XXXXXX")
+    chmod 700 "$PROVE_TMP"
+    mounts=(-v "$PMOS_CONTENT_CHECKOUT:/srv/content-repo:ro" -v "$PROVE_TMP:/run/pmos-prove:ro"
+      -v "$DEPLOY/openshell-prover.lock:/run/pmos-prove-lock/openshell-prover.lock:ro")
+    if [ -n "$prover" ] && [ -f "$prover" ]; then
+      mounts+=(-v "$prover:/run/pmos-prover/openshell-prover:ro")
+    else
+      say "no prover on this host (set PMOS_PROVER, or install openshell-prover): every bot is recorded not_available" >&2
+    fi
+    failed=0
+    for bot in "${bots[@]}"; do
+      if ! (umask 077 && openshell sandbox get "pmos-$bot" --policy-only >"$PROVE_TMP/$bot.yaml"); then
+        say "openshell couldn't print pmos-$bot's policy: recorded as an error" >&2
+        rm -f "$PROVE_TMP/$bot.yaml"
+      fi
+      code=0
+      docker run --rm --network none --user "$(id -u):$(id -g)" "${mounts[@]}" -w /srv/content-repo \
+        "pmos:${PMOS_VERSION:-local}" pmos policy prove --root content \
+        --boundary policies/boundary/pmos-bot.yaml --prover /run/pmos-prover/openshell-prover \
+        --lock /run/pmos-prove-lock/openshell-prover.lock --candidate "/run/pmos-prove/$bot.yaml" \
+        --bot "$bot" --format json >"$PROVE_TMP/$bot.json" || code=$?
+      if [ "$code" -gt 1 ] || ! [ -s "$PROVE_TMP/$bot.json" ]; then
+        say "pmos policy prove couldn't run for $bot (exit $code): nothing recorded for it" >&2
+        failed=1
+        continue
+      fi
+      compose --profile cli run --rm --no-deps -T -e "PMOS_HOST_USER=$host_user" toolserver-cli \
+        pmos-toolserver policy-proof record <"$PROVE_TMP/$bot.json" || { failed=1; continue; }
+      [ "$code" = 0 ] || failed=1
+    done
+    [ "$failed" = 0 ] && say "every bot proved" || say "not every bot is proved: only \`proved\` passes (Policy Admin shows each result)" >&2
+    exit "$failed"
     ;;
 
   host-names)

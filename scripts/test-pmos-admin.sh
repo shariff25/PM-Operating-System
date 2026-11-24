@@ -188,6 +188,13 @@ fi
 if [[ " $* " == *" config --services "* ]]; then
   printf '%s\n' ${FAKE_SERVICES:-postgres docs toolserver gateway bots slack console web worker-docs vllm-default vllm-extraction}
 fi
+# `docker run … pmos policy prove …` (slice A3): the report the test gives (FAKE_PROVE_JSON) and
+# its exit code (FAKE_PROVE_EXIT); `… policy-proof record`: what it read on standard input.
+if [[ " $* " == *" pmos policy prove "* ]] && [ -n "${FAKE_PROVE_JSON:-}" ]; then
+  cat "$FAKE_PROVE_JSON"
+  exit "${FAKE_PROVE_EXIT:-0}"
+fi
+if [[ " $* " == *" policy-proof record "* ]]; then cat >>"${PROOF_STDIN_LOG:-/dev/null}"; fi
 # What reached docker through its environment, never its arguments (S1).
 printf 'evals_token=%s https_proxy=%s personal_rt=%s personal_gw=%s\n' "${PMOS_EVALS_TOKEN-unset}" "${HTTPS_PROXY-unset}" \
   "${PMOS_BRINGUP_PERSONAL_RT_TOKEN-unset}" "${PMOS_BRINGUP_PERSONAL_GW_TOKEN-unset}" >>"${DOCKER_ENV_LOG:-/dev/null}"
@@ -2438,6 +2445,68 @@ FAKE_DOCKER_FAIL=1 run_stack up >/dev/null 2>&1 || code=$?
 [ -d "$WORK/state/route-control" ] || fail "up didn't make the route-control directory"
 rm -rf "$WORK/stack/deploy/secrets" "$WORK/state/compose.upstream-keys.yaml" "$WORK/state/usage" "$WORK/state/gateway.hosted-test.yaml"
 echo "model routes checked"
+
+# --- policy prove: OpenShell's prover on each sandbox's effective policy (slice A3) ------------
+# docs/openshell-prover-and-sandbox-audit-spec.md §A.1, §A.5, §A.8: refuses root and bad names
+# before anything runs; for each bot it saves `openshell sandbox get pmos-<bot> --policy-only`,
+# runs `pmos policy prove` in the image as this user with no network and everything read-only,
+# and records the report with `pmos-toolserver policy-proof record` and PMOS_HOST_USER; a missing
+# prover is recorded (not_available), never skipped.
+mkdir -p "$checkout/policies/boundary"
+cp "$ROOT_SRC/policies/boundary/pmos-bot.yaml" "$checkout/policies/boundary/"
+printf '#!/bin/sh\nexit 0\n' >"$WORK/fake-prover"
+chmod 755 "$WORK/fake-prover"
+export PROOF_STDIN_LOG="$WORK/proof-stdin.log"
+printf '{"prover":{"version":"0.1.9","sha256":null},"boundary_sha256":null,"results":[{"bot":"docs","status":"not_available","coverage":[]}]}\n' >"$WORK/prove.json"
+bot_env "PMOS_PROVER=$WORK/fake-prover"
+: >"$DOCKER_LOG"
+for bad in "../x" "A" "x;id" "--dry-run"; do
+  code=0
+  run_bot policy prove "$bad" >/dev/null 2>&1 || code=$?
+  [ "$code" = 2 ] || fail "policy prove $(printf '%q' "$bad") exits $code, not 2"
+done
+code=0
+run_bot policy >/dev/null 2>&1 || code=$?
+[ "$code" = 2 ] || fail "policy without prove exits $code, not 2"
+code=0
+out=$(FAKE_UID=0 run_bot policy prove docs 2>&1) || code=$?
+[ "$code" = 2 ] && [[ "$out" == *"not as root"* ]] || fail "policy prove as root ($code): $out"
+[ ! -s "$OPENSHELL_LOG" ] && [ ! -s "$DOCKER_LOG" ] || fail "a refused policy prove reached openshell or docker"
+: >"$PROOF_STDIN_LOG"
+FAKE_PROVE_JSON="$WORK/prove.json" FAKE_PROVE_EXIT=1 run_bot policy prove --all >/dev/null 2>&1 || true
+for b in abcdefghijklmnopqrstuvwxyz-12345 docs pm pm-ana; do
+  grep -q "^args=sandbox get pmos-$b --policy-only" "$OPENSHELL_LOG" || fail "policy prove --all didn't read pmos-$b's policy: $(cat "$OPENSHELL_LOG")"
+  grep -q "args=run --rm --network none --user [0-9]*:[0-9]* .*pmos:local pmos policy prove .* --candidate /run/pmos-prove/$b.yaml --bot $b --format json" "$DOCKER_LOG" ||
+    fail "policy prove didn't run pmos for $b without network: $(cat "$DOCKER_LOG")"
+done
+! grep -q 'sandbox get pmos-docs.sandbox' "$OPENSHELL_LOG" || fail "policy prove --all took a launch spec for a bot"
+line=$(grep 'pmos policy prove' "$DOCKER_LOG" | head -1)
+for m in "$checkout:/srv/content-repo:ro" ":/run/pmos-prove:ro" "openshell-prover.lock:/run/pmos-prove-lock/openshell-prover.lock:ro" "$WORK/fake-prover:/run/pmos-prover/openshell-prover:ro"; do
+  [[ "$line" == *"$m"* ]] || fail "policy prove's container doesn't mount $m read-only: $line"
+done
+[ "$(grep -c -- "--profile cli run --rm --no-deps -T -e PMOS_HOST_USER=pmosop toolserver-cli pmos-toolserver policy-proof record" "$DOCKER_LOG")" = 4 ] ||
+  fail "policy prove didn't record one report per bot with PMOS_HOST_USER: $(cat "$DOCKER_LOG")"
+[ "$(grep -c '"not_available"' "$PROOF_STDIN_LOG")" = 4 ] || fail "the reports didn't reach policy-proof record: $(cat "$PROOF_STDIN_LOG")"
+! grep -rq 'SECRET\|token' "$PROOF_STDIN_LOG" || fail "a report carried a token"
+# No prover on the host: still run and recorded, without the prover's mount, and said so.
+bot_env
+: >"$DOCKER_LOG"
+code=0
+out=$(PATH="$SBIN:$WORK/bin:/usr/bin:/bin" FAKE_PROVE_JSON="$WORK/prove.json" FAKE_PROVE_EXIT=1 "${stack[@]}" policy prove docs 2>&1) || code=$?
+[ "$code" = 1 ] || fail "policy prove with no prover exits $code, not 1: $out"
+[[ "$out" == *"every bot is recorded not_available"* ]] || fail "policy prove didn't say the prover is missing: $out"
+! grep -q '/run/pmos-prover/openshell-prover:ro' "$DOCKER_LOG" || fail "a missing prover was mounted"
+grep -q 'policy-proof record' "$DOCKER_LOG" || fail "a missing prover wasn't recorded"
+# A sandbox it can't read is recorded as what the prover makes of no file (an error), not skipped.
+: >"$DOCKER_LOG"
+FAKE_OPENSHELL_FAIL=1 FAKE_PROVE_JSON="$WORK/prove.json" run_bot policy prove docs >/dev/null 2>&1 || true
+grep -q 'policy-proof record' "$DOCKER_LOG" || fail "an unreadable sandbox policy wasn't recorded"
+# A pmos that couldn't run (exit 2) records nothing and fails.
+: >"$DOCKER_LOG"
+code=0
+FAKE_PROVE_JSON="$WORK/prove.json" FAKE_PROVE_EXIT=2 run_bot policy prove docs >/dev/null 2>&1 || code=$?
+[ "$code" = 1 ] && ! grep -q 'policy-proof record' "$DOCKER_LOG" || fail "policy prove recorded a run that couldn't happen ($code)"
+echo "policy prove checks passed"
 
 # --- compose renders (C9, C14): without docker compose, say so and skip ---------------------
 if docker compose version >/dev/null 2>&1; then
