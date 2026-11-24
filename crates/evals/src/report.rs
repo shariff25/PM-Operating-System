@@ -90,7 +90,7 @@ pub struct GatewayModels {
     /// Role name (`default`) to the model id that served it, or the neutral `label:` the
     /// gateway reports in its place (`docs/gateway.md`).
     pub roles: BTreeMap<String, String>,
-    /// Role name to a neutral label for its upstream: `local` (a model server on the Spark),
+    /// Role name to a neutral label for its upstream: `local` (a model server on PM OS's host),
     /// `claude-test` or `remote-test` (testing-only upstreams off the machine). Never a host.
     pub upstreams: BTreeMap<String, String>,
     /// The gateway answered with its stub model.
@@ -99,8 +99,8 @@ pub struct GatewayModels {
     pub cloud_test: bool,
     /// The gateway's own workaround switch (`PMOS_GATEWAY_WORKAROUNDS`).
     pub workarounds: bool,
-    /// The gateway's class (`class:` in its config): `production` only for the Spark's own
-    /// gateway (`deploy/gateway.yaml`), `test` otherwise, and for a gateway too old to say.
+    /// The gateway's class (`class:` in its config): `production` only for the deployment's
+    /// own gateway (`deploy/gateway.yaml`), `test` otherwise, and for a gateway too old to say.
     /// Only a `production` class counts towards a bar (review finding R3).
     #[serde(default = "test_class")]
     pub class: String,

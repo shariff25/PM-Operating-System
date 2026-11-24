@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # PM OS services: every Rust binary in one image; compose picks the binary per service.
-# Built on the Spark itself (arm64) with `deploy/pmos-admin build`.
+# Built on the host, for its own architecture, with `deploy/pmos-admin build`.
 #
 # Behind a proxy that re-signs TLS, `pmos-admin build` passes HTTPS_PROXY as a build argument
 # and the proxy's CA certificate as the build secret `ca` (PMOS_BUILD_CA in deploy/.env).

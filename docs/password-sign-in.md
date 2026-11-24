@@ -496,7 +496,7 @@ should do: treat the host as part of the sign-in's trust boundary; run only PM O
 reverse proxy there; give no untrusted user a shell on it; and, where other software must run
 there, keep it from reaching `127.0.0.1:8770` (a host firewall rule that lets only the proxy's
 user connect, for example `iptables -A OUTPUT -o lo -p tcp --dport 8770 -m owner ! --uid-owner
-<proxy user> -j REJECT`). **Not verified on the Spark:**
+<proxy user> -j REJECT`). **Not verified on a real host:**
 that the published port's traffic arrives from the gateway (it does with Docker's default
 userland proxy and with its iptables rules). If it doesn't, nothing is shared silently any more:
 every password request is refused `403 proxy_not_trusted`, `/readyz` counts them and carries
@@ -752,5 +752,5 @@ keyboards and input methods (only the rule's unit test).
 - **"End the old credential at once" on a reset** (above).
 - **Not verified:** a real authenticator app scanning the URI (the codes are tested against
   RFC 6238's vectors and the URI against the Key Uri Format); a deployment behind a real reverse
-  proxy, and the address it appears from on the Spark (the `pmos` network's gateway, by Docker's
+  proxy, and the address it appears from on the host (the `pmos` network's gateway, by Docker's
   documented behaviour).

@@ -135,7 +135,7 @@ calibrated judge can fail the eval gate.
    - **At least 100,** with both answers well represented; aim for at least 30 of each.
    - **From real outputs,** including hard cases near the line, not only obvious ones.
    - **Labelled before you see the judge's verdict,** so it doesn't sway you.
-2. **Calibrate** on the Spark, where the gateway is:
+2. **Calibrate** on PM OS's host, where the gateway is:
    ```sh
    cd /opt/pmos
    deploy/pmos-admin evals-stack judge calibrate <name>
@@ -164,9 +164,9 @@ the categories of the bot whose files changed (owner's decision): a change tuned
 can regress another, and skills are shared across personas. So a one-line skill edit costs a
 full run, every task times its repeats (103 tasks × 3 = 309 attempts on 2026-11-23), and a PR
 that touches only `content/context/`, `content/templates/` or `content/playbooks/` runs none
-(run the categories that read them by hand). The workflow still names the Spark's
-self-hosted runner label (`pmos-spark`) from the earlier plan; where the runner lives is to be
-decided, since the Spark is no longer a target. Its summary is the job summary of the "Eval
+(run the categories that read them by hand). The gate runs on a self-hosted runner on a host
+the owner chooses (not yet decided); the workflow's runner label, `pmos-spark`, is a historical
+name kept until then. Its summary is the job summary of the "Eval
 gate" check (or, until a runner is registered, pasted into the PR by a platform owner). One
 section per category:
 
@@ -189,7 +189,7 @@ section per category:
   never fail the gate; read their "no"s as leads.
 
 **What to do with a failure:** read the failing tasks' details in the candidate report
-(written on the Spark, linked from the job log), and open their task pages. If a failure is
+(written on the runner's host, linked from the job log), and open their task pages. If a failure is
 the task's fault (a phrase every good answer paraphrases), fix the task in the same PR. If the
 change really made things worse, fix the change. Don't lower a bar or delete a task to pass the
 gate. With few tasks the interval is only approximate: if it barely misses 0, rerun once

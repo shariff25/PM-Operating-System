@@ -4,6 +4,13 @@ One "PM OS can now ___" line per capability a PM would care about (the launch-po
 `docs/bot-decisions.md` D9). Plumbing that a PM never sees doesn't get a line.
 
 ## Unreleased (before Gate 1; nothing is live yet)
+- **The docs now describe PM OS on any suitable Linux host** (slice H6, after the owner's
+  decision of 2026-11-22 to drop the DGX Spark as a deployment target): the runbooks, the
+  gateway and plan docs, and the deploy kit's comments say "PM OS's host"; promises about
+  Slack text (24 hours), traces (30 days) and the audit log (90 days) say what PM OS does on
+  its host, with a hosted provider's own retention a condition of approving it; and
+  `scripts/check-model-promises.sh`, run in CI, finds any doc that still promises prompts stay
+  on local models.
 - Security fixes from the review of `b469d5b` (user database):
   - **Nobody can link someone else's account to their own Microsoft account.** The tool server
     now checks the Microsoft ID token of a first sign-in itself, once per token, instead of

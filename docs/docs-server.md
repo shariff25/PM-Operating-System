@@ -201,7 +201,7 @@ index.)
   Slack** below), or, when the bot runs without `PMOS_BOTS_URL`, a note saying who to ask.
 - **Audit:** each search runs as that PM under the `docs` skill and is audited (`docs.search`,
   user, run `slack-docs-<envelope id>`).
-- **Connection:** Socket Mode, so the Spark needs no inbound connection from Slack.
+- **Connection:** Socket Mode, so PM OS's host needs no inbound connection from Slack.
   - The bot reconnects whenever Slack refreshes the connection.
   - It pings every 30 seconds and reconnects if nothing arrives for 90 seconds, so a link
     that died silently is replaced.
@@ -426,7 +426,7 @@ own token, so the user scopes now include `channels:read`, `groups:read`, `mpim:
 `im:read` (`docs/slack-app-manifest.yaml`). PMs who linked Slack before this need to link it
 again to grant them.
 
-## Network on the Spark
+## Network on PM OS's host
 
 | Service | Needs to reach |
 | --- | --- |

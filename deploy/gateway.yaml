@@ -1,6 +1,6 @@
-# PM OS gateway on the Spark: the roles served by the vLLM containers in deploy/compose.yaml.
+# PM OS gateway for PMOS_MODEL_SOURCE=local: the roles served by the vLLM containers in deploy/compose.yaml.
 # Same roles as config/gateway.yaml; only the upstream addresses differ (compose service names).
-# Confirm the served model names on the Spark before first use; swapping a model is
+# Confirm the served model names on the host before first use; swapping a model is
 # docs/runbooks/model-swap.md.
 #
 # The `model` of each role here is the PRODUCTION ROLE MODEL: an eval report counts towards a
@@ -8,7 +8,8 @@
 # the gateway reported for that run match these, role for role (docs/evals.md, "Which runs
 # count"). Swapping a model here therefore restarts every benchmark streak.
 #
-# `class: production` marks this as the Spark's own gateway: it reports it in
+# `class: production` marks this as the deployment's own gateway (`local`; `hosted`, an
+# approved provider, is not built yet): it reports it in
 # GET /v1/pmos/roles, and an eval report counts towards a bar only when the runtime under test
 # reports a production-class gateway (docs/evals.md, "Which runs count"). A production gateway
 # refuses testing-only upstreams, `local-hosts`, and any model server not named

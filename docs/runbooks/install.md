@@ -1,4 +1,4 @@
-# Install PM OS on the Spark
+# Install PM OS on a host
 
 Do the stages in order and check each one before starting the next. Stages 1–4 use no real
 tokens and no real data, so you can go back and repeat them freely. Stage 6 is Gate 1.
@@ -7,11 +7,19 @@ Allow about half a day, most of it waiting for the first image build and model d
 
 ## Before you start
 
-- **The Spark:** DGX OS, with Docker and the NVIDIA container toolkit (both come with DGX OS).
-  You need a user that may run `docker`.
+- **The host:** a Linux host with Docker (the first host to verify on is an Ubuntu 24.04 x86
+  virtual machine). You need a user that may run `docker`. `deploy/setup.sh` runs the host
+  preflight (`deploy/preflight.sh`, stage `install`) before anything else and stops on any
+  `fail`; nothing has yet been seen working on a real OpenShell host
+  (`docs/openshell-any-host-spec.md` §6).
+- **The model source** (`PMOS_MODEL_SOURCE`, chosen once with `setup.sh --model-source`; Stage 3):
+  `local` needs an NVIDIA GPU and the NVIDIA container toolkit on a host the owner controls;
+  `hosted-test` needs no GPU and takes fake data only. `hosted` (one hosted model the owner has
+  approved, for real data) is not built yet and every service refuses it.
 - **Tools:** `git`, `openssl` and `flock` (from `util-linux`, present on most Linux hosts;
   `setup.sh` checks for all three before it clones anything).
-- **OpenShell:** installed on the Spark (`openshell --version`).
+- **OpenShell:** installed on the host (`openshell --version`), following NVIDIA's own install
+  page.
 - **Network:** outbound HTTPS to:
   - GitHub, for the code and content repos;
   - Docker Hub and `nvcr.io`, for images;
@@ -20,7 +28,7 @@ Allow about half a day, most of it waiting for the first image build and model d
   - Slack: `slack.com`, `wss-primary.slack.com` and `wss-backup.slack.com`;
   - from Gate 1: `api.atlassian.com`, `auth.atlassian.com` and `api.github.com`.
 
-  If the Spark has an outbound proxy, you'll set it in stage 1.
+  If the host has an outbound proxy, you'll set it in stage 1.
 - **The repo in your GitHub org.** The content repo must be in your company's GitHub org
   (`PMOS_CONTENT_REPO` must be in `PMOS_GITHUB_ORG`). If it still lives elsewhere, move it first.
 
@@ -30,8 +38,15 @@ Allow about half a day, most of it waiting for the first image build and model d
 sudo mkdir -p /opt/pmos /srv/pmos && sudo chown "$USER" /opt/pmos /srv/pmos
 git clone <the PM OS repo> /opt/pmos
 cd /opt/pmos
-deploy/setup.sh --content /srv/pmos/content-repo --clone <the content repo> --state /srv/pmos/state
+deploy/setup.sh --content /srv/pmos/content-repo --clone <the content repo> --state /srv/pmos/state \
+  --model-source local --exposure private     # or hosted-test, public: see below
 ```
+
+`--model-source` defaults to `hosted-test` (fake data only) and `--exposure` to `public`, the
+values that allow less; `setup.sh` never replaces a value already in `deploy/.env`. With
+`PMOS_EXPOSURE=public` the web app refuses to start until slice H10 (the admin listener) is
+built; `private` means the host is reached only from a network the company controls, which the
+preflight's H-PRIVATE checks.
 
 1. **Read `setup.sh`'s output.** Warnings about OpenShell or the NVIDIA runtime must be gone
    before stages 3 and 4.
@@ -39,7 +54,7 @@ deploy/setup.sh --content /srv/pmos/content-repo --clone <the content repo> --st
    - in GitHub, open the repo's Settings, then Deploy keys, and add the public key;
    - set `PMOS_CONTENT_DEPLOY_KEY=/srv/pmos/deploy_key` in `deploy/.env`;
    - use the `git@github.com:` URL for the checkout's remote.
-3. **The proxy, if the Spark has one.** In `deploy/.env`, set `HTTPS_PROXY` and `NO_PROXY`.
+3. **The proxy, if the host has one.** In `deploy/.env`, set `HTTPS_PROXY` and `NO_PROXY`.
    Also set `PMOS_BUILD_CA` if the proxy re-signs TLS.
 4. **Your docs site (optional).** For the Docs bot, set `PMOS_DOCS_BASE_URL` (and, if you
    need them, `PMOS_DOCS_NAME`, `PMOS_DOCS_PAGE_PREFIXES`, `PMOS_DOCS_API_PREFIX` and
@@ -47,8 +62,8 @@ deploy/setup.sh --content /srv/pmos/content-repo --clone <the content repo> --st
    pages: see "Pointing the Docs bot at your docs" in `docs/docs-server.md`. You can leave it
    blank and add it later; until then the Docs bot says no docs site is configured.
 5. **The console (optional).** `deploy/setup.sh` generates `PMOS_CONSOLE_PROXY_SECRET` in
-   `deploy/.env`. Its only use is the proxy, so if the console sits behind the Spark's sign-in
-   proxy, do both of these:
+   `deploy/.env`. Its only use is the proxy, so if the console sits behind a sign-in proxy on
+   this host, do both of these:
    - set `PMOS_CONSOLE_TRUST_PROXY=1` in `deploy/.env`, after the secret is there (the console
      won't start with trust on and no secret);
    - configure the proxy to strip `X-Forwarded-User` and `X-Pmos-Proxy-Secret` from the
@@ -144,9 +159,20 @@ the bot, or an admin's invite in the web app.
 
 ## Stage 3: The models
 
-1. **Check the model settings.** In `deploy/.env`, confirm `PMOS_VLLM_IMAGE` (NVIDIA's vLLM
-   image for the Spark), `PMOS_MODEL_DEFAULT` and `PMOS_MODEL_EXTRACTION`. Check each model's
-   id on Hugging Face. Set `HF_TOKEN` if a model needs one.
+There are three paths, by `PMOS_MODEL_SOURCE`: **local models** on this host's GPU (below),
+**a hosted test model** with fake data ("Without a GPU", below), and **`hosted`**, one hosted
+model the owner has approved for real data, which comes only after slices H12 and H13 (the
+owner's recorded approval of the provider, with its retention terms) and is refused until then.
+
+### Local models (`PMOS_MODEL_SOURCE=local`)
+
+1. **Check the model settings.** In `deploy/.env`, set `PMOS_VLLM_IMAGE`: a vLLM image you
+   choose for this host's architecture and GPU, pinned by tag (it has no default; the
+   preflight's H-NVIDIA checks it). Confirm `PMOS_MODEL_DEFAULT` and `PMOS_MODEL_EXTRACTION`, and
+   check each model's id on Hugging Face. Set `HF_TOKEN` if a model needs one.
+   Real data under `local` also needs a recorded attestation that the owner controls this GPU
+   host, before live connectors (the preflight's H-LOCAL):
+   `sudo deploy/pmos-admin host attest local-gpu --owner-controls --reason "<why>"`.
 2. **Turn off the stub:** set `PMOS_GATEWAY_STUB=0`.
 3. **Start the models:**
 
@@ -249,9 +275,9 @@ The bring-up worker isn't isolated. Replace it with the Docs bot's real sandbox.
    deploy/pmos-admin add-bot pm-<handle>
    deploy/pmos-admin sandbox pm-<handle>
    ```
-6. **Run the red-team checklist** in `policies/redteam/checklist.md`. Run it on the Spark only,
-   never on a shared machine. Work through the "Verify on the Spark" table in
-   `docs/sandbox-policies.md` as you go, and note anything that differed.
+6. **Run the red-team checklist** in `policies/redteam/checklist.md`. Run it only on this host,
+   and never on a host shared with other workloads. Work through the "Verify on a real host" list
+   in `docs/sandbox-policies.md` as you go, and note anything that differed.
 
 ## Stage 5: Slack
 
@@ -293,7 +319,8 @@ Only after the red-team checklist passes.
    ```
    Register `PMOS_PUBLIC_URL/oauth/{atlassian,slack,github}/callback` with each app.
 4. **Switch to live:** set `PMOS_CONNECTORS=live` in `deploy/.env`, then
-   `deploy/pmos-admin up --models`.
+   `deploy/pmos-admin up --models`. Only with `PMOS_MODEL_SOURCE=local` and its attestation
+   (Stage 3): under `hosted-test` every service refuses live connectors.
 5. **Link your own accounts.** DM PM OS `setup` and link your accounts. Then ask your bot
    something that needs Jira.
 6. **Run the benchmarks** (`docs/evals.md`):
@@ -323,7 +350,7 @@ Gate 1 is passed when:
 ## The console behind a sign-in proxy (optional)
 
 The console (`docs/console.md`) starts with `deploy/pmos-admin up --models --console`, and only
-behind a sign-in proxy on the Spark. `PMOS_CONSOLE_DEV_USER` is for running the console on your
+behind a sign-in proxy on this host. `PMOS_CONSOLE_DEV_USER` is for running the console on your
 own machine: it needs a loopback bind, and the kit's container listens on `0.0.0.0`, so the
 console refuses it here. Step 5 above made the secret; to put the proxy in front:
 
@@ -349,7 +376,7 @@ console refuses it here. Step 5 above made the secret; to put the proxy in front
    ```
    Give the proxy the secret through its environment or secret store, never in a file in git.
 3. **Check:** `curl -s -o /dev/null -w '%{http_code}\n' -H 'X-Forwarded-User: <your handle>'
-   http://127.0.0.1:8760/bots` on the Spark answers `401`: without the proxy's secret, the
+   http://127.0.0.1:8760/bots` on the host answers `401`: without the proxy's secret, the
    user header counts for nothing. A request through the proxy that sends its own
    `X-Forwarded-User` and `X-Pmos-Proxy-Secret` must not get them through. Through the proxy,
    the Bots screen opens.
@@ -360,7 +387,10 @@ compromised console can't decide one or call a tool.
 ## Optional: the web app
 
 The web app is **off by default**. Turn it on only for a closed test network: development
-sign-in lets anyone who can reach its port sign in as any member. See
+sign-in lets anyone who can reach its port sign in as any member. Until slice H10 (the
+admin-only listener and the public sign-in rules) is built, `pmos-web` refuses to start with
+`PMOS_EXPOSURE=public`, so the web app, and password sign-in with it, runs only on a host
+reached from networks the company controls. See
 [docs/web-app-running.md](../web-app-running.md) before you start it.
 
 With **password sign-in** (`PMOS_WEB_PASSWORD_LOGIN=1`, [docs/password-sign-in.md](../password-sign-in.md))

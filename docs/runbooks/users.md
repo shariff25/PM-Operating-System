@@ -13,7 +13,7 @@ join requests, or here on the host.
 version** ([upgrade.md](upgrade.md), "Upgrading to the user database"). A tool server with an
 empty user database lets nobody in, and logs `the user database is empty` at start-up.
 
-Everything here runs on the Spark through `deploy/pmos-admin users …`. Each command runs in a
+Everything here runs on PM OS's host through `deploy/pmos-admin users …`. Each command runs in a
 one-off tool server container with the database's own access, and records **the OS user who
 ran it** (your login, or the user behind `sudo`) with every change. Nothing here prints a
 token.

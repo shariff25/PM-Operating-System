@@ -1,7 +1,7 @@
 //! One usage event per request: who asked, which role and model, how long it queued and ran,
-//! and the tokens used. Never prompts or answers. Upstreams are local by configuration, so
-//! the "restricted data sent off the Spark" figure is zero by construction; each event still
-//! names the upstream host so that can be checked.
+//! and the tokens used. Never prompts or answers. Under `local` every upstream is a model
+//! server on PM OS's host; a remote upstream runs only as `hosted-test`, with fake data. Each
+//! event names the upstream (its host, or for a labelled role its kind) so that can be checked.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};

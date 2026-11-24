@@ -73,15 +73,17 @@ Instructions ...
 - `tools` is an allowlist: the skill may call only these tools (PRD: Authorization). Each must
   be in `tools.yaml`.
 - `model` names a role, not a model. The gateway maps `default`, `extraction` and `reasoning`
-  to open-weight models, so a bake-off result changes no skill files.
+  to the models of the deployment's gateway (local, or the approved hosted model once that is
+  built), so a bake-off result changes no skill files.
 
 | Role | Addressed as | Used for |
 | --- | --- | --- |
 | `default` | `pmos/default` | Answers and everyday drafts |
 | `extraction` | `pmos/extraction` | Extraction and triage, and the benchmark judges |
 | `reasoning` | `pmos/reasoning` | The PM-craft skills (`docs/pm-craft.md`): work that weighs alternatives and checks itself against the bar. It ships pointing at the same model as `default`; a platform owner can point it at a larger one in the gateway config (`docs/gateway.md`) |
-- `data-class` is the most sensitive data the skill may handle. The gateway routes everything
-  to local models.
+- `data-class` is the most sensitive data the skill may handle. `data-class` decides what a
+  skill may read; where its prompts go is the deployment's model source
+  (`docs/openshell-any-host-spec.md` §3.6), and, once `hosted` is built, the hosted ceiling `max_data_class`, if set.
 - `track` groups skills into a catalog, such as the Slack App Home's **Skills** section
   (`docs/slack-home.md`). It is free text, but the shipped skills use ten: Everyday,
   Product sense, Strategy and decisions, Metrics and experiments, Spec and review, Customer

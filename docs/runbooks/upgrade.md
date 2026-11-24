@@ -146,7 +146,7 @@ Which databases: only a tool-server database (`pmos_toolserver`) that was migrat
 branch numbered its migrations `0009_audit_source_titles` and `0010_audit_admin_reads`; after
 the merge they are `0010` and `0011`, and `main`'s `0009_note_sensitivity` is new. Such a
 database fails at start-up with sqlx's "migration 9 was previously applied but has been
-modified". Only dev and test stacks of that branch can have it: the Spark runs `main`, and
+modified". Only dev and test stacks of that branch can have it: a production host runs `main`, and
 `scripts/claude-test-stack.sh` keeps everything in memory. Check with:
 
 ```sh
@@ -228,32 +228,34 @@ If the new version changed a database (check the release notes, or new files und
 `crates/*/migrations/`), restore the backup from step 1 as well
 ([backup-restore.md](backup-restore.md)). Migrations are not reversible.
 
-## Registering the Spark CI runner
+## Registering the eval-gate runner
 
 The eval gate (`.github/workflows/evals-gate.yml`, `docs/evals.md` "CI") runs on pull requests
 that change roles, skills, bots, the evals or `deploy/gateway.yaml`. It needs the stack and the
-models, so it runs on a GitHub Actions self-hosted runner on the Spark with the labels
-`self-hosted` and `pmos-spark`. Until one is registered the job waits in the queue; a platform
-owner checks out the PR's branch somewhere on the Spark (not in `/opt/pmos`), runs
+models, so it runs on a GitHub Actions self-hosted runner on a host the owner chooses (not yet
+decided), with the labels `self-hosted` and `pmos-spark`. The label's name is historical, from an
+earlier plan; it stays as it is until the owner decides where the runner lives, because the
+workflow selects the runner by it. Until one is registered the job waits in the queue; a
+platform owner checks out the PR's branch somewhere on the host (not in `/opt/pmos`), runs
 `deploy/pmos-admin evals-gate --checkout <that checkout> --base origin/main` from `/opt/pmos`,
 and pastes the output into the PR.
 
 **What the runner runs.** The workflow runs on `pull_request_target`, so its own file always
 comes from the base branch. It checks out the PR's head into `pr/` without credentials and
-runs the Spark's installed script, `/opt/pmos/deploy/pmos-admin evals-gate --checkout pr`. The
+runs the host's installed script, `/opt/pmos/deploy/pmos-admin evals-gate --checkout pr`. The
 PR is only read as data (its `content/`, `evals/` and `deploy/gateway.yaml`); nothing in it is
 run, and no secret file is linked into it. So:
 - **A change to `pmos-admin` or the eval stack's compose file takes effect only after an
-  upgrade on the Spark** (the steps above). A PR that changes them is measured with the
-  Spark's current copies.
-- **The images are the Spark's,** built by the last `deploy/pmos-admin build`. A PR's code
-  changes are not benchmarked by the gate until they are merged and the Spark is upgraded.
+  upgrade on the host** (the steps above). A PR that changes them is measured with the
+  host's current copies.
+- **The images are the host's,** built by the last `deploy/pmos-admin build`. A PR's code
+  changes are not benchmarked by the gate until they are merged and the host is upgraded.
 
-**Once, to register it** (a GitHub repo admin and a Spark platform owner together):
-1. **On GitHub:** the repo's Settings → Actions → Runners → New self-hosted runner, Linux,
-   ARM64. Keep the page open: it shows the download commands and a registration token that
+**Once, to register it** (a GitHub repo admin and a platform owner of that host together):
+1. **On GitHub:** the repo's Settings → Actions → Runners → New self-hosted runner, Linux, and
+   the host's architecture (x64 or ARM64). Keep the page open: it shows the download commands and a registration token that
    lasts an hour.
-2. **On the Spark, a user for the runner** that can run Docker (`pmos-admin` needs it) and
+2. **On the host, a user for the runner** that can run Docker (`pmos-admin` needs it) and
    read the stack's settings. Docker access is root-equivalent, which is why only branches of
    this repository, never forks, run there.
    ```sh
@@ -265,8 +267,8 @@ run, and no secret file is linked into it. So:
    file is readable through an ACL or owned by another account, which is what the runner sees.
    `pmos-admin` and `setup.sh` keep the ACL when they rewrite the file (with `getfacl` and
    `setfacl` from the `acl` package; without them they say to run the `setfacl` line again).
-   If PM OS isn't in `/opt/pmos`, set `PMOS_SPARK_DIR=<that path>` in the runner's `.env`
-   file (in its install directory) after step 3; the workflow runs that copy's
+   If PM OS isn't in `/opt/pmos`, set `PMOS_SPARK_DIR=<that path>` (a historical name the workflow
+   still reads) in the runner's `.env` file (in its install directory) after step 3; the workflow runs that copy's
    `deploy/pmos-admin`, which reads its own `deploy/.env`.
 3. **Install and configure it** as that user, with the commands from step 1 and these
    options:
@@ -275,12 +277,12 @@ run, and no secret file is linked into it. So:
    mkdir actions-runner && cd actions-runner
    # download and unpack, as the GitHub page shows
    ./config.sh --url https://github.com/<org>/<repo> --token <token from the page> \
-     --name spark-1 --labels pmos-spark --unattended
+     --name pmos-host-1 --labels pmos-spark --unattended
    exit
    ```
-   GitHub adds `self-hosted`, `Linux` and `ARM64` itself. The registration token is on
+   GitHub adds `self-hosted`, `Linux` and the architecture itself. The registration token is on
    `config.sh`'s command line, the only way GitHub's runner instructions give it, so any
-   account on the Spark can read it while `config.sh` runs: it is good for one registration
+   account on the host can read it while `config.sh` runs: it is good for one registration
    and expires within the hour, but run this when no one else is logged in, and remove the
    runner on GitHub if you think it leaked. The same holds for the removal token below.
 4. **Run it as a service,** so it survives reboots:
@@ -296,11 +298,11 @@ run, and no secret file is linked into it. So:
    - **Outside collaborators need an approval.** The repo's Settings → Actions → General →
      "Approval for running fork pull request workflows from contributors": choose "Require
      approval for all outside collaborators".
-6. **Check:** Settings → Actions → Runners shows `spark-1` as Idle. Re-run a waiting "Eval
+6. **Check:** Settings → Actions → Runners shows `pmos-host-1` as Idle. Re-run a waiting "Eval
    gate" job, and read its summary.
 
 **Day to day:** the runner updates itself. One job runs at a time, and a new push to the PR
-cancels the previous run. If the Spark is busy or down, the job waits; `sudo ./svc.sh status`
+cancels the previous run. If the host is busy or down, the job waits; `sudo ./svc.sh status`
 in the runner directory shows whether the service is up.
 
 **To remove it:** stop the service (`sudo ./svc.sh stop && sudo ./svc.sh uninstall`), then

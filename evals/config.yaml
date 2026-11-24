@@ -73,7 +73,7 @@ latency_targets:
     source: "Default, not from the PRD (no p50 queue target is in the repo); replace with the PRD's"
   queue_p90:
     seconds: 120
-    source: "docs/implementation-plan.md, Phase 3: a second Spark if p90 queue time passes 2 minutes"
+    source: "docs/implementation-plan.md, Phase 3: a second model server if p90 queue time passes 2 minutes"
   total_p50:
     seconds: 60
     source: "Default, not from the PRD (no total-time target is in the repo); replace with the PRD's"

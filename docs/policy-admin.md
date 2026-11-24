@@ -243,7 +243,7 @@ reaching the default branch without someone else's review.
 ## What it is not
 
 - **Not a writer.** It never edits a file on the server, applies a policy to OpenShell
-  (`openshell policy set` stays a step on the Spark after the merge, `docs/sandbox-policies.md`)
+  (`openshell policy set` stays a step on the host after the merge, `docs/sandbox-policies.md`)
   or restarts a sandbox.
 - **Not live.** It shows the server's deployed revision, which can be behind the default branch
   until the next deployment. Proposals made from a stale copy are refused (`409 stale_base`).

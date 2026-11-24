@@ -1,6 +1,6 @@
 //! Who is looking, what they may see, and form (CSRF) protection.
 //!
-//! - **Identity:** `X-Forwarded-User` from the Spark's SSO proxy, trusted only with
+//! - **Identity:** `X-Forwarded-User` from the host's SSO proxy, trusted only with
 //!   `PMOS_CONSOLE_TRUST_PROXY=1`, and only on a request that also carries
 //!   `X-Pmos-Proxy-Secret` equal to `PMOS_CONSOLE_PROXY_SECRET` (compared in constant time,
 //!   before the user header is read); otherwise `PMOS_CONSOLE_DEV_USER`. The header may carry

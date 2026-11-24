@@ -84,9 +84,9 @@ Related settings on other services:
 | --- | --- | --- |
 | Runtime (`pmos-bots`) | `PMOS_BOTS_TOKENS` | Must list `web=<token>`. |
 | Slack service | `PMOS_WEB_PUBLIC_URL` | An `https://` address. Set, the Slack cards link to the app; unset, they don't. |
-| Slack service | `PMOS_WEB_URL`, `PMOS_WEB_BRIEF_TOKEN` | pmos-web's address as the Slack service reaches it, and the same token as pmos-web's `PMOS_WEB_BRIEF_TOKEN`. Both set: each daily brief fills the home page's brief panels (`docs/daily-brief.md`, "The web app's panels"); pmos-web also needs `PMOS_WEB_BRIEF=1`. In `deploy/.env`: `PMOS_WEB_BRIEF=1` and `PMOS_WEB_BRIEF_URL=http://web.pmos.internal:8770`. |
+| Slack service | `PMOS_WEB_URL`, `PMOS_WEB_BRIEF_TOKEN` | pmos-web's address as the Slack service reaches it, and the same token as pmos-web's `PMOS_WEB_BRIEF_TOKEN`. Both set: each daily brief fills the home page's brief panels (`docs/daily-brief.md`, "The web app's panels"); pmos-web also needs `PMOS_WEB_BRIEF=1`. In `deploy/.env`: `PMOS_WEB_BRIEF=1` and `PMOS_WEB_BRIEF_URL=http://web.pmos.internal:8771`, the web app's internal listener, which is not published (slice H9; `:8770` answers `404` for the brief's route, so a URL ending in `:8770` sends no brief). |
 
-## Deploy it (the Spark)
+## Deploy it (on PM OS's host)
 
 The deploy kit (`deploy/`) knows the web app, **off by default**:
 
@@ -111,10 +111,12 @@ The deploy kit (`deploy/`) knows the web app, **off by default**:
   `deploy/pmos-admin build`.
 - **Only through the reverse proxy.** The port is published on `127.0.0.1:8770`, like the
   console's, and the session cookie is `Secure`, so the app works only behind a TLS proxy on the
-  Spark. Never publish the port on another address. Put the proxy's address in
+  host. Never publish the port on another address. Put the proxy's address in
   `PMOS_WEB_PUBLIC_URL` in `deploy/.env`; Compose passes it to `pmos-web` (for its origin check)
   and to the Slack service (for the cards' links), and blank means unset for both. The proxy
   must pass the request's `Host`, `Origin` and `Cookie` headers unchanged.
+- **Private hosts only, for now.** `pmos-web` refuses to start with `PMOS_EXPOSURE=public`
+  until slice H10 (the admin-only listener and the public sign-in rules) is built.
 - **Health.** The container's health check is `GET /healthz`; `deploy/pmos-admin status` shows
   it while the service runs.
 
@@ -134,5 +136,5 @@ The deploy kit (`deploy/`) knows the web app, **off by default**:
   not limited to one person, so anyone who can run code in or reach the container can act for
   anyone.
 
-Until those are fixed, keep `PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY` at `0` on the
-production Spark.
+Until those are fixed, keep `PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY` at `0` on a
+production host.

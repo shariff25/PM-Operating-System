@@ -250,7 +250,7 @@ pub enum Role {
     Pm,
     /// Edits skills and bots by pull request; otherwise as `pm`.
     SkillAuthor,
-    /// Platform owner: runs the Spark, reviews sandbox policies, approves new members.
+    /// Platform owner: runs PM OS's host, reviews sandbox policies, approves new members.
     Admin,
     /// A PM who also sees other PMs' approvals and recommends a decision. The draft's owner
     /// still decides; a reviewer never decides someone else's approval.

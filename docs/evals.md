@@ -70,7 +70,7 @@ client `evals`. For each task, `repeats` times, it:
   whoever they are for: `pm-<requested_by>`, with `.` and `_` as hyphens, as onboarding names
   it. So `--as ana` runs them against `pm-ana`. The report records the resolved bot.
 - **The gateway token.** Judges call the gateway as client `evals`: the `evals=<token>` entry
-  in the gateway's `PMOS_GATEWAY_TOKENS` (`PMOS_GW_EVALS_TOKEN` on the Spark), with
+  in the gateway's `PMOS_GATEWAY_TOKENS` (`PMOS_GW_EVALS_TOKEN` on PM OS's host), with
   `PMOS_GATEWAY_URL` such as `http://127.0.0.1:8740/v1` (`/v1` is added if missing). Without
   both, judges aren't asked and the report says so. Which model served each role is no
   longer asked of this gateway but of the runtime under test (below), so a run without it
@@ -106,7 +106,7 @@ An error (no token, a bad file, a report that can't be written) exits 2.
 - `--no-judges` skips the judges; the report says they weren't asked.
 
 ### Every week
-On the Spark, against the live runtime with the gateway as it normally runs:
+On PM OS's host, against the live runtime with the gateway as it normally runs:
 
 ```sh
 export PMOS_EVALS_TOKEN=… PMOS_EVALS_TRACE_TOKEN=… PMOS_EVALS_AS=ana
@@ -151,7 +151,7 @@ and whether a workaround can be deleted:
   report's `gateway_models` holds, per role, the model id the gateway served it with and a
   neutral upstream label (`local`, `claude-test` or `remote-test`), whether the stub or a
   testing-only upstream was on, and the gateway's **class**: `production` only for a gateway
-  whose config says `class: production` (`deploy/gateway.yaml`, the Spark's) and that runs
+  whose config says `class: production` (`deploy/gateway.yaml`, the production gateway's) and that runs
   with the stub off, `test` for any other (a production config with `PMOS_GATEWAY_STUB=1`
   included: it starts and reports `test` with `stub: true`), and for a runtime or gateway too
   old to say (`docs/gateway.md`). Never a URL or
@@ -175,7 +175,7 @@ run is lost. Every run counts toward its week, so a change that breaks a categor
 week (see **History** below).
 
 ### On the test stack
-Before the Spark's eval stack is available, the benchmarks run on this machine's test stack
+Before a host's eval stack is available, the benchmarks run on this machine's test stack
 (`scripts/claude-test-stack.sh`, `docs/testing-with-claude.md`) with a cloud model behind the
 gateway. Prompts leave the machine, so it runs on the fake fixtures only.
 `PMOS_TEST_EVALS=1` sets it up the way `deploy/compose.evals.yaml` does:
@@ -231,7 +231,7 @@ Since 2026-11-22 the gateway also caps calls *waiting* per client and per person
 their in-flight caps by default, `docs/gateway.md`); with the script's settings that is
 always at least as many as its workers and judges can have waiting at once, so a run waits as
 before and is never refused with `429` for it. The stack keeps one `worker` gateway token for
-all its harness workers, trusted to name anyone (unlike the Spark's `bot-pm-<handle>` tokens,
+all its harness workers, trusted to name anyone (unlike the production stack's `bot-pm-<handle>` tokens,
 which may name only their PM): a known difference, on a single-machine stack with fresh
 tokens per run.
 
@@ -686,11 +686,13 @@ when all of these hold:
 - **They are the production role models**, role for role: the same roles, each with the same
   model id, as the `model` of each role in the production gateway config. That file is named
   by `benchmark.production_gateway` in `evals/config.yaml`, relative to `evals/`; it is
-  `../deploy/gateway.yaml`, the config the Spark's gateway runs. A run on any other model,
+  `../deploy/gateway.yaml`, the config the production gateway runs. A run on any other model,
   such as a test stack's remote model, doesn't count, whatever its note says. Changing a model
   there (a model swap) means every streak starts again.
 - **No stub and no testing-only upstream:** `stub` and `cloud_test` false, every upstream
-  `local`.
+  `local`. A `hosted-test` run (fake data, an endpoint nobody approved) never counts. `hosted`,
+  one owner-approved hosted model, is not built; how its runs count is decided with it (slice
+  H12).
 - **For a persona's category, the same persona files:** the report's `persona_hash` is the
   hash of the persona's, its role's and its skills' files now (`persona_hash`, above). The
   persona's name and the `role` its `PERSONA.md` names must be plain names (lowercase letters,
@@ -944,7 +946,7 @@ So queue time can be over-counted by up to one poll interval when a task has no 
 
 | Target | Value | Source |
 | --- | --- | --- |
-| p90 queue | 120 s | `docs/implementation-plan.md`, Phase 3: "a second Spark if p90 queue time passes 2 minutes" |
+| p90 queue | 120 s | `docs/implementation-plan.md`, Phase 3: "a second model server if p90 queue time passes 2 minutes" |
 | p50 queue | 30 s | default |
 | p50 total | 60 s | default |
 | p90 total | 180 s | default |
@@ -1196,17 +1198,16 @@ case cards", have the starting bar (`pass_bar: 0.8`) and run each task three tim
 **The eval gate** (`.github/workflows/evals-gate.yml`) runs on pull requests that change
 `content/skills/**`, `content/roles/**`, `content/bots/**`, `evals/**` or
 `deploy/gateway.yaml`:
-- **Where:** a self-hosted runner on the Spark (labels `self-hosted, pmos-spark`), where the
-  runtime, the worker and the models are. PRs from forks never run there. Registering the
-  runner is in `docs/runbooks/upgrade.md`.
-  **The runner's home is to be decided:** the label is from the earlier Spark plan, and the
-  owner dropped the Spark as a target on 2026-11-22. Wherever it moves, it must be a host the
-  improver's sandbox cannot reach. The workflow keeps the label until then, and its
+- **Where:** a self-hosted runner on a host the owner chooses (not yet decided), where PM OS's
+  runtime, worker and models are; it must be a host the improver's sandbox cannot reach. PRs
+  from forks never run there. Registering the runner is in `docs/runbooks/upgrade.md`. The
+  workflow's labels are `self-hosted, pmos-spark`: `pmos-spark` is a historical name from an
+  earlier plan, kept until the owner decides where the runner lives. The workflow's
   `timeout-minutes` (240) predates running every category: a full run on the eval stack can
   outlast it.
-- **What:** the Spark's own `/opt/pmos/deploy/pmos-admin evals-gate --checkout pr --base
+- **What:** the host's own `/opt/pmos/deploy/pmos-admin evals-gate --checkout pr --base
   origin/<base branch>`. The workflow runs on `pull_request_target` and checks the PR's head
-  out into `pr/` as data: nothing in it is run, and the stack uses the Spark's installed
+  out into `pr/` as data: nothing in it is run, and the stack uses the host's installed
   images. It lists the changed
   paths (`git -C pr diff --name-only <base>...HEAD`), passes them to `pmos-evals affected`, starts
   the eval stack on the PR's checkout, runs `pmos-evals gate` for each affected category with
@@ -1215,9 +1216,9 @@ case cards", have the starting bar (`pass_bar: 0.8`) and run each task three tim
   when no category is affected.
 - **Until a runner is registered,** the job waits in the queue. A platform owner runs
   `deploy/pmos-admin evals-gate --checkout <a checkout of the PR's branch> --base origin/main`
-  on the Spark, and pastes the result into the PR.
+  on the host, and pastes the result into the PR.
 
-**Weekly runs, and runs after a model or harness change,** are by hand on the Spark, on the
+**Weekly runs, and runs after a model or harness change,** are by hand on PM OS's host, on the
 eval stack and the content checkout (`main`):
 
 ```sh

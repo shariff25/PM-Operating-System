@@ -60,7 +60,7 @@ admin; `docs/toolserver.md`, "The Admin API"). If the tool server ever cuts an i
 
 ## Sign-in
 
-- **Behind the Spark's SSO proxy:** with `PMOS_CONSOLE_TRUST_PROXY=1`, the proxy's
+- **Behind the host's SSO proxy:** with `PMOS_CONSOLE_TRUST_PROXY=1`, the proxy's
   `X-Forwarded-User` names the person. A value with an `@` is a sign-in name, looked up by
   `by=sign_in_name` (case does not matter); anything else must be a valid PM OS handle, looked
   up by `by=handle`. Anything that is neither is `403` without a lookup. Without that setting
@@ -100,7 +100,7 @@ must:
 2. **Strip** any `X-Forwarded-User` and `X-Pmos-Proxy-Secret` the browser sent.
 3. **Set both itself:** the signed-in person, and the secret from `deploy/.env`.
 
-For example, with Caddy on the Spark (put the secret in Caddy's environment, not in the
+For example, with Caddy on the host (put the secret in Caddy's environment, not in the
 Caddyfile; `forward_auth` stands for whatever does the sign-in):
 
 ```

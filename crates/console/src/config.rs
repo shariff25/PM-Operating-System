@@ -14,7 +14,7 @@ pub const ISSUER: &str = "console";
 /// Who the person in front of the browser is.
 #[derive(Clone, PartialEq, Eq)]
 pub enum Identity {
-    /// Behind the Spark's SSO proxy: `X-Forwarded-User` names the person
+    /// Behind the host's SSO proxy: `X-Forwarded-User` names the person
     /// (`PMOS_CONSOLE_TRUST_PROXY=1`). Every request must also carry `X-Pmos-Proxy-Secret`
     /// equal to `secret` (`PMOS_CONSOLE_PROXY_SECRET`), which only the proxy holds, so a
     /// caller that reaches the console's port some other way can't name a user.
