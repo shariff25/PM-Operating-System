@@ -1,11 +1,21 @@
 //! Onboarding (`docs/onboarding-spec.md` §2–3): memory-repo records, requests to join PM OS,
 //! a platform owner's decision on them, removing a member, and each PM's setup status.
 //!
-//! `team.yaml` stays the source of truth. Approving a member commits the new `team.yaml`, the
-//! member's personal `BOT.md` and its two generated sandbox policy files to the content repo
-//! in one commit, made with the approving platform owner's own GitHub token, so the commit
-//! records who approved. The in-memory team changes at once; the content checkout is then
-//! pulled and reloaded (`content_sync.rs`).
+//! The user database is the source of users and roles (`docs/user-database-spec.md` §4, slice
+//! U3). Approving a join **first** creates the user in the database (`active`, role `pm` only
+//! from the Slack bot client, the sign-in name unconfirmed when it came through that client),
+//! so the person can use PM OS at once; **then** it commits the member's personal `BOT.md`
+//! and its two generated sandbox policy files to the content repo in one commit, made with the
+//! approving platform owner's own GitHub token, so the commit records who approved. Nothing
+//! else is committed: since slice U7 there is no `team.yaml`, and no service reads one.
+//! If the commit fails, the user stays active and the request is `approved` with the error;
+//! the bot is missing until an admin retries. The content checkout is then pulled and reloaded
+//! (`content_sync.rs`).
+//!
+//! Removing a member is a **deactivation** (§6): nothing is committed. The user store ends
+//! their sessions and suspends their linked accounts in one transaction; the sweeper deletes
+//! the accounts and closes their held drafts after the grace unless they are reactivated.
+//! From the Slack bot client it is refused for an Admin or Auditor and capped per hour.
 //!
 //! The policy files are generated unchanged from the reviewed `pm-assistant` role template by
 //! `pmos_policy`, from a scratch copy of the content with the new member in it, so the whole
@@ -22,9 +32,9 @@ use std::time::Duration as StdDuration;
 
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
-use pmos_contract::model::{valid_email, valid_slack_id, Role, TeamFile, TeamMember};
+use pmos_contract::model::{valid_email, valid_slack_id};
 use pmos_contract::onboarding::{
-    bot_path, personal_bot_name, propose_handle, render_personal_bot, render_team_yaml,
+    bot_path, personal_bot_name, propose_handle, render_personal_bot, spelled_handle,
     valid_new_handle,
 };
 use serde_json::{json, Value};
@@ -39,6 +49,8 @@ use crate::oauth::{OAuth, TokenError, TokenSource};
 use crate::service::ToolService;
 use crate::session::valid_handle;
 use crate::store::StoreError;
+use crate::users::access::may_use;
+use crate::users::{Actor, NewUser, Op, UserError, UserRole};
 use crate::vault::{Provider, Secret};
 
 /// How long an approval waits for the content checkout to pull the new commit.
@@ -88,8 +100,9 @@ impl GitHubSetup {
     }
 }
 
-/// The `403` code when a member decision from the Slack bot asks for the `admin` role.
-pub const ADMIN_BY_PULL_REQUEST: &str = "admin_by_pull_request";
+/// The `403` code when a member decision from the Slack bot asks for the `admin` role
+/// (`users::Refusal::AdminNotFromSlack`; `admin_by_pull_request` before slice U3).
+pub const ADMIN_NOT_FROM_SLACK: &str = "admin_not_from_slack";
 
 /// A refusal or failure, as the API answers it: `{error, code, request?}`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,6 +162,54 @@ impl From<Refusal> for Stop {
     }
 }
 
+/// The team bots `handle` owns (their personal bot aside): a deactivation, from Slack or the
+/// web, is refused `409 owns_bots` while there are any, so every team bot keeps an owner who
+/// is a member (spec §6 "Deactivation").
+pub fn owned_team_bots(svc: &ToolService, handle: &str) -> Vec<String> {
+    let personal = personal_bot_name(handle);
+    let mut owned: Vec<String> = svc
+        .roster()
+        .bots()
+        .filter(|b| b.owner == handle && b.name != personal)
+        .map(|b| b.name.clone())
+        .collect();
+    owned.sort();
+    owned
+}
+
+/// A refused or failed user write, as the API answers it.
+fn user_refusal(e: UserError) -> Refusal {
+    use crate::users::Refusal as R;
+    let Some(r) = e.refusal() else {
+        if let UserError::Store(e) = e {
+            return Refusal::from(e);
+        }
+        unreachable!("a user error is a refusal or a storage error");
+    };
+    let status = match r {
+        R::AdminNotFromSlack
+        | R::RoleNotFromSlack
+        | R::ProtectedNotFromSlack
+        | R::NotFromSlack
+        | R::HostOnly
+        | R::Forbidden
+        | R::SelfChange => StatusCode::FORBIDDEN,
+        R::DeactivationLimit => StatusCode::TOO_MANY_REQUESTS,
+        R::NotFound => StatusCode::NOT_FOUND,
+        R::Invalid => StatusCode::UNPROCESSABLE_ENTITY,
+        _ => StatusCode::CONFLICT,
+    };
+    let code = match r {
+        R::Forbidden => "not_admin",
+        R::NotFound => "not_a_member",
+        R::Exists | R::Taken => "already_member",
+        R::Unchanged => "already_deactivated",
+        R::Invalid => "bad_request",
+        r => r.code(),
+    };
+    Refusal::new(status, code, e.to_string())
+}
+
 fn github_not_linked(who: &str) -> Refusal {
     Refusal::new(
         StatusCode::CONFLICT,
@@ -170,6 +231,8 @@ pub struct Onboarding {
     oauth: Option<Arc<OAuth>>,
     github: Option<GitHubSetup>,
     sync: Option<Arc<ContentSync>>,
+    /// Admin policy and content proposals (`crate::proposals`), when turned on.
+    proposals: Option<crate::proposals::ProposalsSetup>,
     /// Held for each decision and removal.
     lock: tokio::sync::Mutex<()>,
 }
@@ -185,8 +248,31 @@ impl Onboarding {
             oauth,
             github,
             sync: None,
+            proposals: None,
             lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// Turn admin proposals on: opened as pull requests in the content repository with the
+    /// acting admin's own GitHub token. Needs the GitHub setup with a content repository;
+    /// without one this changes nothing. `policies_root`: the checked-in policy files
+    /// (`None`: found beside the content checkout).
+    pub fn with_proposals(mut self, per_hour: u32, policies_root: Option<PathBuf>) -> Self {
+        self.proposals = self
+            .github
+            .as_ref()
+            .and_then(|gh| crate::proposals::ProposalsSetup::new(gh, per_hour, policies_root));
+        self
+    }
+
+    /// The proposals set-up, when proposals are on.
+    pub fn proposals(&self) -> Option<&crate::proposals::ProposalsSetup> {
+        self.proposals.as_ref()
+    }
+
+    /// Account linking, when live connectors are on.
+    pub fn oauth(&self) -> Option<&Arc<OAuth>> {
+        self.oauth.as_ref()
     }
 
     /// Pull and reload the content checkout right after each member commit.
@@ -195,8 +281,9 @@ impl Onboarding {
         self
     }
 
-    fn admin(&self, handle: &str) -> bool {
-        self.svc.team().member(handle).is_some_and(|m| m.is_admin())
+    /// Is `handle` an active admin in the user database, now?
+    async fn admin(&self, handle: &str) -> Result<bool, Refusal> {
+        Ok(self.svc.people().is_admin(handle).await?)
     }
 
     /// The user's GitHub token, or why there isn't one.
@@ -230,11 +317,11 @@ impl Onboarding {
                 "GitHub is not configured (PMOS_GITHUB_CLIENT_ID)",
             ));
         };
-        if !valid_handle(user) || !self.svc.team().allows(user) {
+        if !valid_handle(user) || !self.svc.people().allows(user).await? {
             return Err(Refusal::new(
                 StatusCode::FORBIDDEN,
                 "not_a_member",
-                format!("`{user}` is not in team.yaml"),
+                format!("`{user}` is not an active PM OS user"),
             ));
         }
         let repo = repo.trim();
@@ -323,8 +410,9 @@ impl Onboarding {
 
     // ----- requests ---------------------------------------------------------------------
 
-    /// A request to join, from someone not in `team.yaml`. `Ok((true, _))` for a new
-    /// request, `Ok((false, _))` for the one already pending for that Slack id.
+    /// A request to join, from someone not in the user database. `Ok((true, _))` for a new
+    /// request, `Ok((false, _))` for the one already pending for that Slack id. A Slack id
+    /// that belongs to a deactivated user is `409 deactivated`, not a new request.
     pub async fn request(
         &self,
         slack_id: &str,
@@ -346,17 +434,31 @@ impl Onboarding {
             .take(MAX_NAME_CHARS)
             .collect();
         let name = name.trim();
-        let team = self.svc.team();
-        if team.by_slack_id(slack_id).is_some() {
-            return Err(Refusal::new(
-                StatusCode::CONFLICT,
-                "already_member",
-                "that Slack user is already in team.yaml",
-            ));
+        let dir = self.svc.people().directory().await?;
+        match crate::users::access::by_slack_id(&dir, slack_id) {
+            Some(u) if u.active() => {
+                return Err(Refusal::new(
+                    StatusCode::CONFLICT,
+                    "already_member",
+                    "that Slack user is already a PM OS user",
+                ))
+            }
+            Some(_) => {
+                return Err(Refusal::new(
+                    StatusCode::CONFLICT,
+                    "deactivated",
+                    "your access to PM OS was turned off; ask a platform owner",
+                ))
+            }
+            None => {}
         }
         let store = &self.svc.stores().member_requests;
-        let mut taken: BTreeSet<String> =
-            team.file().members.into_iter().map(|m| m.handle).collect();
+        // Handles are never reused, deactivated people's included.
+        // So are their spelled forms (`ana-k` for `ana.k`): a proposed handle is always spelled
+        // as itself, and one spelled as another user's would share that user's model slots
+        // and bot name (the Low on colliding handles, review at 6bb806f).
+        let mut taken: BTreeSet<String> = dir.users.keys().cloned().collect();
+        taken.extend(dir.users.keys().map(|h| spelled_handle(h)));
         taken.extend(
             store
                 .list(Some(RequestStatus::Pending))
@@ -422,9 +524,11 @@ impl Onboarding {
                 tool: tool.to_string(),
                 outcome,
                 sources: Vec::new(),
+                source_titles: Default::default(),
                 args_hash: None,
                 output_ref,
                 detail,
+                persona: None,
             })
             .await;
     }
@@ -449,7 +553,7 @@ impl Onboarding {
                 ))
             }
         };
-        if !self.admin(admin) {
+        if !self.admin(admin).await? {
             self.audit(
                 client,
                 admin,
@@ -457,14 +561,14 @@ impl Onboarding {
                 Outcome::Denied,
                 id,
                 None,
-                Some("decision by someone who isn't an admin in team.yaml".into()),
+                Some("not_admin".into()),
                 now,
             )
             .await;
             return Err(Refusal::new(
                 StatusCode::FORBIDDEN,
                 "not_admin",
-                "only a platform owner (admin in team.yaml) can decide this",
+                "only a platform owner (an active admin in PM OS) can decide this",
             ));
         }
         let _one_at_a_time = self.lock.lock().await;
@@ -516,33 +620,37 @@ impl Onboarding {
                 "`{handle}` can't be a handle: lowercase letters, digits and single hyphens, at most 24"
             )));
         }
-        if self.svc.team().member(&handle).is_some()
+        if self.svc.people().user(&handle).await?.is_some()
             || self.svc.roster().bot(&personal_bot_name(&handle)).is_some()
         {
             return Err(bad_handle(format!("`{handle}` is already taken")));
         }
-        let roles = match &input.roles {
-            None => vec![Role::Pm],
-            Some(names) => {
-                let parsed: Result<Vec<Role>, _> = names
-                    .iter()
-                    .map(|n| serde_json::from_value::<Role>(json!(n)))
-                    .collect();
-                match parsed {
-                    Ok(roles) if !roles.is_empty() => roles,
-                    _ => {
-                        return Err(Refusal::new(
-                            StatusCode::UNPROCESSABLE_ENTITY,
-                            "bad_request",
-                            "roles must be some of pm, skill-author and admin",
-                        ))
-                    }
-                }
-            }
+        let names: Vec<String> = input.roles.clone().unwrap_or_else(|| vec!["pm".into()]);
+        if names.is_empty() {
+            return Err(Refusal::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "bad_request",
+                "roles must be some of pm, reviewer, auditor and admin",
+            ));
+        }
+        // The Slack bot names the deciding admin unsigned (and the orchestrator signs nothing
+        // either), so a join approved through them gets `pm` only. Admin is never granted by
+        // onboarding, from any client: only `grant-admin` on the host makes an admin.
+        let refused_role = if names.iter().any(|n| n == "admin") {
+            Some(UserError::refused(
+                crate::users::Refusal::AdminNotFromSlack,
+                "PM OS never makes an admin from Slack: someone with host access runs `pmos-admin users grant-admin`",
+            ))
+        } else if names.iter().any(|n| n != "pm") {
+            Some(UserError::refused(
+                crate::users::Refusal::RoleNotFromSlack,
+                "a join approved in Slack gets pm only; other roles are given in the web app",
+            ))
+        } else {
+            None
         };
-        // The Slack bot names the deciding admin unsigned, so it may grant `pm` and
-        // `skill-author` only. A new admin is made by a pull request to team.yaml.
-        if client == Client::Bot && roles.contains(&Role::Admin) {
+        if let Some(e) = refused_role {
+            let r = user_refusal(e);
             self.audit(
                 client,
                 admin,
@@ -550,125 +658,123 @@ impl Onboarding {
                 Outcome::Denied,
                 id,
                 None,
-                Some("an admin grant from Slack: admins are added by a pull request".into()),
+                Some(r.code.to_string()),
                 now,
             )
             .await;
-            return Err(Refusal::new(
-                StatusCode::FORBIDDEN,
-                ADMIN_BY_PULL_REQUEST,
-                "PM OS won't make an admin from Slack: add the admin role with a pull request to team.yaml",
-            ));
+            return Err(r);
         }
-        let member = TeamMember {
-            handle: handle.clone(),
-            slack_id: request.slack_id.clone(),
-            email: Some(request.email.clone()),
-            github: None,
-            roles,
-        };
-
-        // 2–3. The approver's GitHub, then one commit with team.yaml, the bot and its policies.
+        // 2. The user, in the database: they can use PM OS at once. A refusal (an address
+        // that belongs to someone else, a forged admin) changes nothing.
+        let created = self
+            .svc
+            .people()
+            .apply(
+                &Actor::bot(admin),
+                Op::CreateUser {
+                    user: NewUser {
+                        handle: handle.clone(),
+                        display_name: request.name.clone(),
+                        sign_in_name: Some(request.email.clone()),
+                        atlassian_email: Some(request.email.clone()),
+                        github_login: None,
+                        slack_id: Some(request.slack_id.clone()),
+                        roles: [UserRole::Pm].into(),
+                    },
+                },
+                now,
+            )
+            .await;
+        if let Err(e) = created {
+            let r = user_refusal(e);
+            if r.status != StatusCode::SERVICE_UNAVAILABLE {
+                self.audit(
+                    client,
+                    admin,
+                    "members.add",
+                    Outcome::Denied,
+                    id,
+                    None,
+                    Some(r.code.to_string()),
+                    now,
+                )
+                .await;
+            }
+            return Err(r);
+        }
+        // 3. The approver's GitHub, then one commit with the bot and its policies.
         let bot = personal_bot_name(&handle);
         let bot_md = render_personal_bot(&handle);
         let paths = self.member_paths(&bot);
         let message =
             format!("Add {handle} to PM OS\n\nApproved-by: {admin} (Slack, request {id})\n");
         let committed = self
-            .commit_team(
-                admin,
-                &paths,
-                &message,
-                |team, existing| {
-                    if team.by_handle(&handle).is_some() || existing.contains(&paths[0]) {
-                        return Err(bad_handle(format!("`{handle}` is already taken")).into());
-                    }
-                    if team.by_slack_id(&member.slack_id).is_some() {
-                        return Err(Refusal::new(
-                            StatusCode::CONFLICT,
-                            "already_member",
-                            "that Slack user is already in team.yaml",
-                        )
-                        .into());
-                    }
-                    team.members.push(member.clone());
-                    Ok(vec![Change::write(&paths[0], &bot_md)])
-                },
-                |yaml| {
-                    let content_root = self
-                        .github
-                        .as_ref()
-                        .map(|gh| gh.content_root.clone())
-                        .unwrap_or_default();
-                    let [policy, spec] = personal_policies(
-                        &content_root,
-                        yaml,
-                        &bot,
-                        &bot_md,
-                        Utc::now().date_naive(),
-                    )
-                    .map_err(Stop::Fail)?;
-                    Ok(vec![
-                        Change::write(&paths[1], policy),
-                        Change::write(&paths[2], spec),
-                    ])
-                },
-            )
+            .commit_content(admin, &paths, &message, |existing| {
+                if existing.contains(&paths[0]) {
+                    return Err(bad_handle(format!("`{handle}` is already taken")).into());
+                }
+                let content_root = self
+                    .github
+                    .as_ref()
+                    .map(|gh| gh.content_root.clone())
+                    .unwrap_or_default();
+                let [policy, spec] =
+                    personal_policies(&content_root, &bot, &bot_md, Utc::now().date_naive())
+                        .map_err(Stop::Fail)?;
+                Ok(vec![
+                    Change::write(&paths[0], &bot_md),
+                    Change::write(&paths[1], policy),
+                    Change::write(&paths[2], spec),
+                ])
+            })
             .await;
 
-        // 4–5. Record the outcome.
-        let (decided, outcome) = match committed {
-            Ok((commit, team)) => {
-                // The member can use PM OS at once, before the checkout is pulled.
-                self.svc.team().replace(team);
+        // 4. Record the outcome. The user exists either way: a bot that didn't commit is
+        // missing until an admin retries, and the request says why.
+        let (commit, error) = match committed {
+            Ok(commit) => (Some(commit), None),
+            Err(Stop::Refuse(r)) => {
+                tracing::warn!(id, handle = %handle, code = r.code, "the personal bot wasn't committed");
                 (
-                    Decided {
-                        status: RequestStatus::Approved,
-                        decided_by: admin.to_string(),
-                        handle: Some(handle.clone()),
-                        commit: Some(commit),
-                        error: None,
-                    },
-                    Outcome::Approved,
+                    None,
+                    Some(format!("the personal bot wasn't committed: {}", r.error)),
                 )
             }
-            Err(Stop::Refuse(r)) => return Err(r),
             Err(Stop::Fail(error)) => {
-                tracing::error!(id, handle = %handle, error = %error, "adding a member failed");
+                tracing::error!(id, handle = %handle, error = %error, "the personal bot wasn't committed");
                 (
-                    Decided {
-                        status: RequestStatus::Failed,
-                        decided_by: admin.to_string(),
-                        handle: Some(handle.clone()),
-                        commit: None,
-                        error: Some(format!("PM OS couldn't commit team.yaml: {error}")),
-                    },
-                    Outcome::Failed,
+                    None,
+                    Some(format!("the personal bot wasn't committed: {error}")),
                 )
             }
+        };
+        let decided = Decided {
+            status: RequestStatus::Approved,
+            decided_by: admin.to_string(),
+            handle: Some(handle.clone()),
+            commit,
+            error,
         };
         let request = self.finish(id, &decided, now).await?;
         self.audit(
             client,
             admin,
             "members.add",
-            outcome,
+            Outcome::Approved,
             id,
             decided.commit.clone(),
-            Some(format!("handle {handle}")),
+            Some(if decided.commit.is_some() {
+                "roles pm; sign_in unconfirmed".to_string()
+            } else {
+                "roles pm; sign_in unconfirmed; bot missing".to_string()
+            }),
             now,
         )
         .await;
-        if outcome == Outcome::Failed {
-            return Err(Refusal::new(
-                StatusCode::BAD_GATEWAY,
-                "commit_failed",
-                decided.error.unwrap_or_default(),
-            )
-            .with_request(request));
+        tracing::info!(id, handle = %handle, admin, bot = decided.commit.is_some(), "member added");
+        if decided.commit.is_some() {
+            self.sync_now(now).await;
         }
-        tracing::info!(id, handle = %handle, admin, "member added");
-        self.sync_now(now).await;
         Ok(request)
     }
 
@@ -696,9 +802,14 @@ impl Onboarding {
         }
     }
 
-    /// Remove `handle` from PM OS as the admin `decided_by`: commit `team.yaml` without them
-    /// and delete their personal `BOT.md`, then unlink every account and drop their memory-repo
-    /// record. Returns the commit.
+    /// "Remove" `handle` as the admin `decided_by`: since slice U3 a **deactivation** in the
+    /// user database (`docs/user-database-spec.md` §6), and nothing is committed. In one
+    /// transaction: status `deactivated`, `admin` revoked if held (reactivation never restores
+    /// it), their MCP sessions ended, their linked accounts suspended. Their pending drafts
+    /// are held; after the grace the sweeper deletes the accounts and closes the drafts unless
+    /// they are reactivated. From the Slack bot client it is refused for an Admin or Auditor
+    /// (`403 protected_not_from_slack`) and capped (`429 deactivation_limit`). Returns a note
+    /// for the admin.
     pub async fn remove(
         &self,
         client: Client,
@@ -707,7 +818,7 @@ impl Onboarding {
         now: DateTime<Utc>,
     ) -> Result<String, Refusal> {
         let run_id = format!("remove-{handle}");
-        if !self.admin(decided_by) {
+        if !self.admin(decided_by).await? {
             self.audit(
                 client,
                 decided_by,
@@ -715,14 +826,14 @@ impl Onboarding {
                 Outcome::Denied,
                 &run_id,
                 None,
-                Some("removal by someone who isn't an admin in team.yaml".into()),
+                Some("not_admin".into()),
                 now,
             )
             .await;
             return Err(Refusal::new(
                 StatusCode::FORBIDDEN,
                 "not_admin",
-                "only a platform owner (admin in team.yaml) can remove members",
+                "only a platform owner (an active admin in PM OS) can remove members",
             ));
         }
         if handle == decided_by {
@@ -732,27 +843,18 @@ impl Onboarding {
                 "a platform owner can't remove themselves",
             ));
         }
-        let not_member = || {
-            Refusal::new(
+        let Some(user) = self.svc.people().user(handle).await? else {
+            return Err(Refusal::new(
                 StatusCode::NOT_FOUND,
                 "not_a_member",
-                format!("`{handle}` is not in team.yaml"),
-            )
+                format!("`{handle}` is not a PM OS user"),
+            ));
         };
-        if self.svc.team().member(handle).is_none() {
-            return Err(not_member());
-        }
-        // A bot whose owner isn't in team.yaml fails the lint, and the content would stop
-        // loading: its owner must change first. The personal bot goes with its owner.
+        // A team bot needs an owner who is a member: its owner must change first. The
+        // personal bot stays in content, refused while its owner is deactivated.
         let personal = personal_bot_name(handle);
-        let owned: Vec<String> = self
-            .svc
-            .roster()
-            .bots()
-            .filter(|b| b.owner == handle && b.name != personal)
-            .map(|b| b.name.clone())
-            .collect();
-        if !owned.is_empty() {
+        let owned = owned_team_bots(&self.svc, handle);
+        if user.active() && !owned.is_empty() {
             return Err(Refusal::new(
                 StatusCode::CONFLICT,
                 "owns_bots",
@@ -763,81 +865,37 @@ impl Onboarding {
             ));
         }
         let _one_at_a_time = self.lock.lock().await;
-        let paths = self.member_paths(&personal);
-        let message = format!("Remove {handle} from PM OS\n\nRemoved-by: {decided_by} (Slack)\n");
-        let committed = self
-            .commit_team(
-                decided_by,
-                &paths,
-                &message,
-                |team, existing| {
-                    if team.by_handle(handle).is_none() {
-                        return Err(not_member().into());
-                    }
-                    team.members.retain(|m| m.handle != handle);
-                    // The bot and its policy files go with them.
-                    Ok(paths
-                        .iter()
-                        .filter(|p| existing.contains(*p))
-                        .map(Change::delete)
-                        .collect())
+        // The Slack bot names the deciding admin unsigned; the orchestrator signs nothing
+        // either: both are the capped, unsigned client.
+        self.svc
+            .people()
+            .apply(
+                &Actor::bot(decided_by),
+                Op::Deactivate {
+                    handle: handle.to_string(),
                 },
-                |_| Ok(Vec::new()),
+                now,
             )
-            .await;
-        let commit = match committed {
-            Ok((commit, team)) => {
-                self.svc.team().replace(team);
-                commit
-            }
-            Err(Stop::Refuse(r)) => return Err(r),
-            Err(Stop::Fail(error)) => {
-                tracing::error!(handle, error = %error, "removing a member failed");
-                self.audit(
-                    client,
-                    decided_by,
-                    "members.remove",
-                    Outcome::Failed,
-                    &run_id,
-                    None,
-                    Some(error.clone()),
-                    now,
-                )
-                .await;
-                return Err(Refusal::new(
-                    StatusCode::BAD_GATEWAY,
-                    "commit_failed",
-                    format!("PM OS couldn't commit team.yaml: {error}"),
-                ));
-            }
-        };
-        // Their accounts and memory record go; the memory repo itself is theirs.
-        for provider in [Provider::Atlassian, Provider::Slack, Provider::Github] {
-            let unlinked = match &self.oauth {
-                Some(oauth) => oauth.unlink_account(handle, provider).await,
-                None => self.svc.stores().credentials.delete(handle, provider).await,
-            };
-            if let Err(e) = unlinked {
-                tracing::error!(handle, provider = %provider, error = %e, "REMOVED MEMBER'S ACCOUNT NOT UNLINKED");
-            }
-        }
-        if let Err(e) = self.svc.stores().memory_repos.delete(handle).await {
-            tracing::error!(handle, error = %e, "removed member's memory-repo record not deleted");
-        }
+            .await
+            .map_err(user_refusal)?;
         self.audit(
             client,
             decided_by,
             "members.remove",
             Outcome::Ok,
             &run_id,
-            Some(commit.clone()),
-            Some(format!("handle {handle}")),
+            None,
+            Some("credentials suspended".into()),
             now,
         )
         .await;
-        tracing::info!(handle, admin = decided_by, commit = %commit, "member removed");
-        self.sync_now(now).await;
-        Ok(commit)
+        tracing::info!(handle, admin = decided_by, "member deactivated");
+        Ok(format!(
+            "`{handle}` is deactivated: their sessions ended and their linked accounts are suspended. \
+             Reactivating them within {}h restores their accounts and held drafts. Their personal \
+             bot's sandbox keeps idling until `pmos-admin pause {personal}`.",
+            crate::users::CREDENTIAL_GRACE_HOURS
+        ))
     }
 
     /// A personal bot's files in the content repo: its `BOT.md`, then its policy and its
@@ -850,20 +908,17 @@ impl Onboarding {
         [gh.content_path(&bot_path(bot)), policy, spec]
     }
 
-    /// Change `team.yaml` at the head of the content branch with `edit`, which may also
-    /// return other changes (`existing` says which of `probe` are there), then add what
-    /// `with_yaml` makes from the new `team.yaml`, and commit it all in one commit with
-    /// `admin`'s GitHub token. The new `team.yaml` must parse and pass the team lint rules.
+    /// Make the changes `changes` returns at the head of the content branch (`existing` says
+    /// which of `probe` are there) and commit them in one commit with `admin`'s GitHub token.
     /// If the branch moves meanwhile, the change is made again on the new head, up to
-    /// [`COMMIT_RETRIES`] times. Returns the commit and the team it committed.
-    async fn commit_team(
+    /// [`COMMIT_RETRIES`] times. Returns the commit.
+    async fn commit_content(
         &self,
         admin: &str,
         probe: &[String],
         message: &str,
-        edit: impl Fn(&mut TeamFile, &BTreeSet<String>) -> Result<Vec<Change>, Stop>,
-        with_yaml: impl Fn(&str) -> Result<Vec<Change>, Stop>,
-    ) -> Result<(String, TeamFile), Stop> {
+        changes: impl Fn(&BTreeSet<String>) -> Result<Vec<Change>, Stop>,
+    ) -> Result<String, Stop> {
         let (gh, repo) = match &self.github {
             Some(gh) => match &gh.content_repo {
                 Some(repo) => (gh, repo.as_str()),
@@ -889,21 +944,8 @@ impl Onboarding {
             Err(e) => return Err(fail(e)),
         }
         let branch = gh.content_branch.as_str();
-        let team_path = gh.content_path("team.yaml");
         for attempt in 0..=COMMIT_RETRIES {
             let head = gh.github.head(&token, repo, branch).await.map_err(fail)?;
-            let current = gh
-                .github
-                .file(&token, repo, &team_path, &head.commit)
-                .await
-                .map_err(fail)?
-                .map(|f| f.text)
-                .unwrap_or_default();
-            let mut team = TeamFile::from_yaml(&current).map_err(|e| {
-                Stop::Fail(format!(
-                    "{team_path} at the head of {branch} doesn't parse: {e}"
-                ))
-            })?;
             let mut existing = BTreeSet::new();
             for path in probe {
                 let found = gh
@@ -915,18 +957,14 @@ impl Onboarding {
                     existing.insert(path.clone());
                 }
             }
-            let mut changes = edit(&mut team, &existing)?;
-            let yaml = render_team_yaml(&current, &team.members);
-            lint_team(&yaml, chrono::Utc::now().date_naive()).map_err(Stop::Fail)?;
-            changes.extend(with_yaml(&yaml)?);
-            changes.insert(0, Change::write(&team_path, yaml));
+            let changes = changes(&existing)?;
             let commit = gh
                 .github
                 .create_commit(&token, repo, &head, message, &changes)
                 .await
                 .map_err(fail)?;
             match gh.github.update_ref(&token, repo, branch, &commit).await {
-                Ok(()) => return Ok((commit, team)),
+                Ok(()) => return Ok(commit),
                 Err(GitHubError::Conflict) => {
                     tracing::info!(
                         repo,
@@ -974,12 +1012,14 @@ impl Onboarding {
         user: Option<&str>,
         slack_id: Option<&str>,
     ) -> Result<Value, StoreError> {
-        let team = self.svc.team();
+        let dir = self.svc.people().directory().await?;
         let member = match (user, slack_id) {
-            (Some(user), _) => team.member(user),
-            (None, Some(slack_id)) => team.by_slack_id(slack_id),
-            (None, None) => None,
-        };
+            (Some(user), _) if !crate::session::is_bot_identity(user) => dir.get(user),
+            (None, Some(slack_id)) => crate::users::access::by_slack_id(&dir, slack_id),
+            _ => None,
+        }
+        .filter(|u| may_use(u))
+        .cloned();
         let Some(member) = member else {
             let pending = match slack_id {
                 Some(slack_id) => {
@@ -995,7 +1035,10 @@ impl Onboarding {
                 "member": false,
                 "handle": null,
                 "admin": false,
-                "linked": {"atlassian": false, "slack": false, "github": false},
+                "linked": Provider::ALL
+                    .iter()
+                    .map(|p| (p.as_str().to_string(), json!(false)))
+                    .collect::<serde_json::Map<_, _>>(),
                 "memory_repo": null,
                 "personal_bot": null,
                 "pending_request": pending,
@@ -1029,12 +1072,11 @@ impl Onboarding {
         Ok(json!({
             "member": true,
             "handle": handle,
-            "admin": member.is_admin(),
-            "linked": {
-                "atlassian": linked.contains(&Provider::Atlassian),
-                "slack": linked.contains(&Provider::Slack),
-                "github": linked.contains(&Provider::Github),
-            },
+            "admin": member.has(UserRole::Admin),
+            "linked": Provider::ALL
+                .iter()
+                .map(|p| (p.as_str().to_string(), json!(linked.contains(p))))
+                .collect::<serde_json::Map<_, _>>(),
             "memory_repo": memory_repo,
             "personal_bot": personal_bot,
             "pending_request": null,
@@ -1051,11 +1093,10 @@ fn not_configured() -> Refusal {
 }
 
 /// A new member's sandbox policy and spec, generated by `pmos_policy` from a scratch copy of
-/// the content at `content_root` with `team_yaml` and the bot's `BOT.md` in place. The copy
-/// must pass `pmos lint` as a whole, as the content will after the commit.
+/// the content at `content_root` with the bot's `BOT.md` in place. The copy must pass
+/// `pmos lint` as a whole, as the content will after the commit.
 pub fn personal_policies(
     content_root: &Path,
-    team_yaml: &str,
     bot: &str,
     bot_md: &str,
     today: chrono::NaiveDate,
@@ -1079,7 +1120,6 @@ pub fn personal_policies(
             std::fs::copy(entry.path(), &dest).map_err(io)?;
         }
     }
-    std::fs::write(root.join("team.yaml"), team_yaml).map_err(io)?;
     let bot_file = root.join(bot_path(bot));
     std::fs::create_dir_all(bot_file.parent().expect("a bot file has a folder")).map_err(io)?;
     std::fs::write(&bot_file, bot_md).map_err(io)?;
@@ -1104,50 +1144,4 @@ pub fn personal_policies(
         take(format!("bots/{bot}.yaml"))?,
         take(format!("bots/{bot}.sandbox.yaml"))?,
     ])
-}
-
-/// Does `yaml` parse as `team.yaml` and pass the team lint rules (`team-*`)? It is linted
-/// alone in a scratch content root, so only the team rules can fire.
-pub fn lint_team(yaml: &str, today: chrono::NaiveDate) -> Result<(), String> {
-    TeamFile::from_yaml(yaml).map_err(|e| format!("the new team.yaml doesn't parse: {e}"))?;
-    let dir = tempfile::tempdir().map_err(|e| format!("a scratch directory: {e}"))?;
-    std::fs::write(dir.path().join("team.yaml"), yaml)
-        .map_err(|e| format!("a scratch team.yaml: {e}"))?;
-    let report = pmos_contract::lint(dir.path(), &pmos_contract::LintOptions::new(today));
-    let problems: Vec<String> = report
-        .errors()
-        .filter(|d| d.code.starts_with("team-"))
-        .map(|d| format!("{}: {}", d.code, d.message))
-        .collect();
-    if problems.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "the new team.yaml fails the team lint: {}",
-            problems.join("; ")
-        ))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_team_lint_catches_what_the_contract_catches() {
-        let today = "2026-11-14".parse().unwrap();
-        let ok = "members:\n  - handle: \"ana\"\n    slack-id: \"U012AB3CD\"\n    roles: [pm]\n";
-        assert_eq!(lint_team(ok, today), Ok(()));
-        let dup = format!("{ok}  - handle: \"ana\"\n    slack-id: \"U0X\"\n    roles: [pm]\n");
-        assert!(lint_team(&dup, today)
-            .unwrap_err()
-            .contains("team-duplicate"));
-        let bad_slack = "members:\n  - handle: \"ana\"\n    slack-id: \"nope\"\n    roles: [pm]\n";
-        assert!(lint_team(bad_slack, today)
-            .unwrap_err()
-            .contains("team-slack-id"));
-        assert!(lint_team("members: [", today)
-            .unwrap_err()
-            .contains("parse"));
-    }
 }

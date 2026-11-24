@@ -4,6 +4,47 @@ One "PM OS can now ___" line per capability a PM would care about (the launch-po
 `docs/bot-decisions.md` D9). Plumbing that a PM never sees doesn't get a line.
 
 ## Unreleased (before Gate 1; nothing is live yet)
+- **The docs now describe PM OS on any suitable Linux host** (slice H6, after the owner's
+  decision of 2026-11-22 to drop the DGX Spark as a deployment target): the runbooks, the
+  gateway and plan docs, and the deploy kit's comments say "PM OS's host"; promises about
+  Slack text (24 hours), traces (30 days) and the audit log (90 days) say what PM OS does on
+  its host, with a hosted provider's own retention a condition of approving it; and
+  `scripts/check-model-promises.sh`, run in CI, finds any doc that still promises prompts stay
+  on local models.
+- Security fixes from the review of `b469d5b` (user database):
+  - **Nobody can link someone else's account to their own Microsoft account.** The tool server
+    now checks the Microsoft ID token of a first sign-in itself, once per token, instead of
+    taking the web app's word; the admin overview lists every first Microsoft sign-in. The
+    tool server gets the web app's tenant and client id (the deploy kit passes them;
+    `docs/runbooks/upgrade.md`).
+  - **An auditor sees nothing of a file they can't open** but its path and status, and a file
+    whose header can't be read counts as restricted.
+  - **The branch-protection check no longer says "verified" when admins are exempt or someone
+    may bypass the review.**
+  - Smaller: only the Slack bot may approve a join or remove a member; a person's old
+    addresses are never given to someone else; user lookups are rate-limited for hits too; a
+    proposal's title can't close an issue; the purges' database exceptions can't be imitated
+    by a look-alike function.
+- **PM OS can now sign people in with a password and an authenticator app**, beside Microsoft
+  sign-in or on its own (`PMOS_WEB_PASSWORD_LOGIN=1`): a one-time setup code from an admin,
+  a password, then always a code from the app (or a recovery code). The back end and its
+  contract are built (`docs/password-sign-in.md`); the screens come next.
+- **People and roles have one home: the PM OS user database.** `content/team.yaml` is retired:
+  no part of PM OS reads it, onboarding no longer commits it, and `pmos lint` refuses one in
+  the content. Upgrading an install that still has the file means importing it once
+  (`pmos-admin users import`, `docs/runbooks/upgrade.md`) before starting the new version.
+- Security fixes from the web app review (service side):
+  - **The web app and the console can't be run with signed user assertions off.** The runtime
+    and the tool server now require them whenever either is configured, and refuse to start
+    otherwise; `add-bot` and a restore no longer restart them with assertions off.
+  - **A follow-up can't leak what an earlier answer read.** A follow-up in the same
+    conversation starts as restricted as the answers it builds on, so a reply drawn from a
+    restricted source is still blocked in a channel with people outside the team.
+  - **The console reads one PM's draft or task only for that PM or an admin.**
+  - **A runtime restart no longer hides Slack replies silently.** The runtime now refuses the
+    Slack service's saved place in the feed when it is from before the restart, instead of
+    answering "nothing new"; the Slack service still needs a small change to start over by
+    itself (until then, its log says what to do).
 - Security fixes from the November review: each token can do only what its service needs, and
   text from a pull request, a model or a connected system never chooses what runs or who sees it.
   - **The eval gate no longer runs a pull request's code on the Spark.** A pull request could
@@ -11,8 +52,8 @@ One "PM OS can now ___" line per capability a PM would care about (the launch-po
     Spark's own installed script, and the pull request is only read as data.
   - **The Slack bot's token can't make an admin or redirect a draft.** Someone holding it could
     have granted themselves admin, or edited a draft to post in another channel or page. Admins
-    are now added by a pull request to `team.yaml`, and an edit can change a draft's text but
-    not where it goes.
+    are now made only on the host (`pmos-admin users grant-admin`), and an edit can change a
+    draft's text but not where it goes.
   - **The Slack bot reads a draft only for the PM it belongs to.** Its token could read any
     PM's drafts by id. Now a read names the PM, and anyone else's draft isn't found; the
     ledger no longer shows it draft ids.

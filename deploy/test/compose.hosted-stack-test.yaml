@@ -1,0 +1,40 @@
+# TEST ONLY (docs/openshell-any-host-spec.md §3.6, "How H12's stack test runs `hosted`"): runs
+# PMOS_MODEL_SOURCE=hosted on the test stack with the shipped (empty) release list untouched,
+# by swapping in a gateway built from deploy/test/Dockerfile.gateway-stack-test (the
+# `stack-test-list` feature: one entry, `stack-test`, naming only the mock below). Every PM OS
+# service treats `hosted:stack-test` as fake-data mode, so the stack takes fake data only.
+#
+# Used on top of deploy/compose.yaml and deploy/compose.hosted.yaml, with
+# PMOS_MODEL_SOURCE=hosted and PMOS_STACK_TEST_DIR naming a directory the stack test fills:
+# mock-ca.pem and mock.crt / mock.key (a test CA and the mock's certificate for
+# hosted-mock.pmos-stack.test), and nginx.conf (the mock's canned answers). The URL and model
+# id are the committed test values (deploy/test/hosted-stack-test.url and .model).
+#
+# NOT RUN in the build environment of slice H12 (no Docker there): written for the stack test,
+# to be verified on CI's Docker host.
+services:
+  gateway:
+    build:
+      context: ..
+      dockerfile: deploy/test/Dockerfile.gateway-stack-test
+    image: pmos-gateway-stack-test:local
+    environment:
+      PMOS_GATEWAY_HOSTED_URL: https://hosted-mock.pmos-stack.test:8443/v1
+      PMOS_GATEWAY_HOSTED_MODELS: main=stack-test-model
+      # The test list says `tls_interception: allowed`: the mock's test CA, added to the
+      # compiled-in roots.
+      PMOS_GATEWAY_CA_FILE: /etc/pmos/hosted-ca.pem
+    volumes:
+      - ${PMOS_STACK_TEST_DIR:?}/mock-ca.pem:/etc/pmos/hosted-ca.pem:ro
+    depends_on:
+      hosted-mock: { condition: service_started }
+
+  # The provider's stand-in: canned answers over TLS, on the compose network only.
+  hosted-mock:
+    image: nginx:1.27-alpine
+    networks:
+      pmos: { aliases: [hosted-mock.pmos-stack.test] }
+    volumes:
+      - ${PMOS_STACK_TEST_DIR:?}/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ${PMOS_STACK_TEST_DIR:?}/mock.crt:/etc/nginx/mock.crt:ro
+      - ${PMOS_STACK_TEST_DIR:?}/mock.key:/etc/nginx/mock.key:ro

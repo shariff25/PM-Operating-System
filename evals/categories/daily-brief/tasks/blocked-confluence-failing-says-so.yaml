@@ -1,0 +1,34 @@
+# Blocked: say so (docs/evals.md, "Blocked: say so"). A source that fails, not one that is
+# missing. As in slack-not-connected-says-so, the request simulates the failure: the fake
+# connector has no per-task failure switch, and a lane's tool server serves every task that
+# runs on it. Every Confluence call fails with a server error. The daily-brief skill says
+# "I couldn't read <system> just now, so it is left out." once, and carries on with the other
+# sources. Rubric: the brief names Confluence and says it is left out, still links the open
+# Slack asks (Ben's is checked here), and shows nothing from Confluence. It fails if it omits
+# the failure (a brief that reads as complete), shows a Confluence page, or drafts anything.
+id: blocked-confluence-failing-says-so
+ask: |-
+  [daily-brief] Write my daily brief with the daily-brief skill. Act as if today is Friday
+  2024-11-15 and my name is Ana. For this run, treat every Confluence call as failing with
+  "Confluence returned 503 Service Unavailable", whatever the tool really answers, and do not
+  use anything you learn from Confluence.
+expect:
+  approvals: 0
+  must_cite:
+    - "https://slack.com/archives/C0PMTEAM/p1731600000000100"
+  must_include:
+    - "Confluence"
+    - "left out"
+  must_not_include:
+    - "<think>"
+    - "9001"
+    - "9002"
+    - "call notes"
+    - "Key export v2"
+  drafts:
+    - tool: slack.post_reply
+      count: 0
+    - tool: slack.send_message
+      count: 0
+tags:
+  - model/omitted-obstacle

@@ -1,0 +1,3482 @@
+{
+  "category": "pm-craft",
+  "bot": "pm-evals",
+  "date": "2026-11-22",
+  "started_at": "2026-11-22T01:12:07.916913375Z",
+  "finished_at": "2026-11-22T03:23:34.320826639Z",
+  "pass_bar": 0.8,
+  "runtime_url": "http://127.0.0.1:8750",
+  "requested_by": "evals",
+  "gateway_workarounds": null,
+  "note": "model: hosted-model-a (the owner's hosted provider, OpenAI-compatible, every role); first full run (E1) on the test stack, fake fixtures",
+  "repeats": 3,
+  "judges": [
+    {
+      "name": "metric-with-guardrail",
+      "blocking": false,
+      "reason": "advisory: not calibrated"
+    },
+    {
+      "name": "names-riskiest-assumption",
+      "blocking": false,
+      "reason": "advisory: not calibrated"
+    },
+    {
+      "name": "recommendation-first",
+      "blocking": false,
+      "reason": "advisory: not calibrated"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "ai-spec-failure-modes-and-evaluation",
+      "ask": "Draft anyway, no questions: an AI feature spec in the PM space for a feature in the Acme Vault console that explains key rotation to admins in plain words, answering from the public docs (docs page vault-key-rotation).",
+      "repeat": 1,
+      "cluster": "ai-feature-spec",
+      "task_id": "tsk_dffd4b846a0444978a37dd78ea4e9660",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 290.402,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "ai-spec-failure-modes-and-evaluation",
+      "ask": "Draft anyway, no questions: an AI feature spec in the PM space for a feature in the Acme Vault console that explains key rotation to admins in plain words, answering from the public docs (docs page vault-key-rotation).",
+      "repeat": 2,
+      "cluster": "ai-feature-spec",
+      "task_id": "tsk_83ff067337dc4adc89a478fb2a505236",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 311.303,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "ai-spec-failure-modes-and-evaluation",
+      "ask": "Draft anyway, no questions: an AI feature spec in the PM space for a feature in the Acme Vault console that explains key rotation to admins in plain words, answering from the public docs (docs page vault-key-rotation).",
+      "repeat": 3,
+      "cluster": "ai-feature-spec",
+      "task_id": "tsk_7f07918b093f414696e988c6eb21a91a",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 546.938,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "decision-recommends-among-options",
+      "ask": "Draft anyway, no questions: a decision doc in the PM space on which to build first for Acme Vault, audit log export or SCIM user provisioning (Jira story PM-102), given the October Acme Cloud call notes (Confluence page 9001).",
+      "repeat": 1,
+      "cluster": "decision-doc",
+      "task_id": "tsk_1f90eaf18dfa48d4b428c06149af2cca",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 320.186,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "decision-recommends-among-options",
+      "ask": "Draft anyway, no questions: a decision doc in the PM space on which to build first for Acme Vault, audit log export or SCIM user provisioning (Jira story PM-102), given the October Acme Cloud call notes (Confluence page 9001).",
+      "repeat": 2,
+      "cluster": "decision-doc",
+      "task_id": "tsk_8097fe491cf34c218eabd712c2629569",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 332.783,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "decision-recommends-among-options",
+      "ask": "Draft anyway, no questions: a decision doc in the PM space on which to build first for Acme Vault, audit log export or SCIM user provisioning (Jira story PM-102), given the October Acme Cloud call notes (Confluence page 9001).",
+      "repeat": 3,
+      "cluster": "decision-doc",
+      "task_id": "tsk_7752c87a3eff4564b4cae10900c000fc",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 347.247,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "look-first-find-out-overall",
+      "ask": "Find out about SAML single sign-on in Acme Vault, overall for enterprises.",
+      "repeat": 1,
+      "cluster": "ask",
+      "task_id": "tsk_36a468c56ab84fa5a159a68a09b9b42c",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 63.761,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "look-first-find-out-overall",
+      "ask": "Find out about SAML single sign-on in Acme Vault, overall for enterprises.",
+      "repeat": 2,
+      "cluster": "ask",
+      "task_id": "tsk_6bf430aa616d4aff8cddf2cb0828b94a",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 67.75,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "look-first-find-out-overall",
+      "ask": "Find out about SAML single sign-on in Acme Vault, overall for enterprises.",
+      "repeat": 3,
+      "cluster": "ask",
+      "task_id": "tsk_29cd815a76bd4f10912cb8c4e9ce5e56",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 49.905,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "look-first-one-question-with-default",
+      "ask": "Write a PRD for the export improvements in Acme Vault.",
+      "repeat": 1,
+      "cluster": "prd-draft",
+      "task_id": "tsk_bd1df5aeed834a698b6311f6db878319",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 146.878,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "look-first-one-question-with-default",
+      "ask": "Write a PRD for the export improvements in Acme Vault.",
+      "repeat": 2,
+      "cluster": "prd-draft",
+      "task_id": "tsk_e5c3dd3f4d6f4f8899042c9169f8cf57",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 137.307,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "look-first-one-question-with-default",
+      "ask": "Write a PRD for the export improvements in Acme Vault.",
+      "repeat": 3,
+      "cluster": "prd-draft",
+      "task_id": "tsk_f70983400c6442e6a5c948e1143b1992",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 220.071,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "look-first-prd-documented-term",
+      "ask": "Write a PRD for SCIM in the Acme Vault console, in the PM space.",
+      "repeat": 1,
+      "cluster": "prd-draft",
+      "task_id": "tsk_48f08d8ce98542c592e30f77cfecc082",
+      "status": "working",
+      "passed": false,
+      "failures": [
+        {
+          "check": "timed_out",
+          "status": "working"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "timed out while `working`",
+        "sub": "model/timed-out"
+      },
+      "queue_secs": 0.0,
+      "total_secs": null,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "look-first-prd-documented-term",
+      "ask": "Write a PRD for SCIM in the Acme Vault console, in the PM space.",
+      "repeat": 2,
+      "cluster": "prd-draft",
+      "task_id": "tsk_b7633d7933da44b2b31dec8d47471138",
+      "status": "failed",
+      "passed": false,
+      "failures": [
+        {
+          "check": "status",
+          "expected": "`needs_approval`",
+          "got": "failed"
+        },
+        {
+          "check": "approvals",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "draft_count",
+          "tool": "confluence.create_draft",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "no_answer"
+        }
+      ],
+      "tag": {
+        "tag": "harness",
+        "rule": "interrupted",
+        "reason": "error mentions `gateway`: the model gateway returned an error (502). please try again in a few minutes.",
+        "sub": "harness/interrupted"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 528.044,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "look-first-prd-documented-term",
+      "ask": "Write a PRD for SCIM in the Acme Vault console, in the PM space.",
+      "repeat": 3,
+      "cluster": "prd-draft",
+      "task_id": "tsk_40a731b64c1945bfbd2b81f6bee89bb2",
+      "status": "working",
+      "passed": false,
+      "failures": [
+        {
+          "check": "timed_out",
+          "status": "working"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "timed out while `working`",
+        "sub": "model/timed-out"
+      },
+      "queue_secs": 0.0,
+      "total_secs": null,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "look-first-thin-sources-drafts-flagged",
+      "ask": "Go ahead without questions: a PRD in the PM space for running Acme Vault on on-premises hardware appliances.",
+      "repeat": 1,
+      "cluster": "prd-draft",
+      "task_id": "tsk_ed9697c3bbcc46b598342a67b3a12539",
+      "status": "working",
+      "passed": false,
+      "failures": [
+        {
+          "check": "timed_out",
+          "status": "working"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "timed out while `working`",
+        "sub": "model/timed-out"
+      },
+      "queue_secs": 0.0,
+      "total_secs": null,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "look-first-thin-sources-drafts-flagged",
+      "ask": "Go ahead without questions: a PRD in the PM space for running Acme Vault on on-premises hardware appliances.",
+      "repeat": 2,
+      "cluster": "prd-draft",
+      "task_id": "tsk_485496fa50174d7c98b0b9a1a13cb551",
+      "status": "needs_approval",
+      "passed": false,
+      "failures": [
+        {
+          "check": "not_declined"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "answered instead of saying its sources don't",
+        "sub": "model/answered-beyond-sources"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 495.397,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "look-first-thin-sources-drafts-flagged",
+      "ask": "Go ahead without questions: a PRD in the PM space for running Acme Vault on on-premises hardware appliances.",
+      "repeat": 3,
+      "cluster": "prd-draft",
+      "task_id": "tsk_4ead926877bc4a338a354468c068fef6",
+      "status": "failed",
+      "passed": false,
+      "failures": [
+        {
+          "check": "status",
+          "expected": "`needs_approval`",
+          "got": "failed"
+        },
+        {
+          "check": "approvals",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "draft_count",
+          "tool": "confluence.create_draft",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "no_answer"
+        }
+      ],
+      "tag": {
+        "tag": "harness",
+        "rule": "interrupted",
+        "reason": "error mentions `gateway`: the model gateway returned an error (502). please try again in a few minutes.",
+        "sub": "harness/interrupted"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 340.555,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "look-first-uncovered-topic-says-so",
+      "ask": "Write a PRD for supporting hardware security modules in on-premises Acme Vault deployments.",
+      "repeat": 1,
+      "cluster": "prd-draft",
+      "task_id": "tsk_95f28787d857413fac3f6ba1e34286c7",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 143.098,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "look-first-uncovered-topic-says-so",
+      "ask": "Write a PRD for supporting hardware security modules in on-premises Acme Vault deployments.",
+      "repeat": 2,
+      "cluster": "prd-draft",
+      "task_id": "tsk_12e504068cc1445195c6b80469070cef",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 272.504,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "look-first-uncovered-topic-says-so",
+      "ask": "Write a PRD for supporting hardware security modules in on-premises Acme Vault deployments.",
+      "repeat": 3,
+      "cluster": "prd-draft",
+      "task_id": "tsk_b46ed35ffd344c78996975cbce570013",
+      "status": "done",
+      "passed": false,
+      "failures": [
+        {
+          "check": "not_declined"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "answered instead of saying its sources don't",
+        "sub": "model/answered-beyond-sources"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 108.907,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "numbers-sample-size-from-tool",
+      "ask": "Draft anyway, no questions: an experiment plan in the PM space for a redesigned key export button in the Acme Vault console. The baseline conversion rate is 10%, and we want to detect a 10% relative lift, with the default significance level and power, in two arms.",
+      "repeat": 1,
+      "cluster": "experiment-design",
+      "task_id": "tsk_668f1e00971748289fc046be2f905eb8",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 211.057,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "numbers-sample-size-from-tool",
+      "ask": "Draft anyway, no questions: an experiment plan in the PM space for a redesigned key export button in the Acme Vault console. The baseline conversion rate is 10%, and we want to detect a 10% relative lift, with the default significance level and power, in two arms.",
+      "repeat": 2,
+      "cluster": "experiment-design",
+      "task_id": "tsk_307911d95e114bddb9dab5a804c33dd6",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 265.238,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "numbers-sample-size-from-tool",
+      "ask": "Draft anyway, no questions: an experiment plan in the PM space for a redesigned key export button in the Acme Vault console. The baseline conversion rate is 10%, and we want to detect a 10% relative lift, with the default significance level and power, in two arms.",
+      "repeat": 3,
+      "cluster": "experiment-design",
+      "task_id": "tsk_fddc9e62c2b446d5809d2a5a2cde2a9d",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 231.989,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "product-sense-asks-before-drafting",
+      "ask": "Write a PRD for adding a dark mode to the Acme Vault console.",
+      "repeat": 1,
+      "cluster": "prd-draft",
+      "task_id": "tsk_13cc6db2b6d44c6abf7ef8c6960446af",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 165.664,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "product-sense-asks-before-drafting",
+      "ask": "Write a PRD for adding a dark mode to the Acme Vault console.",
+      "repeat": 2,
+      "cluster": "prd-draft",
+      "task_id": "tsk_650ab69d6c63444187182c4531e9e606",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 63.017,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "product-sense-asks-before-drafting",
+      "ask": "Write a PRD for adding a dark mode to the Acme Vault console.",
+      "repeat": 3,
+      "cluster": "prd-draft",
+      "task_id": "tsk_fdc35435bbd144b1978a6d321211c56a",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 94.135,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "review-prd-by-severity",
+      "ask": "Review the Key export v2 PRD (Confluence page 9002) with the review panel, and tell me what to fix first.",
+      "repeat": 1,
+      "cluster": "review",
+      "task_id": "tsk_6f980b2ed0eb45949e31b3820ec74fd2",
+      "status": "working",
+      "passed": false,
+      "failures": [
+        {
+          "check": "timed_out",
+          "status": "working"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "timed out while `working`",
+        "sub": "model/timed-out"
+      },
+      "queue_secs": 0.0,
+      "total_secs": null,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "review-prd-by-severity",
+      "ask": "Review the Key export v2 PRD (Confluence page 9002) with the review panel, and tell me what to fix first.",
+      "repeat": 2,
+      "cluster": "review",
+      "task_id": "tsk_334cb2b2635f4fbcbdfbf791f219ad5c",
+      "status": "done",
+      "passed": false,
+      "failures": [
+        {
+          "check": "missing_text",
+          "text": "blocker"
+        },
+        {
+          "check": "missing_text",
+          "text": "three changes"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "doesn't say \"blocker\"; doesn't say \"three changes\"",
+        "sub": "model/missing-fact"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 72.715,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "review-prd-by-severity",
+      "ask": "Review the Key export v2 PRD (Confluence page 9002) with the review panel, and tell me what to fix first.",
+      "repeat": 3,
+      "cluster": "review",
+      "task_id": "tsk_3b7f900333a04caf905dcc301388e305",
+      "status": "done",
+      "passed": false,
+      "failures": [
+        {
+          "check": "missing_text",
+          "text": "blocker"
+        },
+        {
+          "check": "missing_text",
+          "text": "three changes"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "doesn't say \"blocker\"; doesn't say \"three changes\"",
+        "sub": "model/missing-fact"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 31.276,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-advisory-draft",
+      "ask": "Draft anyway, no questions: a customer advisory in the PM space about the export timing out for large key sets in the Acme Vault console (Jira bug PM-103).",
+      "repeat": 1,
+      "cluster": "advisory-draft",
+      "task_id": "tsk_1d054ba3feca4a3180b7b8cc0e11f44f",
+      "status": "needs_approval",
+      "passed": false,
+      "failures": [
+        {
+          "check": "draft_forbidden_text",
+          "tool": "confluence.create_draft",
+          "draft": "apr_91c32db25b3e49ab89693eab2e930807",
+          "text": "CVE-"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "`confluence.create_draft` draft apr_91c32db25b3e49ab89693eab2e930807 says \"CVE-\"",
+        "sub": "model/draft-content"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 132.441,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": false,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-advisory-draft",
+      "ask": "Draft anyway, no questions: a customer advisory in the PM space about the export timing out for large key sets in the Acme Vault console (Jira bug PM-103).",
+      "repeat": 2,
+      "cluster": "advisory-draft",
+      "task_id": "tsk_cab70c39d17143ccaf0938734c334237",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 216.516,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-advisory-draft",
+      "ask": "Draft anyway, no questions: a customer advisory in the PM space about the export timing out for large key sets in the Acme Vault console (Jira bug PM-103).",
+      "repeat": 3,
+      "cluster": "advisory-draft",
+      "task_id": "tsk_e9bd45202a22455dbc2b1ab2e7fb081d",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 201.961,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": false,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-ai-feature-spec",
+      "ask": "Draft anyway, no questions: an AI feature spec in the PM space for an assistant in the Acme Vault console that answers admins' questions about SAML SSO setup from the public docs (docs page vault-saml-sso).",
+      "repeat": 1,
+      "cluster": "ai-feature-spec",
+      "task_id": "tsk_ec0a56e2cba440489443117af1adf1f1",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 328.246,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": false,
+          "blocking": false
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-ai-feature-spec",
+      "ask": "Draft anyway, no questions: an AI feature spec in the PM space for an assistant in the Acme Vault console that answers admins' questions about SAML SSO setup from the public docs (docs page vault-saml-sso).",
+      "repeat": 2,
+      "cluster": "ai-feature-spec",
+      "task_id": "tsk_b87b85f598574d23961a85d06a515a08",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 226.163,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-ai-feature-spec",
+      "ask": "Draft anyway, no questions: an AI feature spec in the PM space for an assistant in the Acme Vault console that answers admins' questions about SAML SSO setup from the public docs (docs page vault-saml-sso).",
+      "repeat": 3,
+      "cluster": "ai-feature-spec",
+      "task_id": "tsk_798bb09d89b44d149272cbd5d7d876e1",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 281.683,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-call-synth",
+      "ask": "Draft anyway, no questions: a call synthesis in the PM space of the October Acme Cloud customer call notes (Confluence page 9001).",
+      "repeat": 1,
+      "cluster": "call-synth",
+      "task_id": "tsk_0b5a93772c9045ec86115ee66eb58b25",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 281.281,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-call-synth",
+      "ask": "Draft anyway, no questions: a call synthesis in the PM space of the October Acme Cloud customer call notes (Confluence page 9001).",
+      "repeat": 2,
+      "cluster": "call-synth",
+      "task_id": "tsk_2f082ae62870415e89ca4f6af38fb8cb",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 314.062,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-call-synth",
+      "ask": "Draft anyway, no questions: a call synthesis in the PM space of the October Acme Cloud customer call notes (Confluence page 9001).",
+      "repeat": 3,
+      "cluster": "call-synth",
+      "task_id": "tsk_300f9af08e79412a8234b3150cfc0f35",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 290.7,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-competitive-brief",
+      "ask": "Draft anyway, no questions: a competitive brief in the PM space on Initech against Acme Vault for SAML SSO and key rotation, from the team's context and the public docs.",
+      "repeat": 1,
+      "cluster": "competitive-brief",
+      "task_id": "tsk_4ea48f1317d6413194c59b8c5088967e",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 486.058,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-competitive-brief",
+      "ask": "Draft anyway, no questions: a competitive brief in the PM space on Initech against Acme Vault for SAML SSO and key rotation, from the team's context and the public docs.",
+      "repeat": 2,
+      "cluster": "competitive-brief",
+      "task_id": "tsk_40d4b44a35d246dcae37e678ed643a52",
+      "status": "failed",
+      "passed": false,
+      "failures": [
+        {
+          "check": "status",
+          "expected": "`needs_approval`",
+          "got": "failed"
+        },
+        {
+          "check": "approvals",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "draft_count",
+          "tool": "confluence.create_draft",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "no_answer"
+        }
+      ],
+      "tag": {
+        "tag": "harness",
+        "rule": "interrupted",
+        "reason": "error mentions `gateway`: the model gateway returned an error (502). please try again in a few minutes.",
+        "sub": "harness/interrupted"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 359.459,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "structure-competitive-brief",
+      "ask": "Draft anyway, no questions: a competitive brief in the PM space on Initech against Acme Vault for SAML SSO and key rotation, from the team's context and the public docs.",
+      "repeat": 3,
+      "cluster": "competitive-brief",
+      "task_id": "tsk_e66a93f4ddf84e30882530a525c3f88a",
+      "status": "failed",
+      "passed": false,
+      "failures": [
+        {
+          "check": "status",
+          "expected": "`needs_approval`",
+          "got": "failed"
+        },
+        {
+          "check": "approvals",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "draft_count",
+          "tool": "confluence.create_draft",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "no_answer"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "failed: i took too many steps without finishing. try a narrower question, or split it into parts.",
+        "sub": "model/failed"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 121.904,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "structure-decision-doc",
+      "ask": "Draft anyway, no questions: a decision doc in the PM space on whether SCIM user provisioning (Jira story PM-102) ships in the same release as SAML SSO for the Acme Vault console (epic PM-101) or in the one after.",
+      "repeat": 1,
+      "cluster": "decision-doc",
+      "task_id": "tsk_e5b716282c4b46b386be9754900a9cfb",
+      "status": "working",
+      "passed": false,
+      "failures": [
+        {
+          "check": "timed_out",
+          "status": "working"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "timed out while `working`",
+        "sub": "model/timed-out"
+      },
+      "queue_secs": 0.0,
+      "total_secs": null,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "structure-decision-doc",
+      "ask": "Draft anyway, no questions: a decision doc in the PM space on whether SCIM user provisioning (Jira story PM-102) ships in the same release as SAML SSO for the Acme Vault console (epic PM-101) or in the one after.",
+      "repeat": 2,
+      "cluster": "decision-doc",
+      "task_id": "tsk_972deaafcffc4a3e895f89c960415117",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 359.895,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-decision-doc",
+      "ask": "Draft anyway, no questions: a decision doc in the PM space on whether SCIM user provisioning (Jira story PM-102) ships in the same release as SAML SSO for the Acme Vault console (epic PM-101) or in the one after.",
+      "repeat": 3,
+      "cluster": "decision-doc",
+      "task_id": "tsk_0f5e9fe4c4b049028af7a15bf3ef9568",
+      "status": "working",
+      "passed": false,
+      "failures": [
+        {
+          "check": "timed_out",
+          "status": "working"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "timed out while `working`",
+        "sub": "model/timed-out"
+      },
+      "queue_secs": 0.0,
+      "total_secs": null,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "structure-eval-plan",
+      "ask": "Draft anyway, no questions: an eval plan in the PM space for an assistant in the Acme Vault console that answers admins' questions about SAML SSO setup from the public docs (docs page vault-saml-sso).",
+      "repeat": 1,
+      "cluster": "eval-plan",
+      "task_id": "tsk_58e296c65b6d406eb170fa28c701f264",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 289.575,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-eval-plan",
+      "ask": "Draft anyway, no questions: an eval plan in the PM space for an assistant in the Acme Vault console that answers admins' questions about SAML SSO setup from the public docs (docs page vault-saml-sso).",
+      "repeat": 2,
+      "cluster": "eval-plan",
+      "task_id": "tsk_139c88d0746d4ded8f255632c00e9b8d",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 252.023,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-eval-plan",
+      "ask": "Draft anyway, no questions: an eval plan in the PM space for an assistant in the Acme Vault console that answers admins' questions about SAML SSO setup from the public docs (docs page vault-saml-sso).",
+      "repeat": 3,
+      "cluster": "eval-plan",
+      "task_id": "tsk_7d06c7e4131c4ee6a81a84a3a001914f",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 285.469,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-experiment-design",
+      "ask": "Draft anyway, no questions: an experiment plan in the PM space for testing a guided setup checklist on the SAML SSO page of the Acme Vault console (Jira epic PM-101). Today 20% of admins who start SSO setup finish it, and we want to detect a 15% relative lift.",
+      "repeat": 1,
+      "cluster": "experiment-design",
+      "task_id": "tsk_b7dca919cfcf4a738e19515801c9e251",
+      "status": "working",
+      "passed": false,
+      "failures": [
+        {
+          "check": "timed_out",
+          "status": "working"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "timed out while `working`",
+        "sub": "model/timed-out"
+      },
+      "queue_secs": 0.0,
+      "total_secs": null,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "structure-experiment-design",
+      "ask": "Draft anyway, no questions: an experiment plan in the PM space for testing a guided setup checklist on the SAML SSO page of the Acme Vault console (Jira epic PM-101). Today 20% of admins who start SSO setup finish it, and we want to detect a 15% relative lift.",
+      "repeat": 2,
+      "cluster": "experiment-design",
+      "task_id": "tsk_b48deeeb3cb64e7ea11ae2050ab35700",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 337.725,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": false,
+          "blocking": false
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-experiment-design",
+      "ask": "Draft anyway, no questions: an experiment plan in the PM space for testing a guided setup checklist on the SAML SSO page of the Acme Vault console (Jira epic PM-101). Today 20% of admins who start SSO setup finish it, and we want to detect a 15% relative lift.",
+      "repeat": 3,
+      "cluster": "experiment-design",
+      "task_id": "tsk_75c39e283233458da0a21efecac954a9",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 422.905,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-experiment-readout",
+      "ask": "Draft anyway, no questions: an experiment readout in the PM space for the guided SSO setup test in the Acme Vault console (Jira epic PM-101). Control: 10,000 admins started setup and 1,000 finished. Treatment: 10,000 started and 1,100 finished. The planned sample size was 10,000 per arm, and support tickets about SSO did not change.",
+      "repeat": 1,
+      "cluster": "experiment-readout",
+      "task_id": "tsk_d5b72503d4d04eeabde0ab8a5c86bc00",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 229.232,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-experiment-readout",
+      "ask": "Draft anyway, no questions: an experiment readout in the PM space for the guided SSO setup test in the Acme Vault console (Jira epic PM-101). Control: 10,000 admins started setup and 1,000 finished. Treatment: 10,000 started and 1,100 finished. The planned sample size was 10,000 per arm, and support tickets about SSO did not change.",
+      "repeat": 2,
+      "cluster": "experiment-readout",
+      "task_id": "tsk_5030a64b576d4abcafcdf36cfa2454d9",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 403.141,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-experiment-readout",
+      "ask": "Draft anyway, no questions: an experiment readout in the PM space for the guided SSO setup test in the Acme Vault console (Jira epic PM-101). Control: 10,000 admins started setup and 1,000 finished. Treatment: 10,000 started and 1,100 finished. The planned sample size was 10,000 per arm, and support tickets about SSO did not change.",
+      "repeat": 3,
+      "cluster": "experiment-readout",
+      "task_id": "tsk_4c4d45ccc1464f16a53c23b3860f3065",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 345.281,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-launch-checklist",
+      "ask": "Draft anyway, no questions: a launch checklist in the PM space for the SAML SSO launch in the Acme Vault console (Jira epic PM-101 and story PM-102).",
+      "repeat": 1,
+      "cluster": "launch-checklist",
+      "task_id": "tsk_ea76ef7485214022bd2b31f906aa8c50",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 294.609,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-launch-checklist",
+      "ask": "Draft anyway, no questions: a launch checklist in the PM space for the SAML SSO launch in the Acme Vault console (Jira epic PM-101 and story PM-102).",
+      "repeat": 2,
+      "cluster": "launch-checklist",
+      "task_id": "tsk_22c320fac3114be58c2397ab026779d5",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 235.487,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-launch-checklist",
+      "ask": "Draft anyway, no questions: a launch checklist in the PM space for the SAML SSO launch in the Acme Vault console (Jira epic PM-101 and story PM-102).",
+      "repeat": 3,
+      "cluster": "launch-checklist",
+      "task_id": "tsk_75e220f8d11846449a33d64b0327bbd4",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 200.619,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-metrics-tree",
+      "ask": "Draft anyway, no questions: a metrics tree in the PM space for SAML SSO in the Acme Vault console (Jira epic PM-101).",
+      "repeat": 1,
+      "cluster": "metrics-tree",
+      "task_id": "tsk_b632cd90252741c88e75a661438bed74",
+      "status": "failed",
+      "passed": false,
+      "failures": [
+        {
+          "check": "status",
+          "expected": "`needs_approval`",
+          "got": "failed"
+        },
+        {
+          "check": "approvals",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "draft_count",
+          "tool": "confluence.create_draft",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "no_answer"
+        }
+      ],
+      "tag": {
+        "tag": "harness",
+        "rule": "interrupted",
+        "reason": "error mentions `gateway`: the model gateway returned an error (502). please try again in a few minutes.",
+        "sub": "harness/interrupted"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 358.552,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "structure-metrics-tree",
+      "ask": "Draft anyway, no questions: a metrics tree in the PM space for SAML SSO in the Acme Vault console (Jira epic PM-101).",
+      "repeat": 2,
+      "cluster": "metrics-tree",
+      "task_id": "tsk_6f7df7d789714bbeab5fad8c3100ef5a",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 305.553,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-metrics-tree",
+      "ask": "Draft anyway, no questions: a metrics tree in the PM space for SAML SSO in the Acme Vault console (Jira epic PM-101).",
+      "repeat": 3,
+      "cluster": "metrics-tree",
+      "task_id": "tsk_a2531db438a841b98154706cbf3e41ac",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 437.885,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-opportunity-sizing",
+      "ask": "Draft anyway, no questions: an opportunity sizing in the PM space for audit log export in Acme Vault, from the October Acme Cloud call notes (Confluence page 9001). Assume 400 enterprise customers, a quarter of whom need audit export, at 6,000 dollars a year each.",
+      "repeat": 1,
+      "cluster": "opportunity-sizing",
+      "task_id": "tsk_2407f29096ec4e72a8f70a056b6cfd8d",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 331.857,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-opportunity-sizing",
+      "ask": "Draft anyway, no questions: an opportunity sizing in the PM space for audit log export in Acme Vault, from the October Acme Cloud call notes (Confluence page 9001). Assume 400 enterprise customers, a quarter of whom need audit export, at 6,000 dollars a year each.",
+      "repeat": 2,
+      "cluster": "opportunity-sizing",
+      "task_id": "tsk_ac3a95bb85be409c9c2549398ea5b4c3",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 473.961,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-opportunity-sizing",
+      "ask": "Draft anyway, no questions: an opportunity sizing in the PM space for audit log export in Acme Vault, from the October Acme Cloud call notes (Confluence page 9001). Assume 400 enterprise customers, a quarter of whom need audit export, at 6,000 dollars a year each.",
+      "repeat": 3,
+      "cluster": "opportunity-sizing",
+      "task_id": "tsk_c3d5e6ab15ef43af9537b315f68c7eb4",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 368.722,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-partner-brief",
+      "ask": "Draft anyway, no questions: a partner brief in the PM space on a partnership with Initech to bring SSO to Acme Vault customers (Jira epic PM-101, Confluence page 9001).",
+      "repeat": 1,
+      "cluster": "partner-brief",
+      "task_id": "tsk_d71df1146c1c4e3588d9f909934dcca1",
+      "status": "failed",
+      "passed": false,
+      "failures": [
+        {
+          "check": "status",
+          "expected": "`needs_approval`",
+          "got": "failed"
+        },
+        {
+          "check": "approvals",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "draft_count",
+          "tool": "confluence.create_draft",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "no_answer"
+        }
+      ],
+      "tag": {
+        "tag": "harness",
+        "rule": "interrupted",
+        "reason": "error mentions `gateway`: the model gateway returned an error (502). please try again in a few minutes.",
+        "sub": "harness/interrupted"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 413.213,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "structure-partner-brief",
+      "ask": "Draft anyway, no questions: a partner brief in the PM space on a partnership with Initech to bring SSO to Acme Vault customers (Jira epic PM-101, Confluence page 9001).",
+      "repeat": 2,
+      "cluster": "partner-brief",
+      "task_id": "tsk_8ef6cdf195fc4bf3b713be369db13b0a",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 453.029,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-partner-brief",
+      "ask": "Draft anyway, no questions: a partner brief in the PM space on a partnership with Initech to bring SSO to Acme Vault customers (Jira epic PM-101, Confluence page 9001).",
+      "repeat": 3,
+      "cluster": "partner-brief",
+      "task_id": "tsk_84fd149b33d34e4c93ca003c373afc47",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 328.835,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-poc-plan",
+      "ask": "Draft anyway, no questions: a POC plan in the PM space for a trial of SAML SSO in the Acme Vault console with Globex (epic PM-101).",
+      "repeat": 1,
+      "cluster": "poc-plan",
+      "task_id": "tsk_198322b8f26c47628e329592baf8a4b8",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 292.981,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-poc-plan",
+      "ask": "Draft anyway, no questions: a POC plan in the PM space for a trial of SAML SSO in the Acme Vault console with Globex (epic PM-101).",
+      "repeat": 2,
+      "cluster": "poc-plan",
+      "task_id": "tsk_3376c5c991974c4eb526214e2c2077a5",
+      "status": "failed",
+      "passed": false,
+      "failures": [
+        {
+          "check": "status",
+          "expected": "`needs_approval`",
+          "got": "failed"
+        },
+        {
+          "check": "approvals",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "draft_count",
+          "tool": "confluence.create_draft",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "no_answer"
+        }
+      ],
+      "tag": {
+        "tag": "harness",
+        "rule": "interrupted",
+        "reason": "error mentions `gateway`: the model gateway returned an error (502). please try again in a few minutes.",
+        "sub": "harness/interrupted"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 428.031,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "structure-poc-plan",
+      "ask": "Draft anyway, no questions: a POC plan in the PM space for a trial of SAML SSO in the Acme Vault console with Globex (epic PM-101).",
+      "repeat": 3,
+      "cluster": "poc-plan",
+      "task_id": "tsk_22bcfd9deb8e4492995b9e51e847e23d",
+      "status": "failed",
+      "passed": false,
+      "failures": [
+        {
+          "check": "status",
+          "expected": "`needs_approval`",
+          "got": "failed"
+        },
+        {
+          "check": "approvals",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "draft_count",
+          "tool": "confluence.create_draft",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "no_answer"
+        }
+      ],
+      "tag": {
+        "tag": "harness",
+        "rule": "interrupted",
+        "reason": "error mentions `gateway`: the model gateway returned an error (502). please try again in a few minutes.",
+        "sub": "harness/interrupted"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 475.388,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "structure-prd-draft",
+      "ask": "Draft anyway, no questions: a PRD in the PM space for SCIM user provisioning in the Acme Vault console, from Jira story PM-102 and epic PM-101.",
+      "repeat": 1,
+      "cluster": "prd-draft",
+      "task_id": "tsk_38268a7a16bb4ab2be4e7123159d4a6b",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 341.219,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-prd-draft",
+      "ask": "Draft anyway, no questions: a PRD in the PM space for SCIM user provisioning in the Acme Vault console, from Jira story PM-102 and epic PM-101.",
+      "repeat": 2,
+      "cluster": "prd-draft",
+      "task_id": "tsk_eeb3decf36bc427fb786a041fc229936",
+      "status": "failed",
+      "passed": false,
+      "failures": [
+        {
+          "check": "status",
+          "expected": "`needs_approval`",
+          "got": "failed"
+        },
+        {
+          "check": "approvals",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "draft_count",
+          "tool": "confluence.create_draft",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "no_answer"
+        }
+      ],
+      "tag": {
+        "tag": "harness",
+        "rule": "interrupted",
+        "reason": "error mentions `gateway`: the model gateway returned an error (502). please try again in a few minutes.",
+        "sub": "harness/interrupted"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 210.878,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "structure-prd-draft",
+      "ask": "Draft anyway, no questions: a PRD in the PM space for SCIM user provisioning in the Acme Vault console, from Jira story PM-102 and epic PM-101.",
+      "repeat": 3,
+      "cluster": "prd-draft",
+      "task_id": "tsk_9c066fcff6954f99a716625df757f3f6",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 407.744,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-problem-framing",
+      "ask": "Draft anyway, no questions: a problem statement in the PM space for the SSO asks in the October Acme Cloud call notes (Confluence page 9001) and Jira epic PM-101.",
+      "repeat": 1,
+      "cluster": "problem-framing",
+      "task_id": "tsk_19aaa63108dc454e9d2ba42347db7772",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 333.56,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-problem-framing",
+      "ask": "Draft anyway, no questions: a problem statement in the PM space for the SSO asks in the October Acme Cloud call notes (Confluence page 9001) and Jira epic PM-101.",
+      "repeat": 2,
+      "cluster": "problem-framing",
+      "task_id": "tsk_f00fc9fcd9674cb48eeaea115c0562a0",
+      "status": "failed",
+      "passed": false,
+      "failures": [
+        {
+          "check": "status",
+          "expected": "`needs_approval`",
+          "got": "failed"
+        },
+        {
+          "check": "approvals",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "draft_count",
+          "tool": "confluence.create_draft",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "no_answer"
+        }
+      ],
+      "tag": {
+        "tag": "harness",
+        "rule": "interrupted",
+        "reason": "error mentions `gateway`: the model gateway returned an error (502). please try again in a few minutes.",
+        "sub": "harness/interrupted"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 20.934,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "structure-problem-framing",
+      "ask": "Draft anyway, no questions: a problem statement in the PM space for the SSO asks in the October Acme Cloud call notes (Confluence page 9001) and Jira epic PM-101.",
+      "repeat": 3,
+      "cluster": "problem-framing",
+      "task_id": "tsk_031f3f3eabd5463f9570a9a7fd20bbf3",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 367.976,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-release-notes",
+      "ask": "Draft anyway, no questions: release notes in the PM space for the SSO work in Jira epic PM-101 (story PM-102, SCIM user provisioning), for customers of the Acme Vault console.",
+      "repeat": 1,
+      "cluster": "release-notes",
+      "task_id": "tsk_813abef3c03e49bdbbf4ce93378b45e3",
+      "status": "needs_approval",
+      "passed": false,
+      "failures": [
+        {
+          "check": "draft_missing_text",
+          "tool": "confluence.create_draft",
+          "draft": "apr_9020d92f289f4343afd3020522caa804",
+          "text": "Improved"
+        },
+        {
+          "check": "draft_missing_text",
+          "tool": "confluence.create_draft",
+          "draft": "apr_9020d92f289f4343afd3020522caa804",
+          "text": "Fixed"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "`confluence.create_draft` draft apr_9020d92f289f4343afd3020522caa804 doesn't say \"Improved\"; `confluence.create_draft` draft apr_9020d92f289f4343afd3020522caa804 doesn't say \"Fixed\"",
+        "sub": "model/draft-content"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 255.733,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": false,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-release-notes",
+      "ask": "Draft anyway, no questions: release notes in the PM space for the SSO work in Jira epic PM-101 (story PM-102, SCIM user provisioning), for customers of the Acme Vault console.",
+      "repeat": 2,
+      "cluster": "release-notes",
+      "task_id": "tsk_d6badd15774a4237836c16ce329d718e",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 167.561,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": false,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-release-notes",
+      "ask": "Draft anyway, no questions: release notes in the PM space for the SSO work in Jira epic PM-101 (story PM-102, SCIM user provisioning), for customers of the Acme Vault console.",
+      "repeat": 3,
+      "cluster": "release-notes",
+      "task_id": "tsk_96706bafed43410e868ac6a0ce4452d4",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 146.743,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": false,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-status-update",
+      "ask": "Draft anyway, no questions: a status update in the PM space on the SSO work for the Acme Vault console (Jira epic PM-101 and its story PM-102).",
+      "repeat": 1,
+      "cluster": "status-update",
+      "task_id": "tsk_23b6684b8d7c4483aaaa0976f583c60c",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 290.011,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": false,
+          "blocking": false
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-status-update",
+      "ask": "Draft anyway, no questions: a status update in the PM space on the SSO work for the Acme Vault console (Jira epic PM-101 and its story PM-102).",
+      "repeat": 2,
+      "cluster": "status-update",
+      "task_id": "tsk_f8b76938aa064c0da803da715ba4a240",
+      "status": "failed",
+      "passed": false,
+      "failures": [
+        {
+          "check": "status",
+          "expected": "`needs_approval`",
+          "got": "failed"
+        },
+        {
+          "check": "approvals",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "draft_count",
+          "tool": "confluence.create_draft",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "no_answer"
+        }
+      ],
+      "tag": {
+        "tag": "harness",
+        "rule": "interrupted",
+        "reason": "error mentions `gateway`: the model gateway returned an error (502). please try again in a few minutes.",
+        "sub": "harness/interrupted"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 219.705,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "structure-status-update",
+      "ask": "Draft anyway, no questions: a status update in the PM space on the SSO work for the Acme Vault console (Jira epic PM-101 and its story PM-102).",
+      "repeat": 3,
+      "cluster": "status-update",
+      "task_id": "tsk_7c04275b67da4bf782fa962dad7cb9f4",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 125.595,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": false,
+          "blocking": false
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-strategy-doc",
+      "ask": "Draft anyway, no questions: a strategy doc in the PM space for enterprise identity in the Acme Vault console (SAML SSO and SCIM), from Jira epic PM-101, story PM-102 and the October Acme Cloud call notes (Confluence page 9001).",
+      "repeat": 1,
+      "cluster": "strategy-doc",
+      "task_id": "tsk_6142b3c3082e412abbd0510fd50f6a79",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 287.209,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-strategy-doc",
+      "ask": "Draft anyway, no questions: a strategy doc in the PM space for enterprise identity in the Acme Vault console (SAML SSO and SCIM), from Jira epic PM-101, story PM-102 and the October Acme Cloud call notes (Confluence page 9001).",
+      "repeat": 2,
+      "cluster": "strategy-doc",
+      "task_id": "tsk_067e2ef4ce874bc8b132f01b54600919",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 326.875,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-strategy-doc",
+      "ask": "Draft anyway, no questions: a strategy doc in the PM space for enterprise identity in the Acme Vault console (SAML SSO and SCIM), from Jira epic PM-101, story PM-102 and the October Acme Cloud call notes (Confluence page 9001).",
+      "repeat": 3,
+      "cluster": "strategy-doc",
+      "task_id": "tsk_b15846d4d1a341c3b9b561f7c75c48b4",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 401.484,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "thread-follow-up-changes-one-detail",
+      "ask": "Draft one Jira story in project PM, under the epic PM-101, for letting an admin require SAML SSO for every Acme Vault console login. Don't create anything else.",
+      "repeat": 1,
+      "cluster": "thread",
+      "task_id": "tsk_e784421bac214c96aff171bc74f75ba4",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 86.198,
+      "attempts": 1,
+      "trace_read": false,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": false,
+          "blocking": false
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": false,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        }
+      ],
+      "turns": [
+        {
+          "turn": 1,
+          "ask": "Draft one Jira story in project PM, under the epic PM-101, for letting an admin require SAML SSO for every Acme Vault console login. Don't create anything else.",
+          "graded": true,
+          "passed": true,
+          "task_id": "tsk_f43873c982c9480d91a75337409e793f",
+          "status": "needs_approval",
+          "failures": [],
+          "tag": null,
+          "queue_secs": 0.0,
+          "total_secs": 91.171
+        },
+        {
+          "turn": 2,
+          "ask": "Same thing, but make it a Task, not a Story. Keep everything else as it is.",
+          "graded": true,
+          "passed": true,
+          "task_id": "tsk_e784421bac214c96aff171bc74f75ba4",
+          "status": "needs_approval",
+          "failures": [],
+          "tag": null,
+          "queue_secs": 0.0,
+          "total_secs": 86.198
+        }
+      ]
+    },
+    {
+      "id": "thread-follow-up-changes-one-detail",
+      "ask": "Draft one Jira story in project PM, under the epic PM-101, for letting an admin require SAML SSO for every Acme Vault console login. Don't create anything else.",
+      "repeat": 2,
+      "cluster": "thread",
+      "task_id": "tsk_8e366dd45dcf49fa9e98f7c8219768a2",
+      "status": "failed",
+      "passed": false,
+      "failures": [
+        {
+          "check": "status",
+          "expected": "`needs_approval`",
+          "got": "failed"
+        },
+        {
+          "check": "approvals",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "draft_count",
+          "tool": "jira.create_issue",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "no_answer"
+        }
+      ],
+      "tag": {
+        "tag": "harness",
+        "rule": "interrupted",
+        "reason": "turn 1 of 2: error mentions `gateway`: the model gateway returned an error (502). please try again in a few minutes.",
+        "sub": "harness/interrupted"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 122.39,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": false,
+          "blocking": false
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": false,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ],
+      "turns": [
+        {
+          "turn": 1,
+          "ask": "Draft one Jira story in project PM, under the epic PM-101, for letting an admin require SAML SSO for every Acme Vault console login. Don't create anything else.",
+          "graded": true,
+          "passed": false,
+          "task_id": "tsk_8e366dd45dcf49fa9e98f7c8219768a2",
+          "status": "failed",
+          "failures": [
+            {
+              "check": "status",
+              "expected": "`needs_approval`",
+              "got": "failed"
+            },
+            {
+              "check": "approvals",
+              "expected": 1,
+              "got": 0
+            },
+            {
+              "check": "draft_count",
+              "tool": "jira.create_issue",
+              "expected": 1,
+              "got": 0
+            },
+            {
+              "check": "no_answer"
+            }
+          ],
+          "tag": {
+            "tag": "harness",
+            "rule": "interrupted",
+            "reason": "turn 1 of 2: error mentions `gateway`: the model gateway returned an error (502). please try again in a few minutes.",
+            "sub": "harness/interrupted"
+          },
+          "queue_secs": 0.0,
+          "total_secs": 122.39
+        },
+        {
+          "turn": 2,
+          "ask": "Same thing, but make it a Task, not a Story. Keep everything else as it is.",
+          "graded": true,
+          "passed": true,
+          "task_id": "tsk_7dec466a0a09405988613163dd0e3169",
+          "status": "needs_approval",
+          "failures": [],
+          "tag": null,
+          "queue_secs": 0.0,
+          "total_secs": 93.45
+        }
+      ],
+      "failed_turn": 1
+    },
+    {
+      "id": "thread-follow-up-changes-one-detail",
+      "ask": "Draft one Jira story in project PM, under the epic PM-101, for letting an admin require SAML SSO for every Acme Vault console login. Don't create anything else.",
+      "repeat": 3,
+      "cluster": "thread",
+      "task_id": "tsk_6b1852e07eb64f579f1ac63bc7101649",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 79.814,
+      "attempts": 1,
+      "trace_read": false,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": false,
+          "blocking": false
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": false,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ],
+      "turns": [
+        {
+          "turn": 1,
+          "ask": "Draft one Jira story in project PM, under the epic PM-101, for letting an admin require SAML SSO for every Acme Vault console login. Don't create anything else.",
+          "graded": true,
+          "passed": true,
+          "task_id": "tsk_74d231c039074440a1a72804213e9cf6",
+          "status": "needs_approval",
+          "failures": [],
+          "tag": null,
+          "queue_secs": 0.0,
+          "total_secs": 101.142
+        },
+        {
+          "turn": 2,
+          "ask": "Same thing, but make it a Task, not a Story. Keep everything else as it is.",
+          "graded": true,
+          "passed": true,
+          "task_id": "tsk_6b1852e07eb64f579f1ac63bc7101649",
+          "status": "needs_approval",
+          "failures": [],
+          "tag": null,
+          "queue_secs": 0.0,
+          "total_secs": 79.814
+        }
+      ]
+    },
+    {
+      "id": "thread-generate-the-content-continues-the-document",
+      "ask": "I want a call synthesis in the PM space of the October Acme Cloud customer call notes (Confluence page 9001). What would it cover?",
+      "repeat": 1,
+      "cluster": "thread",
+      "task_id": "tsk_ab95c88a3d1a41219c9f9e9ec330372f",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 371.794,
+      "attempts": 1,
+      "trace_read": false,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ],
+      "turns": [
+        {
+          "turn": 1,
+          "ask": "I want a call synthesis in the PM space of the October Acme Cloud customer call notes (Confluence page 9001). What would it cover?",
+          "graded": false,
+          "passed": true,
+          "task_id": "tsk_80f4baf718254667bb76ff9d12170532",
+          "status": "done",
+          "failures": [],
+          "tag": null,
+          "queue_secs": 0.0,
+          "total_secs": 231.09
+        },
+        {
+          "turn": 2,
+          "ask": "OK, generate the content.",
+          "graded": true,
+          "passed": true,
+          "task_id": "tsk_ab95c88a3d1a41219c9f9e9ec330372f",
+          "status": "needs_approval",
+          "failures": [],
+          "tag": null,
+          "queue_secs": 0.0,
+          "total_secs": 371.794
+        }
+      ]
+    },
+    {
+      "id": "thread-generate-the-content-continues-the-document",
+      "ask": "I want a call synthesis in the PM space of the October Acme Cloud customer call notes (Confluence page 9001). What would it cover?",
+      "repeat": 2,
+      "cluster": "thread",
+      "task_id": "tsk_d894a70d047d4c87a08b86d8d0983c34",
+      "status": "failed",
+      "passed": false,
+      "failures": [
+        {
+          "check": "status",
+          "expected": "`needs_approval`",
+          "got": "failed"
+        },
+        {
+          "check": "approvals",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "draft_count",
+          "tool": "confluence.create_draft",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "no_answer"
+        }
+      ],
+      "tag": {
+        "tag": "harness",
+        "rule": "interrupted",
+        "reason": "turn 2 of 2: error mentions `gateway`: the model gateway returned an error (502). please try again in a few minutes.",
+        "sub": "harness/interrupted"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 150.119,
+      "attempts": 1,
+      "trace_read": true,
+      "turns": [
+        {
+          "turn": 1,
+          "ask": "I want a call synthesis in the PM space of the October Acme Cloud customer call notes (Confluence page 9001). What would it cover?",
+          "graded": false,
+          "passed": true,
+          "task_id": "tsk_e221c8f417bb4a9496712027f33056e7",
+          "status": "done",
+          "failures": [],
+          "tag": null,
+          "queue_secs": 0.0,
+          "total_secs": 98.077
+        },
+        {
+          "turn": 2,
+          "ask": "OK, generate the content.",
+          "graded": true,
+          "passed": false,
+          "task_id": "tsk_d894a70d047d4c87a08b86d8d0983c34",
+          "status": "failed",
+          "failures": [
+            {
+              "check": "status",
+              "expected": "`needs_approval`",
+              "got": "failed"
+            },
+            {
+              "check": "approvals",
+              "expected": 1,
+              "got": 0
+            },
+            {
+              "check": "draft_count",
+              "tool": "confluence.create_draft",
+              "expected": 1,
+              "got": 0
+            },
+            {
+              "check": "no_answer"
+            }
+          ],
+          "tag": {
+            "tag": "harness",
+            "rule": "interrupted",
+            "reason": "turn 2 of 2: error mentions `gateway`: the model gateway returned an error (502). please try again in a few minutes.",
+            "sub": "harness/interrupted"
+          },
+          "queue_secs": 0.0,
+          "total_secs": 150.119
+        }
+      ],
+      "failed_turn": 2
+    },
+    {
+      "id": "thread-generate-the-content-continues-the-document",
+      "ask": "I want a call synthesis in the PM space of the October Acme Cloud customer call notes (Confluence page 9001). What would it cover?",
+      "repeat": 3,
+      "cluster": "thread",
+      "task_id": "tsk_f561cdc064764e889c23418a5bd24c84",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 334.345,
+      "attempts": 1,
+      "trace_read": false,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ],
+      "turns": [
+        {
+          "turn": 1,
+          "ask": "I want a call synthesis in the PM space of the October Acme Cloud customer call notes (Confluence page 9001). What would it cover?",
+          "graded": false,
+          "passed": true,
+          "task_id": "tsk_f28ba6c622114c5d982a7095e053e66f",
+          "status": "done",
+          "failures": [],
+          "tag": null,
+          "queue_secs": 0.0,
+          "total_secs": 82.941
+        },
+        {
+          "turn": 2,
+          "ask": "OK, generate the content.",
+          "graded": true,
+          "passed": true,
+          "task_id": "tsk_f561cdc064764e889c23418a5bd24c84",
+          "status": "needs_approval",
+          "failures": [],
+          "tag": null,
+          "queue_secs": 0.0,
+          "total_secs": 334.345
+        }
+      ]
+    },
+    {
+      "id": "thread-one-word-answer-is-an-answer",
+      "ask": "Write a PRD for adding a dark mode to the Acme Vault console.",
+      "repeat": 1,
+      "cluster": "thread",
+      "task_id": "tsk_21f32e111c2e43a6b3eba07731922fc3",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 347.61,
+      "attempts": 1,
+      "trace_read": false,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ],
+      "turns": [
+        {
+          "turn": 1,
+          "ask": "Write a PRD for adding a dark mode to the Acme Vault console.",
+          "graded": true,
+          "passed": true,
+          "task_id": "tsk_7a534ef3aa4b45ada1685ca1c77c2302",
+          "status": "done",
+          "failures": [],
+          "tag": null,
+          "queue_secs": 0.0,
+          "total_secs": 49.5
+        },
+        {
+          "turn": 2,
+          "ask": "customer",
+          "graded": true,
+          "passed": true,
+          "task_id": "tsk_21f32e111c2e43a6b3eba07731922fc3",
+          "status": "needs_approval",
+          "failures": [],
+          "tag": null,
+          "queue_secs": 0.0,
+          "total_secs": 347.61
+        }
+      ]
+    },
+    {
+      "id": "thread-one-word-answer-is-an-answer",
+      "ask": "Write a PRD for adding a dark mode to the Acme Vault console.",
+      "repeat": 2,
+      "cluster": "thread",
+      "task_id": "tsk_6268c004ab98488893ba8bd46e093f1f",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 403.247,
+      "attempts": 1,
+      "trace_read": false,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes nor no"
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ],
+      "turns": [
+        {
+          "turn": 1,
+          "ask": "Write a PRD for adding a dark mode to the Acme Vault console.",
+          "graded": true,
+          "passed": true,
+          "task_id": "tsk_3d2dfd4d44be428aa148c6b2063ff2f1",
+          "status": "done",
+          "failures": [],
+          "tag": null,
+          "queue_secs": 0.0,
+          "total_secs": 157.163
+        },
+        {
+          "turn": 2,
+          "ask": "customer",
+          "graded": true,
+          "passed": true,
+          "task_id": "tsk_6268c004ab98488893ba8bd46e093f1f",
+          "status": "needs_approval",
+          "failures": [],
+          "tag": null,
+          "queue_secs": 0.0,
+          "total_secs": 403.247
+        }
+      ]
+    },
+    {
+      "id": "thread-one-word-answer-is-an-answer",
+      "ask": "Write a PRD for adding a dark mode to the Acme Vault console.",
+      "repeat": 3,
+      "cluster": "thread",
+      "task_id": "tsk_36227f55bcd3432d8740938e53e29e49",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 325.233,
+      "attempts": 1,
+      "trace_read": false,
+      "judges": [
+        {
+          "name": "metric-with-guardrail",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "names-riskiest-assumption",
+          "verdict": true,
+          "blocking": false
+        },
+        {
+          "name": "recommendation-first",
+          "verdict": true,
+          "blocking": false
+        }
+      ],
+      "turns": [
+        {
+          "turn": 1,
+          "ask": "Write a PRD for adding a dark mode to the Acme Vault console.",
+          "graded": true,
+          "passed": true,
+          "task_id": "tsk_94f65666cc20495daf13c2eeaa01fc15",
+          "status": "done",
+          "failures": [],
+          "tag": null,
+          "queue_secs": 0.0,
+          "total_secs": 87.464
+        },
+        {
+          "turn": 2,
+          "ask": "customer",
+          "graded": true,
+          "passed": true,
+          "task_id": "tsk_36227f55bcd3432d8740938e53e29e49",
+          "status": "needs_approval",
+          "failures": [],
+          "tag": null,
+          "queue_secs": 0.0,
+          "total_secs": 325.233
+        }
+      ]
+    }
+  ]
+}

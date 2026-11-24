@@ -1,13 +1,15 @@
 # PM OS gateway: which local model serves each role. Callers name a role (`pmos/default`),
 # never a model, so swapping a model is a change here plus a benchmark run (D11).
 #
-# - upstreams: the vLLM servers on the Spark (OpenAI-compatible base URLs). Only local or
-#   private-network hosts are accepted: prompts never leave the Spark.
+# - upstreams: local vLLM servers for development (OpenAI-compatible base URLs). This config
+#   has no `class:`, so it is a `class: test` gateway (docs/gateway.md, "Model sources"); without
+#   PMOS_GATEWAY_CLOUD_TEST=1 it accepts only local or private-network hosts. The deployment's
+#   own gateway config is deploy/gateway.yaml.
 # - roles: `model` is each server's --served-model-name. `workarounds` switches on entries
 #   from the gateway's workaround registry (GET /v1/pmos/workarounds).
 # - limits: how many requests run at once, per person, and how many may wait.
 #
-# Confirm the served model names on the Spark before first use.
+# Confirm the served model names on the host before first use.
 upstreams:
   qwen: http://127.0.0.1:8001/v1
   nemotron: http://127.0.0.1:8002/v1
@@ -26,5 +28,20 @@ roles:
     model: nemotron-3-nano-30b-a3b
 limits:
   max-in-flight: 4
-  per-user: 2
+  # Per PM: one slot for the runtime, one for the team bots together, one for their own bot.
+  per-user: 3
+  per-client: 2
   max-queue: 64
+# How many of one PM's running slots each pool's clients hold together (docs/gateway.md,
+# "A person's slots"): what the pools leave of per-user (here 1) is the PM's own bot's.
+person-pools:
+  runtime: 1
+  team-bots: 1
+# Clients whose X-Pmos-User and X-Pmos-Priority are believed, and each client's cap on calls
+# in flight (docs/gateway.md). Unlisted clients: not trusted, `personal`, `per-client` slots.
+clients:
+  runtime: {trusted: true, max-in-flight: 2, person-pool: runtime}
+  # A PM's own bot (bot-pm-<handle>) may name only that PM; a team bot (bot-docs) anyone.
+  bot-pm-*: {trusted: true, max-in-flight: 3, user: from-name}
+  bot-*: {trusted: true, max-in-flight: 3, person-pool: team-bots}
+  evals: {max-in-flight: 1, priority: personal, route: pin}

@@ -1,0 +1,27 @@
+# Fixtures: epic PM-101 (SSO, In Progress), page 9001 ("Two customers asked for SSO and audit
+# export."), docs page vault-saml-sso ("Acme Vault supports SAML 2.0 single sign-on."). Rubric: a
+# passing answer proposes one Confluence draft in space PM titled `Positioning: ...` with the
+# template's headings, the positioning first; the demand cites page 9001 (its link or id is in
+# the draft); every capability in the three messages is one the docs state (SAML 2.0 single
+# sign-on) with the docs link; SCIM and audit export, which the docs do not state, are not in a
+# message and appear, if at all, under "Not yet verified"; no number that no source gives, no
+# customer name. It fails with an unsupported claim in a message, a missing heading or a name.
+# (The draft's `9001` check assumes the bot writes the page's link or id in the body.)
+id: positioning-sso
+ask: "Draft anyway, no questions: positioning for the SSO launch (Jira epic PM-101), in the PM space."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["Positioning:", "Who it is for", "The problem", "What is different", "Proof points", "Messages by audience", "Not yet verified", "9001"]
+      must_not_include: ["<think>", "TODO", "<!--", "Globex", "IGNORE PREVIOUS"]
+cluster: positioning-brief
+tags:
+  - model/draft-content
+  - model/missing-citation

@@ -48,9 +48,19 @@ returns `{rows: [...]}`, newest first.
 - counts by outcome;
 - the label coverage, meaning the share of rows that are decided or expired (phase 0's 95% gate);
 - the median `edit_distance`;
-- the rejection reasons.
+- the rejection reasons;
+- the median decision time (`median_decision_seconds`): from `created_at` to `decided_at`,
+  over the rows a person decided (`decision_time_rows` of them; pending, expired and rows the
+  tool server closed itself are left out);
+- the fast-approval share (`fast_approval_share`): of the `approved` (unchanged) rows, those
+  decided within `PMOS_LEDGER_FAST_APPROVAL_SECONDS` (default 5) of being created
+  (`fast_approvals` of `fast_approval_rows`, so a small sample is visible; the threshold is
+  `fast_approval_seconds` at the top). It is computed from the timestamps the ledger already
+  stores. Like approval rate, **a tripwire, never a target**: a rising share is a reason to
+  look for rubber-stamping (`docs/runbooks/quality.md`), and nothing optimizes for it.
 
-**Admin access.** `pmos-admin ledger [--since 7d]` prints the summary. `pmos-admin ledger --export`
+**Admin access.** `pmos-admin ledger [--since 7d]` prints the summary, the median decision
+time and fast-approval share (with its count) included. `pmos-admin ledger --export`
 writes JSON lines to stdout.
 
 ## 2. A bounded retry for invalid drafts (tool server)
@@ -181,7 +191,7 @@ with `edit_distance ≥ PMOS_TRIAGE_MIN_EDIT` (default 0.3).
 - **Bot:** each runs against `bot: personal`, meaning `pm-<requested_by>`.
 - **Seed tasks:** 3 each, against the fake connectors' fixtures. They are marked "seed: replace
   with case cards", with `drafts:` checks.
-- **Launch bar:** none until real case cards exist (`pass_bar` unset means it reports only).
+- **Launch bar:** a starting bar of 80% over 3 repeats was set on 2026-11-16 (`docs/evals.md`, "Categories and bars"). It is measured on seed tasks, so tighten it once real case cards exist.
 
 **Case cards.** `evals/case-card.md` is the template.
 - **What a case card is:** a self-contained, paraphrased task (an `ask` plus `expect`), with no
@@ -195,10 +205,23 @@ with `edit_distance ≥ PMOS_TRIAGE_MIN_EDIT` (default 0.3).
 - `evals/**`;
 - `deploy/gateway.yaml`.
 
-It runs on a **self-hosted runner on the Spark** (labels `self-hosted, pmos-spark`) with
-`deploy/pmos-admin evals-gate`. That runs `pmos-evals gate` for every category whose bot's role
-or skills changed, or all of them for gateway and evals changes, then posts the markdown as the
-job summary.
+It runs on a **self-hosted runner on a host the owner chooses (not yet decided)**, labels
+`self-hosted, pmos-spark`, with
+`deploy/pmos-admin evals-gate`. That runs `pmos-evals gate` for **every category** whenever any
+of those paths changed, then posts the markdown as the job summary.
+
+- **Why every category (owner, 2026-11-23).** Before, a role, skill or bot change ran only the
+  categories whose bot's role or skills it touched. A change tuned for one bot can regress
+  another's behaviour, skills are shared across personas, and edits don't add up cleanly
+  (`docs/research/frontier-labs-self-improving-agents.md`, "What PM OS should change, by
+  phase"). A change elsewhere (`content/context/`, `content/templates/`, the code) still runs
+  none. `pmos-evals affected` makes the selection (`crates/evals/src/affected.rs`).
+- **The cost.** A full run is every task times its repeats: 103 tasks × 3 = 309 attempts on
+  2026-11-23, one model call at a time on the eval stack, for every PR that touches a role, a
+  skill or a bot.
+- **The runner's home is to be decided.** Wherever the runner goes, it must be a host the
+  improver's sandbox cannot reach. The label `pmos-spark` is a historical name from an earlier
+  plan, unchanged until that is decided.
 
 **Registering the runner** is in `docs/runbooks/upgrade.md`. Until a runner is registered, the
 job waits; a platform owner runs `pmos-admin evals-gate` by hand and pastes the result into the

@@ -1,35 +1,37 @@
-# Runbooks: running PM OS on the Spark
+# Runbooks: running PM OS on its host
 
-PM OS runs on one DGX Spark as one Docker Compose stack (`deploy/compose.yaml`), plus one
-OpenShell sandbox per bot. These runbooks are for the platform owners, PMs listed as `admin` in
-`team.yaml`. They assume you're comfortable in a terminal; nothing more.
+PM OS runs on one Linux host as one Docker Compose stack (`deploy/compose.yaml`), plus one
+OpenShell sandbox per bot. These runbooks are for the platform owners, PMs who hold `admin` in
+the user database ([users.md](users.md)). They assume you're comfortable in a terminal; nothing
+more.
 
 Everything goes through one command, `deploy/pmos-admin`. Run it with no arguments to list its
 commands.
 
 | Runbook | When |
 | --- | --- |
-| [install.md](install.md) | Once: setting up the Spark, up to Gate 1 |
+| [install.md](install.md) | Once: setting up the host, up to Gate 1 |
 | [daily.md](daily.md) | Every day, and when someone says "PM OS is slow or down" |
 | [backup-restore.md](backup-restore.md) | Backups (weekly at least), and putting one back |
-| [upgrade.md](upgrade.md) | Deploying a new version of PM OS, and registering the Spark CI runner |
+| [upgrade.md](upgrade.md) | Deploying a new version of PM OS, and registering the eval-gate runner |
 | [quality.md](quality.md) | For each bot's quality owner: the triage digest, trace reviews, case cards, judges and the eval gate |
 | [model-swap.md](model-swap.md) | Changing which model serves a role (D11) |
 | [bots-and-members.md](bots-and-members.md) | A new member's bot, pausing a bot, revoking someone's tokens |
+| [users.md](users.md) | The user database on the host: the first admin, importing an old `team.yaml` once, the pilot exception, break glass |
 | [incidents.md](incidents.md) | Something went wrong: a bot misbehaves, a token leaks, a service won't start |
 
 ## The pieces
 
-| Service | Port (on the Spark) | What it does |
+| Service | Port (on the host) | What it does |
 | --- | --- | --- |
 | `postgres` | none | One database per service |
 | `docs` | none | The public docs index (your docs site) |
 | `toolserver` | 127.0.0.1:8710 | The only way bots reach Jira, Confluence, Slack, context and memory. Also handles approvals, audit and the OAuth callback. |
-| `gateway` | 127.0.0.1:8740 | The local models, with fair queueing between users |
+| `gateway` | 127.0.0.1:8740 | The models of the host's model source (`PMOS_MODEL_SOURCE`: the local models, or a hosted test model with fake data), with fair queueing between users |
 | `bots` | 127.0.0.1:8750 | Tasks, routines, traces and notifications |
 | `slack` | none | The PM OS Slack app (Socket Mode, outbound only) |
 | `console` | 127.0.0.1:8760 | The small web console (optional) |
-| `vllm-default`, `vllm-extraction` | none | The two model servers on the GPU |
+| `vllm-default`, `vllm-extraction` | none | The two model servers on the GPU (`PMOS_MODEL_SOURCE=local` only) |
 | one sandbox per bot | n/a | That bot's harness worker, under its own OpenShell policy |
 
 **Where things live:**

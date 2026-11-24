@@ -37,6 +37,8 @@ pub struct TaskFilter {
     pub requested_by: Option<String>,
     pub status: Option<TaskStatus>,
     pub source: Option<crate::model::Source>,
+    /// `Some(None)`: Nudge's tasks only; `Some(Some(key))`: that persona's.
+    pub persona: Option<Option<String>>,
     pub limit: usize,
 }
 
@@ -49,6 +51,7 @@ impl TaskFilter {
                 .is_none_or(|r| &t.requested_by == r)
             && self.status.is_none_or(|s| t.status == s)
             && self.source.is_none_or(|s| t.source == s)
+            && self.persona.as_ref().is_none_or(|p| &t.persona == p)
     }
 }
 
@@ -76,6 +79,10 @@ pub struct Transition {
     pub error: Option<String>,
     pub approvals: Option<Vec<String>>,
     pub checklist: Option<Vec<ChecklistItem>>,
+    /// The highest data class the task's sessions read (`Task::sources_sensitivity`).
+    pub sensitivity: Option<crate::model::Sensitivity>,
+    /// Which labelled models answered the task, and whether a fallback did (slice MP7).
+    pub models: Option<(Vec<crate::model::ModelUse>, bool)>,
     pub attempts_delta: i32,
     /// `(kind, text)` added to the task's events.
     pub event: Option<(String, String)>,
@@ -109,6 +116,8 @@ pub struct RoutinePatch {
     pub enabled: Option<bool>,
     pub schedule: Option<Schedule>,
     pub prompt: Option<String>,
+    /// `Some(None)` moves the routine to Nudge; `Some(Some(key))` to that persona.
+    pub persona: Option<Option<String>>,
     /// Recomputed by the caller whenever the schedule or `enabled` changes.
     pub next_run_at: Option<Option<DateTime<Utc>>>,
 }
@@ -152,6 +161,21 @@ pub trait BotsStore: Send + Sync {
         change: &Transition,
         now: DateTime<Utc>,
     ) -> StoreResult<Result<Task, Refused>>;
+    /// The earlier turns of `task`'s conversation, newest first, at most `limit`: tasks of the
+    /// same bot, the same requester, the same thread (`Task::thread_key`) and the same persona
+    /// (`None` equals `None`), created at or after `since` and before `task`, and no longer
+    /// queued or working. Empty for a task with no thread.
+    async fn earlier_turns(
+        &self,
+        task: &Task,
+        since: DateTime<Utc>,
+        limit: usize,
+    ) -> StoreResult<Vec<Task>>;
+    /// The persona of the newest task in `task`'s thread (same bot, requester and thread,
+    /// any status, any age), or `None` when that task is Nudge's or the thread has no task
+    /// yet. A task naming no persona inherits it (`docs/bot-marketplace-spec.md` §6,
+    /// Conversations). `None` for a task with no thread.
+    async fn thread_persona(&self, task: &Task) -> StoreResult<Option<String>>;
     /// `working` tasks whose lease lapsed before `now`.
     async fn expired_leases(&self, now: DateTime<Utc>) -> StoreResult<Vec<Task>>;
     async fn events(&self, task_id: &str) -> StoreResult<Vec<Event>>;
@@ -170,6 +194,10 @@ pub trait BotsStore: Send + Sync {
 
     /// Notifications after `after` (a sequence number), oldest first.
     async fn notifications(&self, after: i64, limit: usize) -> StoreResult<Vec<Notification>>;
+    /// The last notification sequence number issued, whether or not that notification has
+    /// been pruned since; `0` before the first. Never goes down while the store lives, so a
+    /// cursor past it came from another store (or another process's memory).
+    async fn feed_head(&self) -> StoreResult<i64>;
     /// Delete notifications created before `before`. Returns how many.
     async fn prune_notifications(&self, before: DateTime<Utc>) -> StoreResult<u64>;
 
@@ -189,11 +217,55 @@ pub trait BotsStore: Send + Sync {
     /// Enqueue one run of a routine. False if it was no longer due (another tick ran it, or
     /// it was paused or changed meanwhile).
     async fn run_routine(&self, run: &RoutineRun, now: DateTime<Utc>) -> StoreResult<bool>;
+    /// Skip one run of a routine that is enabled and due at `due_at`: its next run becomes
+    /// `next_run_at`, nothing is enqueued, and it stays enabled. False if it was no longer
+    /// due, as for [`BotsStore::run_routine`].
+    async fn skip_routine_run(
+        &self,
+        id: &str,
+        due_at: DateTime<Utc>,
+        next_run_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> StoreResult<bool>;
 
     /// A PM's settings, if they ever set any.
     async fn member_settings(&self, handle: &str) -> StoreResult<Option<MemberSettings>>;
     /// Save a PM's settings, replacing any they had.
     async fn set_member_settings(&self, settings: &MemberSettings) -> StoreResult<()>;
+
+    /// Has this database ever held real data (slice H4)? The marker, once written, is never
+    /// cleared ([`BotsStore::mark_held_real_data`]).
+    async fn held_real_data(&self) -> StoreResult<bool>;
+    /// Write the permanent `held_real_data` marker (idempotent): the runtime started with live
+    /// connectors. Postgres refuses to change or delete it afterwards.
+    async fn mark_held_real_data(&self) -> StoreResult<()>;
+}
+
+/// The `held_real_data` rule at start-up (slice H4, spec §3.6): with live connectors the
+/// marker is written (for good), whatever the model source; in fake-data mode a database that
+/// has it is refused ("this database has held real data").
+pub async fn check_held_real_data(
+    store: &dyn BotsStore,
+    live: bool,
+    fake_only: bool,
+) -> Result<(), String> {
+    if live {
+        store
+            .mark_held_real_data()
+            .await
+            .map_err(|e| format!("writing the held_real_data marker: {e}"))?;
+    }
+    if fake_only
+        && store
+            .held_real_data()
+            .await
+            .map_err(|e| format!("reading the held_real_data marker: {e}"))?
+    {
+        return Err(pmos_contract::model_source::fake_data_refusal(
+            pmos_contract::model_source::HELD_REAL_DATA,
+        ));
+    }
+    Ok(())
 }
 
 /// Apply `change` to `task` if its guards hold. Shared by both stores so they decide alike.
@@ -232,6 +304,13 @@ pub fn apply(task: &mut Task, change: &Transition, now: DateTime<Utc>) -> Result
     if let Some(c) = &change.checklist {
         task.checklist = c.clone();
     }
+    if let Some(s) = change.sensitivity {
+        task.sources_sensitivity = Some(s);
+    }
+    if let Some((used, fallback)) = &change.models {
+        task.models_used = Some(used.clone());
+        task.fallback_used = *fallback;
+    }
     task.attempts += change.attempts_delta;
     task.updated_at = now;
     Ok(())
@@ -260,6 +339,9 @@ fn notification_for(
         text: n.text.clone(),
         approvals: n.approvals.clone(),
         outcomes: n.outcomes.clone(),
+        routine_id: task.routine_id.clone(),
+        persona: task.persona.clone(),
+        fallback_used: task.fallback_used,
         at: now,
     }
 }
@@ -284,10 +366,15 @@ struct State {
     notification_seq: i64,
     routines: BTreeMap<String, Routine>,
     member_settings: BTreeMap<String, MemberSettings>,
+    held_real_data: bool,
 }
 
 impl State {
     fn notify(&mut self, task: &Task, n: &NewNotification, now: DateTime<Utc>) {
+        // A web task has no Slack thread to post in; its caller reads the task and its events.
+        if task.source == crate::model::Source::Web {
+            return;
+        }
         self.notification_seq += 1;
         let item = notification_for(task, self.notification_seq, n, now);
         self.notifications.push(item);
@@ -413,6 +500,56 @@ impl BotsStore for MemoryStore {
         Ok(Ok(updated))
     }
 
+    async fn earlier_turns(
+        &self,
+        task: &Task,
+        since: DateTime<Utc>,
+        limit: usize,
+    ) -> StoreResult<Vec<Task>> {
+        let Some(key) = task.thread_key() else {
+            return Ok(Vec::new());
+        };
+        let s = self.state();
+        let mut out: Vec<Task> = s
+            .tasks
+            .values()
+            .filter(|t| {
+                t.bot == task.bot
+                    && t.requested_by == task.requested_by
+                    && t.persona == task.persona
+                    && t.thread_key().as_ref() == Some(&key)
+                    && t.created_at >= since
+                    && (&t.created_at, &t.id) < (&task.created_at, &task.id)
+                    && !matches!(t.status, TaskStatus::Queued | TaskStatus::Working)
+            })
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    async fn thread_persona(&self, task: &Task) -> StoreResult<Option<String>> {
+        let Some(key) = task.thread_key() else {
+            return Ok(None);
+        };
+        let s = self.state();
+        Ok(s.tasks
+            .values()
+            .filter(|t| {
+                t.id != task.id
+                    && t.bot == task.bot
+                    && t.requested_by == task.requested_by
+                    && t.thread_key().as_ref() == Some(&key)
+            })
+            .max_by(|a, b| (&a.created_at, &a.id).cmp(&(&b.created_at, &b.id)))
+            .and_then(|t| t.persona.clone()))
+    }
+
     async fn expired_leases(&self, now: DateTime<Utc>) -> StoreResult<Vec<Task>> {
         Ok(self
             .state()
@@ -500,6 +637,10 @@ impl BotsStore for MemoryStore {
             .collect())
     }
 
+    async fn feed_head(&self) -> StoreResult<i64> {
+        Ok(self.state().notification_seq)
+    }
+
     async fn prune_notifications(&self, before: DateTime<Utc>) -> StoreResult<u64> {
         let mut s = self.state();
         let len = s.notifications.len();
@@ -555,6 +696,9 @@ impl BotsStore for MemoryStore {
         if let Some(p) = &patch.prompt {
             r.prompt = p.clone();
         }
+        if let Some(p) = &patch.persona {
+            r.persona = p.clone();
+        }
         if let Some(n) = patch.next_run_at {
             r.next_run_at = n;
         }
@@ -599,6 +743,25 @@ impl BotsStore for MemoryStore {
         Ok(true)
     }
 
+    async fn skip_routine_run(
+        &self,
+        id: &str,
+        due_at: DateTime<Utc>,
+        next_run_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> StoreResult<bool> {
+        let mut s = self.state();
+        let Some(r) = s.routines.get_mut(id) else {
+            return Ok(false);
+        };
+        if !r.enabled || r.next_run_at != Some(due_at) {
+            return Ok(false);
+        }
+        r.next_run_at = Some(next_run_at);
+        r.updated_at = now;
+        Ok(true)
+    }
+
     async fn member_settings(&self, handle: &str) -> StoreResult<Option<MemberSettings>> {
         Ok(self.state().member_settings.get(handle).cloned())
     }
@@ -607,6 +770,15 @@ impl BotsStore for MemoryStore {
         self.state()
             .member_settings
             .insert(settings.handle.clone(), settings.clone());
+        Ok(())
+    }
+
+    async fn held_real_data(&self) -> StoreResult<bool> {
+        Ok(self.state().held_real_data)
+    }
+
+    async fn mark_held_real_data(&self) -> StoreResult<()> {
+        self.state().held_real_data = true;
         Ok(())
     }
 }

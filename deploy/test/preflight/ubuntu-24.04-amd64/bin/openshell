@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# A stand-in for OpenShell's CLI (scripts/test-preflight.sh, scripts/test-pmos-admin.sh): it records
+# each call in OPENSHELL_FIXTURE_LOG and copies a --policy file to OPENSHELL_FIXTURE_POLICIES/<name>.yaml.
+# FAKE_CANARY: ok (default), nostart, nonode or nolandlock; FAKE_REACH: what the reach canary's node
+# prints (default "200 200 200"); FAKE_OS_ENDPOINT: the endpoint `status` names.
+printf '%s\n' "$*" >>"${OPENSHELL_FIXTURE_LOG:-/dev/null}"
+case "$1 ${2:-}" in
+  "--version ") echo "openshell 0.1.9" ;;
+  "status ")
+    echo "Gateway: ${FAKE_OS_ENDPOINT:-https://127.0.0.1:17670} (mTLS)"
+    exit "${FAKE_OS_STATUS_EXIT:-0}"
+    ;;
+  "sandbox create")
+    name="" policy="" prev=""
+    for a in "$@"; do
+      [ "$prev" = --name ] && name=$a
+      [ "$prev" = --policy ] && policy=$a
+      prev=$a
+    done
+    [ -z "${OPENSHELL_FIXTURE_POLICIES:-}" ] || cp "$policy" "$OPENSHELL_FIXTURE_POLICIES/$name.yaml"
+    [ "${FAKE_CANARY:-ok}" != nostart ] || exit 1
+    ;;
+  "sandbox exec")
+    if [[ "$*" == *pmos-preflight-net* ]]; then
+      echo "${FAKE_REACH:-200 200 200}"
+      [ "${FAKE_REACH:-200 200 200}" = "200 200 200" ] || exit 1
+    else
+      [ "${FAKE_CANARY:-ok}" != nonode ] || exit 1
+    fi
+    ;;
+  "logs -n") [ "${FAKE_CANARY:-ok}" = nolandlock ] || echo "INFO sandbox: Landlock ruleset built (abi 6)" ;;
+esac
+exit 0

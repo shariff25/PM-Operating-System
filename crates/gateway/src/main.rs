@@ -1,21 +1,77 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use pmos_contract::model_source::ModelSource;
 use pmos_gateway::config::{Config, Models, UpstreamKind};
 use pmos_gateway::usage::UsageLog;
-use pmos_gateway::{router, GatewayConfig};
+use pmos_gateway::{router_with, GatewayConfig, RouterOptions};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // The HTTP libraries' own lines are kept at `warn` whatever RUST_LOG says: their debug and
+    // info lines name the upstream's address and port ("connecting to …"), which no gateway
+    // line may (V3, slice H4).
+    let mut filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    for quiet in ["reqwest", "hyper", "hyper_util", "h2", "rustls"] {
+        filter = filter.add_directive(format!("{quiet}=warn").parse().expect("a valid directive"));
+    }
+    // `pmos-gateway --check-config [path]` (docs/model-providers-spec.md §4.12): every start-up
+    // check of the config against this environment, then exit, serving nothing. Prints the
+    // roles and their routes by label only, never a URL, host, key or model id.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // `pmos-gateway --digest-from-stdin` and `--model-digest-from-stdin` (spec §3.6, "A
+    // reviewer can check an entry's digests"): one URL (or model id) from standard input,
+    // never a command-line argument, normalised exactly as the gateway does; prints its digest
+    // and nothing else, or the gateway's refusal.
+    if let Some(flag @ ("--digest-from-stdin" | "--model-digest-from-stdin")) =
+        args.first().map(String::as_str)
+    {
+        let mut input = String::new();
+        std::io::Read::read_to_string(&mut std::io::Read::take(std::io::stdin(), 4096), &mut input)
+            .context("reading standard input")?;
+        let digest = if flag == "--digest-from-stdin" {
+            pmos_gateway::hosted::url_digest_from(&input)
+        } else {
+            pmos_gateway::hosted::model_digest_from(&input)
+        };
+        return match digest {
+            Ok(d) => {
+                println!("{d}");
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        };
+    }
+    if args.first().map(String::as_str) == Some("--check-config") {
+        return match pmos_gateway::config::check_config(
+            |k| std::env::var(k).ok(),
+            args.get(1).map(std::path::PathBuf::from),
+        ) {
+            Ok(summary) => {
+                println!("{summary}");
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        };
+    }
     tracing_subscriber::fmt()
         .json()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_env_filter(filter)
         .init();
     let config = Config::from_env().map_err(anyhow::Error::msg)?;
     let text = std::fs::read_to_string(&config.models_path)
         .with_context(|| format!("reading {}", config.models_path.display()))?;
-    let models = Models::parse(&text, config.cloud_test).map_err(anyhow::Error::msg)?;
+    let mut models = Models::parse(&text, config.cloud_test).map_err(anyhow::Error::msg)?;
+    for w in models.lookalike_warnings(&config.clients) {
+        tracing::warn!("{w}");
+    }
     let usage =
         Arc::new(UsageLog::new(config.usage_log.as_deref()).context("opening the usage log")?);
     if config.stub {
@@ -25,6 +81,55 @@ async fn main() -> Result<()> {
         tracing::warn!("PMOS_GATEWAY_WORKAROUNDS=off: every workaround is switched off");
     }
     config.check_keys(&models).map_err(anyhow::Error::msg)?;
+    // Slice H4: the config must fit PMOS_MODEL_SOURCE, checked on its own class.
+    config.check_source(&models).map_err(anyhow::Error::msg)?;
+    // Slice H12: under `hosted`, the compiled list, the host's URL and model ids against its
+    // digests, the key file, the CA, the stop file and the ceiling. The list ships empty, so a
+    // gateway built from a fresh checkout stops here ("no approved entry").
+    let list = pmos_gateway::hosted::compiled().map_err(anyhow::Error::msg)?;
+    let hosted = if config.model_source == ModelSource::Hosted {
+        let build = pmos_gateway::hosted::BuildInfo::compiled();
+        let binding = pmos_gateway::hosted::bind(
+            &mut models,
+            &list,
+            &config.hosted,
+            std::path::Path::new(pmos_gateway::hosted::CONTROL_DIR),
+            build.clone(),
+        )
+        .map_err(anyhow::Error::msg)?;
+        // Built only from committed code (X5): `pmos-admin build` passes the commit and the
+        // merged branch's commit; a binary built any other way doesn't serve `hosted`.
+        if build.commit.is_none() || build.merged_commit.is_none() {
+            anyhow::bail!(
+                "PMOS_MODEL_SOURCE=hosted: this gateway was not built by `pmos-admin build` (no \
+                 commit and merged commit compiled in), so it can't show it carries the merged \
+                 approved list; rebuild with `pmos-admin build`"
+            );
+        }
+        Some(binding)
+    } else {
+        None
+    };
+    let (class, warning) = config.served_class(&models);
+    if let Some(w) = warning {
+        tracing::warn!("{w}");
+    }
+    models.class = class;
+    let build = pmos_gateway::hosted::BuildInfo::compiled();
+    tracing::info!(
+        class = models.class.as_str(),
+        model_source = hosted
+            .as_ref()
+            .filter(|_| !config.stub)
+            .map(|b| b.source())
+            .unwrap_or_else(|| config.served_source().to_string()),
+        approved_list = list.kind.as_str(),
+        approved_list_sha256 = %list.sha256,
+        commit = build.commit.as_deref().unwrap_or("unknown"),
+        merged_commit = build.merged_commit.as_deref().unwrap_or("unknown"),
+        max_data_class = hosted.as_ref().map(|b| b.max_data_class.to_string()).unwrap_or_default(),
+        "gateway class and model source"
+    );
     if models
         .roles
         .values()
@@ -40,25 +145,86 @@ async fn main() -> Result<()> {
         .values()
         .filter(|r| r.kind == UpstreamKind::RemoteOpenAi)
     {
+        // V3 (slice H4): the role and its kind label, never the provider's host.
         tracing::warn!(
             role = %role.alias(),
-            upstream = %role.upstream_host(),
+            upstream = role.upstream_kind_label(),
             "TESTING ONLY: a remote test upstream is on (an OpenAI-compatible API on the internet), \
              so this role's prompts leave this machine; use test data and test accounts only"
         );
     }
     for role in models.roles.values() {
-        tracing::info!(role = %role.alias(), model = %role.model, upstream = %role.upstream, "model role");
+        // A labelled role is logged by its label and upstream kind only (`config::Role::label`);
+        // every role's upstream by its kind, never its URL (V3, slice H4), except that a
+        // production gateway's model server keeps its pinned `*.pmos.internal` name.
+        let host = role.upstream_host();
+        let server = if pmos_gateway::config::pinned_address(&host).is_some() {
+            host
+        } else {
+            String::new()
+        };
+        tracing::info!(
+            role = %role.alias(), model = %role.reported_model(),
+            model_sha256 = role.model_sha256().as_deref().unwrap_or(""),
+            upstream = role.upstream_kind_label(), model_server = %server,
+            labelled = role.label.is_some(), "model role"
+        );
     }
-    let app = router(GatewayConfig {
-        models,
-        clients: config.clients.clone(),
-        usage,
-        stub: config.stub,
-        workarounds_on: config.workarounds_on,
-        anthropic_key: config.anthropic_key.clone(),
-        remote_key: config.remote_key.clone(),
-    });
+    // Names and settings only, never a token.
+    for client in &config.clients {
+        let p = models.client_policy(&client.name);
+        tracing::info!(
+            client = %client.name, trusted = p.trusted, max_in_flight = p.max_in_flight,
+            max_queue = p.max_queue, priority = ?p.priority, user = ?p.user,
+            per_user_share = p.per_user_share,
+            person_pool = p.pool.map_or("", |pool| models.pool_name(pool.id)),
+            person_pool_slots = ?p.pool.map(|pool| pool.cap), "client"
+        );
+    }
+    // Slice MP2: the upstreams' key files are read afresh on SIGHUP (and on a change of size or
+    // modification time, looked at once a second at most).
+    let keys = std::sync::Arc::new(pmos_gateway::keys::KeyStore::default());
+    #[cfg(unix)]
+    {
+        let keys = keys.clone();
+        let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+            .context("listening for SIGHUP")?;
+        tokio::spawn(async move {
+            while hup.recv().await.is_some() {
+                keys.reload();
+                tracing::info!("SIGHUP: the upstreams' key files will be read afresh");
+            }
+        });
+    }
+    let app = router_with(
+        GatewayConfig {
+            models,
+            clients: config.clients.clone(),
+            usage: usage.clone(),
+            stub: config.stub,
+            workarounds_on: config.workarounds_on,
+            anthropic_key: config.anthropic_key.clone(),
+            remote_key: config.remote_key.clone(),
+            retry: config.retry,
+            timeouts: Default::default(),
+            model_source: config.model_source,
+        },
+        RouterOptions {
+            keys: keys.clone(),
+            // Slice MP8: `disabled-<label>` files here take a model out of every route.
+            route_control: std::env::var("PMOS_GATEWAY_ROUTE_CONTROL")
+                .ok()
+                .filter(|p| !p.is_empty())
+                .map(std::path::PathBuf::from),
+            hosted,
+            // The test-only list's mock is on the compose network (a private address), which
+            // the hosted resolver refuses for a real entry; only that build accepts it.
+            hosted_net: Some(pmos_gateway::hosted::HostedNet {
+                allow_private: cfg!(feature = "stack-test-list"),
+                ..pmos_gateway::hosted::HostedNet::strict()
+            }),
+        },
+    );
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .with_context(|| format!("binding {}", config.bind))?;
@@ -69,5 +235,7 @@ async fn main() -> Result<()> {
             tracing::info!("shutting down: finishing in-flight requests");
         })
         .await?;
+    // Refusals still held for a summary line are counted in the log before exiting.
+    usage.flush_all_refusals();
     Ok(())
 }

@@ -1,4 +1,4 @@
-# TESTING ONLY: a Claude model behind the gateway, for trying PM OS before the Spark's local
+# TESTING ONLY: a Claude model behind the gateway, for trying PM OS before local
 # models are up (decided 2026-11-14). Prompts sent to these roles leave the machine, so use it
 # only with a test Slack workspace, fake connectors and your public docs site; never with
 # real PM tokens or company data.
@@ -6,23 +6,36 @@
 # The gateway refuses this file unless PMOS_GATEWAY_CLOUD_TEST=1. The API key comes from
 # PMOS_GATEWAY_ANTHROPIC_KEY. See
 # docs/testing-with-claude.md.
+# Every role has a `label:`: the gateway takes this config only as PMOS_MODEL_SOURCE=hosted-test
+# (slice H4), which needs one on every role, so it reports and logs the label, never the model id.
 upstreams:
   claude: anthropic+https://api.anthropic.com
 roles:
   default:
     upstream: claude
     model: claude-opus-5-5
+    label: claude-test-a
     effort: medium
   # The PM assistant's drafting and critique. Point it at a larger model if the bake-off picks one.
   reasoning:
     upstream: claude
     model: claude-opus-5-5
+    label: claude-test-a
     effort: medium
   extraction:
     upstream: claude
     model: claude-opus-5-5
+    label: claude-test-a
     effort: low
 limits:
   max-in-flight: 4
   per-user: 2
   max-queue: 64
+# scripts/claude-test-stack.sh's clients: the runtime and the one `worker` token every harness
+# worker uses (trusted: they name the PM), and `evals` for the benchmark judges. The benchmarks
+# ask as one person (evals) through `worker`, so it may hold both of that person's slots
+# (`per-user-share`; a client that may name anyone holds 1 of them by default).
+clients:
+  runtime: {trusted: true, max-in-flight: 4, per-user-share: 2}
+  worker: {trusted: true, max-in-flight: 4, per-user-share: 2}
+  evals: {max-in-flight: 2, priority: personal, route: pin}

@@ -224,7 +224,82 @@ pub fn normalize_text(s: &str) -> String {
         };
         out.extend(mapped.to_lowercase());
     }
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
+    drop_zero_fractions(&out.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+/// A decimal's trailing zeros don't change it: "25.0%" is "25%", "60.00" is "60", "1.70" is
+/// "1.7". Only a plain decimal (digits, one point, digits), never part of a version or an
+/// address ("1.0.3", "10.0.0.1").
+fn drop_zero_fractions(s: &str) -> String {
+    let c: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < c.len() {
+        if c[i] == '.'
+            && i > 0
+            && c[i - 1].is_ascii_digit()
+            && c.get(i + 1).is_some_and(|x| x.is_ascii_digit())
+        {
+            // The digits before the point must not follow another point ("1.2.0").
+            let mut start = i;
+            while start > 0 && c[start - 1].is_ascii_digit() {
+                start -= 1;
+            }
+            let after_point = start > 0 && c[start - 1] == '.';
+            let mut end = i + 1;
+            while end < c.len() && c[end].is_ascii_digit() {
+                end += 1;
+            }
+            let more_number =
+                c.get(end) == Some(&'.') && c.get(end + 1).is_some_and(|x| x.is_ascii_digit());
+            if !after_point && !more_number {
+                let fraction: String = c[i + 1..end].iter().collect();
+                let kept = fraction.trim_end_matches('0');
+                if !kept.is_empty() {
+                    out.push('.');
+                    out.push_str(kept);
+                }
+                i = end;
+                continue;
+            }
+        }
+        out.push(c[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Whether normalized `text` contains normalized `needle`, with numbers whole: a needle that
+/// starts with a digit doesn't match inside a longer number ("25%" isn't in "125%" or
+/// "0.25%"), and one that ends with a digit doesn't match the start of one ("1.7" isn't in
+/// "1.75", "12" isn't in "12.5"). Both sides must already be [`normalize_text`]ed.
+pub fn contains_text(text: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let starts_digit = needle.starts_with(|c: char| c.is_ascii_digit());
+    let ends_digit = needle.ends_with(|c: char| c.is_ascii_digit());
+    let bytes = text.as_bytes();
+    let mut from = 0;
+    while let Some(pos) = text[from..].find(needle) {
+        let at = from + pos;
+        let end = at + needle.len();
+        let before_ok = !starts_digit
+            || at == 0
+            || !(bytes[at - 1].is_ascii_digit()
+                || (bytes[at - 1] == b'.' && at >= 2 && bytes[at - 2].is_ascii_digit()));
+        let after_ok = !ends_digit
+            || end >= bytes.len()
+            || !(bytes[end].is_ascii_digit()
+                || (matches!(bytes[end], b'.' | b',')
+                    && bytes.get(end + 1).is_some_and(|b| b.is_ascii_digit())));
+        if before_ok && after_ok {
+            return true;
+        }
+        // Next char boundary after `at`.
+        from = at + text[at..].chars().next().map_or(1, char::len_utf8);
+    }
+    false
 }
 
 /// A URL as citations are compared: no scheme, no `www.`, no query string or fragment, no
@@ -278,15 +353,18 @@ pub fn extract_urls(text: &str) -> Vec<String> {
 }
 
 /// A draft's text, as its `must_include` and `must_not_include` see it: its top-level string
-/// arguments, sorted by key and joined by newlines (as the feedback ledger measures edits).
+/// arguments, sorted by key and joined by newlines (as the feedback ledger measures edits),
+/// as they would be written: without source markers (`[[src-…]]`, which the tool server
+/// removes when it writes), so a marker never splits a phrase a check looks for.
 pub fn draft_text(args: &Value) -> String {
     let Some(map) = args.as_object() else {
-        return args.as_str().unwrap_or_default().to_string();
+        return pmos_contract::cite::strip(args.as_str().unwrap_or_default());
     };
     let mut keys: Vec<&String> = map.keys().collect();
     keys.sort();
     keys.iter()
         .filter_map(|k| map[k.as_str()].as_str())
+        .map(pmos_contract::cite::strip)
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -353,7 +431,7 @@ pub fn grade_drafts(checks: &[DraftCheck], drafts: &[Draft]) -> Vec<Check> {
             }
             let text = normalize_text(&draft_text(&d.args));
             for t in &c.must_include {
-                if !text.contains(&normalize_text(t)) {
+                if !contains_text(&text, &normalize_text(t)) {
                     failures.push(Check::DraftMissingText {
                         tool: c.tool.clone(),
                         draft: d.id.clone(),
@@ -362,7 +440,7 @@ pub fn grade_drafts(checks: &[DraftCheck], drafts: &[Draft]) -> Vec<Check> {
                 }
             }
             for t in &c.must_not_include {
-                if text.contains(&normalize_text(t)) {
+                if contains_text(&text, &normalize_text(t)) {
                     failures.push(Check::DraftForbiddenText {
                         tool: c.tool.clone(),
                         draft: d.id.clone(),
@@ -419,7 +497,8 @@ pub fn grade(task: &EvalTask, outcome: &Outcome, decline_phrases: &[String]) -> 
             None => failures.extend(grade_drafts(&task.expect.drafts, &outcome.drafts)),
         }
     }
-    let answer = outcome.result_text();
+    // As Slack and the web app show it: without source markers.
+    let answer = &pmos_contract::cite::strip(outcome.result_text());
     if answer.trim().is_empty() {
         failures.push(Check::NoAnswer);
         return Grade { failures };
@@ -435,19 +514,19 @@ pub fn grade(task: &EvalTask, outcome: &Outcome, decline_phrases: &[String]) -> 
     }
     let text = normalize_text(answer);
     for t in &task.expect.must_include {
-        if !text.contains(&normalize_text(t)) {
+        if !contains_text(&text, &normalize_text(t)) {
             failures.push(Check::MissingText { text: t.clone() });
         }
     }
     for t in &task.expect.must_not_include {
-        if text.contains(&normalize_text(t)) {
+        if contains_text(&text, &normalize_text(t)) {
             failures.push(Check::ForbiddenText { text: t.clone() });
         }
     }
     if task.expect.must_decline
         && !decline_phrases
             .iter()
-            .any(|p| text.contains(&normalize_text(p)))
+            .any(|p| contains_text(&text, &normalize_text(p)))
     {
         failures.push(Check::NotDeclined);
     }

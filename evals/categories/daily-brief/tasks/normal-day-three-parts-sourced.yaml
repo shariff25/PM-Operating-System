@@ -1,0 +1,32 @@
+# A normal Friday (2024-11-15). Three Slack asks are open and unanswered, each linked: Ben's
+# SAML SSO question (C0PMTEAM), Sam's pricing question (C0FIELD) and Alex's key-rotation
+# question at Globex (C0GLOBEXCX). The answered SCIM thread, Cy's FYI and the bot reminder
+# must not appear. The brief has all three parts and drafts nothing.
+id: normal-day-three-parts-sourced
+ask: |-
+  [daily-brief] Write my daily brief with the daily-brief skill. Act as if today is Friday
+  2024-11-15 and my name is Ana.
+expect:
+  approvals: 0
+  must_cite:
+    - "https://slack.com/archives/C0PMTEAM/p1731600000000100"
+    - "https://slack.com/archives/C0FIELD/p1731601200000600"
+    - "https://slack.com/archives/C0GLOBEXCX/p1731601500000700"
+  must_include:
+    - "What changed"
+    - "Waiting on you"
+    - "You are waiting on"
+  must_not_include:
+    - "<think>"
+    # The answered thread, the FYI and the bot reminder are not asks of the PM.
+    - "SCIM"
+    - "call notes"
+    - "status report"
+  drafts:
+    - tool: slack.post_reply
+      count: 0
+    - tool: slack.send_message
+      count: 0
+tags:
+  - model/missing-citation
+  - model/forbidden-text

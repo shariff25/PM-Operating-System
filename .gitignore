@@ -8,10 +8,13 @@ dist/
 # Local agent worktrees and tool state
 /.claude/
 
-# Spark deployment: secrets and backups stay on the machine
+# Deployment: secrets and backups stay on the host
 /deploy/.env
+/deploy/.env.*
 /deploy/live.env
 /deploy/backups/
+# The hosted model's key file (slice H12), made empty by setup.sh, written by pmos-admin hosted-key set
+/deploy/secrets/
 
 # Research notes and reports (kept local unless asked)
 /research_notes/

@@ -2,7 +2,7 @@
 //! (`common`), a mock bots runtime (`GET /v1/bots`, with owners) and a mock tool server
 //! ledger (`GET /internal/ledger`).
 //!
-//! - One DM per quality owner, grouped by bot; owners outside `team.yaml` are skipped.
+//! - One DM per quality owner, grouped by bot; owners outside the user directory are skipped.
 //! - The ledger query asks for rejected rows, and edited ones from the threshold up.
 //! - Nothing is sent when nothing qualifies, and at most once per owner per day, across a
 //!   restart.
@@ -18,7 +18,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use chrono::{DateTime, NaiveTime, Utc};
-use common::{serve, Call, FakeSlack, SLACK_BOT_TOKEN};
+use common::{person, serve, Call, Directory, FakeSlack, SLACK_BOT_TOKEN};
 use pmos_slack::bots::{Bots, BotsConfig};
 use pmos_slack::runtime::Runtime;
 use pmos_slack::slackapi::SlackApi;
@@ -29,7 +29,13 @@ use tokio_util::sync::CancellationToken;
 
 const BOTS_TOKEN: &str = "test-bots-token-slack-0123456789abcdef";
 const TOOL_BOT_TOKEN: &str = "test-bot-token-0123456789abcdef-0123";
-const TEAM: &str = "members:\n  - {handle: ana, slack-id: U0ANA, roles: [pm]}\n  - {handle: bob, slack-id: U0BOB, roles: [pm]}\n";
+/// The user directory: Ana and Bob.
+fn team() -> Vec<pmos_directory::snapshot::DirectoryUser> {
+    vec![
+        person("ana", "U0ANA", &["pm"]),
+        person("bob", "U0BOB", &["pm"]),
+    ]
+}
 
 fn bearer(headers: &HeaderMap) -> &str {
     headers
@@ -129,7 +135,8 @@ struct Stack {
     rt_base: String,
     ts_base: String,
     state: tempfile::TempDir,
-    team: tempfile::TempDir,
+    content: tempfile::TempDir,
+    directory: Directory,
     stop: Vec<CancellationToken>,
 }
 
@@ -146,8 +153,8 @@ impl Stack {
                 .with_state(ledger.clone()),
         )
         .await;
-        let team = tempfile::tempdir().unwrap();
-        std::fs::write(team.path().join("team.yaml"), TEAM).unwrap();
+        let content = tempfile::tempdir().unwrap();
+        let directory = Directory::seeded(team()).await;
         Self {
             slack,
             ledger,
@@ -155,7 +162,8 @@ impl Stack {
             rt_base,
             ts_base,
             state: tempfile::tempdir().unwrap(),
-            team,
+            content,
+            directory,
             stop: vec![stop_slack, stop_rt, stop_ts],
         }
     }
@@ -167,11 +175,13 @@ impl Stack {
             slack: SlackApi::new(self.slack_base.clone(), slack_token, http.clone()),
             runtime: Runtime::new(self.rt_base.clone(), BOTS_TOKEN, http),
             toolserver: ToolServer::new(toolserver, TOOL_BOT_TOKEN),
-            team_file: self.team.path().join("team.yaml"),
+            people: self.directory.people(),
+            content_root: self.content.path().to_path_buf(),
             default_tz: "America/Los_Angeles".into(),
             github_org: None,
             response_url_prefix: "https://hooks.slack.com/".into(),
             state_dir: self.state.path().to_path_buf(),
+            web_url: None,
         })
     }
 

@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 
 use super::http::{arg, client, limit};
 use super::{
-    Audience, Caller, Connector, ConnectorError, Item, SourceRef, DRAFTED_MARKER,
+    Audience, Caller, Connector, ConnectorError, Conversation, Item, SourceRef, DRAFTED_MARKER,
     MAX_AUDIENCE_MEMBERS,
 };
 use crate::oauth::TokenSource;
@@ -46,8 +46,8 @@ fn slack_id(value: &str) -> Result<&str, ConnectorError> {
     }
 }
 
-/// Each thread message returned to the model, at most.
-const MAX_MESSAGE_CHARS: usize = 2_000;
+/// Each thread message returned to the model, at most (the MCP route clips to it too).
+pub const MAX_MESSAGE_CHARS: usize = 2_000;
 
 /// A message timestamp, such as `1731500000.000100`.
 fn slack_ts(value: &str) -> Result<&str, ConnectorError> {
@@ -63,7 +63,8 @@ fn slack_ts(value: &str) -> Result<&str, ConnectorError> {
     }
 }
 
-fn archive_url(channel: &str, ts: &str) -> String {
+/// A link to a Slack message or thread that works for anyone in the workspace who can see it.
+pub fn archive_url(channel: &str, ts: &str) -> String {
     format!(
         "https://slack.com/archives/{channel}/p{}",
         ts.replace('.', "")
@@ -311,6 +312,7 @@ impl Connector for Slack {
             .await?;
         let flag = |name: &str| info["channel"][name].as_bool().unwrap_or(false);
         let (external, shared, im) = (flag("is_ext_shared"), flag("is_shared"), flag("is_im"));
+        let conversation = Conversation::from_info(channel, &info["channel"]);
 
         let mut members = Vec::new();
         let mut cursor = String::new();
@@ -352,7 +354,25 @@ impl Connector for Slack {
             im,
             members,
             truncated,
+            conversation,
         })
+    }
+
+    async fn conversation(
+        &self,
+        caller: Caller<'_>,
+        channel: &str,
+    ) -> Result<Conversation, ConnectorError> {
+        let channel = slack_id(channel)?;
+        let info = self
+            .call(
+                caller.user,
+                "conversations.info",
+                &[("channel", channel)],
+                &format!("channel {channel}"),
+            )
+            .await?;
+        Ok(Conversation::from_info(channel, &info["channel"]))
     }
 }
 

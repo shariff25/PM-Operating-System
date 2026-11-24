@@ -127,6 +127,9 @@ export async function startFakeRuntime(options: {
   };
 }
 
+/** The `ref` the fake `docs_search` gives its result. */
+export const FAKE_DOCS_REF = "src-3f9a1c";
+
 export interface FakeMcp {
   url: string;
   calls: { name: string; args: unknown; authorization?: string }[];
@@ -161,6 +164,8 @@ export async function startFakeMcp(options: { searchDelayMs?: number } = {}): Pr
         }
         return structured({
           untrusted: true,
+          // Like the tool server: the ref a draft's source marker names this item by.
+          ref: FAKE_DOCS_REF,
           source: "docs",
           content: [{ url: "https://docs.example.com/docs/ports", title: `Ports (${query})` }],
         });
@@ -226,8 +231,29 @@ export interface FakeGateway {
   close(): Promise<void>;
 }
 
-/** An OpenAI-compatible `/v1/chat/completions` that always answers `answer`. */
-export async function startFakeGateway(answer: string): Promise<FakeGateway> {
+/** One scripted answer of the fake gateway (slice H4): the source it says, a status, a tool call. */
+export interface GatewayStep {
+  /** `x-pmos-model-source` on the answer; default `local`. */
+  source?: string;
+  /** Answer this status (such as `409`) instead of a completion. */
+  status?: number;
+  /** Answer with a call of this tool (its harness name) instead of text. */
+  toolCall?: { name: string; args: Record<string, unknown> };
+  /** Stream part of `answer` and end the body without a finish reason or `[DONE]`. */
+  cut?: boolean;
+}
+
+/**
+ * An OpenAI-compatible `/v1/chat/completions` that always answers `answer`, or, with `fail`,
+ * always answers that status with the gateway's `X-Pmos-Upstream-Attempts` header. Every
+ * answer says `x-pmos-model-source: local`, as the gateway does, unless `steps` says otherwise
+ * for that call (the n-th call takes the n-th step; calls past the list take its last).
+ */
+export async function startFakeGateway(
+  answer: string,
+  fail?: { status: number; upstreamAttempts: number },
+  steps: GatewayStep[] = [],
+): Promise<FakeGateway> {
   const requests: Recorded[] = [];
   const server = createServer(async (req, res) => {
     const recorded: Recorded = {
@@ -237,6 +263,108 @@ export async function startFakeGateway(answer: string): Promise<FakeGateway> {
       body: await readBody(req),
     };
     requests.push(recorded);
+    const step = steps[Math.min(requests.length, steps.length) - 1] ?? {};
+    res.setHeader("x-pmos-model-source", step.source ?? "local");
+    if (step.status) {
+      json(res, step.status, { error: { type: "model_source_mismatch" } });
+      return;
+    }
+    if (fail) {
+      res
+        .writeHead(fail.status, {
+          "content-type": "application/json",
+          "x-pmos-upstream-attempts": String(fail.upstreamAttempts),
+        })
+        .end(JSON.stringify({ error: { message: "busy", type: "server_error" } }));
+      return;
+    }
+    if (step.cut) {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.end(
+        `data: ${JSON.stringify({
+          id: "chatcmpl-fake",
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: recorded.body?.model,
+          choices: [
+            { index: 0, delta: { role: "assistant", content: answer.slice(0, 5) }, finish_reason: null },
+          ],
+        })}\n\n`,
+      );
+      return;
+    }
+    if (step.toolCall && recorded.body?.stream) {
+      // As the gateway passes on a model server's stream: the call's id and name first, its
+      // arguments split over two events, then the finish reason, the usage and `[DONE]`.
+      const args = JSON.stringify(step.toolCall.args);
+      const half = Math.floor(args.length / 2);
+      const created = Math.floor(Date.now() / 1000);
+      const event = (choices: unknown[], extra: Record<string, unknown> = {}) =>
+        `data: ${JSON.stringify({
+          id: "chatcmpl-fake",
+          object: "chat.completion.chunk",
+          created,
+          model: recorded.body?.model,
+          choices,
+          ...extra,
+        })}\n\n`;
+      const call = (fn: Record<string, unknown>, first: boolean) => ({
+        index: 0,
+        delta: {
+          ...(first ? { role: "assistant", content: "" } : {}),
+          tool_calls: [
+            {
+              index: 0,
+              ...(first ? { id: `call_${requests.length}`, type: "function" } : {}),
+              function: fn,
+            },
+          ],
+        },
+        finish_reason: null,
+      });
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(event([call({ name: step.toolCall.name, arguments: "" }, true)]));
+      res.write(event([call({ arguments: args.slice(0, half) }, false)]));
+      res.write(event([call({ arguments: args.slice(half) }, false)]));
+      res.write(event([{ index: 0, delta: {}, finish_reason: "tool_calls" }]));
+      if (recorded.body?.stream_options?.include_usage) {
+        res.write(
+          event([], { usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } }),
+        );
+      }
+      res.end("data: [DONE]\n\n");
+      return;
+    }
+    if (step.toolCall) {
+      json(res, 200, {
+        id: "chatcmpl-fake",
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model: recorded.body?.model,
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: "assistant",
+              content: "",
+              tool_calls: [
+                {
+                  id: `call_${requests.length}`,
+                  type: "function",
+                  function: {
+                    name: step.toolCall.name,
+                    arguments: JSON.stringify(step.toolCall.args),
+                  },
+                },
+              ],
+            },
+            finish_reason: "tool_calls",
+          },
+        ],
+        usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+      });
+      return;
+    }
     if (recorded.path !== "/v1/chat/completions") {
       json(res, 404, { error: { message: "not found" } });
       return;
@@ -255,6 +383,18 @@ export async function startFakeGateway(answer: string): Promise<FakeGateway> {
         })}\n\n`;
       res.write(chunk({ role: "assistant", content: answer }, null));
       res.write(chunk({}, "stop"));
+      if (recorded.body?.stream_options?.include_usage) {
+        res.write(
+          `data: ${JSON.stringify({
+            id: "chatcmpl-fake",
+            object: "chat.completion.chunk",
+            created,
+            model,
+            choices: [],
+            usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+          })}\n\n`,
+        );
+      }
       res.end("data: [DONE]\n\n");
       return;
     }

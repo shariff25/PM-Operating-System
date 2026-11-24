@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use chrono::NaiveDate;
 use common::{
-    spawn, spawn_gateway, write_category, Gateway, Mock, Script, CONSOLE_TOKEN, GATEWAY_TOKEN,
-    TOKEN,
+    prod_gateway, spawn, spawn_gateway, write_category, Gateway, Mock, Script, CONSOLE_TOKEN,
+    GATEWAY_TOKEN, TOKEN,
 };
 use pmos_evals::client::Runtime;
 use pmos_evals::judge::{self, Judge};
@@ -26,6 +26,7 @@ fn opts() -> RunOptions {
         follow: Follow {
             poll: Duration::from_millis(10),
             timeout: Duration::from_millis(2000),
+            cancel_wait: Duration::from_secs(1),
         },
         concurrency: 4,
         date: NaiveDate::from_ymd_opt(2026, 11, 16).unwrap(),
@@ -36,6 +37,7 @@ fn opts() -> RunOptions {
         decline_phrases: vec!["don't answer".into(), "couldn't find".into()],
         judges: None,
         judges_skipped: None,
+        isolation: None,
     }
 }
 
@@ -113,11 +115,11 @@ async fn repeats_run_each_task_k_times_and_report_pass_hat_k() {
         "{md}"
     );
     assert!(
-        md.contains("| pass^3 | 50% (1 of 2 tasks passed every run) |"),
+        md.contains("| All attempts passed (pass^3) | 50% (1 of 2 tasks passed every run) |"),
         "{md}"
     );
     assert!(
-        md.contains("| `flaky` | **2/3** | model/missing-fact ×1 |"),
+        md.contains("| `flaky` | **2/3** | no | model/missing-fact ×1 |"),
         "{md}"
     );
     // One cluster: the standard error falls back to the binomial.
@@ -343,6 +345,7 @@ async fn judges_record_verdicts_without_changing_pass_or_fail() {
     o.judges = Some(JudgeRun {
         gateway: pmos_evals::judge::Gateway::new(&gw_url, GATEWAY_TOKEN),
         judges: vec![(faithful, status)],
+        labels: None,
     });
 
     // Without a console token the trace can't be read, so a judge that needs sources skips.
@@ -371,9 +374,138 @@ async fn judges_record_verdicts_without_changing_pass_or_fail() {
     assert!(user.contains("KMIP uses port 5696"), "the sources: {user}");
     let md = report.to_markdown();
     assert!(
-        md.contains("| `faithful` | advisory: not calibrated | 1 | 1 | 0 |"),
+        md.contains("| `faithful` | advisory: not calibrated | 1 | 1 | 0 | 0 |"),
         "{md}"
     );
+}
+
+/// A judge may answer "unknown"; the report counts it apart. With a label sink the run keeps
+/// a labelling-pack candidate per judged attempt (Slack results left out, label empty), and
+/// `judge::pack` adds a mix of them to the labels file for a person, which `calibrate` then
+/// leaves out until they are labelled.
+#[tokio::test]
+async fn unknown_verdicts_label_candidates_and_the_pack() {
+    let mock = Arc::new(Mock::default());
+    let docs = common::entry(
+        "tool_result",
+        json!({"tool": "docs.read", "content": "KMIP uses port 5696."}),
+    );
+    let slack = common::entry(
+        "tool_result",
+        json!({"tool": "slack.read_thread", "content": "a fixture Slack message"}),
+    );
+    for (ask, answer) in [
+        ("q-good", "KMIP is 5696."),
+        ("q-bad", "KMIP is 443."),
+        ("q-vague", "KMIP is maybe somewhere."),
+    ] {
+        mock.script(
+            ask,
+            Script {
+                result: Some(answer.into()),
+                trace: vec![docs.clone(), slack.clone()],
+                ..Script::default()
+            },
+        );
+    }
+    let url = spawn(mock.clone()).await;
+    let gw = Arc::new(Gateway {
+        reply: Box::new(|user: &str| {
+            let output = user.split("<output>").nth(1).unwrap_or_default();
+            if output.contains("5696") {
+                "yes".into()
+            } else if output.contains("maybe") {
+                "Unknown.".into()
+            } else {
+                "no".into()
+            }
+        }),
+        calls: Mutex::new(Vec::new()),
+    });
+    let gw_url = spawn_gateway(gw.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let yaml = |id: &str, ask: &str| {
+        format!("id: {id}\nask: \"{ask}\"\nexpect:\n  must_include: [KMIP]\n")
+    };
+    write_category(
+        dir.path(),
+        "cat",
+        "docs",
+        0.5,
+        &[
+            ("good", yaml("good", "q-good")),
+            ("bad", yaml("bad", "q-bad")),
+            ("vague", yaml("vague", "q-vague")),
+        ],
+    );
+    let category = load_category(dir.path(), "cat").unwrap();
+    let faithful = judge("faithful", true);
+    let status = judge::status(&faithful, None);
+    let sink = pmos_evals::run::LabelSink::default();
+    let mut o = opts();
+    o.judges = Some(JudgeRun {
+        gateway: pmos_evals::judge::Gateway::new(&gw_url, GATEWAY_TOKEN),
+        judges: vec![(faithful.clone(), status)],
+        labels: Some(sink.clone()),
+    });
+    let rt = Runtime::new(&url, TOKEN, Some(CONSOLE_TOKEN));
+    let report = run_category(&rt, &url, &category, &o).await;
+    let v = |id: &str| report.tasks.iter().find(|t| t.id == id).unwrap().judges[0].clone();
+    assert_eq!(v("good").verdict, Some(true));
+    assert_eq!(v("bad").verdict, Some(false));
+    let vague = v("vague");
+    assert_eq!((vague.verdict, vague.unknown), (None, true));
+    assert!(vague.error.unwrap().contains("unknown"));
+    let md = report.to_markdown();
+    assert!(
+        md.contains("| `faithful` | advisory: not calibrated | 1 | 1 | 1 | 0 |"),
+        "{md}"
+    );
+    // The judge is told it may say unknown.
+    let calls = gw.calls.lock().unwrap().clone();
+    assert!(calls[0]["messages"][0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("yes, no, or unknown"));
+
+    let lines = sink.lock().unwrap().clone();
+    assert_eq!(lines.len(), 3);
+    for (name, l) in &lines {
+        assert_eq!(name, "faithful");
+        assert_eq!(l.label, judge::Human::Pending);
+        assert!(l.input.contains("KMIP uses port 5696."), "{}", l.input);
+        assert!(!l.input.contains("a fixture Slack message"), "{}", l.input);
+        assert!(
+            l.input.contains("Slack tool result(s) left out"),
+            "{}",
+            l.input
+        );
+    }
+    let said: Vec<_> = lines
+        .iter()
+        .map(|(_, l)| l.judge_said.clone().unwrap())
+        .collect();
+    assert!(said.contains(&"unknown".to_string()));
+
+    // The candidates on disk, then the pack: two lines, one the judge said no to and one yes.
+    let root = dir.path();
+    let cands = root.join("candidates");
+    let written = judge::write_candidates(&cands, &report.date, "cat", &lines).unwrap();
+    assert_eq!(written.len(), 1);
+    std::fs::create_dir_all(root.join("judges")).unwrap();
+    std::fs::write(root.join("judges/faithful.labels.jsonl"), "").unwrap();
+    let packed = judge::pack(root, &faithful, &cands, 2).unwrap();
+    assert_eq!((packed.no, packed.yes, packed.unknown), (1, 1, 0));
+    let labels = judge::load_labels(root, &faithful).unwrap();
+    assert_eq!(labels.len(), 2);
+    assert!(labels.iter().all(|l| l.label == judge::Human::Pending));
+    // Packing again adds the one left, never a line already there.
+    let again = judge::pack(root, &faithful, &cands, 20).unwrap();
+    assert_eq!(
+        (again.no, again.yes, again.unknown, again.already),
+        (0, 0, 1, 2)
+    );
+    assert_eq!(judge::load_labels(root, &faithful).unwrap().len(), 3);
 }
 
 fn cli(root: &Path, args: &[&str], stdin: Option<&str>) -> std::process::Output {
@@ -386,6 +518,8 @@ fn cli(root: &Path, args: &[&str], stdin: Option<&str>) -> std::process::Output 
         .env_remove("PMOS_EVALS_TOKEN")
         .env_remove("PMOS_BOTS_URL")
         .env_remove("PMOS_EVALS_AS")
+        .env_remove("PMOS_EVALS_LANES")
+        .env_remove("PMOS_EVALS_FRESH_CMD")
         .env_remove("PMOS_GATEWAY_URL")
         .env_remove("PMOS_EVALS_GATEWAY_TOKEN")
         .env_remove("PMOS_EVALS_BASELINE_REF")
@@ -730,16 +864,23 @@ async fn cli_judge_calibration_decides_blocking() {
         );
         lines.push('\n');
     }
+    // Plus a line a person marked unknown and two still waiting: neither counts.
+    lines.push_str("{\"input\": \"qu\", \"output\": \"Port 443.\", \"label\": \"unknown\"}\n");
+    lines.push_str("{\"input\": \"qp1\", \"output\": \"Port 443.\", \"label\": null, \"from\": \"t run 1\", \"judge_said\": \"no\"}\n");
+    lines.push_str("{\"input\": \"qp2\", \"output\": \"Port 5696.\", \"label\": null}\n");
     std::fs::write(judges.join("faithful.labels.jsonl"), lines).unwrap();
     let mut args = vec!["judge", "calibrate", "faithful", "--date", "2026-11-15"];
     args.extend(gw_args);
+    let calls_before = gw.calls.lock().unwrap().len();
     let cal = cli_async(root, &args, None).await;
     assert_eq!(cal.status.code(), Some(0), "{}", out(&cal));
     assert!(
-        out(&cal).contains("n 120 (60 yes, 60 no), TPR 0.90, TNR 1.00, 0 unparsed"),
+        out(&cal).contains("n 120 (60 yes, 60 no), TPR 0.90, TNR 1.00, 0 unparsed (0 unknown); left out: 1 labelled unknown, 2 not labelled yet"),
         "{}",
         out(&cal)
     );
+    // Only the 120 answered labels were put to the judge.
+    assert_eq!(gw.calls.lock().unwrap().len() - calls_before, 120);
     assert!(out(&cal).contains("blocking: n 120"), "{}", out(&cal));
     let written: judge::Calibration = serde_json::from_str(
         &std::fs::read_to_string(judges.join("faithful.calibration.json")).unwrap(),
@@ -754,7 +895,9 @@ async fn cli_judge_calibration_decides_blocking() {
 
     let check = cli_async(root, &["check", "--content", "missing"], None).await;
     assert!(
-        out(&check).contains("judge faithful: 120 labels, blocking"),
+        out(&check).contains(
+            "judge faithful: 120 labels (1 labelled unknown, 2 waiting for a person), blocking"
+        ),
         "{}",
         out(&check)
     );
@@ -776,6 +919,12 @@ async fn cli_judge_calibration_decides_blocking() {
 async fn cli_affected_reads_changed_paths() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals");
     let content = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../content");
+    let every: String = pmos_evals::spec::category_names(&root)
+        .unwrap()
+        .iter()
+        .map(|n| format!("{n}\n"))
+        .collect();
+    // A skill change runs every category, not only the Docs bot's (owner, 2026-11-23).
     let o = cli_async(
         &root,
         &["affected", "--content", content.to_str().unwrap()],
@@ -783,7 +932,16 @@ async fn cli_affected_reads_changed_paths() {
     )
     .await;
     assert_eq!(o.status.code(), Some(0), "{}", out(&o));
-    assert_eq!(String::from_utf8_lossy(&o.stdout), "docs-qa\n");
+    assert_eq!(String::from_utf8_lossy(&o.stdout), every);
+    // A change outside the evals, the gateway config and the bots' content runs nothing.
+    let o = cli_async(
+        &root,
+        &["affected", "--content", content.to_str().unwrap()],
+        Some("README.md\ncontent/templates/prd.md\n"),
+    )
+    .await;
+    assert_eq!(o.status.code(), Some(0), "{}", out(&o));
+    assert_eq!(String::from_utf8_lossy(&o.stdout), "");
     let o = cli_async(
         &root,
         &[
@@ -800,5 +958,144 @@ async fn cli_affected_reads_changed_paths() {
     assert!(
         all.contains("docs-qa\n") && all.contains("slack-reply\n"),
         "{all}"
+    );
+}
+
+/// Review finding N5: `run` records the models the gateway itself reports (never what the
+/// operator types in `--note`), and `history` counts a run only when they are the production
+/// role models; the others are listed with the reason.
+#[tokio::test]
+async fn cli_run_records_the_gateways_models_and_history_counts_only_production_ones() {
+    let mock = Arc::new(Mock::default());
+    mock.script(
+        "q-a",
+        Script {
+            result: Some("KMIP is 5696.".into()),
+            ..Script::default()
+        },
+    );
+    let url = spawn(mock.clone()).await;
+    let gw_url = spawn_gateway(gateway()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_category(
+        root,
+        "cat",
+        "docs",
+        0.5,
+        &[(
+            "a",
+            "id: a\nask: \"q-a\"\nexpect:\n  must_include: [\"5696\"]\n".to_string(),
+        )],
+    );
+    // `write_category` names `prod-gateway.yaml` as the production gateway config.
+    let prod = |default: &str| {
+        std::fs::write(
+            root.join("prod-gateway.yaml"),
+            format!("upstreams: {{q: 'http://vllm:8000/v1'}}\nroles:\n  default: {{upstream: q, model: {default}}}\n  extraction: {{upstream: q, model: nemo-prod}}\n"),
+        )
+        .unwrap();
+    };
+    prod("qwen-prod");
+    let run = |date: &'static str, with_gateway: bool| {
+        let url = url.clone();
+        let gw_url = gw_url.clone();
+        async move {
+            let mut args = vec![
+                "run",
+                "--category",
+                "cat",
+                "--bots-url",
+                &url,
+                "--token",
+                TOKEN,
+                "--as",
+                "ana",
+                "--date",
+                date,
+                "--no-judges",
+                "--note",
+                "model: whatever the operator typed",
+            ];
+            if with_gateway {
+                args.extend(["--gateway-url", &gw_url, "--gateway-token", GATEWAY_TOKEN]);
+            }
+            cli_async(root, &args, None).await
+        }
+    };
+    // Two weeks with the models of the runtime's own (production) gateway recorded.
+    *mock.gateway.lock().unwrap() = Some(prod_gateway());
+    for date in ["2026-11-09", "2026-11-16"] {
+        let o = run(date, true).await;
+        assert_eq!(o.status.code(), Some(0), "{}", out(&o));
+    }
+    // A runtime that doesn't report its gateway: nothing recorded, though the runner has one.
+    *mock.gateway.lock().unwrap() = None;
+    let o = run("2026-11-17", true).await;
+    assert!(out(&o).contains("won't count towards a bar"), "{}", out(&o));
+    // R3: the runtime's gateway is a test one serving the same model names, while the runner
+    // was pointed at another gateway. The report records the runtime's, which doesn't count.
+    let mut test_gw = prod_gateway();
+    test_gw["class"] = json!("test");
+    *mock.gateway.lock().unwrap() = Some(test_gw);
+    let o = run("2026-11-18", true).await;
+    assert!(out(&o).contains("counts towards no bar"), "{}", out(&o));
+    let json18: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join("reports/2026-11-18-cat.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(json18["gateway_models"]["class"], "test");
+    // Without the runner's own gateway the models are still recorded: they come from the
+    // runtime.
+    *mock.gateway.lock().unwrap() = Some(prod_gateway());
+    let o = run("2026-11-19", false).await;
+    assert_eq!(o.status.code(), Some(0), "{}", out(&o));
+    let json19: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join("reports/2026-11-19-cat.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(json19["gateway_models"]["class"], "production");
+    let json: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join("reports/2026-11-16-cat.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        json["gateway_models"]["roles"],
+        json!({"default": "qwen-prod", "extraction": "nemo-prod"})
+    );
+    assert_eq!(json["gateway_models"]["upstreams"]["default"], "local");
+    assert!(
+        !json.to_string().contains(&gw_url),
+        "no gateway address in a report"
+    );
+    let md = std::fs::read_to_string(root.join("reports/2026-11-16-cat.md")).unwrap();
+    assert!(md.contains("default: `qwen-prod` (local)"), "{md}");
+
+    let history = || cli(root, &["history", "--category", "cat"], None);
+    let h = history();
+    assert_eq!(h.status.code(), Some(0), "{}", out(&h));
+    assert!(
+        out(&h).contains("met its bar two weeks in a row"),
+        "{}",
+        out(&h)
+    );
+    assert!(
+        out(&h).contains("2026-11-17-cat.json: the gateway's models weren't recorded"),
+        "{}",
+        out(&h)
+    );
+    assert!(
+        out(&h).contains("2026-11-18-cat.json: the runtime's gateway is a `test` gateway"),
+        "{}",
+        out(&h)
+    );
+    // Production moves to another model: the earlier runs no longer count.
+    prod("qwen-next");
+    let h = history();
+    assert_eq!(h.status.code(), Some(1), "{}", out(&h));
+    assert!(
+        out(&h).contains("default: `qwen-prod`, production `qwen-next`"),
+        "{}",
+        out(&h)
     );
 }

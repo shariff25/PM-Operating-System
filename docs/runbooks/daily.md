@@ -23,10 +23,10 @@ Once a week, also run `deploy/pmos-admin smoke <your handle>`.
    | --- | --- |
    | `toolserver` storage not ok | Postgres is down or full: `deploy/pmos-admin logs postgres`; check free disk with `df -h` |
    | `gateway` upstream not ok | A model server is down: `deploy/pmos-admin logs vllm-default` (or `vllm-extraction`), then `deploy/pmos-admin restart vllm-default` |
-   | `gateway` `"waiting"` high | Too many requests for the GPU. Interactive work goes first; scheduled routines wait. If it stays high for days, that's the signal for a second Spark (implementation plan, Phase 3). |
+   | `gateway` `"waiting"` high | Too many requests for the GPU. Interactive work goes first; scheduled routines wait. If it stays high for days, that's the signal for a second model server (implementation plan, Phase 3). |
    | `bots` not ok | Read its `checks`: it names the service it can't reach |
    | Slack bot not listed | Its tokens are missing, or it's crashing: `deploy/pmos-admin logs slack` |
-   | Everything ok, but one bot doesn't answer | Its sandbox: `openshell sandbox list`, then `deploy/pmos-admin pause <bot>` and `resume <bot>` |
+   | Everything ok, but one bot doesn't answer | Its sandbox and worker: `openshell sandbox list` and `systemctl --user list-units 'pmos-worker@*'` (as the user OpenShell runs as), then `deploy/pmos-admin pause <bot>` and `resume <bot>` |
 
 2. **Look at the console** (Activity), or ask the PM for the task's thread. A task stuck in
    `queued` means no worker is claiming for that bot. One that `failed` gives its reason.

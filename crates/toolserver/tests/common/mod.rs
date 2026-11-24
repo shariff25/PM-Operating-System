@@ -6,7 +6,9 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use pmos_toolserver::audit::{AuditEvent, AuditSink, MemoryAudit};
+use pmos_toolserver::audit::{
+    AuditEvent, AuditQuery, AuditSink, MemoryAudit, Outcome, ReadEvent, StoredEvent,
+};
 use pmos_toolserver::catalog::Catalog;
 use pmos_toolserver::connectors::fake::FakeConnector;
 use pmos_toolserver::connectors::Connector;
@@ -31,10 +33,21 @@ pub struct TestPg {
     pub store: PgStore,
     base: PgConnectOptions,
     schema: String,
+    url: String,
 }
 
 impl TestPg {
     pub async fn new() -> Option<Self> {
+        Self::create(false).await
+    }
+
+    /// As [`Self::new`], in a schema whose name is one letter (the first free one): for the
+    /// cases where a name's length matters (identifiers are cut at 63 bytes).
+    pub async fn new_short_schema() -> Option<Self> {
+        Self::create(true).await
+    }
+
+    async fn create(short: bool) -> Option<Self> {
         let Ok(url) = std::env::var("PMOS_TEST_DATABASE_URL") else {
             assert!(
                 std::env::var_os("CI").is_none(),
@@ -44,14 +57,26 @@ impl TestPg {
             return None;
         };
         let base = PgConnectOptions::from_str(&url).expect("PMOS_TEST_DATABASE_URL parses");
-        let schema = format!("t_{}", uuid::Uuid::new_v4().simple());
         let mut admin = sqlx::PgConnection::connect_with(&base)
             .await
             .expect("connect");
-        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
-            .execute(&mut admin)
-            .await
-            .expect("create schema");
+        let names: Vec<String> = if short {
+            ('a'..='z').map(String::from).collect()
+        } else {
+            vec![format!("t_{}", uuid::Uuid::new_v4().simple())]
+        };
+        let mut schema = None;
+        for name in names {
+            if sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {name}")))
+                .execute(&mut admin)
+                .await
+                .is_ok()
+            {
+                schema = Some(name);
+                break;
+            }
+        }
+        let schema = schema.expect("create schema");
         admin.close().await.ok();
         let pool = PgPoolOptions::new()
             .max_connections(12)
@@ -64,7 +89,17 @@ impl TestPg {
             store,
             base,
             schema,
+            url,
         })
+    }
+
+    /// A connection URL for this test's schema, for a child process (the host commands).
+    pub fn schema_url(&self) -> String {
+        let sep = if self.url.contains('?') { '&' } else { '?' };
+        format!(
+            "{}{sep}options=-c%20search_path%3D{}",
+            self.url, self.schema
+        )
     }
 
     pub async fn drop_schema(self) {
@@ -93,6 +128,40 @@ impl AuditSink for SwitchAudit {
             return Err(StoreError("audit log unreachable".into()));
         }
         self.inner.record(event).await
+    }
+
+    async fn reads(
+        &self,
+        user: &str,
+        run_id: &str,
+        until: DateTime<Utc>,
+        limit: usize,
+    ) -> StoreResult<Option<Vec<ReadEvent>>> {
+        self.inner.reads(user, run_id, until, limit).await
+    }
+
+    async fn search(&self, query: &AuditQuery) -> StoreResult<Option<Vec<StoredEvent>>> {
+        self.inner.search(query).await
+    }
+
+    async fn count_outcomes(
+        &self,
+        since: DateTime<Utc>,
+    ) -> StoreResult<Option<std::collections::BTreeMap<Outcome, u64>>> {
+        self.inner.count_outcomes(since).await
+    }
+
+    async fn purge(
+        &self,
+        retention_days: u32,
+        batch: u32,
+        now: DateTime<Utc>,
+    ) -> StoreResult<Option<pmos_toolserver::audit::Purged>> {
+        self.inner.purge(retention_days, batch, now).await
+    }
+
+    async fn retention(&self) -> StoreResult<Option<pmos_toolserver::audit::RetentionFacts>> {
+        self.inner.retention().await
     }
 }
 
@@ -150,26 +219,145 @@ pub async fn pg_fixture() -> Option<(Fixture, TestPg)> {
     Some((fixture, pg))
 }
 
-/// The in-memory fixture with `team.yaml` enforced, as with live connectors.
-pub fn team_fixture(members: &[&str]) -> Fixture {
-    let (dir, root) = content_tree();
-    let (stores, audit) = Stores::in_memory(&root);
-    let team = pmos_toolserver::team::Team::of(
-        members
-            .iter()
-            .map(|h| pmos_contract::model::TeamMember {
-                handle: h.to_string(),
-                slack_id: "U0TEST".into(),
-                email: None,
-                github: None,
-                roles: vec![pmos_contract::model::Role::Pm],
-            })
-            .collect(),
-    );
-    build_with(dir, root, stores, audit, Some(team))
+/// The handle and Slack id of the admin a seeded directory gets when its members name none
+/// (the user database always has an active admin).
+pub const FIXTURE_ADMIN: (&str, &str) = ("fixture-admin", "U0FIXADMIN");
+
+/// One person in a fixture's seed. The seed is the import's file shape (a `members:` list),
+/// written out by [`seed_yaml`] and parsed by the tool server's import, the only code that
+/// parses that shape (slice U7).
+#[derive(Debug, Clone)]
+pub struct SeedMember {
+    pub handle: String,
+    pub slack_id: String,
+    pub email: Option<String>,
+    pub github: Option<String>,
+    pub entra_oid: Option<String>,
+    pub roles: Vec<pmos_contract::model::Role>,
 }
 
-/// For the Slack reply assistant: `team.yaml` enforced with the Slack fixtures' team
+/// `members` in the seed's YAML shape.
+pub fn seed_yaml(members: &[SeedMember]) -> String {
+    let quote = |s: &str| serde_json::to_string(s).unwrap();
+    let mut out = String::from("members:\n");
+    if members.is_empty() {
+        return "members: []\n".into();
+    }
+    for m in members {
+        out.push_str(&format!("  - handle: {}\n", quote(&m.handle)));
+        out.push_str(&format!("    slack-id: {}\n", quote(&m.slack_id)));
+        if let Some(e) = &m.email {
+            out.push_str(&format!("    email: {}\n", quote(e)));
+        }
+        if let Some(g) = &m.github {
+            out.push_str(&format!("    github: {}\n", quote(g)));
+        }
+        if let Some(o) = &m.entra_oid {
+            out.push_str(&format!("    entra-oid: {}\n", quote(o)));
+        }
+        let roles: Vec<&str> = m.roles.iter().map(|r| r.as_str()).collect();
+        out.push_str(&format!("    roles: [{}]\n", roles.join(", ")));
+    }
+    out
+}
+
+/// `members` as a bootstrap seed, with [`FIXTURE_ADMIN`] added when none of them is an admin.
+pub fn seed_request(mut members: Vec<SeedMember>) -> pmos_toolserver::users::ImportRequest {
+    use pmos_contract::model::Role;
+    if !members.iter().any(|m| m.roles.contains(&Role::Admin)) {
+        members.push(SeedMember {
+            handle: FIXTURE_ADMIN.0.into(),
+            slack_id: FIXTURE_ADMIN.1.into(),
+            email: None,
+            github: None,
+            entra_oid: None,
+            roles: vec![Role::Pm, Role::Admin],
+        });
+    }
+    pmos_toolserver::users::ImportRequest::parse(
+        seed_yaml(&members).as_bytes(),
+        None,
+        pmos_toolserver::users::ImportMode::Bootstrap,
+    )
+    .expect("the fixture seed parses")
+}
+
+/// An in-memory user store seeded with `members` (and [`FIXTURE_ADMIN`] if none is an admin),
+/// whose deactivations reach `stores`. The `evals` account may have its fake Slack id, as in
+/// the eval stack's seed.
+pub async fn memory_users(
+    members: Vec<SeedMember>,
+    stores: &Stores,
+) -> Arc<dyn pmos_toolserver::users::UserStore> {
+    let rules = pmos_toolserver::users::Rules {
+        evals_slack_allowed: true,
+        ..Default::default()
+    };
+    Arc::new(
+        pmos_toolserver::users::MemoryUsers::seeded(
+            seed_request(members),
+            rules,
+            Some(stores.audit.clone()),
+        )
+        .await
+        .expect("the fixture seed applies")
+        .with_linked(stores.linked()),
+    )
+}
+
+/// Seed `members` (and [`FIXTURE_ADMIN`] if none is an admin) into `stores`' own user store,
+/// as `import --bootstrap` does.
+pub async fn seed_users(stores: &Stores, members: Vec<SeedMember>) {
+    stores
+        .users
+        .apply(
+            &pmos_toolserver::users::Actor::import(None),
+            pmos_toolserver::users::Op::Import(Box::new(seed_request(members))),
+            seeded_at(),
+        )
+        .await
+        .expect("the fixture seed applies");
+}
+
+/// When fixtures seed their user database ([`now`]): its audit events are the newest.
+pub fn seeded_at() -> DateTime<Utc> {
+    now()
+}
+
+/// A seed member: `handle`, Slack id, roles.
+pub fn member(handle: &str, slack_id: &str, roles: Vec<pmos_contract::model::Role>) -> SeedMember {
+    SeedMember {
+        handle: handle.to_string(),
+        slack_id: slack_id.to_string(),
+        email: None,
+        github: None,
+        entra_oid: None,
+        roles,
+    }
+}
+
+/// A distinct fake Slack id for the `i`th fixture member.
+fn slack_of(i: usize) -> String {
+    format!("U0TEST{i:03}")
+}
+
+/// The in-memory fixture with the user database enforced, holding `members` as PMs.
+pub async fn team_fixture(members: &[&str]) -> Fixture {
+    let (dir, root) = content_tree();
+    let (stores, audit) = Stores::in_memory(&root);
+    seed_users(
+        &stores,
+        members
+            .iter()
+            .enumerate()
+            .map(|(i, h)| member(h, &slack_of(i), vec![pmos_contract::model::Role::Pm]))
+            .collect(),
+    )
+    .await;
+    build_with(dir, root, stores, audit, true)
+}
+
+/// For the Slack reply assistant: the user database seeded with the Slack fixtures' team
 /// ([`pmos_toolserver::connectors::fake::SLACK_TEAM`]: evals, ben and cy), and a `reply-test`
 /// skill whose data class is `restricted`, with the context, Jira, docs, Slack and memory tools. In
 /// memory, or with `postgres` every store in Postgres (`None` when no test database is set).
@@ -180,18 +368,10 @@ pub async fn reply_fixture(postgres: bool) -> Option<(Fixture, Option<TestPg>)> 
         "skills/reply-test/SKILL.md",
         "---\nname: reply-test\ndescription: Test skill that drafts Slack replies.\nmetadata:\n  owner: \"@pm\"\n  version: \"0.1.0\"\n  model: \"default\"\n  data-class: \"restricted\"\n  tools: \"context.search context.read jira.search jira.read docs.search docs.read slack.search slack.read_thread slack.post_reply slack.send_message jira.create_issue memory.read memory.update\"\n---\n\n# /reply-test\n\nTest.\n",
     );
-    let team = pmos_toolserver::team::Team::of(
-        pmos_toolserver::connectors::fake::SLACK_TEAM
-            .iter()
-            .map(|(handle, slack_id)| pmos_contract::model::TeamMember {
-                handle: handle.to_string(),
-                slack_id: slack_id.to_string(),
-                email: None,
-                github: None,
-                roles: vec![pmos_contract::model::Role::Pm],
-            })
-            .collect(),
-    );
+    let team: Vec<_> = pmos_toolserver::connectors::fake::SLACK_TEAM
+        .iter()
+        .map(|(handle, slack_id)| member(handle, slack_id, vec![pmos_contract::model::Role::Pm]))
+        .collect();
     if postgres {
         let pg = TestPg::new().await?;
         pg.store.reindex(&load_docs(&root)).await.expect("reindex");
@@ -202,24 +382,205 @@ pub async fn reply_fixture(postgres: bool) -> Option<(Fixture, Option<TestPg>)> 
             stores.audit.clone(),
             audit.clone(),
         ]));
-        let f = build_with(dir, root, stores, audit, Some(team));
+        // The users in memory: the `evals` account's fake Slack id is an eval stack's seed,
+        // which the database never holds.
+        stores.users = memory_users(team, &stores).await;
+        let f = build_with(dir, root, stores, audit, true);
+        Some((f, Some(pg)))
+    } else {
+        let (mut stores, audit) = Stores::in_memory(&root);
+        stores.users = memory_users(team, &stores).await;
+        Some((build_with(dir, root, stores, audit, true), None))
+    }
+}
+
+/// The Slack MCP server's host in [`reply_fixture_mcp`]: routed to the fake on loopback.
+pub const SLACK_MCP_HOST: &str = "slack-mcp.example.test";
+
+/// Each team member's own token at the Slack MCP server: never another's, never PM OS's.
+struct TeamTokens;
+
+#[async_trait::async_trait]
+impl pmos_toolserver::mcp_client::UserTokens for TeamTokens {
+    async fn token(
+        &self,
+        user: &str,
+        _server: &str,
+    ) -> Result<pmos_toolserver::vault::Secret, pmos_toolserver::connectors::ConnectorError> {
+        pmos_toolserver::connectors::fake::SLACK_TEAM
+            .iter()
+            .find(|(h, _)| *h == user)
+            .map(|(h, _)| pmos_toolserver::vault::Secret::new(team_token(h)))
+            .ok_or_else(|| {
+                pmos_toolserver::connectors::ConnectorError::NotConnected(
+                    "connect Slack in PM OS first".into(),
+                )
+            })
+    }
+}
+
+/// `handle`'s token at the Slack MCP server in [`reply_fixture_mcp`].
+pub fn team_token(handle: &str) -> String {
+    format!("slack-mcp-token-{handle}-0123456789abcdef")
+}
+
+/// [`reply_fixture`] (in memory) with Slack served over MCP (slice M8): the fake MCP server over
+/// the fixture's own fakes (so `f.slack` sees what is written), behind a per-PM record like a
+/// vendor's (each PM's own token; the fake writes as the token's account). With
+/// `audience_checks` the record approves the conversation and members checks and Slack posts
+/// go to the server; without, the record serves reads only and posts, the audience check and
+/// the target label stay on the built-in connector.
+pub async fn reply_fixture_mcp(
+    audience_checks: bool,
+) -> (Fixture, pmos_toolserver::mcp_client::fake::FakeMcp) {
+    let (f, fake, _) = reply_fixture_mcp_with(audience_checks).await;
+    (f, fake)
+}
+
+/// [`reply_fixture_mcp`], with the Slack connector the service uses.
+pub async fn reply_fixture_mcp_with(
+    audience_checks: bool,
+) -> (
+    Fixture,
+    pmos_toolserver::mcp_client::fake::FakeMcp,
+    Arc<dyn Connector>,
+) {
+    use pmos_toolserver::mcp_client::fake::{self, FakeMcp};
+    use pmos_toolserver::mcp_client::transport::TestRoutes;
+    use pmos_toolserver::mcp_client::{McpConnector, McpServer, ServerAuth};
+    let (mut f, _) = reply_fixture(false).await.unwrap();
+    let fake =
+        FakeMcp::new().with_connectors(f.jira.clone(), f.confluence.clone(), f.slack.clone());
+    for (handle, _) in pmos_toolserver::connectors::fake::SLACK_TEAM {
+        fake.add_account(&team_token(handle), handle);
+    }
+    // The server lives as long as the test's runtime.
+    let addr = fake::serve(
+        fake.clone(),
+        vec![SLACK_MCP_HOST.into()],
+        None,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let mut record = fake::fake_records(addr)
+        .into_iter()
+        .find(|r| r.id == "fake-slack")
+        .unwrap();
+    record.url = format!("https://{SLACK_MCP_HOST}/mcp");
+    record.identity = pmos_contract::mcp::Identity {
+        host: Some(SLACK_MCP_HOST.into()),
+        ..Default::default()
+    };
+    record.auth = pmos_contract::mcp::AuthKind::OauthPerUser;
+    record.secret_env = None;
+    if !audience_checks {
+        record.checks.clear();
+        record
+            .tools
+            .retain(|t| t.class() == pmos_contract::mcp::ToolClass::Read);
+    }
+    let server = Arc::new(
+        McpServer::new(
+            record,
+            ServerAuth::PerUser(Arc::new(TeamTokens)),
+            Some(f.stores.audit.clone()),
+            &TestRoutes::default().route(SLACK_MCP_HOST, addr),
+        )
+        .unwrap(),
+    );
+    let mcp = Arc::new(McpConnector::new("slack", server, "fake-mcp").unwrap());
+    assert_eq!(mcp.posts_on_mcp(), audience_checks);
+    let slack: Arc<dyn Connector> = if audience_checks {
+        mcp
+    } else {
+        Arc::new(pmos_toolserver::mcp_client::split::ReadsOnly::new(mcp, f.slack.clone()).unwrap())
+    };
+    let catalog = Catalog::load(&f.root, now().date_naive()).expect("fixture content lints");
+    let connectors: Vec<Arc<dyn Connector>> = vec![
+        f.jira.clone(),
+        f.confluence.clone(),
+        slack.clone(),
+        Arc::new(FakeConnector::docs()),
+    ];
+    f.svc = Arc::new(ToolService::new(catalog, f.stores.clone(), connectors).unwrap());
+    (f, fake, slack)
+}
+
+/// The user database seeded with `members` and their roles; every store in memory, or with
+/// `postgres` in Postgres (`None` when no test database is set). The audit log is read back
+/// from the backend under test.
+pub async fn roles_fixture(
+    members: &[(&str, pmos_contract::model::Role)],
+    postgres: bool,
+) -> Option<(Fixture, Option<TestPg>)> {
+    roles_fixture_with(members, postgres, |_| {}).await
+}
+
+/// [`roles_fixture`], with `extra` writing more content under the fixture's content root
+/// before it is loaded.
+pub async fn roles_fixture_with(
+    members: &[(&str, pmos_contract::model::Role)],
+    postgres: bool,
+    extra: impl FnOnce(&Path),
+) -> Option<(Fixture, Option<TestPg>)> {
+    let (dir, root) = content_tree();
+    extra(&root);
+    let team: Vec<_> = members
+        .iter()
+        .enumerate()
+        .map(|(i, (handle, role))| member(handle, &slack_of(i), vec![role.clone()]))
+        .collect();
+    if postgres {
+        let pg = TestPg::new().await?;
+        pg.store.reindex(&load_docs(&root)).await.expect("reindex");
+        let stores = pg.store.stores();
+        seed_users(&stores, team).await;
+        let f = build_with(dir, root, stores, Arc::new(MemoryAudit::default()), true);
         Some((f, Some(pg)))
     } else {
         let (stores, audit) = Stores::in_memory(&root);
-        Some((build_with(dir, root, stores, audit, Some(team)), None))
+        seed_users(&stores, team).await;
+        Some((build_with(dir, root, stores, audit, true), None))
     }
 }
 
 fn build(dir: TempDir, root: PathBuf, stores: Stores, audit: Arc<MemoryAudit>) -> Fixture {
-    build_with(dir, root, stores, audit, None)
+    build_with(dir, root, stores, audit, false)
 }
 
+/// [`fixture`], with the tool server checking the model gateway's source at every session
+/// open and tool call through `guard` (slice H4).
+pub fn fixture_with_model_source(
+    guard: Arc<pmos_toolserver::model_source::SourceGuard>,
+) -> Fixture {
+    let (dir, root) = content_tree();
+    let (stores, audit) = Stores::in_memory(&root);
+    let mut f = build(dir, root, stores, audit);
+    let catalog = Catalog::load(&f.root, now().date_naive()).expect("fixture content lints");
+    let connectors: Vec<Arc<dyn Connector>> = vec![
+        f.jira.clone(),
+        f.confluence.clone(),
+        f.slack.clone(),
+        Arc::new(FakeConnector::docs()),
+    ];
+    f.svc = Arc::new(
+        ToolService::new(catalog, f.stores.clone(), connectors)
+            .unwrap()
+            .with_open_directory()
+            .with_model_source(guard),
+    );
+    f
+}
+
+/// `enforced`: the user database decides who may use PM OS; otherwise it is open (tests
+/// only: any valid handle not listed may).
 fn build_with(
     dir: TempDir,
     root: PathBuf,
     mut stores: Stores,
     audit: Arc<MemoryAudit>,
-    team: Option<Arc<pmos_toolserver::team::Team>>,
+    enforced: bool,
 ) -> Fixture {
     let audit_switch = Arc::new(SwitchAudit {
         inner: stores.audit.clone(),
@@ -237,8 +598,8 @@ fn build_with(
         Arc::new(FakeConnector::docs()),
     ];
     let mut svc = ToolService::new(catalog, stores.clone(), connectors).unwrap();
-    if let Some(team) = team {
-        svc = svc.with_team(team);
+    if !enforced {
+        svc = svc.with_open_directory();
     }
     Fixture {
         _dir: dir,
@@ -283,6 +644,11 @@ pub fn content_tree() -> (TempDir, PathBuf) {
     );
     write(
         &root,
+        "skills/page-update/SKILL.md",
+        "---\nname: page-update\ndescription: Test skill that updates Confluence pages.\nmetadata:\n  owner: \"@pm\"\n  version: \"0.1.0\"\n  model: \"default\"\n  data-class: \"internal\"\n  tools: \"confluence.read confluence.create_draft confluence.update_page\"\n---\n\n# /page-update\n\nTest.\n",
+    );
+    write(
+        &root,
         "skills/field-watch/SKILL.md",
         "---\nname: field-watch\ndescription: Test skill that watches field questions.\nmetadata:\n  owner: \"@pm\"\n  version: \"0.1.0\"\n  model: \"default\"\n  data-class: \"internal\"\n  tools: \"context.search context.read jira.search jira.read jira.create_issue confluence.search confluence.read slack.search slack.read_thread slack.post_reply\"\n---\n\n# /field-watch\n\nTest.\n",
     );
@@ -313,4 +679,25 @@ pub fn content_tree() -> (TempDir, PathBuf) {
 /// Write a file under the fixture's content root, as a merge to the content repo would.
 pub fn write_content(root: &Path, rel: &str, text: &str) {
     write(root, rel, text)
+}
+
+/// A stand-in model gateway that only says which model source it serves (`GET /readyz`, slice
+/// H4), for a runtime or tool server that checks it before a claim or a session. Its base URL,
+/// with `/v1`; it runs until the test ends.
+pub async fn gateway_serving(source: &str) -> String {
+    let body = serde_json::json!({"ready": true, "class": "test", "stub": false,
+                                  "model_source": source});
+    let app = axum::Router::new().route(
+        "/readyz",
+        axum::routing::get(move || {
+            let body = body.clone();
+            async move { axum::Json(body) }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    format!("{base}/v1")
 }

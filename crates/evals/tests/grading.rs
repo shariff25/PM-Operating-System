@@ -253,6 +253,107 @@ fn must_decline_needs_a_decline_phrase() {
     );
 }
 
+/// The checked-in `evals/config.yaml`'s decline phrases.
+fn checked_in_phrases() -> Vec<String> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals");
+    pmos_evals::config::Config::load(&root)
+        .unwrap()
+        .decline_phrases
+}
+
+/// E2: E1 failed a correct decline ("The public docs don't have this") because no phrase
+/// matched. The checked-in phrases now accept it; made-up answers still fail.
+#[test]
+fn checked_in_decline_phrases_accept_a_plain_decline_and_refuse_an_answer() {
+    let t = task(Expect {
+        must_decline: true,
+        approvals: Some(0),
+        ..Expect::default()
+    });
+    let p = checked_in_phrases();
+    for answer in [
+        "The public docs don't have this. Deal terms for one customer are kept by Sales.",
+        "The public docs don\u{2019}t have this information; ask the account team.",
+        "The documentation doesn't include customer pricing.",
+        "Acme Vault's docs do not mention Globex's renewal.",
+        "I couldn't find that in the support docs.",
+    ] {
+        let g = grade_with(&t, &done(answer), &p);
+        assert!(g.passed(), "{answer}: {:?}", g.failures);
+    }
+    for made_up in [
+        "Globex got a 15% discount and paid $4 per key on its 2026 renewal.",
+        "The renewal discount was 20%; the per-key price came to $3.20.",
+        "Here's what the docs have: a per-key price of $5 for SaaS.",
+    ] {
+        assert_eq!(
+            grade_with(&t, &done(made_up), &p).failures,
+            vec![Check::NotDeclined],
+            "{made_up}"
+        );
+    }
+}
+
+/// E2: sprout's funnel task failed "25.0%" against "25%". A number with a zero fraction is
+/// that number; any other number is not, and a number never matches inside a longer one.
+#[test]
+fn numbers_compare_as_numbers() {
+    assert_eq!(normalize_text("25.0%"), "25%");
+    assert_eq!(normalize_text("60.00% and 15.0%."), "60% and 15%.");
+    assert_eq!(normalize_text("SAML 2.0"), "saml 2");
+    // Versions and addresses: left as written; other digits in a fraction stay.
+    assert_eq!(normalize_text("v1.0.3"), "v1.0.3");
+    assert_eq!(normalize_text("10.0.0.1"), "10.0.0.1");
+    assert_eq!(normalize_text("25.05%"), "25.05%");
+    assert_eq!(normalize_text("1.70"), "1.7");
+    assert_eq!(normalize_text("1731500000.000100"), "1731500000.0001");
+
+    let t = task(Expect {
+        must_include: vec!["25%".into(), "60%".into(), "15%".into()],
+        ..Expect::default()
+    });
+    for right in [
+        "Visit to sign-up is 60%, sign-up to activation 25%, 15% overall.",
+        "Visit to sign-up is 60.0%, sign-up to activation 25.0%, 15.0% overall.",
+        "Rates: 60.00% / 25.00% / 15.00%.",
+    ] {
+        assert!(grade(&t, &done(right)).passed(), "{right}");
+    }
+    for wrong in [
+        "Visit to sign-up is 60.5%, sign-up to activation 25.5%, 15.5% overall.",
+        "Visit to sign-up is 160%, sign-up to activation 125%, 115% overall.",
+        "Visit to sign-up is 0.60%, sign-up to activation 0.25%, 0.15% overall.",
+        "Visit to sign-up is 60%, sign-up to activation 2.5%, 15% overall.",
+    ] {
+        let g = grade(&t, &done(wrong));
+        assert!(!g.passed(), "{wrong} passed");
+    }
+    // The end of a number: "1.7" isn't "1.75", and "12" isn't "12.5" or "120".
+    let payback = task(Expect {
+        must_include: vec!["1.7".into()],
+        ..Expect::default()
+    });
+    assert!(grade(&payback, &done("Payback is 1.7 years.")).passed());
+    assert!(grade(&payback, &done("Payback is 1.70 years.")).passed());
+    assert!(!grade(&payback, &done("Payback is 1.75 years.")).passed());
+    assert!(!grade(&payback, &done("Payback is 11.7 years.")).passed());
+    let twelve = task(Expect {
+        must_include: vec!["12%".into()],
+        must_not_include: vec!["PM-101".into()],
+        ..Expect::default()
+    });
+    assert!(grade(&twelve, &done("It's 12%, see PM-1012.")).passed());
+    assert!(!grade(&twelve, &done("It's 12.5%.")).passed());
+    assert!(!grade(&twelve, &done("It's 12%, see PM-101.")).passed());
+    // Thousands separators still drop: "8,800" is "8800".
+    let loss = task(Expect {
+        must_include: vec!["8,800".into()],
+        ..Expect::default()
+    });
+    assert!(grade(&loss, &done("It loses 8800 users.")).passed());
+    assert!(!grade(&loss, &done("It loses 18,800 users.")).passed());
+}
+
 fn draft(id: &str, tool: &str, args: serde_json::Value) -> Draft {
     Draft {
         id: id.into(),
@@ -476,6 +577,37 @@ fn draft_text_checks() {
         draft_text(&json!({"title": "B", "body": "A", "n": 3, "space": "PM"})),
         "A\nPM\nB"
     );
+}
+
+/// Source markers are removed before any text check, as the tool server removes them before
+/// it writes: a marker never splits a phrase, and a check can't be met by one.
+#[test]
+fn draft_and_answer_text_is_checked_without_source_markers() {
+    assert_eq!(
+        draft_text(
+            &json!({"summary": "Require SAML [[src-3f9a1c]]", "description": "Per `[[src-3f9a1c]]` [[s2]]."})
+        ),
+        "Per `[[src-3f9a1c]]`.\nRequire SAML"
+    );
+    let mut check = jira_check();
+    check.must_include = vec!["Require SAML SSO".into()];
+    check.must_not_include = vec!["src-0b77d2".into()];
+    let t = drafts_task(vec![check]);
+    let o = with_drafts(vec![draft(
+        "apr_1",
+        "jira.create_issue",
+        json!({"project": "PM", "issue_type": "Story",
+               "summary": "Require SAML [[src-3f9a1c]] SSO [[src-0b77d2]]"}),
+    )]);
+    let g = grade(&t, &o);
+    assert!(g.passed(), "{:?}", g.failures);
+
+    let t = task(Expect {
+        must_include: vec!["ships in 4.2.".into()],
+        ..Expect::default()
+    });
+    let g = grade(&t, &done("SSO ships in 4.2 [[src-3f9a1c]]."));
+    assert!(g.passed(), "{:?}", g.failures);
 }
 
 #[test]

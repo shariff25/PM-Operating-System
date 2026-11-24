@@ -20,10 +20,15 @@
 # space, its title has the skill's prefix, and its body has the template's headings, written
 # exactly as docs/pm-craft-spec.md §1 lists them. Whether the thinking is good is for the
 # three advisory judges (evals/judges/) and for people. Replace the tasks with case cards
-# (evals/case-card.md) as real ones come in. No pass_bar until then: the category reports
-# only.
+# (evals/case-card.md) as real ones come in. The bar and repeats below are starting values (docs/evals.md, "Categories and bars").
 name: pm-craft
 bot: personal
+# pass_bar 0.8 is a starting value: the docs give no launch number for this category, only the
+# 80% example in docs/evals.md. Tighten it after the first valid run against case cards.
+pass_bar: 0.8
+# repeats 3: the Phase 1 exit gate reports pass^3 for every bot category
+# (docs/research/self-improvement-loops.md, "Exit gate").
+repeats: 3
 description: >-
   A PM asks their personal bot for senior-PM work: a problem statement, strategy, decision,
   metrics tree, experiment plan or readout, PRD, call synthesis, competitive brief, sizing, AI

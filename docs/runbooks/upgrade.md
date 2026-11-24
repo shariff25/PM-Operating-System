@@ -23,11 +23,25 @@ reach PMs until the affected category still meets its bar (D10).
    ```
    The services run their own database migrations at start-up. Each service stops on SIGTERM
    only after finishing in-flight work, and a running task is retried once.
-5. **If the worker image changed,** recreate each bot's sandbox so it runs the new one:
+   **The upgrade that brings slice H2** (fixed addresses on the `pmos` network) makes `up` refuse
+   the network made before it, because Compose doesn't change a network that exists. Re-create
+   it once, with no eval stack running: `deploy/pmos-admin down && deploy/pmos-admin up --models`.
+   Then write the service names: `sudo deploy/pmos-admin host-names apply`
+   (`docs/runbooks/install.md`, Stage 4 step 1).
+5. **If the worker image changed,** recreate each bot's sandbox so it runs the new one. Stop
+   its worker first (`pause` stops and disables its systemd unit as well as the sandbox):
    ```sh
+   deploy/pmos-admin pause <bot>
    openshell sandbox delete pmos-<bot>
    deploy/pmos-admin sandbox <bot>
    ```
+   **The upgrade that brings slice H0** (the worker unit and the image's numeric `sandbox`
+   user) changes the worker image, so every sandbox is recreated this way. A worker started
+   before it was started with `&` from someone's shell: find it with
+   `pgrep -af 'openshell sandbox exec'` and stop it (`kill <pid>`) before `pause`. Turn on
+   lingering first if it isn't (`docs/runbooks/install.md`, Stage 4 step 2). Before slice H2,
+   sandboxes couldn't reach the services, so there is nothing to recreate on a stack that still
+   runs the bring-up worker: start from Stage 4 of the install runbook instead.
 6. **If a role's skills or tools changed** (the changelog says so), regenerate the bots'
    sandbox policies in your content repo, commit the result, then recreate each bot's
    sandbox as in step 5. A policy lists the tools its bot may call, so a bot keeps its old
@@ -40,6 +54,147 @@ reach PMs until the affected category still meets its bar (D10).
    and reinstall it; see below.
 8. **Check:** run `deploy/pmos-admin smoke <your handle>`, then the benchmarks for any category
    the change touches (`deploy/pmos-admin evals-run --category <c>`).
+
+## The tool server validates first Microsoft sign-ins (review of `b469d5b`)
+
+From this version the tool server checks the ID token of a person's **first** Microsoft
+sign-in itself, instead of taking the web app's word for who it is
+([../entra-sign-in.md](../entra-sign-in.md)). It needs the tenant id and client id:
+
+- **With the deploy kit, nothing to add.** `deploy/compose.yaml` passes the web app's
+  `PMOS_WEB_ENTRA_TENANT_ID`, `PMOS_WEB_ENTRA_CLIENT_ID` and `PMOS_WEB_ENTRA_AUTHORITY` to the
+  tool server as `PMOS_ENTRA_TENANT_ID`, `PMOS_ENTRA_CLIENT_ID` and `PMOS_ENTRA_AUTHORITY`
+  (never the client secret). The tool server now fetches the tenant's keys from
+  `login.microsoftonline.com` itself, through the same outbound proxy as the web app.
+- **Running the services another way:** set those three on the tool server, with the same
+  values as the web app's. Without them a first Microsoft sign-in is refused
+  (`reason=users_unavailable`) and the tool server logs it; people already linked keep signing
+  in.
+- **Check:** `deploy/pmos-admin status` shows the web app's `/readyz`; with Entra on it must
+  include `"entra_link":"ok"`. `down` means the tool server has no Entra settings, or other ids
+  than the web app (its log says which).
+
+The same version also (all automatic, migration `0021`): only the Slack bot's token may decide
+a join request or remove a member (an orchestrator script that did either now gets `403`);
+`resolve` answers at most 600 hits a minute per client; the audit and role-history purges run
+with a fixed search path and their triggers accept only the real function; and a user's old
+sign-in name, Atlassian email or GitHub login can no longer be given to someone else. A
+`PMOS_GITHUB_URL` (or any other connector base override) that is `http://` to anything but
+loopback now stops the tool server at start-up: use `https://`.
+
+## Upgrading to the user database (`team.yaml` retired)
+
+From this version **no service reads `content/team.yaml`**. Who may use PM OS, and their
+roles, come only from the tool server's user database ([users.md](users.md)): sign-in, Slack,
+asking bots, the console, the admin screens and approval decisions. Onboarding no longer
+writes the file, `pmos member add` is gone, and `pmos lint` fails while a `team.yaml` is in the
+content (`team-file-retired`). **Import the people in it before you start the new version.**
+
+1. Back up (step 1 above), get the new code and build it (steps 2 and 3), but don't run `up`
+   yet.
+2. Note the content commit and keep a copy of the file outside the content (the pull request
+   in step 5 deletes it):
+   ```sh
+   sha=$(git -C "$PMOS_CONTENT_CHECKOUT" rev-parse HEAD)
+   git -C "$PMOS_CONTENT_CHECKOUT" show "$sha:content/team.yaml" > ~/team.yaml.$sha
+   ```
+3. Import it with the new image (the one-off container applies the tool server's migrations
+   first). Read the dry run, then apply; admins come in with `--allow-admins`, or run
+   `bootstrap-admin` first ([users.md](users.md), "Importing team.yaml"):
+   ```sh
+   deploy/pmos-admin users import --from ~/team.yaml.$sha --commit "$sha"
+   deploy/pmos-admin users import --from ~/team.yaml.$sha --commit "$sha" --allow-admins --apply
+   deploy/pmos-admin users list
+   ```
+   Then `users set-entra <handle> --oid <object id>` for each Admin and Auditor. On an install
+   that already imported (any release since slice U3), the import is safe to run again: everyone
+   is `unchanged`, and anyone added to the file since then is created.
+4. Start the new version (step 4 above) and check (step 8).
+5. Open a pull request on the content repo that deletes `content/team.yaml` (and its
+   `CODEOWNERS` line, if you have one). Until it merges, CI's `pmos lint` fails on the file;
+   the services only log a warning and ignore it.
+
+**If you start the new version without importing,** nobody gets in, and the tool server says
+so at start-up (`deploy/pmos-admin logs toolserver`): "the user database is empty: nobody can
+use PM OS until `pmos-admin users import` (or bootstrap-admin) runs". The web app answers every sign-in with "not a member",
+Slack offers everyone **Request access**, and the runtime refuses every ask. Nothing is lost:
+run step 3; the services pick the users up within 30 seconds, without a restart.
+
+**Rolling back past this version:** the previous version's Slack service, runtime, web app and
+console may still read `team.yaml`. Write the current database back as one before you roll
+back: `deploy/pmos-admin users export --format team-yaml > team.yaml`, commit it to the content
+repo, then roll back as below.
+
+## Upgrading to user assertions on by default
+
+From this version the runtime and the tool server run in `require` whenever the web app's or
+the console's tokens are set, and refuse to start in `off` or `verify` (`docs/user-assertion.md`,
+Modes). On an existing install:
+
+1. Run `deploy/setup.sh` again (same arguments). It writes `PMOS_ASSERTION_MODE=require` into
+   `deploy/.env` if the line is blank, and `PMOS_ONBOARDING_V2=1` and `PMOS_NUDGES=1`.
+2. If `deploy/.env` says `PMOS_ASSERTION_MODE=off` or `verify`, change it to `require`.
+   `pmos-admin up`, `add-bot` and `restore` now refuse to go on otherwise, and say so.
+3. `deploy/pmos-admin up --models` (with `--console` and `--web` if you run them). The mode now
+   comes from `deploy/.env` on every path, so an `add-bot` or the `up` after a `restore` no
+   longer starts the runtime with assertions off while the web app keeps running.
+
+## Tool-server migrations renumbered (web-app branch databases only)
+
+Which databases: only a tool-server database (`pmos_toolserver`) that was migrated by the
+`claude/web-app` branch **before** it merged `main`'s security fixes (commit 5bb6de4). That
+branch numbered its migrations `0009_audit_source_titles` and `0010_audit_admin_reads`; after
+the merge they are `0010` and `0011`, and `main`'s `0009_note_sensitivity` is new. Such a
+database fails at start-up with sqlx's "migration 9 was previously applied but has been
+modified". Only dev and test stacks of that branch can have it: a production host runs `main`, and
+`scripts/claude-test-stack.sh` keeps everything in memory. Check with:
+
+```sh
+docker compose -f deploy/compose.yaml --env-file deploy/.env exec -T postgres \
+  psql -U postgres -d pmos_toolserver -c "SELECT version, description FROM _sqlx_migrations ORDER BY version"
+```
+
+Affected when version 9 reads `audit source titles`.
+
+**Reset (verified path; loses the tool server's data: approvals, sessions, linked accounts,
+audit):** a dev or test stack holds fake data only.
+
+```sh
+deploy/pmos-admin down
+docker compose -f deploy/compose.yaml --env-file deploy/.env up -d postgres
+docker compose -f deploy/compose.yaml --env-file deploy/.env exec -T postgres psql -U postgres \
+  -v ON_ERROR_STOP=1 -c "DROP DATABASE pmos_toolserver WITH (FORCE)" \
+  -c "CREATE DATABASE pmos_toolserver OWNER pmos_toolserver"
+deploy/pmos-admin up
+```
+
+The tool server makes its tables again at start-up. For a local `cargo run` with its own
+database, drop and recreate that database the same way.
+
+**Repair (keeps the data). Dev and test stacks of that branch only; prefer the reset above.**
+Never edit `_sqlx_migrations` by hand. The repair is one guarded script,
+`scripts/repair-toolserver-migration-numbers.sql`. In one transaction, with the table locked,
+it checks that the database is in exactly the affected state: version 9 is
+`audit source titles` and version 10 `audit admin reads`, both applied, each with the
+checksum of its file, and nothing after 10. Only then does it renumber them to 10 and 11 (the
+SQL of both files is unchanged, so their checksums stay). In any other state (already
+repaired, never affected, a different history) it changes nothing, rolls back and exits
+non-zero with what it found. Take a backup first ([backup-restore.md](backup-restore.md)), then:
+
+```sh
+deploy/pmos-admin down
+docker compose -f deploy/compose.yaml --env-file deploy/.env up -d postgres
+docker compose -f deploy/compose.yaml --env-file deploy/.env exec -T postgres \
+  psql -U postgres -d pmos_toolserver -v ON_ERROR_STOP=1 \
+  -f - <scripts/repair-toolserver-migration-numbers.sql
+deploy/pmos-admin up
+```
+
+`pmos-admin up` starts the tool server, which applies `0009_note_sensitivity` (it only adds a
+nullable column) and anything newer. Verified on 2026-11-17 against a scratch Postgres 16
+database: the branch's old migrations applied with sqlx, the current tool server refusing them
+("migration 9 was previously applied but has been modified"), the script refusing a tampered
+row and a second run, and after the repair the current migrations applying cleanly.
 
 ## Updating the Slack app
 
@@ -73,40 +228,47 @@ If the new version changed a database (check the release notes, or new files und
 `crates/*/migrations/`), restore the backup from step 1 as well
 ([backup-restore.md](backup-restore.md)). Migrations are not reversible.
 
-## Registering the Spark CI runner
+## Registering the eval-gate runner
 
 The eval gate (`.github/workflows/evals-gate.yml`, `docs/evals.md` "CI") runs on pull requests
 that change roles, skills, bots, the evals or `deploy/gateway.yaml`. It needs the stack and the
-models, so it runs on a GitHub Actions self-hosted runner on the Spark with the labels
-`self-hosted` and `pmos-spark`. Until one is registered the job waits in the queue; a platform
-owner checks out the PR's branch somewhere on the Spark (not in `/opt/pmos`), runs
+models, so it runs on a GitHub Actions self-hosted runner on a host the owner chooses (not yet
+decided), with the labels `self-hosted` and `pmos-spark`. The label's name is historical, from an
+earlier plan; it stays as it is until the owner decides where the runner lives, because the
+workflow selects the runner by it. Until one is registered the job waits in the queue; a
+platform owner checks out the PR's branch somewhere on the host (not in `/opt/pmos`), runs
 `deploy/pmos-admin evals-gate --checkout <that checkout> --base origin/main` from `/opt/pmos`,
 and pastes the output into the PR.
 
 **What the runner runs.** The workflow runs on `pull_request_target`, so its own file always
 comes from the base branch. It checks out the PR's head into `pr/` without credentials and
-runs the Spark's installed script, `/opt/pmos/deploy/pmos-admin evals-gate --checkout pr`. The
+runs the host's installed script, `/opt/pmos/deploy/pmos-admin evals-gate --checkout pr`. The
 PR is only read as data (its `content/`, `evals/` and `deploy/gateway.yaml`); nothing in it is
 run, and no secret file is linked into it. So:
 - **A change to `pmos-admin` or the eval stack's compose file takes effect only after an
-  upgrade on the Spark** (the steps above). A PR that changes them is measured with the
-  Spark's current copies.
-- **The images are the Spark's,** built by the last `deploy/pmos-admin build`. A PR's code
-  changes are not benchmarked by the gate until they are merged and the Spark is upgraded.
+  upgrade on the host** (the steps above). A PR that changes them is measured with the
+  host's current copies.
+- **The images are the host's,** built by the last `deploy/pmos-admin build`. A PR's code
+  changes are not benchmarked by the gate until they are merged and the host is upgraded.
 
-**Once, to register it** (a GitHub repo admin and a Spark platform owner together):
-1. **On GitHub:** the repo's Settings → Actions → Runners → New self-hosted runner, Linux,
-   ARM64. Keep the page open: it shows the download commands and a registration token that
+**Once, to register it** (a GitHub repo admin and a platform owner of that host together):
+1. **On GitHub:** the repo's Settings → Actions → Runners → New self-hosted runner, Linux, and
+   the host's architecture (x64 or ARM64). Keep the page open: it shows the download commands and a registration token that
    lasts an hour.
-2. **On the Spark, a user for the runner** that can run Docker (`pmos-admin` needs it) and
+2. **On the host, a user for the runner** that can run Docker (`pmos-admin` needs it) and
    read the stack's settings. Docker access is root-equivalent, which is why only branches of
    this repository, never forks, run there.
    ```sh
    sudo useradd --create-home --groups docker gh-runner
    sudo setfacl -m u:gh-runner:r /opt/pmos/deploy/.env
    ```
-   If PM OS isn't in `/opt/pmos`, set `PMOS_SPARK_DIR=<that path>` in the runner's `.env`
-   file (in its install directory) after step 3; the workflow runs that copy's
+   Read only, never write, and never `chmod` it wider: `pmos-admin` refuses to run while every
+   account can read `deploy/.env` or its group can write it. It warns (and goes on) when the
+   file is readable through an ACL or owned by another account, which is what the runner sees.
+   `pmos-admin` and `setup.sh` keep the ACL when they rewrite the file (with `getfacl` and
+   `setfacl` from the `acl` package; without them they say to run the `setfacl` line again).
+   If PM OS isn't in `/opt/pmos`, set `PMOS_SPARK_DIR=<that path>` (a historical name the workflow
+   still reads) in the runner's `.env` file (in its install directory) after step 3; the workflow runs that copy's
    `deploy/pmos-admin`, which reads its own `deploy/.env`.
 3. **Install and configure it** as that user, with the commands from step 1 and these
    options:
@@ -115,10 +277,14 @@ run, and no secret file is linked into it. So:
    mkdir actions-runner && cd actions-runner
    # download and unpack, as the GitHub page shows
    ./config.sh --url https://github.com/<org>/<repo> --token <token from the page> \
-     --name spark-1 --labels pmos-spark --unattended
+     --name pmos-host-1 --labels pmos-spark --unattended
    exit
    ```
-   GitHub adds `self-hosted`, `Linux` and `ARM64` itself.
+   GitHub adds `self-hosted`, `Linux` and the architecture itself. The registration token is on
+   `config.sh`'s command line, the only way GitHub's runner instructions give it, so any
+   account on the host can read it while `config.sh` runs: it is good for one registration
+   and expires within the hour, but run this when no one else is logged in, and remove the
+   runner on GitHub if you think it leaked. The same holds for the removal token below.
 4. **Run it as a service,** so it survives reboots:
    ```sh
    cd ~gh-runner/actions-runner
@@ -132,11 +298,11 @@ run, and no secret file is linked into it. So:
    - **Outside collaborators need an approval.** The repo's Settings → Actions → General →
      "Approval for running fork pull request workflows from contributors": choose "Require
      approval for all outside collaborators".
-6. **Check:** Settings → Actions → Runners shows `spark-1` as Idle. Re-run a waiting "Eval
+6. **Check:** Settings → Actions → Runners shows `pmos-host-1` as Idle. Re-run a waiting "Eval
    gate" job, and read its summary.
 
 **Day to day:** the runner updates itself. One job runs at a time, and a new push to the PR
-cancels the previous run. If the Spark is busy or down, the job waits; `sudo ./svc.sh status`
+cancels the previous run. If the host is busy or down, the job waits; `sudo ./svc.sh status`
 in the runner directory shows whether the service is up.
 
 **To remove it:** stop the service (`sudo ./svc.sh stop && sudo ./svc.sh uninstall`), then

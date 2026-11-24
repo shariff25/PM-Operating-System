@@ -3,8 +3,9 @@
 runner:
   # The bot runtime (pmos-bots). Overridden by --bots-url or PMOS_BOTS_URL.
   bots_url: http://127.0.0.1:8750
-  # Who the eval tasks are for (`requested_by`). Team bots serve team members only, so this
-  # handle must be in content/team.yaml. Overridden by --as or PMOS_EVALS_AS.
+  # Who the eval tasks are for (`requested_by`). Team bots serve active PM OS users only, so
+  # this handle must be one in the user database (the eval stack seeds it, `pm` only).
+  # Overridden by --as or PMOS_EVALS_AS.
   requested_by: evals
   # How often a task is polled, and how long one task may take before it is graded as timed out.
   poll_ms: 2000
@@ -12,6 +13,14 @@ runner:
   # Tasks in flight at once during `run`. One sandbox serves each bot, so more than one mostly
   # adds queue time; `load` ignores this and sends all of its tasks at once.
   concurrency: 1
+
+# Which runs count towards a bar (the two-weeks rule, and a marketplace bot's
+# `benchmarked: true`; docs/evals.md, "Which runs count"). The production role models are the
+# `model` of each role in this gateway config (relative to this directory): a report counts
+# only when the models its gateway reported for the run match them, role for role, with no
+# stub and no testing-only upstream. Reports without the gateway's models never count.
+benchmark:
+  production_gateway: ../deploy/gateway.yaml
 
 # What a `must_decline` answer says when its sources don't answer the question. It passes when
 # it contains any of these, compared loosely (lowercase, dashes as spaces, curly apostrophes as
@@ -39,6 +48,22 @@ decline_phrases:
   - "not in the support docs"
   - "not in the public docs"
   - "not publicly documented"
+  # Added in E2 (2026-11-22): E1 failed a correct decline, "The public docs don't have this".
+  # Each names the docs as the subject, so a normal answer rarely says it.
+  - "docs don't have"
+  - "docs do not have"
+  - "docs don't include"
+  - "docs do not include"
+  - "docs don't mention"
+  - "docs do not mention"
+  - "docs don't say"
+  - "docs do not say"
+  - "documentation doesn't have"
+  - "documentation does not have"
+  - "documentation doesn't include"
+  - "documentation does not include"
+  - "documentation doesn't mention"
+  - "documentation does not mention"
 
 # Latency targets for `pmos-evals load`, in seconds, at p50 and p90. Queue time is from task
 # creation until a worker picks it up; total time is from creation until the task settles.
@@ -48,7 +73,7 @@ latency_targets:
     source: "Default, not from the PRD (no p50 queue target is in the repo); replace with the PRD's"
   queue_p90:
     seconds: 120
-    source: "docs/implementation-plan.md, Phase 3: a second Spark if p90 queue time passes 2 minutes"
+    source: "docs/implementation-plan.md, Phase 3: a second model server if p90 queue time passes 2 minutes"
   total_p50:
     seconds: 60
     source: "Default, not from the PRD (no total-time target is in the repo); replace with the PRD's"

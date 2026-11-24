@@ -3,13 +3,16 @@
 //! removal confirmation.
 //!
 //! Names, emails and errors come from people or other services, so every one is escaped for
-//! `mrkdwn`; handles and commit shas are checked before they go in a code span.
+//! `mrkdwn`; a person's display name is rendered inert with [`crate::blocks::name`] (no
+//! mention, link or formatting can come from it). Handles and commit shas are checked before
+//! they go in a code span.
 
 use pmos_contract::model::{valid_handle, valid_slack_id};
 use pmos_contract::onboarding::personal_bot_name;
 use serde_json::{json, Value};
 
-use crate::blocks::{escape, truncate};
+use crate::access_copy;
+use crate::blocks::{escape, name as shown_name, truncate};
 use crate::cards::person;
 
 /// Action ids of the onboarding buttons, and the callback ids of its modals.
@@ -34,7 +37,7 @@ pub mod action {
 pub const HANDLE_BLOCK: &str = "handle";
 pub const REPO_BLOCK: &str = "repo";
 
-/// What someone outside `team.yaml` is told, with the button.
+/// What someone outside the user directory is told, with the button.
 pub const NOT_A_MEMBER: &str = "PM OS is for the product team.";
 
 const SECTION_MAX: usize = 2900;
@@ -88,7 +91,7 @@ pub fn short_sha(sha: &str) -> Option<String> {
     (sha.len() >= 7 && sha.chars().all(|c| c.is_ascii_hexdigit())).then(|| sha[..7].to_string())
 }
 
-/// The note for someone outside `team.yaml`, with **Request access**.
+/// The note for someone outside the user directory, with **Request access**.
 pub fn request_access_note() -> (String, Value) {
     (
         NOT_A_MEMBER.to_string(),
@@ -110,18 +113,16 @@ pub fn request_access_ack() -> Value {
     json!({"response_type": "ephemeral", "text": text, "blocks": blocks})
 }
 
-/// What approving grants. The card never offers `admin`: the tool server refuses an admin
-/// grant from the Slack bot, and a new admin is made by a pull request to `team.yaml`.
-pub const ROLE_LINE: &str = "Approving adds them to `team.yaml` as a PM and gives them a \
-     personal bot. Admins are added by a pull request to `team.yaml`.";
+/// What approving grants (`access_copy::ROLE_LINE`).
+pub const ROLE_LINE: &str = access_copy::ROLE_LINE;
 
 /// Who asked: name, email, Slack mention and the proposed handle.
 fn request_head(request: &Value) -> Vec<Value> {
-    let name = str_of(request, "name");
-    let name = if name.trim().is_empty() {
+    let name = shown_name(str_of(request, "name"), 100);
+    let name = if name.is_empty() {
         "Someone".to_string()
     } else {
-        escape(&truncate(name, 100))
+        name
     };
     let slack_id = str_of(request, "slack_id");
     let mention = if valid_slack_id(slack_id) {
@@ -157,7 +158,7 @@ pub fn request_card(request: &Value) -> (String, Value) {
     (
         format!(
             "Access request from {}",
-            escape(&truncate(str_of(request, "name"), 100))
+            shown_name(str_of(request, "name"), 100)
         ),
         Value::Array(blocks),
     )
@@ -224,7 +225,7 @@ pub fn handle_modal(request: &Value, channel: &str, ts: &str) -> Value {
         "blocks": [
             section(&format!(
                 "Approve {} with this handle.",
-                escape(&truncate(str_of(request, "name"), 100))
+                shown_name(str_of(request, "name"), 100)
             )),
             {
                 "type": "input",
@@ -408,21 +409,48 @@ pub fn memory_error(code: Option<&str>, error: &str, org: Option<&str>) -> Strin
     }
 }
 
-/// The confirmation for `remove <handle>`.
-pub fn remove_confirm(handle: &str, slack_id: &str) -> (String, Value) {
-    let mention = if valid_slack_id(slack_id) {
-        format!(" (<@{slack_id}>)")
-    } else {
-        String::new()
-    };
-    let shown = code(handle, valid_handle(handle), "this member");
+/// Who a `remove` card is about: the handle, and the display name and Slack id the user
+/// directory has for them (either may be empty).
+#[derive(Debug, Clone, Copy)]
+pub struct RemoveTarget<'a> {
+    pub handle: &'a str,
+    /// Untrusted text from Slack: rendered inert.
+    pub display_name: &'a str,
+    pub slack_id: &'a str,
+}
+
+impl RemoveTarget<'_> {
+    /// "*Ben Smith* `ben` (<@U0BEN>)", each part only when it is safe to show.
+    fn shown(&self) -> String {
+        let name = shown_name(self.display_name, 80);
+        let name = if name.is_empty() {
+            String::new()
+        } else {
+            format!("{name} ")
+        };
+        let mention = if valid_slack_id(self.slack_id) {
+            format!(" (<@{}>)", self.slack_id)
+        } else {
+            String::new()
+        };
+        format!(
+            "{name}{}{mention}",
+            code(self.handle, valid_handle(self.handle), "this member")
+        )
+    }
+}
+
+/// The confirmation for `remove <handle>`: since slice U3 a deactivation, which nothing is
+/// committed for.
+pub fn remove_confirm(target: RemoveTarget<'_>) -> (String, Value) {
+    let handle = target.handle;
     (
         format!("Remove {} from PM OS?", escape(handle)),
         json!([
             section(&format!(
-                "*Remove {shown}{mention} from PM OS?*\nThis commits `team.yaml` without them, \
-                 deletes their bot, unlinks their accounts and forgets their memory repo. The \
-                 repo itself stays theirs."
+                "*Remove {} from PM OS?*\n{}",
+                target.shown(),
+                access_copy::REMOVE_EXPLAINED
             )),
             {"type": "actions", "block_id": "member_remove", "elements": [
                 button("Remove", action::REMOVE_CONFIRM, handle, Some("danger")),
@@ -444,23 +472,31 @@ pub fn remove_closed(handle: &str, line: &str) -> (String, Value) {
     )
 }
 
-/// The removal card with its buttons back and a warning.
-pub fn remove_retry(handle: &str, slack_id: &str, warning: &str) -> (String, Value) {
-    let (text, blocks) = remove_confirm(handle, slack_id);
+/// The removal card with its buttons back and a warning (`mrkdwn` this service wrote; any
+/// text from elsewhere in it is escaped first).
+pub fn remove_retry(target: RemoveTarget<'_>, warning: &str) -> (String, Value) {
+    let (text, blocks) = remove_confirm(target);
     let mut blocks = blocks.as_array().cloned().unwrap_or_default();
-    blocks.push(context(&format!(":warning: {}", escape(warning))));
+    blocks.push(context(&format!(":warning: {warning}")));
     (text, Value::Array(blocks))
 }
 
-/// "Removed `ben` (commit `abc1234`)".
-pub fn removed_line(handle: &str, by: &str, commit: &str) -> String {
-    let commit = short_sha(commit)
-        .map(|s| format!(" (commit `{s}`)"))
-        .unwrap_or_default();
+/// "Removed `ben` by Ana: deactivated" with what that means.
+pub fn removed_line(handle: &str, by: &str) -> String {
     format!(
-        ":white_check_mark: Removed {} by {}{commit}",
+        ":white_check_mark: Removed {} by {}: deactivated. Their sessions ended and their \
+         linked accounts are suspended; reactivating them within 24 hours (in the web app) \
+         restores them.",
         code(handle, valid_handle(handle), "the member"),
         escape(&person(by))
+    )
+}
+
+/// A `remove` refusal's copy with `{handle}` filled in as code.
+pub fn remove_note(copy: &str, handle: &str) -> String {
+    copy.replace(
+        "{handle}",
+        &code(handle, valid_handle(handle), "that member"),
     )
 }
 
@@ -470,7 +506,7 @@ pub fn welcome(name: &str, handle: &str, by: &str) -> (String, Value) {
     let greeting = if first.is_empty() {
         "Welcome to PM OS!".to_string()
     } else {
-        format!("Welcome to PM OS, {}!", escape(&truncate(first, 60)))
+        format!("Welcome to PM OS, {}!", shown_name(first, 60))
     };
     let text = format!(
         "{greeting} {} approved you as {}. A few steps and your own bot is ready; the checklist \
@@ -497,7 +533,8 @@ mod tests {
     fn request_cards_escape_and_carry_the_id() {
         let (_, blocks) = request_card(&request());
         let s = blocks.to_string();
-        assert!(s.contains("Ben *Bold* &lt;script&gt;"), "{s}");
+        assert!(s.contains("Ben \u{2217}Bold\u{2217} &lt;script&gt;"), "{s}");
+        assert!(!s.contains("*Bold*"), "a name makes no bold: {s}");
         assert!(s.contains("ben&lt;x&gt;@example.com"));
         assert!(s.contains("(<@U0BEN>)"));
         assert!(s.contains("`ben`"));

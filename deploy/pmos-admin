@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# PM OS operations on the Spark, for platform-owner PMs (docs/runbooks/README.md).
+# PM OS operations on its host, for platform-owner PMs (docs/runbooks/README.md).
 #
 #   pmos-admin build                  build the service and worker images on this machine
-#   pmos-admin up [--models] [--console] [--bringup]
+#   pmos-admin up [--models] [--console] [--web] [--bringup]
 #                                     start the stack (Slack joins when its tokens are set)
 #   pmos-admin down                   stop everything (data is kept)
 #   pmos-admin status                 is every service up and ready?
@@ -11,16 +11,44 @@
 #   pmos-admin backup                 databases and logs to deploy/backups/<time>/
 #   pmos-admin restore <dir>          put a backup back (stops the services while it runs)
 #   pmos-admin reindex                reload content after a merge (lint-gated)
+#   pmos-admin audit purge --dry-run  how many audit events the next daily purge deletes
 #   pmos-admin revoke <handle> <atlassian|slack|github>
 #                                     remove a PM's linked account and its tokens
+#   pmos-admin users <command> …      the user database, on the host (docs/runbooks/users.md):
+#                                     bootstrap-admin, grant-admin, revoke-admin, set-entra,
+#                                     unset-entra, set-sign-in-name, set-atlassian-email,
+#                                     deactivate, reactivate, pilot-exception, import, export,
+#                                     list; each records the OS user who ran it
 #   pmos-admin ledger [--since 7d] [--export]
 #                                     what happened to the bots' drafts (feedback ledger)
 #   pmos-admin add-bot <bot>          give a new bot its own runtime and gateway tokens
-#   pmos-admin sandbox <bot>          create the bot's OpenShell sandbox and start its worker
+#   pmos-admin sandbox <bot> [--dry-run]
+#                                     create the bot's OpenShell sandbox and start its worker as
+#                                     a systemd user unit (--dry-run: print what it would run)
+#   pmos-admin policy prove <bot> | --all
+#                                     OpenShell's pinned policy prover on each sandbox's effective
+#                                     policy, recorded for Policy Admin (as the gateway's user)
+#   pmos-admin sandbox-audit configure|check|up
+#                                     OpenShell's own sandbox decisions into the audit log: the
+#                                     collector's tokens, OpenShell's export settings, the service
 #   pmos-admin pause <bot> / resume <bot>
-#                                     stop or restart a bot's sandbox
-#   pmos-admin lint                   pmos lint and pmos policy check on the content checkout
-#   pmos-admin pmos <args>            the pmos CLI on the checkout, e.g. `pmos member add …`
+#                                     stop or restart a bot's sandbox and its worker unit
+#   pmos-admin host-names apply       (with sudo) write the managed block in /etc/hosts that maps
+#                                     the three service names to their pinned addresses
+#   pmos-admin host-names check       do the three names resolve on this host as pinned?
+#   pmos-admin preflight [args]       the host preflight, deploy/preflight.sh (--help for its
+#                                     arguments); up, restore, add-bot, sandbox and resume run it
+#   pmos-admin host-firewall apply|check|remove
+#                                     (apply and remove with sudo) the block that keeps PM OS's
+#                                     containers from the cloud metadata services
+#   pmos-admin host acknowledge H-PRIVATE --reason <text> | --clear H-PRIVATE
+#                                     (with sudo) record that a host declared private isn't
+#                                     (only H-PRIVATE takes an acknowledgement)
+#   pmos-admin host attest local-gpu --owner-controls --reason <text> | local-gpu --clear
+#                                     (with sudo) record that the owner controls this GPU host,
+#                                     which real data under PMOS_MODEL_SOURCE=local needs
+#   pmos-admin lint                  pmos lint and pmos policy check on the content checkout
+#   pmos-admin pmos <args>            the pmos CLI on the checkout, e.g. `pmos bot add-personal …`
 #                                     (paths are relative to the checkout: --root content)
 #   pmos-admin evals <args>           pmos-evals against the live stack (the load test)
 #   pmos-admin evals-run --category <c> [--checkout <dir>] [--note <why>]
@@ -32,42 +60,819 @@
 #                                     the eval gate for a checkout's changes (default: this
 #                                     one; CI passes the PR's head, which is only read as data)
 #   pmos-admin smoke <handle>         one Docs-bot question through the whole stack
+#   pmos-admin upstream-key set <u>   a model upstream's key, read from standard input, into
+#                                     deploy/secrets/upstream-<u>.key (hosted-test routes; never
+#                                     printed, never in an argument; docs/model-providers-spec.md)
+#   pmos-admin route disable <label> --reason <text> | route enable <label>
+#                                     take a model out of every route, or put it back, without a
+#                                     restart (logged in $PMOS_STATE_DIR/route-control/log)
+#   pmos-admin routes                 each route's models, circuits and probes (the gateway's
+#                                     admin client, PMOS_GW_ADMIN_TOKEN)
+#   pmos-admin usage --by-label       tokens per model label from the usage log, priced from
+#                                     $PMOS_STATE_DIR/prices.yaml when it exists
 set -euo pipefail
 
 DEPLOY="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$DEPLOY/.." && pwd)"
 ENV="$DEPLOY/.env"
-[ -f "$ENV" ] || { echo "no deploy/.env yet: run deploy/setup.sh first" >&2; exit 1; }
-set -a
-# shellcheck disable=SC1090
-. "$ENV"
-set +a
-
-compose() { docker compose --project-directory "$DEPLOY" -f "$DEPLOY/compose.yaml" --env-file "$ENV" "$@"; }
 say() { printf '%s\n' "$*"; }
+cmd=${1:-help}
+
+# What is removed however the script stops (an error, Ctrl-C, a kill; the review of eb49991):
+# a new deploy/.env not yet renamed into place (set_env) and the
+# eval stack (eval_stack_up). A signal becomes an exit, so the EXIT trap runs for it too.
+ENV_TMP=""
+HOSTS_TMP=""
+EVAL_STACK_UP=0
+PROVE_TMP=""
+cleanup() {
+  [ -z "$ENV_TMP" ] || rm -f -- "$ENV_TMP"
+  [ -z "$HOSTS_TMP" ] || rm -f -- "$HOSTS_TMP"
+  [ -z "$PROVE_TMP" ] || rm -rf -- "$PROVE_TMP"
+  [ "$EVAL_STACK_UP" = 0 ] || eval_stack_down
+  return 0
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# `pause` and `down` are how an incident is stopped (docs/runbooks/incidents.md), so a
+# deploy/.env that can't be parsed, or that fails the checks below, warns loudly instead of
+# blocking them (the security review of 6bb806f, S3). `pause` needs nothing from the file (the
+# bot's name, this user's systemd and openshell), so it never reads it: only its mode and owner
+# are looked at (stat, which needs no read access), and a deploy/.env the caller can't read
+# (root's, 0600, after a `sudo deploy/setup.sh`) doesn't stop it (the review of eb49991, T2).
+# `down` needs only what Docker Compose reads from it itself. Every other command stops.
+ENV_LENIENT=0
+case "$cmd" in pause | down) ENV_LENIENT=1 ;; esac
+# `host-names` needs nothing from deploy/.env (it writes and checks only the pinned addresses,
+# which are constants below, never settings), and `apply` runs with sudo: so it neither needs
+# the file to exist nor reads it, and root never loads its secrets for it (slice H2).
+ENV_UNUSED=0
+case "$cmd" in host-names) ENV_UNUSED=1 ;; esac
+env_problem() { # message: stop (exit 2), or for pause and down, warn and go on
+  if [ "$ENV_LENIENT" = 1 ]; then
+    say "WARNING: $*" >&2
+    say "WARNING: pmos-admin $cmd goes on, as it needs nothing pmos-admin reads from deploy/.env; fix the file afterwards." >&2
+  else
+    say "$*" >&2
+    exit 2
+  fi
+}
+# What to do by hand when `down` can't use deploy/.env (missing, unreadable, or Compose fails).
+down_advice() {
+  say "Stop PM OS's containers directly (data is kept):" >&2
+  say "  docker ps -q --filter label=com.docker.compose.project=pmos | xargs -r docker stop" >&2
+}
+if [ "$ENV_UNUSED" = 0 ] && [ ! -f "$ENV" ]; then
+  if [ "$cmd" = pause ]; then
+    say "WARNING: there is no deploy/.env; pmos-admin pause goes on without it." >&2
+  elif [ "$cmd" = down ]; then
+    say "there is no deploy/.env, and docker compose needs it to stop the stack." >&2
+    down_advice
+    exit 1
+  else
+    echo "no deploy/.env yet: run deploy/setup.sh first" >&2
+    exit 1
+  fi
+fi
+
+# Every call uses the same files, so `status`, `logs` and `down` see the stack `up` started: with
+# PMOS_MODEL_SOURCE=hosted-test, the gateway's testing-only overlay (and its CA, when set); with
+# `local` and the model servers on (the stub off), the overlay that makes PMOS_VLLM_IMAGE
+# required (slice H4).
+compose() {
+  local files=(-f "$DEPLOY/compose.yaml")
+  if [ "${PMOS_MODEL_SOURCE:-}" = hosted-test ]; then
+    files+=(-f "$DEPLOY/compose.hosted-test.yaml")
+    [ -z "${PMOS_GATEWAY_CA_FILE:-}" ] || files+=(-f "$DEPLOY/compose.gateway-ca.yaml")
+    # Slice MP2: one Compose secret per upstream key file, mounted into the gateway only.
+    if upstream_keys_overlay; then files+=(-f "$PMOS_STATE_DIR/compose.upstream-keys.yaml"); fi
+  elif [ "${PMOS_MODEL_SOURCE:-}" = hosted ]; then
+    # Slice H12: the gateway on the approved hosted model (its URL, model ids, key file and the
+    # stop file's directory, the gateway's alone), and the CA only for tls_interception: allowed.
+    files+=(-f "$DEPLOY/compose.hosted.yaml")
+    [ -z "${PMOS_GATEWAY_CA_FILE:-}" ] || files+=(-f "$DEPLOY/compose.hosted-ca.yaml")
+  elif [ "${PMOS_MODEL_SOURCE:-}" = local ] && [ "${PMOS_GATEWAY_STUB:-0}" != 1 ]; then
+    files+=(-f "$DEPLOY/compose.local.yaml")
+  fi
+  docker compose --project-directory "$DEPLOY" "${files[@]}" --env-file "$ENV" "$@"
+}
+
+# Slice MP2 (docs/model-providers-spec.md §4.11): deploy/secrets/upstream-<u>.key, each mounted by
+# a Compose secret into the gateway container only, at /run/secrets/pmos-upstream-<u>.key, where
+# the route config's `key-file:` names it. Writes $PMOS_STATE_DIR/compose.upstream-keys.yaml
+# (paths only, never a key) and succeeds when there is at least one key file.
+UPSTREAM_NAME_RE='^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$'
+upstream_keys_overlay() {
+  local f u out lines=() secrets=()
+  [ -d "${PMOS_STATE_DIR:-}" ] || return 1
+  for f in "$DEPLOY"/secrets/upstream-*.key; do
+    [ -f "$f" ] || continue
+    u=${f##*/upstream-}
+    u=${u%.key}
+    [[ "$u" =~ $UPSTREAM_NAME_RE ]] || continue
+    lines+=("      - {source: pmos-upstream-$u, target: pmos-upstream-$u.key}")
+    secrets+=("  pmos-upstream-$u: {file: \"$f\"}")
+  done
+  [ "${#lines[@]}" -gt 0 ] || return 1
+  out="$PMOS_STATE_DIR/compose.upstream-keys.yaml"
+  {
+    say "# Written by deploy/pmos-admin (slice MP2): each upstream's key file, for the gateway only."
+    say "services:"
+    say "  gateway:"
+    say "    secrets:"
+    printf '%s\n' "${lines[@]}"
+    say "secrets:"
+    printf '%s\n' "${secrets[@]}"
+  } >"$out.new" && mv -f "$out.new" "$out"
+}
+
+# deploy/.env holds the vault key and every service token, so (the security review of 6bb806f):
+# - a file every account may read or write, or its group may write, is refused (only warned
+#   about for pause and down): `chmod 600 deploy/.env`;
+# - a file its group may read, or that is readable through an ACL, is warned about, not
+#   refused: the eval-gate runner reads it through an ACL by design
+#   (docs/runbooks/upgrade.md, "Registering the eval-gate runner": `setfacl -m u:gh-runner:r`),
+#   and an ACL shows as group read;
+# - a file owned by another account than the caller is warned about, not refused, for the
+#   same runner (root is not warned: it reads every file anyway).
+env_file_checks() {
+  [ -f "$ENV" ] || return 0
+  local mode owner me
+  if ! read -r mode owner < <(stat -L -c '%a %u' -- "$ENV" 2>/dev/null); then
+    env_problem "couldn't read deploy/.env's owner and mode (stat failed)"
+    return 0
+  fi
+  me=$(id -u)
+  if (((8#$mode & 8#007) != 0)); then
+    env_problem "deploy/.env (mode $mode) can be read or written by every account on this machine, and it holds the vault key and every token: run chmod 600 deploy/.env, and rotate the tokens if anyone else may have read it (docs/runbooks/incidents.md)"
+  elif (((8#$mode & 8#020) != 0)); then
+    env_problem "deploy/.env (mode $mode) can be written by its group: run chmod 600 deploy/.env (the eval runner needs read only: setfacl -m u:gh-runner:r deploy/.env)"
+  fi
+  if (((8#$mode & 8#040) != 0)); then
+    say "WARNING: deploy/.env (mode $mode) is readable by its group or through an ACL: check with getfacl deploy/.env that only the eval runner's account is named (docs/runbooks/upgrade.md)" >&2
+  fi
+  if [ "$owner" != "$me" ] && [ "$me" != 0 ]; then
+    say "WARNING: deploy/.env is owned by uid $owner, not by you (uid $me): whoever owns it decides every setting in it" >&2
+  fi
+}
+[ "$ENV_UNUSED" = 1 ] || env_file_checks
+
+# deploy/.env is read as data, never run as shell (slice H0; docs/openshell-any-host-spec.md,
+# surprise 12). It used to be sourced (`set -a; . deploy/.env`), so a value holding `$(…)`, a
+# backtick or a newline ran as the operator. Each line is `KEY=VALUE` (or `export KEY=VALUE`), a
+# comment or blank. The value is taken literally: one pair of surrounding quotes is removed, and
+# an unquoted value ends at ` #`, as Docker Compose reads the same file. Nothing is expanded, so a
+# value is written out in full (`k2:<base64>`, never `k2:$(openssl …)`). Only the settings this
+# script reads are exported (PMOS_*, HF_TOKEN and the proxy settings); Compose reads the whole
+# file itself through --env-file. Any other kind of line stops the script (down warns, skips the
+# line and goes on: env_problem above; pause doesn't read the file).
+load_env() {
+  local line key value n=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    line=${line%$'\r'}
+    [[ "$line" =~ ^[[:space:]]*(#.*)?$ ]] && continue
+    if [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+      key=${BASH_REMATCH[2]}
+      value=${BASH_REMATCH[3]}
+    else
+      env_problem "deploy/.env line $n isn't KEY=VALUE, a comment or blank: fix it (nothing in it is run as shell)"
+      continue
+    fi
+    case "$key" in
+      PMOS_* | HF_TOKEN | HTTPS_PROXY | HTTP_PROXY | NO_PROXY | https_proxy | http_proxy | no_proxy) ;;
+      *) continue ;;
+    esac
+    if [[ "$value" =~ ^\"([^\"]*)\"([[:space:]]+#.*)?[[:space:]]*$ ||
+      "$value" =~ ^\'([^\']*)\'([[:space:]]+#.*)?[[:space:]]*$ ]]; then
+      value=${BASH_REMATCH[1]}
+    else
+      value=${value%%[[:space:]]#*}
+      value=${value%"${value##*[![:space:]]}"}
+    fi
+    export "$key=$value"
+  done <"$ENV"
+}
+# pause never reads it. down needs nothing pmos-admin reads from it (Compose reads the file
+# itself), so a deploy/.env the caller can't read is skipped here and `down` prints the manual
+# advice below when Compose can't read it either, instead of dying on the redirect.
+if [ "$cmd" != pause ] && [ "$ENV_UNUSED" = 0 ] && [ -f "$ENV" ]; then
+  if [ "$cmd" != down ] || [ -r "$ENV" ]; then
+    load_env
+  else
+    say "WARNING: deploy/.env can't be read by this account; pmos-admin down goes on without it." >&2
+  fi
+fi
 row() { printf '  %-12s %-6s %s\n' "$1" "$2" "$3"; }
+
+# The console's sign-in settings. The console checks them too; this says so before anything
+# starts (docs/console.md, Sign-in).
+console_checks() {
+  local proxy_secret="${PMOS_CONSOLE_PROXY_SECRET:-}"
+  if [ "${PMOS_CONSOLE_TRUST_PROXY:-0}" = 1 ] && [ ${#proxy_secret} -lt 32 ]; then
+    echo "PMOS_CONSOLE_TRUST_PROXY=1 needs PMOS_CONSOLE_PROXY_SECRET (at least 32 characters) in" >&2
+    echo "deploy/.env: run deploy/setup.sh to generate it, and set the reverse proxy to send it in" >&2
+    echo "X-Pmos-Proxy-Secret (docs/console.md, Sign-in)." >&2
+    return 1
+  fi
+  if [ -n "${PMOS_CONSOLE_DEV_USER:-}" ]; then
+    echo "PMOS_CONSOLE_DEV_USER needs a loopback bind, and the console container listens on" >&2
+    echo "0.0.0.0: clear it and use PMOS_CONSOLE_TRUST_PROXY=1 (docs/console.md, Sign-in)." >&2
+    return 1
+  fi
+}
+
+# A real value in deploy/.env: set, and not the `generated` placeholder setup.sh fills in.
+is_set() { [ -n "${!1:-}" ] && [ "${!1}" != generated ]; }
+
+# User assertions (docs/user-assertion.md, Modes), checked before anything (re)creates the
+# runtime or the tool server: `up`, `add-bot`, and the `up` after a `restore`. The mode lives in
+# deploy/.env (setup.sh writes `require`), never in one command's environment, so every path
+# starts them the same way. With a web or console token set, the services themselves refuse to
+# start in `off` or `verify`; this says so first, and that each set client has its keys, so
+# nothing is half-configured. The development override (PMOS_ASSERTION_INSECURE_OFF) is for
+# fake-data development stacks only: compose.yaml doesn't pass it, so it is refused here too.
+assertion_checks() {
+  local mode="${PMOS_ASSERTION_MODE:-}" person=() k
+  for k in PMOS_RT_WEB_TOKEN PMOS_TS_WEB_TOKEN PMOS_RT_CONSOLE_TOKEN PMOS_CONSOLE_TS_TOKEN; do
+    if is_set "$k"; then person+=("$k"); fi
+  done
+  case "$mode" in
+    "" | off | verify | require) ;;
+    *) say "PMOS_ASSERTION_MODE=$mode in deploy/.env: use require (docs/user-assertion.md)" >&2; return 1 ;;
+  esac
+  if [ ${#person[@]} -gt 0 ] && [ -n "$mode" ] && [ "$mode" != require ]; then
+    if [ -n "${PMOS_ASSERTION_INSECURE_OFF:-}" ]; then
+      say "PMOS_ASSERTION_INSECURE_OFF is set in deploy/.env: that override is for fake-data" >&2
+      say "development stacks only, and this deployment doesn't pass it to the services." >&2
+    fi
+    say "PMOS_ASSERTION_MODE=$mode in deploy/.env, with ${person[*]} set: the runtime and the" >&2
+    say "tool server refuse to start like this. Set PMOS_ASSERTION_MODE=require in deploy/.env" >&2
+    say "(docs/user-assertion.md, Modes)." >&2
+    return 1
+  fi
+  local pair effective
+  for pair in PMOS_RT_WEB_TOKEN:PMOS_AK_WEB_BOTS PMOS_TS_WEB_TOKEN:PMOS_AK_WEB_TOOLSERVER \
+    PMOS_RT_CONSOLE_TOKEN:PMOS_AK_CONSOLE_BOTS PMOS_CONSOLE_TS_TOKEN:PMOS_AK_CONSOLE_TOOLSERVER; do
+    if is_set "${pair%%:*}" && ! is_set "${pair##*:}"; then
+      say "${pair%%:*} is set but ${pair##*:} isn't: run deploy/setup.sh again to generate it" >&2
+      return 1
+    fi
+  done
+  if [ ${#person[@]} -gt 0 ]; then
+    effective=${mode:-require}
+  else
+    effective=${mode:-off}
+  fi
+  say "user assertions: $effective"
+}
+
+# Everything a client needs before its profile starts: `up --web` or `up --console`.
+client_settings() { # web|console
+  local k missing=()
+  case "$1" in
+    web) set -- PMOS_RT_WEB_TOKEN PMOS_TS_WEB_TOKEN PMOS_AK_WEB_BOTS PMOS_AK_WEB_TOOLSERVER ;;
+    console) set -- PMOS_RT_CONSOLE_TOKEN PMOS_CONSOLE_TS_TOKEN PMOS_AK_CONSOLE_BOTS PMOS_AK_CONSOLE_TOOLSERVER ;;
+  esac
+  for k in "$@"; do is_set "$k" || missing+=("$k"); done
+  if [ ${#missing[@]} -gt 0 ]; then
+    say "not set in deploy/.env: ${missing[*]}. Run deploy/setup.sh again to generate them." >&2
+    return 1
+  fi
+}
+
+# An IPv4 address as a number; nothing for anything else.
+ipv4_number() {
+  local IFS=. a b c d
+  read -r a b c d <<<"$1"
+  for o in "$a" "$b" "$c" "$d"; do
+    [[ "$o" =~ ^[0-9]{1,3}$ ]] && [ "$o" -le 255 ] || return 1
+  done
+  echo $(((a << 24) | (b << 16) | (c << 8) | d))
+}
+
+# Is the IPv4 address $1 inside the IPv4 subnet $2 (a.b.c.d/n)?
+ipv4_in_subnet() {
+  local ip net bits mask
+  ip=$(ipv4_number "$1") || return 1
+  net=$(ipv4_number "${2%/*}") || return 1
+  bits=${2#*/}
+  [[ "$bits" =~ ^[0-9]{1,2}$ ]] && [ "$bits" -le 32 ] || return 1
+  mask=$(((0xffffffff << (32 - bits)) & 0xffffffff))
+  [ $((ip & mask)) = $((net & mask)) ]
+}
+
+# Password sign-in counts refused attempts per browser address (docs/password-sign-in.md,
+# "Behind the deploy kit's reverse proxy"). The web app listens on 0.0.0.0 in its container and
+# the reverse proxy on this host reaches it through the published port, so every request
+# arrives from the `pmos` network's gateway, which deploy/compose.yaml pins
+# (PMOS_NETWORK_GATEWAY, in PMOS_NETWORK_SUBNET; the re-check of eb24d28, M1). pmos-web refuses
+# to start unless it is told that address (PMOS_WEB_TRUSTED_PROXIES) and has an https:// public
+# URL. This refuses, with the exact fix, before anything starts: a blank setting; a network
+# made before its gateway was pinned (its real gateway isn't PMOS_NETWORK_GATEWAY); and a
+# trusted address that is neither the real gateway nor inside the pinned subnet, which would
+# make pmos-web refuse every browser. An address inside the subnet (a proxy in a container on
+# the pmos network) needs PMOS_WEB_TRUST_PROXY_IN_NETWORK=1 and is warned about every time
+# (the gate review of 04c175f, GL4): Docker hands those addresses out.
+password_web_checks() {
+  [ "${PMOS_WEB_PASSWORD_LOGIN:-0}" = 1 ] || return 0
+  local bad=0 real want subnet entry
+  want=${PMOS_NETWORK_GATEWAY:-10.201.77.1}
+  subnet=${PMOS_NETWORK_SUBNET:-10.201.77.0/24}
+  real=$(docker network inspect pmos_pmos --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null || true)
+  if [ -n "$real" ] && [ "$real" != "$want" ]; then
+    {
+      say "The pmos network's gateway is $real, but deploy/.env pins PMOS_NETWORK_GATEWAY=$want"
+      say "(PMOS_NETWORK_SUBNET=$subnet): the network was made before its address was pinned, or"
+      say "with other settings. Re-create it, then start again:"
+      say "  deploy/pmos-admin down && deploy/pmos-admin up --web"
+    } >&2
+    bad=1
+  fi
+  [ -n "$real" ] || real=$want
+  if [ -z "${PMOS_WEB_TRUSTED_PROXIES:-}" ]; then
+    {
+      say "PMOS_WEB_TRUSTED_PROXIES is blank in deploy/.env. With password sign-in on, the web app"
+      say "must know the address the reverse proxy reaches it from, or every browser would share"
+      say "one limit on refused sign-ins (and pmos-web refuses to start)."
+      say "The reverse proxy on this host reaches it from the pmos network's gateway. Set:"
+      say "  PMOS_WEB_TRUSTED_PROXIES=$real"
+      say "  (the gateway is pinned in deploy/.env, PMOS_NETWORK_GATEWAY; check it with:"
+      say "   docker network inspect pmos_pmos --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}')"
+      say "A reverse proxy in a container on the pmos network instead: set its container address."
+    } >&2
+    bad=1
+  else
+    local list=()
+    IFS=, read -ra list <<<"$PMOS_WEB_TRUSTED_PROXIES"
+    for entry in "${list[@]}"; do
+      entry=${entry//[[:space:]]/}
+      [ -n "$entry" ] || continue
+      [ "$entry" = "$real" ] && continue
+      # The gate review of 04c175f (GL4): only the gateway by default. An address inside the
+      # subnet (a proxy in a container on the pmos network) is assigned by Docker and can be
+      # handed to another container after a restart, which would then be believed about its
+      # X-Forwarded-For: it needs PMOS_WEB_TRUST_PROXY_IN_NETWORK=1, and a warning every time.
+      if ipv4_in_subnet "$entry" "$subnet" && [ "${PMOS_WEB_TRUST_PROXY_IN_NETWORK:-0}" = 1 ]; then
+        {
+          say "WARNING: PMOS_WEB_TRUSTED_PROXIES names $entry, an address inside the pmos network"
+          say "($subnet), trusted because PMOS_WEB_TRUST_PROXY_IN_NETWORK=1. Docker assigns those"
+          say "addresses: pin the proxy container's address (ipv4_address in compose), or any"
+          say "container that later gets $entry is believed about which browser it speaks for."
+        } >&2
+        continue
+      fi
+      if ipv4_in_subnet "$entry" "$subnet"; then
+        {
+          say "PMOS_WEB_TRUSTED_PROXIES names $entry, an address inside the pmos network ($subnet)."
+          say "Only the network's gateway, $real, is trusted by default: Docker assigns the other"
+          say "addresses, and whichever container holds $entry would be believed about which"
+          say "browser it speaks for. A reverse proxy on this host reaches the web app from the"
+          say "gateway; set:"
+          say "  PMOS_WEB_TRUSTED_PROXIES=$real"
+          say "A reverse proxy in a container on the pmos network with a pinned address: also set"
+          say "  PMOS_WEB_TRUST_PROXY_IN_NETWORK=1"
+        } >&2
+        bad=1
+      else
+        {
+          say "PMOS_WEB_TRUSTED_PROXIES names $entry, but the reverse proxy on this host reaches the"
+          say "web app from the pmos network's gateway, $real. pmos-web would refuse every browser"
+          say "(403 proxy_not_trusted). Set:"
+          say "  PMOS_WEB_TRUSTED_PROXIES=$real"
+          say "(A proxy in a container on the pmos network has an address inside $subnet.)"
+        } >&2
+        bad=1
+      fi
+    done
+  fi
+  case "${PMOS_WEB_PUBLIC_URL:-}" in
+    https://*) ;;
+    *)
+      say "PMOS_WEB_PUBLIC_URL must be the web app's https:// address with password sign-in on" >&2
+      say "(passwords and codes never cross the network in the clear)." >&2
+      bad=1
+      ;;
+  esac
+  return $bad
+}
+
+# The web app's front doors (slice H10, docs/openshell-any-host-spec.md §3.8; decisions D2 (a) and
+# D3 (b)): pmos-web refuses each of these itself, however it is started, and so does the host
+# preflight (H-SIGNIN, H-ADMIN); `up --web` says it first, before anything is checked against
+# Docker or started, with the exact fix.
+#
+# - The admin door on every host: PMOS_WEB_ADMIN_URL set; PMOS_WEB_ADMIN_PUBLISH (where compose
+#   publishes 8772; default 127.0.0.1) an IPv4 loopback, RFC 1918 or 100.64.0.0/10 address (an
+#   IPv6 one is refused here, the stricter reading: compose's short port syntax can't take it
+#   unbracketed); an http admin URL (the tunnel mode) only with a loopback publish, a loopback
+#   name and a port, and no PMOS_WEB_ADMIN_TRUSTED_PROXIES; an https one (the proxy mode) only
+#   with them, and on a host name other than PMOS_WEB_PUBLIC_URL's. A bare localhost or 127.0.0.1
+#   is warned about: use a deployment-unique <deployment>.localhost name.
+# - On PMOS_EXPOSURE=public: no development sign-in, and password sign-in only with
+#   PMOS_WEB_PASSWORD_CLIENTS listing networks no wider than a /16 (IPv4) or a /48 (IPv6).
+web_door_problems() {
+  local url=${PMOS_WEB_ADMIN_URL:-} publish=${PMOS_WEB_ADMIN_PUBLISH:-127.0.0.1}
+  local proxies=${PMOS_WEB_ADMIN_TRUSTED_PROXIES:-} scheme host public_host
+  if [ -z "$url" ]; then
+    echo "PMOS_WEB_ADMIN_URL is blank: the admin routes are served only on the admin door (decision D3 (b)), which needs its own address: http://<deployment>.localhost:8772 through an SSH tunnel, or https://<a private name> through a TLS terminator on a private address (docs/runbooks/install.md, \"The admin door\")"
+  fi
+  case "$(addr_kind "$publish")" in
+    loopback | private) ;;
+    v6) echo "PMOS_WEB_ADMIN_PUBLISH=$publish: use an IPv4 address (127.0.0.1 for a tunnel, or the host's VPN or private address)" ;;
+    *) echo "PMOS_WEB_ADMIN_PUBLISH=$publish: the admin door is published only on loopback, an RFC 1918 or a 100.64.0.0/10 address, never a public one" ;;
+  esac
+  if [ -n "$url" ]; then
+    scheme=${url%%://*}
+    host=${url#*://}
+    host=${host%%/*}
+    case "$scheme" in
+      http)
+        [ "$(addr_kind "$publish")" = loopback ] ||
+          echo "PMOS_WEB_ADMIN_URL is http (the tunnel mode) and PMOS_WEB_ADMIN_PUBLISH=$publish isn't loopback: an http admin door is reached only through an SSH tunnel to 127.0.0.1 (or use https through a TLS terminator)"
+        [ -z "$proxies" ] ||
+          echo "PMOS_WEB_ADMIN_URL is http (the tunnel mode) and PMOS_WEB_ADMIN_TRUSTED_PROXIES is set: a tunnel has no proxy; unset it, or use an https admin URL"
+        case "${host%:*}" in
+          localhost | *.localhost | 127.0.0.1 | '[::1]') ;;
+          *) echo "PMOS_WEB_ADMIN_URL=$url: an http admin URL must be a loopback name (http://<deployment>.localhost:<port>)" ;;
+        esac
+        [[ "$host" == *:* && "$host" != *']' ]] || echo "PMOS_WEB_ADMIN_URL=$url: write the tunnel's port (http://<deployment>.localhost:8772)"
+        ;;
+      https)
+        [ -n "$proxies" ] ||
+          echo "PMOS_WEB_ADMIN_URL is https (the proxy mode): set PMOS_WEB_ADMIN_TRUSTED_PROXIES to the address the TLS terminator reaches the web app from (on this host, the pmos network's gateway, ${PMOS_NETWORK_GATEWAY:-10.201.77.1})"
+        public_host=${PMOS_WEB_PUBLIC_URL#*://}
+        public_host=${public_host%%/*}
+        if [ -n "${PMOS_WEB_PUBLIC_URL:-}" ] && [ "${public_host%:*}" = "${host%:*}" ]; then
+          echo "PMOS_WEB_ADMIN_URL's host is PMOS_WEB_PUBLIC_URL's: cookies are kept by host name, so give the admin door a name of its own"
+        fi
+        ;;
+      *) echo "PMOS_WEB_ADMIN_URL=$url: use http://<deployment>.localhost:<port> or https://<name>" ;;
+    esac
+  fi
+  if [ "${PMOS_EXPOSURE:-}" = public ]; then
+    [ "${PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY:-0}" != 1 ] ||
+      echo "PMOS_EXPOSURE=public with development sign-in (PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=1): anyone who reaches it signs in as anyone; set it to 0"
+    if [ "${PMOS_WEB_PASSWORD_LOGIN:-0}" = 1 ]; then
+      if [ -z "${PMOS_WEB_PASSWORD_CLIENTS:-}" ]; then
+        echo "PMOS_EXPOSURE=public with password sign-in: set PMOS_WEB_PASSWORD_CLIENTS (a VPN or office range), or turn password sign-in off and use Microsoft sign-in (decision D2)"
+      fi
+    fi
+  fi
+  if [ -n "${PMOS_WEB_PASSWORD_CLIENTS:-}" ]; then
+    python3 -I -c '
+import ipaddress, sys
+for e in (x.strip() for x in sys.argv[1].split(",")):
+    if not e:
+        continue
+    try:
+        n = ipaddress.ip_network(e, strict=True)
+    except ValueError:
+        print(f"PMOS_WEB_PASSWORD_CLIENTS: {e!s} is not a network written address/length with no host bits"); continue
+    if "/" not in e:
+        print(f"PMOS_WEB_PASSWORD_CLIENTS: {e} has no /length"); continue
+    mapped = n.version == 6 and n.network_address.ipv4_mapped is not None
+    if (n.version == 4 and n.prefixlen < 16) or (n.version == 6 and n.prefixlen < 48) or (mapped and n.prefixlen < 112):
+        print(f"PMOS_WEB_PASSWORD_CLIENTS: {e} is wider than decision D2 (a) allows (no shorter than /16 for IPv4 or /48 for IPv6)")
+' "$PMOS_WEB_PASSWORD_CLIENTS"
+  fi
+}
+# loopback | private | public | v6 | bad, for an address (IPv4 private: RFC 1918 and 100.64.0.0/10).
+addr_kind() {
+  case "$1" in
+    127.*) echo loopback; return ;;
+    *:*) echo v6; return ;;
+  esac
+  if ipv4_in_subnet "$1" 10.0.0.0/8 || ipv4_in_subnet "$1" 172.16.0.0/12 ||
+    ipv4_in_subnet "$1" 192.168.0.0/16 || ipv4_in_subnet "$1" 100.64.0.0/10; then
+    echo private
+  elif ipv4_number "$1" >/dev/null 2>&1; then
+    echo public
+  else
+    echo bad
+  fi
+}
+web_door_checks() {
+  local problems
+  problems=$(web_door_problems)
+  if [ -n "$problems" ]; then
+    {
+      say "pmos-admin up --web: the web app's doors aren't as decisions D2 and D3 need (docs/openshell-any-host-spec.md §3.8). Nothing was started:"
+      while IFS= read -r p; do say "- $p"; done <<<"$problems"
+    } >&2
+    return 1
+  fi
+  case "${PMOS_WEB_ADMIN_URL:-}" in
+    http://localhost:* | http://127.0.0.1:* | 'http://[::1]:'*)
+      say "WARNING: PMOS_WEB_ADMIN_URL=$PMOS_WEB_ADMIN_URL: every tunnel to a bare localhost shares its cookies (another deployment, a test stack, any local page). Use a deployment-unique name such as http://pmos-prod.localhost:${PMOS_WEB_ADMIN_URL##*:}" >&2
+      ;;
+  esac
+  return 0
+}
+
+# The daily brief's address (PMOS_WEB_BRIEF_URL, which the Slack service gets as PMOS_WEB_URL).
+# Since slice H9 the route it calls, PUT /internal/brief/{handle}, is served only on the web app's
+# internal listener, 8771 (PMOS_WEB_INTERNAL_BIND in deploy/compose.yaml), over plain http on the
+# `pmos` network; the browser-facing 8770 answers 404 for it, so a value left from before H9
+# (…:8770) would send no brief and say nothing. Blank is off (the Slack service sends nothing).
+# Anything else but http://<name>:8771 is refused, the stale port with its own message: the
+# stricter reading, since no other address in this kit serves the route.
+brief_url_checks() {
+  local url=${PMOS_WEB_BRIEF_URL:-} port
+  if [ -z "$url" ]; then
+    if [ "${PMOS_WEB_BRIEF:-0}" = 1 ]; then
+      say "note: PMOS_WEB_BRIEF=1 with PMOS_WEB_BRIEF_URL blank: the web app shows the brief panels, but the Slack service sends nothing to fill them (set PMOS_WEB_BRIEF_URL=http://web.pmos.internal:8771)" >&2
+    fi
+    return 0
+  fi
+  [[ "$url" =~ ^http://[A-Za-z0-9.-]+:8771/?$ ]] && return 0
+  port=""
+  [[ "$url" =~ ^[A-Za-z][A-Za-z0-9+.-]*://[^/:]+:([0-9]+)(/.*)?$ ]] && port=${BASH_REMATCH[1]}
+  if [ "$port" = 8770 ] || { [ -n "$port" ] && [ "$port" = "${PMOS_WEB_PORT:-8770}" ]; }; then
+    say "PMOS_WEB_BRIEF_URL=$(printf '%q' "$url") in deploy/.env is the web app's browser-facing port, which answers 404 for the brief's route since slice H9: no daily brief would reach the web app. Set PMOS_WEB_BRIEF_URL=http://web.pmos.internal:8771 (the web app's internal listener, on the pmos network only), or leave it blank to send none." >&2
+  else
+    say "PMOS_WEB_BRIEF_URL=$(printf '%q' "$url") in deploy/.env: the brief's route is served only on the web app's internal listener. Set PMOS_WEB_BRIEF_URL=http://web.pmos.internal:8771, or leave it blank to send none." >&2
+  fi
+  return 1
+}
+
+# Is the web app's Entra sign-in fully set in deploy/.env? (pmos-web itself refuses a partial
+# one at start-up, naming what is missing.)
+entra_configured() {
+  [ -n "${PMOS_WEB_ENTRA_TENANT_ID:-}" ] && [ -n "${PMOS_WEB_ENTRA_CLIENT_ID:-}" ] &&
+    [ -n "${PMOS_WEB_ENTRA_CLIENT_SECRET:-}" ] && [ -n "${PMOS_WEB_PUBLIC_URL:-}" ]
+}
+
+# Where the gateway's model comes from (docs/openshell-any-host-spec.md §3.6): `local` (the
+# default: deploy/gateway.yaml and the vLLM servers) or `hosted-test`, TESTING ONLY: every role on
+# a hosted OpenAI-compatible model nobody approved, so prompts leave this host and the stack takes
+# fake data only. This is the gateway's part of slice H4, built ahead of it for a first run on a
+# host without a GPU; `hosted` (an approved provider) is slice H12 and isn't built. With
+# hosted-test this checks the settings, refuses live connectors and writes the gateway's config to
+# $PMOS_STATE_DIR/gateway.hosted-test.yaml (outside the repo: it names the provider's URL and
+# model id, which no committed file may), with every role behind PMOS_HOSTED_TEST_LABEL so the
+# gateway reports and logs only the label (docs/gateway.md, "Hiding the model behind a label").
+# `-` last in each set, so it is never read as a range.
+LABEL_CHARS=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-
+MODEL_ID_CHARS=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._:/-
+model_source_checks() {
+  local source=${PMOS_MODEL_SOURCE:-} url model label bad=0 cfg
+  # Slice H4: the three host settings are required (setup.sh writes them); a blank one is never
+  # read as the value that allows more (§3.1, "Defaults that allow less").
+  case "${PMOS_EXPOSURE:-}" in
+    private | public) ;;
+    '') say "PMOS_EXPOSURE is blank in deploy/.env: run deploy/setup.sh, which writes public (or --exposure private)" >&2; return 1 ;;
+    *) say "PMOS_EXPOSURE=$(printf '%q' "$PMOS_EXPOSURE") in deploy/.env: use private or public" >&2; return 1 ;;
+  esac
+  case "${PMOS_OPENSHELL_DRIVER:-docker}" in
+    docker) ;;
+    *) say "PMOS_OPENSHELL_DRIVER=$(printf '%q' "$PMOS_OPENSHELL_DRIVER"): only docker is supported (Tier 1); podman and kubernetes aren't verified" >&2; return 1 ;;
+  esac
+  case "$source" in
+    '') say "PMOS_MODEL_SOURCE is blank in deploy/.env: run deploy/setup.sh, which writes hosted-test (or --model-source local); a blank source is never read as local" >&2; return 1 ;;
+    local)
+      if [ -n "${PMOS_GATEWAY_CA_FILE:-}" ]; then
+        say "PMOS_GATEWAY_CA_FILE is for PMOS_MODEL_SOURCE=hosted-test only: the production sources take no run-time CA (docs/openshell-any-host-spec.md §3.6, Egress). Clear it." >&2
+        return 1
+      fi
+      return 0
+      ;;
+    hosted-test) ;;
+    hosted) hosted_checks; return ;;
+    *) say "PMOS_MODEL_SOURCE=$(printf '%q' "$source") in deploy/.env: use local, hosted or hosted-test" >&2; return 1 ;;
+  esac
+  # Routes (docs/model-providers-spec.md §4.12, slice MP8): with PMOS_HOSTED_TEST_ROUTES=1 the
+  # operator writes the route config at $PMOS_STATE_DIR/gateway.hosted-test.yaml (outside the
+  # repository: it names the providers' URLs and model ids) with one `key-file:` per upstream;
+  # pmos-admin doesn't write it, and `up` checks it with the gateway's --check-config first.
+  if [ "${PMOS_HOSTED_TEST_ROUTES:-0}" = 1 ]; then
+    if [ "${PMOS_CONNECTORS:-fake}" != fake ]; then
+      say "PMOS_MODEL_SOURCE=hosted-test sends prompts to endpoints nobody approved, so it allows fake data only: PMOS_CONNECTORS must be fake (it is ${PMOS_CONNECTORS})" >&2
+      return 1
+    fi
+    if [ -n "${PMOS_GATEWAY_REMOTE_KEY:-}" ]; then
+      say "PMOS_HOSTED_TEST_ROUTES=1: each upstream's key is its own file (deploy/pmos-admin upstream-key set <u>); clear PMOS_GATEWAY_REMOTE_KEY, which the gateway refuses beside two upstreams" >&2
+      return 1
+    fi
+    if ! problems=$(test_content_problems); then
+      while IFS= read -r p; do say "PMOS_MODEL_SOURCE=hosted-test allows fake data only: $p" >&2; done <<<"$problems"
+      return 1
+    fi
+    [ -d "${PMOS_STATE_DIR:-}" ] || { say "PMOS_STATE_DIR isn't a directory: run deploy/setup.sh" >&2; return 1; }
+    [ -f "$PMOS_STATE_DIR/gateway.hosted-test.yaml" ] || {
+      say "PMOS_HOSTED_TEST_ROUTES=1 needs the route config at $PMOS_STATE_DIR/gateway.hosted-test.yaml (docs/gateway.md, \"Routes\")" >&2
+      return 1
+    }
+    say "model source: hosted-test, the operator's route config (TESTING ONLY: prompts leave this host; fake data only)"
+    return 0
+  fi
+  url=${PMOS_HOSTED_TEST_URL:-}
+  model=${PMOS_HOSTED_TEST_MODEL:-}
+  label=${PMOS_HOSTED_TEST_LABEL:-hosted-model-a}
+  if ! [[ "$url" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$ ]]; then
+    say "PMOS_MODEL_SOURCE=hosted-test needs PMOS_HOSTED_TEST_URL, the provider's OpenAI-compatible base URL (https://<host>/<path>, plain characters)" >&2
+    bad=1
+  fi
+  if [ -z "$model" ] || [ ${#model} -gt 128 ] || ! only_chars "$model" "$MODEL_ID_CHARS"; then
+    say "PMOS_MODEL_SOURCE=hosted-test needs PMOS_HOSTED_TEST_MODEL, the model id (letters, digits, . _ - : /)" >&2
+    bad=1
+  fi
+  if [ ${#label} -gt 64 ] || ! only_chars "$label" "$LABEL_CHARS"; then
+    say "PMOS_HOSTED_TEST_LABEL=$(printf '%q' "$label"): 1 to 64 letters, digits, . _ and -" >&2
+    bad=1
+  fi
+  if ! is_set PMOS_GATEWAY_REMOTE_KEY; then
+    say "PMOS_MODEL_SOURCE=hosted-test needs PMOS_GATEWAY_REMOTE_KEY in deploy/.env (the provider's key, or the placeholder your egress proxy replaces)" >&2
+    bad=1
+  fi
+  if [ "${PMOS_CONNECTORS:-fake}" != fake ]; then
+    say "PMOS_MODEL_SOURCE=hosted-test sends prompts to an endpoint nobody approved, so it allows fake data only: PMOS_CONNECTORS must be fake (it is ${PMOS_CONNECTORS})" >&2
+    bad=1
+  fi
+  # What every service refuses itself (slice H4), said here first, before anything starts.
+  if [ "$(env_or_live PMOS_MEMORY)" = github ]; then
+    say "PMOS_MODEL_SOURCE=hosted-test sends prompts to an endpoint nobody approved, so it allows fake data only: PMOS_MEMORY must not be github" >&2
+    bad=1
+  fi
+  for k in PMOS_GITHUB_CLIENT_ID PMOS_GITHUB_CLIENT_SECRET; do
+    if [ -n "$(env_or_live "$k")" ]; then
+      say "PMOS_MODEL_SOURCE=hosted-test sends prompts to an endpoint nobody approved, so it allows fake data only: $k must be blank" >&2
+      bad=1
+    fi
+  done
+  if ! problems=$(test_content_problems); then
+    while IFS= read -r p; do
+      say "PMOS_MODEL_SOURCE=hosted-test sends prompts to an endpoint nobody approved, so it allows fake data only: $p" >&2
+    done <<<"$problems"
+    bad=1
+  fi
+  if [ -n "${PMOS_GATEWAY_CA_FILE:-}" ] && { [[ "$PMOS_GATEWAY_CA_FILE" != /* ]] || ! [ -f "$PMOS_GATEWAY_CA_FILE" ] || ! [ -r "$PMOS_GATEWAY_CA_FILE" ]; }; then
+    say "PMOS_GATEWAY_CA_FILE=$(printf '%q' "$PMOS_GATEWAY_CA_FILE") isn't a readable file given by its absolute path" >&2
+    bad=1
+  fi
+  [ "$bad" = 0 ] || return 1
+  [ -d "${PMOS_STATE_DIR:-}" ] || { say "PMOS_STATE_DIR isn't a directory: run deploy/setup.sh" >&2; return 1; }
+  cfg="$PMOS_STATE_DIR/gateway.hosted-test.yaml"
+  # Limits and clients as deploy/gateway.yaml's; no `class:`, so it is a `test` gateway, the only
+  # kind that takes a remote test upstream, and its eval runs never count.
+  (umask 022 && cat >"$cfg.new" <<EOF
+# TESTING ONLY, written by deploy/pmos-admin from deploy/.env (PMOS_MODEL_SOURCE=hosted-test):
+# every role on a hosted model nobody approved, so prompts leave this host. Fake data only.
+upstreams:
+  remote: "openai+${url%/}"
+roles:
+  default: {upstream: remote, model: "$model", label: "$label"}
+  reasoning: {upstream: remote, model: "$model", label: "$label"}
+  extraction: {upstream: remote, model: "$model", label: "$label"}
+limits:
+  max-in-flight: 4
+  per-user: 2
+  max-queue: 64
+  queue-wait-secs: 300
+  stream-max-secs: 900
+  max-answer-bytes: 16777216
+  per-user-queue: 4
+clients:
+  runtime: {trusted: true, max-in-flight: 2}
+  bot-pm-*: {trusted: true, max-in-flight: 3, user: from-name}
+  bot-*: {trusted: true, max-in-flight: 3}
+  evals: {max-in-flight: 1, priority: personal, route: pin}
+EOF
+  ) && mv -f "$cfg.new" "$cfg" || { say "couldn't write $cfg" >&2; return 1; }
+  say "model source: hosted-test, every role as $label (TESTING ONLY: prompts leave this host; fake data only)"
+}
+
+# A setting as the tool server gets it: deploy/.env, else deploy/live.env (its env_file), which
+# holds the live settings. Read as data, never sourced.
+env_or_live() { # key
+  local v=${!1:-}
+  if [ -z "$v" ] && [ -f "$DEPLOY/live.env" ] && [ -r "$DEPLOY/live.env" ]; then
+    v=$(LIVE_KEY=$1 awk -F= '$1 == ENVIRON["LIVE_KEY"] { v = substr($0, length($1) + 2) } END { print v }' "$DEPLOY/live.env")
+    v=${v%$'\r'}
+    v=${v%%[[:space:]]#*}
+    v=${v#\"}; v=${v%\"}; v=${v#\'}; v=${v%\'}
+  fi
+  printf '%s' "$v"
+}
+
+# The content checkout as fake-data mode needs it (spec §3.6; `pmos content check-test` in Rust
+# is the same check, front matter only): a TEST-CONTENT marker at the content root and no
+# Markdown file under it with a line `sensitivity: restricted` (anywhere in the file here, the
+# safe side). Prints one problem per line and returns 1, or returns 0.
+test_content_problems() {
+  local root="${PMOS_CONTENT_CHECKOUT:-}/content" bad=0 f
+  if [ -z "${PMOS_CONTENT_CHECKOUT:-}" ] || [ ! -d "$root" ]; then
+    printf '%s\n' "the content checkout (PMOS_CONTENT_CHECKOUT) has no content/ folder"
+    return 1
+  fi
+  if [ -L "$root/TEST-CONTENT" ] || [ ! -f "$root/TEST-CONTENT" ]; then
+    printf '%s\n' "the content root has no TEST-CONTENT marker (a committed file stating the checkout holds no company data)"
+    bad=1
+  fi
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    printf '%s\n' "${f#"$root"/} is marked restricted"
+    bad=1
+  done < <(grep -rlIiE --include='*.md' '^sensitivity:[[:space:]]*["'"'"']?restricted' -- "$root" 2>/dev/null | LC_ALL=C sort)
+  return "$bad"
+}
+
+# The bring-up workers (worker-docs, worker-personal) are plain containers, not sandboxes, so they
+# run only on a stack that can hold nothing real (slice H4): fake connectors, no GitHub memory and
+# test content. Prints one problem per line and returns 1, or returns 0.
+bringup_problems() {
+  local bad=0 problems
+  if [ "${PMOS_CONNECTORS:-fake}" != fake ]; then
+    printf '%s\n' "PMOS_CONNECTORS must be fake (it is $PMOS_CONNECTORS)"
+    bad=1
+  fi
+  if [ "$(env_or_live PMOS_MEMORY)" = github ]; then
+    printf '%s\n' "PMOS_MEMORY must not be github"
+    bad=1
+  fi
+  if ! problems=$(test_content_problems); then
+    printf '%s\n' "$problems"
+    bad=1
+  fi
+  return "$bad"
+}
 
 profiles() {
   local p=()
   if [ -n "${PMOS_SLACK_APP_TOKEN:-}" ] && [ -n "${PMOS_SLACK_BOT_TOKEN:-}" ]; then
-    p+=(--profile slack)
+    if [ "${PMOS_MODEL_SOURCE:-}" = hosted-test ]; then
+      # A test workspace can't be told apart from a real one, so Slack stays off in fake-data
+      # mode (docs/openshell-any-host-spec.md §3.6, "hosted-test, and fake-data mode").
+      say "note: the Slack bot stays off with PMOS_MODEL_SOURCE=hosted-test (fake data only; a real workspace can't be told apart)" >&2
+    else
+      p+=(--profile slack)
+    fi
   fi
   for arg in "$@"; do
     case "$arg" in
-      --models) p+=(--profile models) ;;
+      --models)
+        if [ "${PMOS_MODEL_SOURCE:-}" = hosted-test ]; then
+          say "--models starts the local model servers, which PMOS_MODEL_SOURCE=hosted-test doesn't use" >&2
+          exit 2
+        fi
+        p+=(--profile models) ;;
       --console) p+=(--profile console) ;;
-      --bringup) p+=(--profile bringup) ;;
+      --web)
+        if [ "${PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY:-0}" != 1 ] && ! entra_configured &&
+          [ "${PMOS_WEB_PASSWORD_LOGIN:-0}" != 1 ]; then
+          {
+            echo "the web app is off: it needs Entra sign-in (PMOS_WEB_ENTRA_TENANT_ID,"
+            echo "PMOS_WEB_ENTRA_CLIENT_ID, PMOS_WEB_ENTRA_CLIENT_SECRET and PMOS_WEB_PUBLIC_URL in"
+            echo "deploy/.env; docs/entra-sign-in.md), or password sign-in (PMOS_WEB_PASSWORD_LOGIN=1;"
+            echo "docs/password-sign-in.md). Or, on a closed test network only, set"
+            echo "PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=1 for DEVELOPMENT sign-in"
+            echo "(anyone who can reach it signs in as any team member; docs/web-app-running.md)."
+          } >&2
+          exit 2
+        fi
+        p+=(--profile web) ;;
+      --bringup)
+        # Slice H4: the bring-up workers aren't isolated, so fake data only, checked here.
+        if ! problems=$(bringup_problems); then
+          {
+            say "up --bringup starts plain, NOT isolated containers that hold a bot's tokens, so it runs only on a stack that can hold nothing real:"
+            sed 's/^/  /' <<<"$problems"
+          } >&2
+          exit 2
+        fi
+        p+=(--profile bringup)
+        [ -z "${PMOS_BRINGUP_PERSONAL_BOT:-}" ] || p+=(--profile bringup-personal) ;;
       *) say "unknown option $arg" >&2; exit 2 ;;
     esac
   done
   [ ${#p[@]} -eq 0 ] || printf '%s\n' "${p[@]}"
 }
 
+# Tokens reach curl on its standard input, as a config file (`--config -`), never on its
+# command line, where every account on this machine can read them in /proc/<pid>/cmdline while
+# it runs (the security review of 6bb806f, S1). printf is a shell builtin, so the token is on
+# no command line on the way either. A token with a quote, a backslash or a line break can't be
+# written in curl's config syntax as it is, so it is refused before curl runs.
+token_ok() { # name of the variable holding the token
+  local t=${!1:-}
+  case "$t" in
+    '' | generated) say "$1 isn't set in deploy/.env: run deploy/setup.sh" >&2; return 1 ;;
+    *[\"\\]* | *$'\n'* | *$'\r'*) say "$1 in deploy/.env holds a quote, backslash or line break: generate a new one (openssl rand -hex 24)" >&2; return 1 ;;
+  esac
+}
+bearer_config() { # name of the variable holding the token (checked with token_ok first)
+  printf 'header = "Authorization: Bearer %s"\n' "${!1}"
+}
+
 # A call to the tool server's internal API as the orchestrator.
 internal() { # method path [json]
-  curl -fsS --noproxy '*' -X "$1" "http://127.0.0.1:8710$2" \
-    -H "Authorization: Bearer $PMOS_SERVICE_TOKEN" -H 'content-type: application/json' \
-    ${3:+-d "$3"}
+  token_ok PMOS_SERVICE_TOKEN || exit 2
+  bearer_config PMOS_SERVICE_TOKEN |
+    curl --config - -fsS --noproxy '*' -X "$1" "http://127.0.0.1:$PMOS_TOOLSERVER_PORT$2" \
+      -H 'content-type: application/json' ${3:+-d "$3"}
 }
 
 # The `pmos` CLI in the image, in the content checkout, as the checkout's owner.
@@ -88,31 +893,37 @@ eval_stack_up() { # checkout
   local checkout
   checkout=$(cd "$1" && pwd)
   [ -f "$checkout/content/tools.yaml" ] || { say "$checkout has no content/tools.yaml" >&2; exit 2; }
-  if ! curl -fsS --noproxy '*' -m 5 http://127.0.0.1:8740/healthz >/dev/null 2>&1; then
+  if ! curl -fsS --noproxy '*' -m 5 "http://127.0.0.1:$PMOS_GATEWAY_PORT/healthz" >/dev/null 2>&1; then
     say "the gateway isn't running: start the stack first (deploy/pmos-admin up --models)" >&2
     exit 2
   fi
   EVAL_DIR=$(mktemp -d "${TMPDIR:-/tmp}/pmos-evals.XXXXXX")
   chmod 755 "$EVAL_DIR"
-  # The checkout's content, plus the members the fake fixtures expect: `evals` (U0EVALS), whom
-  # the benchmark tasks are requested by, with their personal bot pm-evals, and their teammates
-  # ben (U0BEN) and cy (U0CY), so the fake channels' audiences mean what the tasks say
-  # (crates/toolserver/src/connectors/fake.rs). Only this copy is changed.
+  # The checkout's content, plus the people the fake fixtures expect: `evals` (U0EVALS), whom
+  # the benchmark tasks are requested by, and their teammates ben (U0BEN) and cy (U0CY), so
+  # the fake channels' audiences mean what the tasks say (crates/toolserver/src/connectors/fake.rs),
+  # and `eval-admin` (U0EVALADM, in no fake channel): the user database always needs an active
+  # admin. They are the tool server's seed (PMOS_USERS_SEED, compose.evals.yaml), a file beside
+  # the content, never in it; each gets a personal bot in this copy of the content (pm-evals is
+  # the one the tasks use). Only this copy is changed.
   # -P: a symbolic link in the checkout is copied as a link, never followed on this machine.
   cp -RP "$checkout/content" "$EVAL_DIR/content"
   mkdir -p "$EVAL_DIR/baseline" "$EVAL_DIR/out"
   local who
-  for who in evals:U0EVALS ben:U0BEN cy:U0CY; do
+  printf 'members:\n' >"$EVAL_DIR/users.seed.yaml"
+  for who in evals:U0EVALS:pm ben:U0BEN:pm cy:U0CY:pm eval-admin:U0EVALADM:pm,admin; do
+    local handle=${who%%:*} rest=${who#*:}
+    printf '  - {handle: %s, slack-id: %s, roles: [%s]}\n' "$handle" "${rest%%:*}" "${rest#*:}" >>"$EVAL_DIR/users.seed.yaml"
     docker run --rm --user "${PMOS_UID:-10001}:${PMOS_GID:-10001}" -v "$EVAL_DIR/content:/srv/content" \
-      "pmos:${PMOS_VERSION:-local}" pmos member add --root /srv/content --handle "${who%%:*}" \
-      --slack-id "${who##*:}" --roles pm >/dev/null
+      "pmos:${PMOS_VERSION:-local}" pmos bot add-personal --root /srv/content --handle "$handle" >/dev/null
   done
   chown -R "${PMOS_UID:-10001}:${PMOS_GID:-10001}" "$EVAL_DIR" 2>/dev/null || true
+  export PMOS_EVAL_USERS_SEED="$EVAL_DIR/users.seed.yaml"
   export PMOS_EVAL_CONTENT="$EVAL_DIR/content" PMOS_EVAL_CHECKOUT="$checkout" PMOS_EVAL_BASELINE="$EVAL_DIR/baseline" PMOS_EVAL_OUT="$EVAL_DIR/out"
   for v in SERVICE_TOKEN BOT_TOKEN RT_EVALS RT_CONSOLE RT_DOCS RT_PERSONAL; do
     export "PMOS_EVAL_$v=$(openssl rand -hex 24)"
   done
-  trap eval_stack_down EXIT
+  EVAL_STACK_UP=1 # removed by cleanup (the EXIT trap at the top), however the script stops
   evals_compose up -d --wait toolserver bots worker-docs worker-personal >/dev/null
 }
 eval_stack_down() {
@@ -121,25 +932,1199 @@ eval_stack_down() {
 }
 evals_runner() { evals_compose --profile runner run --rm -T runner "$@"; }
 
-# Replace or append KEY=VALUE in deploy/.env.
+# Does $1 consist only of the characters listed one by one in $2 (no ranges, so no locale can
+# widen them)? An empty $1 does.
+only_chars() { case "$1" in *[!$2]*) return 1 ;; esac; }
+ENV_KEY_CHARS=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_
+# What pmos-admin may write as a value into deploy/.env (tokens, `key=token` lists): nothing a
+# shell or Compose gives a meaning to (no `$`, quote, backslash, space, `#`, `~` or newline).
+ENV_VALUE_CHARS='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.,:=/+-'
+
+# Changes to deploy/.env (the security review of 6bb806f) are made under a lock, so two
+# commands that change it at once can't lose one change, and atomically: the new file is
+# written beside it (mktemp: mode 0600), given the old file's owner and ACL (the eval runner's
+# read ACL, docs/runbooks/upgrade.md), then renamed over it, so no reader ever sees half a file.
+# deploy/setup.sh does the same. The lock is flock on deploy/.env.lock; where flock isn't
+# installed the change is refused (the review of eb49991: there was no lock at all).
+ENV_LOCK_HELD=0
+lock_env() {
+  [ "$ENV_LOCK_HELD" = 0 ] || return 0
+  if command -v flock >/dev/null; then
+    # Opened read-only where it exists: flock needs no write access, and a lock file made by
+    # root (after a `sudo deploy/setup.sh`) must not stop the operator. Created only if missing.
+    if [ ! -e "$DEPLOY/.env.lock" ]; then
+      (umask 077 && : >>"$DEPLOY/.env.lock") 2>/dev/null || {
+        say "couldn't create $DEPLOY/.env.lock (the lock for deploy/.env): check who owns deploy/" >&2
+        exit 1
+      }
+    fi
+    # In braces: `exec 9<f 2>/dev/null` alone would send all of this script's later errors to
+    # /dev/null too (an exec with redirections applies them to the shell itself).
+    { exec 9<"$DEPLOY/.env.lock"; } 2>/dev/null || {
+      say "couldn't open $DEPLOY/.env.lock for reading (the lock for deploy/.env): check its owner and mode" >&2
+      exit 1
+    }
+    flock -w 60 9 || {
+      say "another pmos-admin or setup.sh has been changing deploy/.env for a minute ($DEPLOY/.env.lock): try again" >&2
+      exit 1
+    }
+  else
+    say "flock (util-linux) isn't installed: install it and run this again. deploy/.env is changed only under its lock, so two commands can't lose each other's change." >&2
+    exit 1
+  fi
+  ENV_LOCK_HELD=1
+}
+# Put the file $1 (a new deploy/.env, in the same directory) in place of deploy/.env.
+replace_env() {
+  chmod 600 "$1"
+  chown --reference="$ENV" "$1" 2>/dev/null || true
+  if command -v getfacl >/dev/null && command -v setfacl >/dev/null; then
+    getfacl -p -- "$ENV" 2>/dev/null | setfacl --set-file=- -- "$1" 2>/dev/null ||
+      say "WARNING: couldn't copy deploy/.env's ACL; if the eval runner reads it, run again: sudo setfacl -m u:gh-runner:r $ENV" >&2
+  elif [[ "$(ls -ld -- "$ENV")" == ??????????+* ]]; then
+    say "WARNING: deploy/.env had an ACL and getfacl/setfacl aren't installed to keep it: run again: sudo setfacl -m u:gh-runner:r $ENV" >&2
+  fi
+  mv -f -- "$1" "$ENV"
+}
+
+# Replace or append KEY=VALUE in deploy/.env. A key or value with any other character is
+# refused (exit 2) before the file is touched.
 set_env() {
   local tmp
-  tmp=$(mktemp)
-  if grep -qE "^$1=" "$ENV"; then
-    awk -v k="$1" -v v="$2" -F= 'BEGIN{OFS="="} $1==k{print k, v; next} {print}' "$ENV" >"$tmp"
-  else
-    cat "$ENV" >"$tmp"
-    printf '%s=%s\n' "$1" "$2" >>"$tmp"
+  if [ -z "$1" ] || ! only_chars "$1" "$ENV_KEY_CHARS" || ! only_chars "$2" "$ENV_VALUE_CHARS"; then
+    say "refusing to write $(printf '%q' "$1") to deploy/.env: only plain characters may go there" >&2
+    exit 2
   fi
-  cat "$tmp" >"$ENV"
-  rm -f "$tmp"
+  lock_env
+  tmp=$(mktemp "$DEPLOY/.env.XXXXXX")
+  ENV_TMP=$tmp
+  # The value reaches awk through its environment, never its command line (`-v`), where every
+  # account on this machine can read it in /proc/<pid>/cmdline while awk runs (the review of
+  # eb49991, T1: add-bot passes every bot's tokens here); printf is a builtin. ENVIRON also takes
+  # the value literally, where -v would expand backslash escapes in it.
+  if {
+    if grep -qE "^$1=" "$ENV"; then
+      ENV_SET_VALUE=$2 awk -v k="$1" -F= 'BEGIN{OFS="="} $1==k{print k, ENVIRON["ENV_SET_VALUE"]; next} {print}' "$ENV" >"$tmp"
+    else
+      cat "$ENV" >"$tmp" && printf '%s=%s\n' "$1" "$2" >>"$tmp"
+    fi
+  }; then
+    replace_env "$tmp"
+    ENV_TMP=""
+  else
+    rm -f "$tmp"
+    ENV_TMP=""
+    say "couldn't write deploy/.env; it is unchanged" >&2
+    exit 1
+  fi
+}
+
+# The services, the bots' bring-up and eval workers and every one-off container run as
+# PMOS_UID:PMOS_GID (deploy/compose.yaml, deploy/compose.evals.yaml, pmos_cli, eval_stack_up),
+# which setup.sh takes from the content checkout's owner. A root-owned checkout made that root,
+# so the eval gate's workers ran as root on a pull request's content (the review of eb49991,
+# T3): uid or gid 0, or anything but a number, is refused. Blank means the images' default.
+uid_checks() {
+  local k v
+  for k in PMOS_UID PMOS_GID; do
+    v=${!k:-}
+    [ -n "$v" ] || continue
+    if ! only_chars "$v" 0123456789 || [ ${#v} -gt 10 ]; then
+      env_problem "$k=$(printf '%q' "$v") in deploy/.env isn't a number: set it to the content checkout's owner (stat -c '%u:%g' <checkout>)"
+    elif [ $((10#$v)) = 0 ]; then
+      env_problem "$k=$v in deploy/.env: the services and the bots' workers would run as root (or root's group). Give the content checkout and the state directory to a service account and set its ids, e.g. sudo useradd --system --no-create-home --shell /usr/sbin/nologin pmos; sudo chown -R pmos:pmos \"\$PMOS_CONTENT_CHECKOUT\" \"\$PMOS_STATE_DIR\"; then PMOS_UID=\$(id -u pmos) and PMOS_GID=\$(id -g pmos) in deploy/.env (docs/runbooks/install.md)"
+    fi
+  done
+}
+
+# The host ports the services are published on, on 127.0.0.1 only (deploy/compose.yaml):
+# PMOS_TOOLSERVER_PORT, PMOS_GATEWAY_PORT, PMOS_BOTS_PORT, PMOS_CONSOLE_PORT and PMOS_WEB_PORT in
+# deploy/.env, for a host where another stack (a test stack, say) already listens on the
+# defaults, 8710, 8740, 8750, 8760 and 8770. Blank means the default; anything but a port number
+# is refused. `status`, `smoke`, `reindex`, `revoke`, `ledger` and the eval stack call these.
+port_checks() {
+  local k d v
+  for k in TOOLSERVER:8710 GATEWAY:8740 BOTS:8750 CONSOLE:8760 WEB:8770 SANDBOX_AUDIT:8780; do
+    d=${k#*:}
+    k=PMOS_${k%%:*}_PORT
+    v=${!k:-}
+    if [ -z "$v" ]; then
+      v=$d
+    elif ! only_chars "$v" 0123456789 || [ ${#v} -gt 5 ] || [ $((10#$v)) -lt 1 ] || [ $((10#$v)) -gt 65535 ]; then
+      env_problem "$k=$(printf '%q' "$v") in deploy/.env isn't a port number (1 to 65535); blank means $d"
+      v=$d
+    fi
+    printf -v "$k" '%s' $((10#$v))
+  done
+}
+
+# --- The pmos network's pinned addresses and the host names (slice H2) ----------------------
+# docs/openshell-any-host-spec.md §3.3 and §3.5. A sandbox reaches the tool server, gateway and
+# runtime by name (the policy allows only `<name>.pmos.internal` on its own port), and loopback is
+# never an allowed destination, so each service has its own fixed address on the `pmos` network
+# and the host resolves the names to those addresses through a managed block in /etc/hosts.
+#
+# The addresses are reviewed code, never settings: literals in deploy/compose.yaml
+# (`ipv4_address`), repeated here and checked equal by scripts/test-pmos-admin.sh; the three
+# services' are also the policy crate's constants (TOOLSERVER_ADDR, GATEWAY_ADDR, BOTS_ADDR in
+# crates/policy/src/lib.rs, slice H3), which pin each name to its own /32 in every bot's policy
+# (`allowed_ips`); crates/policy/tests/policies.rs checks PINNED_NAMES and PINNED_SERVICE_ADDRS
+# against them. Moving them is a code change under POL-2 review, not an edit of deploy/.env. The two vLLM
+# servers (.13, .14) are pinned too, because the gateway checks what their names resolve to
+# (slice H4); no sandbox reaches them, so they have no host name here.
+#
+# Verify on a real host (the acceptance run, §6 step 4; checks O-REACH and H-1): that OpenShell
+# resolves through the host's resolver, so this block is what a sandbox gets, and that its
+# supervisor reaches an address on the pmos bridge. host-names check shows only the host's view.
+# If a sandbox can't reach the services by these names, stop and report (§3.3 step 6): no
+# fallback is built.
+PINNED_NAMES=(toolserver.pmos.internal gateway.pmos.internal bots.pmos.internal)
+PINNED_SERVICE_ADDRS=(10.201.77.10 10.201.77.11 10.201.77.12)
+PINNED_ADDRS=(10.201.77.10 10.201.77.11 10.201.77.12 10.201.77.13 10.201.77.14)
+# The pmos network's bridge, named in deploy/compose.yaml so the host-side metadata block (slice
+# H1) can match it by name however often the network is made again.
+NETWORK_BRIDGE=pmos0
+NETWORK_NAME=pmos_pmos
+# The defaults, as deploy/compose.yaml has them for a blank setting.
+NETWORK_SUBNET_DEFAULT=10.201.77.0/24
+NETWORK_GATEWAY_DEFAULT=10.201.77.1
+NETWORK_IP_RANGE_DEFAULT=10.201.77.128/25
+
+# An IPv4 address as a number, written the plain way only: four decimal octets, no leading zero
+# (`010` would be octal to the shell and 10 to Docker, so the two would disagree).
+ipv4_strict() {
+  local IFS=. a b c d o
+  [[ "$1" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 1
+  read -r a b c d <<<"$1"
+  for o in "$a" "$b" "$c" "$d"; do
+    [[ "$o" =~ ^(0|[1-9][0-9]{0,2})$ ]] && [ "$o" -le 255 ] || return 1
+  done
+  echo $(((a << 24) | (b << 16) | (c << 8) | d))
+}
+# An IPv4 network a.b.c.d/n with its host bits clear, as "<network number> <prefix>".
+ipv4_cidr() {
+  local addr bits n
+  [[ "$1" == */* ]] || return 1
+  addr=${1%/*}
+  bits=${1#*/}
+  [[ "$bits" =~ ^(0|[1-9][0-9]?)$ ]] && [ "$bits" -le 32 ] || return 1
+  n=$(ipv4_strict "$addr") || return 1
+  [ $((n & ((0xffffffff << (32 - bits)) & 0xffffffff))) = "$n" ] || return 1
+  echo "$n $bits"
+}
+# Is the address number $1 inside the network "<number> <prefix>" ($2 $3)?
+ipv4_num_in() { [ $(($1 & ((0xffffffff << (32 - $3)) & 0xffffffff))) = "$2" ]; }
+# Is the address $1 a host of the network "<number> <prefix>" ($2 $3): inside it, and neither its
+# network nor its broadcast address?
+ipv4_host_in() {
+  local n
+  n=$(ipv4_strict "$1") || return 1
+  ipv4_num_in "$n" "$2" "$3" && [ "$n" != "$2" ] && [ "$n" != $(($2 | ((1 << (32 - $3)) - 1))) ]
+}
+
+# The network settings in deploy/.env against the pinned addresses (§3.3, §3.5): the subnet a
+# /24 or longer that holds every pinned address (a /8 or /16 would hold them and much else
+# besides); the gateway inside it and not a pinned address; the range Docker hands unpinned
+# containers (the eval stack's, H-METADATA's probe, an operator's `docker run`) inside the subnet
+# and holding none of them, or one of those could take a service's address and the service
+# couldn't start. Prints each problem; 1 when there is one. The three services' addresses are
+# checked first, as the policy crate's constants (slice H3): a subnet without them would leave
+# every sandbox's policy refusing every connection, since each name is allowed only at its own /32.
+network_settings_problems() {
+  local subnet=${PMOS_NETWORK_SUBNET:-$NETWORK_SUBNET_DEFAULT} gw=${PMOS_NETWORK_GATEWAY:-$NETWORK_GATEWAY_DEFAULT}
+  local range=${PMOS_NETWORK_IP_RANGE:-$NETWORK_IP_RANGE_DEFAULT}
+  local sn sb rn rb g a i bcast bad=0 subnet_ok=0
+  if ! read -r sn sb < <(ipv4_cidr "$subnet"); then
+    say "PMOS_NETWORK_SUBNET=$(printf '%q' "$subnet") isn't an IPv4 network a.b.c.d/n with its host bits clear: use $NETWORK_SUBNET_DEFAULT"
+    bad=1
+  elif [ "$sb" -lt 24 ]; then
+    say "PMOS_NETWORK_SUBNET=$subnet is shorter than a /24: it would hold the pinned addresses and much else besides. Use $NETWORK_SUBNET_DEFAULT (docs/openshell-any-host-spec.md §3.3)"
+    bad=1
+  else
+    subnet_ok=1
+    bcast=$((sn | ((1 << (32 - sb)) - 1)))
+    for i in "${!PINNED_SERVICE_ADDRS[@]}"; do
+      a=${PINNED_SERVICE_ADDRS[$i]}
+      if ! ipv4_host_in "$a" "$sn" "$sb"; then
+        say "PMOS_NETWORK_SUBNET=$subnet doesn't hold $a, the address every bot's sandbox policy allows ${PINNED_NAMES[$i]} at (allowed_ips $a/32, from the policy crate's constants TOOLSERVER_ADDR, GATEWAY_ADDR and BOTS_ADDR in crates/policy/src/lib.rs): on this network every sandbox's connections would be refused. Those addresses are reviewed code, not settings: moving them is a code change to the policy crate's constants and deploy/compose.yaml, with the policies regenerated, under POL-2 review (policies/README.md), never an edit of deploy/.env alone. Use $NETWORK_SUBNET_DEFAULT"
+        bad=1
+        break
+      fi
+    done
+    if [ "$bad" = 0 ]; then
+      for a in "${PINNED_ADDRS[@]}"; do
+        if ! ipv4_host_in "$a" "$sn" "$sb"; then
+          say "PMOS_NETWORK_SUBNET=$subnet doesn't hold $a, which deploy/compose.yaml pins (the services' and model servers' addresses, 10.201.77.10 to .14). Those addresses are reviewed code, not settings: moving them is a code change to deploy/compose.yaml (and, for the three services, to the policy crate's constants) under POL-2 review, never an edit of deploy/.env alone. Use $NETWORK_SUBNET_DEFAULT"
+          bad=1
+          break
+        fi
+      done
+    fi
+  fi
+  if ! g=$(ipv4_strict "$gw"); then
+    say "PMOS_NETWORK_GATEWAY=$(printf '%q' "$gw") isn't an IPv4 address: use $NETWORK_GATEWAY_DEFAULT"
+    bad=1
+  else
+    for a in "${PINNED_ADDRS[@]}"; do
+      if [ "$gw" = "$a" ]; then
+        say "PMOS_NETWORK_GATEWAY=$gw is a pinned address (10.201.77.10 to .14): use $NETWORK_GATEWAY_DEFAULT"
+        bad=1
+      fi
+    done
+    if [ "$subnet_ok" = 1 ] && { ! ipv4_num_in "$g" "$sn" "$sb" || [ "$g" = "$sn" ] || [ "$g" = "$bcast" ]; }; then
+      say "PMOS_NETWORK_GATEWAY=$gw isn't an address inside PMOS_NETWORK_SUBNET=$subnet: use $NETWORK_GATEWAY_DEFAULT"
+      bad=1
+    fi
+  fi
+  if ! read -r rn rb < <(ipv4_cidr "$range"); then
+    say "PMOS_NETWORK_IP_RANGE=$(printf '%q' "$range") isn't an IPv4 network a.b.c.d/n with its host bits clear: use $NETWORK_IP_RANGE_DEFAULT"
+    bad=1
+  else
+    if [ "$subnet_ok" = 1 ] && { [ "$rb" -lt "$sb" ] || ! ipv4_num_in "$rn" "$sn" "$sb"; }; then
+      say "PMOS_NETWORK_IP_RANGE=$range isn't inside PMOS_NETWORK_SUBNET=$subnet: use $NETWORK_IP_RANGE_DEFAULT"
+      bad=1
+    fi
+    for a in "${PINNED_ADDRS[@]}"; do
+      if ipv4_num_in "$(ipv4_strict "$a")" "$rn" "$rb"; then
+        say "PMOS_NETWORK_IP_RANGE=$range holds $a, a pinned address: a container started without a pinned address could take it, and the service pinned there couldn't start. Use $NETWORK_IP_RANGE_DEFAULT (.128 to .254; .2 to .127 are for pinned addresses)"
+        bad=1
+        break
+      fi
+    done
+  fi
+  return $bad
+}
+
+# The pmos network as Docker has it, against deploy/.env and deploy/compose.yaml (§3.3 step 3):
+# Compose doesn't change the IPAM of a network that exists, so a network made before slice H2
+# (no ip_range, Docker's own bridge name) or with other settings stays as it was. Prints the
+# network's line ("<subnet> <gateway> <ip_range>;<bridge>"); nothing when there is no such network
+# yet (or docker can't be asked), which `up` then makes from compose.yaml as it should be. A
+# network with no ip_range shows it as "invalid Prefix" (Docker 29), never equal to the setting.
+NETWORK_INSPECT_FORMAT='{{range .IPAM.Config}}{{.Subnet}} {{.Gateway}} {{.IPRange}};{{end}}{{index .Options "com.docker.network.bridge.name"}}'
+live_network() { docker network inspect "$NETWORK_NAME" --format "$NETWORK_INSPECT_FORMAT" 2>/dev/null || true; }
+expected_network() {
+  printf '%s %s %s;%s\n' "${PMOS_NETWORK_SUBNET:-$NETWORK_SUBNET_DEFAULT}" "${PMOS_NETWORK_GATEWAY:-$NETWORK_GATEWAY_DEFAULT}" \
+    "${PMOS_NETWORK_IP_RANGE:-$NETWORK_IP_RANGE_DEFAULT}" "$NETWORK_BRIDGE"
+}
+# Says how the live network differs, if it does; 1 when it does.
+live_network_problems() {
+  local live want
+  live=$(live_network)
+  [ -n "$live" ] || return 0
+  want=$(expected_network)
+  [ "$live" != "$want" ] || return 0
+  say "The pmos network ($NETWORK_NAME) was made with other settings than deploy/.env and deploy/compose.yaml give:"
+  say "  it has (subnet gateway ip_range;bridge):   $live"
+  say "  they say:                                  $want"
+  say "Compose doesn't change a network that exists. Re-create it (no eval stack may be running):"
+  say "  deploy/pmos-admin down && deploy/pmos-admin up"
+  return 1
+}
+# Everything `up` checks about the network before anything starts.
+network_checks() {
+  local bad=0
+  network_settings_problems >&2 || bad=1
+  live_network_problems >&2 || bad=1
+  return $bad
+}
+
+# The managed block in /etc/hosts (§3.3 step 4). The path is a constant, not a setting: there is
+# no override of the file, the names or the addresses (the red-team check RT-13b writes its own
+# temporary line, and host-names check fails while it is there).
+readonly HOSTS_FILE=/etc/hosts
+HOSTS_BEGIN='# BEGIN pmos (managed by pmos-admin)'
+HOSTS_END='# END pmos'
+# A line that starts either marker, however it is spaced: a hand-edited one is treated as the
+# block's (stale, so apply rewrites it), never as some other line.
+HOSTS_BEGIN_RE='^#[[:space:]]*BEGIN[[:space:]]+pmos([[:space:]]|$)'
+HOSTS_END_RE='^#[[:space:]]*END[[:space:]]+pmos([[:space:]]|$)'
+hosts_block() {
+  local i
+  printf '%s\n' "$HOSTS_BEGIN"
+  for i in "${!PINNED_NAMES[@]}"; do printf '%s %s\n' "${PINNED_SERVICE_ADDRS[$i]}" "${PINNED_NAMES[$i]}"; done
+  printf '%s\n' "$HOSTS_END"
+}
+# Reads the hosts file into: HP_OUTSIDE (the lines outside any block), HP_BLOCKS (how many blocks),
+# HP_BLOCK (the first block, markers included, one "\n" after each line) and HP_AT (how many
+# outside lines come before it; -1 without a block). 1, with HP_MALFORMED saying why, when the
+# markers don't pair up (a BEGIN inside a block, an END outside one, a BEGIN never ended).
+hosts_parse() {
+  local line in=0 cur="" n=0
+  HP_OUTSIDE=() HP_BLOCKS=0 HP_BLOCK="" HP_AT=-1 HP_MALFORMED=""
+  while IFS= read -r line || [ -n "$line" ]; do
+    n=$((n + 1))
+    if [[ "$line" =~ $HOSTS_BEGIN_RE ]]; then
+      [ "$in" = 0 ] || { HP_MALFORMED="line $n starts a block inside another"; return 1; }
+      in=1
+      cur="$line"$'\n'
+    elif [[ "$line" =~ $HOSTS_END_RE ]]; then
+      [ "$in" = 1 ] || { HP_MALFORMED="line $n ends a block that never started"; return 1; }
+      in=0
+      cur+="$line"$'\n'
+      HP_BLOCKS=$((HP_BLOCKS + 1))
+      if [ "$HP_BLOCKS" = 1 ]; then
+        HP_BLOCK=$cur
+        HP_AT=${#HP_OUTSIDE[@]}
+      fi
+    elif [ "$in" = 1 ]; then
+      cur+="$line"$'\n'
+    else
+      HP_OUTSIDE+=("$line")
+    fi
+  done <"$HOSTS_FILE"
+  [ "$in" = 0 ] || { HP_MALFORMED="a block starts and never ends"; return 1; }
+}
+is_pinned_name() { # name, lowercased, without a trailing dot
+  local n
+  for n in "${PINNED_NAMES[@]}"; do [ "$1" = "$n" ] && return 0; done
+  return 1
+}
+# Everything wrong with the three names on this host: the block missing, stale (anything but
+# exactly the pinned addresses) or doubled; any line outside it that names one of them (a
+# loopback one said so, as the old install runbook's 127.0.0.1 line did); and what the host's
+# resolver answers (`getent ahostsv4`, which also catches a resolver consulted before the file).
+# Prints each problem; 1 when there is one.
+host_names_problems() {
+  local bad=0 line l f name addr i ans want
+  if [ ! -r "$HOSTS_FILE" ] || [ ! -f "$HOSTS_FILE" ]; then
+    say "$HOSTS_FILE is missing or can't be read"
+    return 1
+  fi
+  if ! hosts_parse; then
+    say "$HOSTS_FILE has broken pmos markers ($HP_MALFORMED): remove the lines from '# BEGIN pmos' to '# END pmos' (and nothing else), then run sudo deploy/pmos-admin host-names apply"
+    return 1
+  fi
+  if [ "$HP_BLOCKS" = 0 ]; then
+    say "no managed pmos block in $HOSTS_FILE: run sudo deploy/pmos-admin host-names apply"
+    bad=1
+  elif [ "$HP_BLOCKS" != 1 ]; then
+    say "$HOSTS_FILE has $HP_BLOCKS managed pmos blocks: run sudo deploy/pmos-admin host-names apply"
+    bad=1
+  elif [ "$HP_BLOCK" != "$(hosts_block)"$'\n' ]; then
+    say "the managed pmos block in $HOSTS_FILE is stale (not exactly the pinned addresses): run sudo deploy/pmos-admin host-names apply"
+    bad=1
+  fi
+  for line in "${HP_OUTSIDE[@]}"; do
+    l=${line%%#*}
+    read -r -a f <<<"$l" || true
+    [ ${#f[@]} -ge 2 ] || continue
+    addr=${f[0]}
+    for name in "${f[@]:1}"; do
+      name=${name,,}
+      name=${name%.}
+      is_pinned_name "$name" || continue
+      case "$addr" in
+        127.* | ::1 | 0:0:0:0:0:0:0:1 | 0.0.0.0 | ::)
+          say "$HOSTS_FILE maps $name to loopback ($addr) outside the managed block: remove that line ($(printf '%q' "$line"))" ;;
+        *)
+          say "$HOSTS_FILE has a second line for $name outside the managed block ($addr): remove it ($(printf '%q' "$line"))" ;;
+      esac
+      bad=1
+    done
+  done
+  if ! command -v getent >/dev/null; then
+    say "getent isn't installed, so what the names resolve to on this host can't be checked"
+    return 1
+  fi
+  for i in "${!PINNED_NAMES[@]}"; do
+    name=${PINNED_NAMES[$i]}
+    want=${PINNED_SERVICE_ADDRS[$i]}
+    ans=$(getent ahostsv4 "$name" 2>/dev/null | awk '{ print $1 }' | sort -u | tr '\n' ' ' || true)
+    ans=${ans% }
+    if [ -z "$ans" ]; then
+      say "$name doesn't resolve on this host (it should be $want)"
+      bad=1
+    elif [ "$ans" != "$want" ]; then
+      say "$name resolves on this host to $ans, not $want"
+      bad=1
+    fi
+  done
+  return $bad
+}
+# `host-names check` and `status`: one line per name when all is well.
+host_names_ok_lines() {
+  local i
+  for i in "${!PINNED_NAMES[@]}"; do printf '%s %s\n' "${PINNED_NAMES[$i]}" "${PINNED_SERVICE_ADDRS[$i]}"; done
+}
+
+# `host-names apply`: the block replaces the file's own block (the first one, where it stands;
+# any later one is removed) or, without one, is added at the end. Every other line is kept as it
+# is. Idempotent: an up-to-date file isn't written at all. The new file is written beside the old
+# one and renamed over it, so no reader sees half a file, with the old file's mode and owner.
+host_names_apply() {
+  local dir tmp i out
+  if [ -L "$HOSTS_FILE" ] || [ ! -f "$HOSTS_FILE" ]; then
+    say "$HOSTS_FILE isn't a regular file (a symbolic link, or missing): host-names apply only rewrites a regular file. Fix it by hand." >&2
+    exit 1
+  fi
+  dir=$(dirname "$HOSTS_FILE")
+  if [ ! -w "$HOSTS_FILE" ] || [ ! -w "$dir" ]; then
+    say "host-names apply writes $HOSTS_FILE: run it with sudo: sudo deploy/pmos-admin host-names apply" >&2
+    exit 1
+  fi
+  command -v flock >/dev/null || { say "flock (util-linux) isn't installed: install it and run this again" >&2; exit 1; }
+  exec 8<"$HOSTS_FILE"
+  flock -w 30 8 || { say "someone else has been changing $HOSTS_FILE for 30 seconds: try again" >&2; exit 1; }
+  if ! hosts_parse; then
+    say "$HOSTS_FILE has broken pmos markers ($HP_MALFORMED), so which lines are the block's isn't clear and nothing was written. Remove the lines from '# BEGIN pmos' to '# END pmos' by hand (and nothing else), then run this again." >&2
+    exit 1
+  fi
+  tmp=$(mktemp "$dir/.hosts.pmos.XXXXXX")
+  HOSTS_TMP=$tmp
+  {
+    for i in "${!HP_OUTSIDE[@]}"; do
+      [ "$i" != "$HP_AT" ] || hosts_block
+      printf '%s\n' "${HP_OUTSIDE[$i]}"
+    done
+    if [ "$HP_AT" = -1 ] || [ "$HP_AT" = "${#HP_OUTSIDE[@]}" ]; then hosts_block; fi
+  } >"$tmp"
+  if cmp -s -- "$tmp" "$HOSTS_FILE"; then
+    rm -f -- "$tmp"
+    HOSTS_TMP=""
+    say "the managed block in $HOSTS_FILE is already up to date"
+  else
+    chmod --reference="$HOSTS_FILE" -- "$tmp"
+    chown --reference="$HOSTS_FILE" -- "$tmp" 2>/dev/null || true
+    # Where SELinux labels files, the new file takes the old one's label.
+    if command -v chcon >/dev/null && [ -e /sys/fs/selinux/enforce ]; then
+      chcon --reference="$HOSTS_FILE" -- "$tmp" 2>/dev/null || say "WARNING: couldn't copy $HOSTS_FILE's SELinux label" >&2
+    fi
+    mv -f -- "$tmp" "$HOSTS_FILE"
+    HOSTS_TMP=""
+    say "wrote the managed block in $HOSTS_FILE"
+  fi
+  if out=$(host_names_problems); then
+    host_names_ok_lines | sed 's/^/  ok  /'
+  else
+    say "host-names check still fails (apply changes only its own block):" >&2
+    sed 's/^/  /' <<<"$out" >&2
+    exit 1
+  fi
+}
+
+# --- The host preflight, the metadata block, acknowledgements (slice H1) --------------------
+# docs/openshell-any-host-spec.md §3.2. deploy/preflight.sh checks the host and changes nothing;
+# `up`, `restore` and `add-bot` run its `run` stage, `sandbox` and `resume` add the OpenShell
+# checks, and the worker unit runs its `quick` stage before every start (ExecStartPre).
+PREFLIGHT="$DEPLOY/preflight.sh"
+# What runs the preflight and refuses on a fail (exit 2), before anything starts. Warnings are
+# shown; a pass says so in one line.
+run_preflight() { # command-name preflight-arguments…
+  local what=$1 out code=0
+  shift
+  out=$("$PREFLIGHT" --env-file "$ENV" "$@" 2>&1) || code=$?
+  case "$code" in
+    0)
+      if grep -qE '^  [A-Z][A-Z-]+ +warn ' <<<"$out"; then
+        grep -A1 -E '^  [A-Z][A-Z-]+ +warn ' <<<"$out" | grep -v '^--$' >&2
+      fi
+      say "host preflight: pass"
+      ;;
+    1)
+      {
+        printf '%s\n' "$out"
+        say "pmos-admin $what: the host preflight failed (each fail above), so nothing was started or changed."
+        say "Fix each one, then run this again; deploy/pmos-admin preflight shows them."
+      } >&2
+      exit 2
+      ;;
+    *)
+      { printf '%s\n' "$out"; say "pmos-admin $what: the host preflight couldn't run (above)"; } >&2
+      exit 2
+      ;;
+  esac
+}
+
+# --- Slice H12: PMOS_MODEL_SOURCE=hosted (docs/openshell-any-host-spec.md §3.6) -------------------
+# The approved list is compiled into the gateway; these read the checkout's copy only to say,
+# before anything starts, what the gateway will refuse, and to compare what it runs with the
+# merged branch's. The URL, the model ids and the key are never printed.
+APPROVED_LIST=crates/gateway/approved-hosted.yaml
+HOSTED_CONTROL=/var/lib/pmos/hosted-control
+HOSTED_KEY_REL=secrets/hosted-model.key
+hosted_stop_file() { printf '%s\n' "$HOST_PREFIX$HOSTED_CONTROL/stopped"; }
+approved_list_has_entry() { [ -f "$ROOT/$APPROVED_LIST" ] && grep -q '^- ' "$ROOT/$APPROVED_LIST"; }
+# The release remote and branch the owner's branch protection covers (X5).
+release_ref() {
+  local remote=${PMOS_RELEASE_REMOTE:-origin} branch=${PMOS_RELEASE_BRANCH:-main}
+  if ! [[ "$remote" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || ! [[ "$branch" =~ ^[A-Za-z0-9._/-]{1,128}$ ]] || [[ "$branch" == -* || "$branch" == *..* ]]; then
+    say "PMOS_RELEASE_REMOTE and PMOS_RELEASE_BRANCH must be a plain remote and branch name" >&2
+    return 1
+  fi
+  printf '%s %s\n' "$remote" "$branch"
+}
+# Fetches the merged branch into its remote-tracking ref; prints the ref.
+fetch_release_ref() {
+  local rb remote branch
+  rb=$(release_ref) || return 2
+  remote=${rb%% *}
+  branch=${rb#* }
+  git -C "$ROOT" fetch --no-tags -- "$remote" "+refs/heads/$branch:refs/remotes/$remote/$branch" >/dev/null 2>&1 || return 1
+  printf 'refs/remotes/%s/%s\n' "$remote" "$branch"
+}
+last_fetched_ref() {
+  local rb
+  rb=$(release_ref) || return 1
+  git -C "$ROOT" rev-parse -q --verify "refs/remotes/${rb%% *}/${rb#* }" >/dev/null || return 1
+  printf 'refs/remotes/%s/%s\n' "${rb%% *}" "${rb#* }"
+}
+# The SHA-256 of the approved list at a ref (the gateway reports the same digest of its bytes).
+list_sha_at() { git -C "$ROOT" show "$1:$APPROVED_LIST" 2>/dev/null | sha256sum | cut -d' ' -f1; }
+# The gateway's /readyz field, by name (a JSON string), or nothing.
+gateway_ready_field() { # field
+  local body
+  body=$(curl -sS --noproxy '*' -m 5 "http://127.0.0.1:${PMOS_GATEWAY_PORT:-8740}/readyz" 2>/dev/null) || return 1
+  python3 -I -c 'import json,sys
+d=json.loads(sys.stdin.readline()); v=d.get(sys.argv[1])
+print(v if isinstance(v,str) else "")' "$1" <<<"$body" 2>/dev/null
+}
+hosted_checks() {
+  local bad=0 url key_file host p
+  if ! approved_list_has_entry; then
+    say "PMOS_MODEL_SOURCE=hosted: there is no approved entry on the gateway's list ($APPROVED_LIST ships empty; the first entry is the owner's slice H13), so the gateway refuses it. Use local, or hosted-test with fake data only" >&2
+    return 1
+  fi
+  url=${PMOS_GATEWAY_HOSTED_URL:-}
+  if ! [[ "$url" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$ ]]; then
+    say "PMOS_MODEL_SOURCE=hosted needs PMOS_GATEWAY_HOSTED_URL, the approved provider's base URL (https://<host>/<path>, plain characters; the gateway checks its digest)" >&2
+    bad=1
+  fi
+  if ! [[ "${PMOS_GATEWAY_HOSTED_MODELS:-}" =~ ^[a-z0-9-]{1,32}=[A-Za-z0-9._:/-]{1,128}(,[a-z0-9-]{1,32}=[A-Za-z0-9._:/-]{1,128})*$ ]]; then
+    say "PMOS_MODEL_SOURCE=hosted needs PMOS_GATEWAY_HOSTED_MODELS: <ref>=<model id> pairs separated by commas (each role's host:<ref>)" >&2
+    bad=1
+  fi
+  key_file="$DEPLOY/$HOSTED_KEY_REL"
+  if ! [ -s "$key_file" ]; then
+    say "PMOS_MODEL_SOURCE=hosted needs the provider's key: deploy/pmos-admin hosted-key set (standard input)" >&2
+    bad=1
+  elif [ -n "$(find "$key_file" -perm /077 2>/dev/null)" ] || [ -n "$(find "$DEPLOY/secrets" -maxdepth 0 -perm /077 2>/dev/null)" ]; then
+    say "deploy/$HOSTED_KEY_REL (mode 600) and deploy/secrets (mode 700) must not be readable by group or others" >&2
+    bad=1
+  fi
+  if [ -n "${PMOS_GATEWAY_CA_FILE:-}" ] && ! grep -q 'tls_interception: allowed' "$ROOT/$APPROVED_LIST" 2>/dev/null; then
+    say "PMOS_GATEWAY_CA_FILE is set, but the approved entry says tls_interception: refused: the gateway takes no run-time CA" >&2
+    bad=1
+  fi
+  if [ -e "$(hosted_stop_file)" ]; then
+    say "the hosted model is stopped ($(head -c 200 "$(hosted_stop_file)" 2>/dev/null | tr -d '\n')): sudo deploy/pmos-admin hosted start --reason <text>" >&2
+    bad=1
+  elif ! [ -d "$HOST_PREFIX$HOSTED_CONTROL" ]; then
+    say "the stop file's directory $HOSTED_CONTROL doesn't exist: sudo deploy/pmos-admin hosted init" >&2
+    bad=1
+  fi
+  # The hosted host must not match NO_PROXY, or its calls would bypass the egress proxy.
+  host=${url#https://}
+  host=${host%%[:/]*}
+  host=${host,,}
+  if [ -n "$host" ] && [ -n "${HTTPS_PROXY:-}" ]; then
+    IFS=, read -ra p <<<"${NO_PROXY:-}"
+    for e in "${p[@]}"; do
+      e=${e// /}
+      e=${e,,}
+      [ -n "$e" ] || continue
+      if [ "$e" = '*' ] || [ "$host" = "${e#.}" ] || [[ "$host" == *".${e#.}" ]]; then
+        say "the hosted model's host matches NO_PROXY in deploy/.env, so its calls would bypass the egress proxy: remove that entry" >&2
+        bad=1
+        break
+      fi
+    done
+  fi
+  [ "$bad" = 0 ] || return 1
+  say "model source: hosted (the approved entry on the gateway's list; real data once the owner's conditions are recorded, spec §3.9)"
+}
+# `build`'s check under hosted (X5): the list and the gateway's code are the merged branch's.
+build_release_checks() { # use-last-fetch(0|1); prints "merged_commit checked_at"
+  local ref at=""
+  if ! ref=$(fetch_release_ref); then
+    if [ "$1" = 1 ] && ref=$(last_fetched_ref); then
+      at=$(git -C "$ROOT" reflog -1 --format=%cI "$ref" 2>/dev/null || true)
+      say "offline: checking against $ref as last fetched (${at:-unknown}), commit $(git -C "$ROOT" rev-parse --short "$ref")" >&2
+    else
+      say "build: couldn't fetch the merged branch ($(release_ref | tr ' ' /)); under hosted the image is built only from it. Retry online, or add --use-last-fetch to check against the last fetch" >&2
+      return 2
+    fi
+  fi
+  if [ -n "$(git -C "$ROOT" status --porcelain -- crates/gateway/)" ]; then
+    say "build: crates/gateway/ has uncommitted or untracked changes; under hosted the gateway is built only from the merged branch" >&2
+    return 2
+  fi
+  if [ "$(git -C "$ROOT" hash-object -- "$APPROVED_LIST")" != "$(git -C "$ROOT" rev-parse "$ref:$APPROVED_LIST" 2>/dev/null)" ]; then
+    say "build: $APPROVED_LIST differs from the merged branch's ($ref)" >&2
+    return 2
+  fi
+  if ! git -C "$ROOT" diff --quiet "$ref" -- crates/gateway/; then
+    say "build: the gateway's code differs from the merged branch's ($ref), a local commit included" >&2
+    return 2
+  fi
+  printf '%s %s\n' "$(git -C "$ROOT" rev-parse "$ref")" "$at"
+}
+# The running gateway's list digest against the merged branch's (status and up, X5).
+list_comparison() { # prints one line; exit 1 on a difference
+  local ref running merged at=""
+  if ! ref=$(fetch_release_ref); then
+    ref=$(last_fetched_ref) || { echo "can't compare: the merged branch was never fetched"; return 1; }
+    at=" (offline: last fetched $(git -C "$ROOT" reflog -1 --format=%cI "$ref" 2>/dev/null || echo unknown))"
+  fi
+  merged=$(list_sha_at "$ref")
+  running=$(gateway_ready_field approved_list_sha256 || true)
+  if [ -z "$running" ]; then
+    echo "the gateway doesn't report its approved list's digest$at"
+    return 1
+  fi
+  if [ "$running" != "$merged" ]; then
+    echo "approved list differs from $(release_ref | tr ' ' /) at $(git -C "$ROOT" rev-parse --short "$ref")$at"
+    return 1
+  fi
+  echo "approved list is $(release_ref | tr ' ' /)'s at $(git -C "$ROOT" rev-parse --short "$ref")$at"
+}
+hosted_key_set() {
+  local dir="$DEPLOY/secrets" key dest
+  (umask 077 && mkdir -p "$dir") && chmod 700 "$dir"
+  if [ -t 0 ]; then
+    printf 'the hosted model provider key (not shown): ' >&2
+    IFS= read -rs key || true
+    printf '\n' >&2
+  else
+    IFS= read -r key || true
+  fi
+  key=${key%$'\r'}
+  if [ -z "$key" ] || [[ "$key" == *[[:space:]]* ]]; then
+    say "no key was read, or it has spaces in it; nothing was written" >&2
+    exit 2
+  fi
+  dest="$DEPLOY/$HOSTED_KEY_REL"
+  (umask 077 && printf '%s\n' "$key" >"$dest.new") && chmod 600 "$dest.new" && mv -f "$dest.new" "$dest" ||
+    { rm -f "$dest.new"; say "couldn't write deploy/$HOSTED_KEY_REL" >&2; exit 1; }
+  unset key
+  say "wrote deploy/$HOSTED_KEY_REL (mode 600); the gateway reads it within a second of its next hosted call, or now with: deploy/pmos-admin restart gateway --signal HUP"
+}
+hosted_cmd() {
+  local sub=${1:-} reason="" to="" record="" model=0 last=""
+  hosted_usage() {
+    say "usage: sudo deploy/pmos-admin hosted init | hosted stop --reason <text> | hosted start --reason <text>" >&2
+    say "       sudo deploy/pmos-admin hosted acknowledge-switch --to hosted:<name> --reason <text>" >&2
+    say "       deploy/pmos-admin hosted digest [--model] < (a URL or a model id on standard input) | hosted digest --record <file>" >&2
+    exit 2
+  }
+  [ $# -ge 1 ] && shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --reason) [ $# -ge 2 ] || hosted_usage; reason=$2; shift 2 ;;
+      --to) [ $# -ge 2 ] || hosted_usage; to=$2; shift 2 ;;
+      --record) [ $# -ge 2 ] || hosted_usage; record=$2; shift 2 ;;
+      --model) model=1; shift ;;
+      *) hosted_usage ;;
+    esac
+  done
+  case "$sub" in
+    init)
+      require_root "hosted init"
+      mkdir -p -- "$HOST_PREFIX$HOSTED_CONTROL"
+      chown 0:0 -- "$HOST_PREFIX$HOSTED_CONTROL" 2>/dev/null || true
+      chmod 755 -- "$HOST_PREFIX$HOSTED_CONTROL"
+      say "made $HOSTED_CONTROL (root's, mode 755): the gateway mounts it read-only and refuses hosted without it"
+      ;;
+    stop)
+      require_root "hosted stop"
+      valid_reason "$reason" || { say "hosted stop needs --reason: 1 to 200 printable characters on one line" >&2; exit 2; }
+      mkdir -p -- "$HOST_PREFIX$HOSTED_CONTROL" && chmod 755 -- "$HOST_PREFIX$HOSTED_CONTROL"
+      # The stop file first: the gateway checks it before every hosted call, and refuses to
+      # start while it is there, however the container is started again.
+      printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$reason" | install_root_file "$HOSTED_CONTROL/stopped" 644
+      ack_log hosted stop "-" "-" "$reason"
+      compose kill gateway >/dev/null 2>&1 || say "note: docker compose kill gateway failed (is it running?); the stop file holds either way" >&2
+      say "the hosted model is stopped: the stop file is in place and the gateway was killed (logged in $ACK_LOG)"
+      ;;
+    start)
+      require_root "hosted start"
+      valid_reason "$reason" || { say "hosted start needs --reason: 1 to 200 printable characters on one line" >&2; exit 2; }
+      rm -f -- "$(hosted_stop_file)"
+      ack_log hosted start "-" "-" "$reason"
+      if [ "${PMOS_MODEL_SOURCE:-}" = hosted ]; then
+        hosted_checks || exit 2
+        compose up -d gateway
+      fi
+      say "the stop file is removed (logged in $ACK_LOG)"
+      ;;
+    acknowledge-switch)
+      require_root "hosted acknowledge-switch"
+      valid_reason "$reason" || { say "hosted acknowledge-switch needs --reason: 1 to 200 printable characters on one line" >&2; exit 2; }
+      [[ "$to" =~ ^hosted:[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$ ]] && [ "$to" != hosted:stack-test ] ||
+        { say "--to must be hosted:<name>, the approved entry the gateway serves" >&2; exit 2; }
+      last=$(gateway_ready_field model_source || true)
+      [ "$last" = "$to" ] || { say "the gateway reports $(printf '%q' "${last:-nothing}"), not $to: only the source it serves now can be acknowledged" >&2; exit 2; }
+      ack_log hosted acknowledge-switch "$to" "-" "$reason"
+      internal POST /internal/system/model-source-acknowledgement \
+        "$(python3 -I -c 'import json,sys; print(json.dumps({"to": sys.argv[1], "by": sys.argv[2], "reason": sys.argv[3]}))' "$to" "$(ack_login)" "$reason")" >/dev/null ||
+        { say "the tool server refused the acknowledgement (its status: GET /internal/system/model-source-status)" >&2; exit 1; }
+      say "acknowledged the switch to $to (logged in $ACK_LOG and the audit log)"
+      ;;
+    digest)
+      if [ -n "$record" ]; then
+        [ "$model" = 0 ] || hosted_usage
+        [ -f "$record" ] || { say "--record: no such file" >&2; exit 2; }
+        sha256sum -- "$record" | cut -d' ' -f1
+        return
+      fi
+      # The gateway's own normalisation, from standard input; never an argument.
+      if [ "$model" = 1 ]; then
+        compose run --rm --no-deps -T gateway pmos-gateway --model-digest-from-stdin
+      else
+        compose run --rm --no-deps -T gateway pmos-gateway --digest-from-stdin
+      fi
+      ;;
+    *) hosted_usage ;;
+  esac
+}
+
+# Where the host's own files are, for host-firewall, host acknowledge and host attest: the root
+# directory. Empty on a real host; scripts/test-pmos-admin.sh's copy of this script (and only that
+# copy) names a temporary directory here, as for HOSTS_FILE. No setting or argument changes it.
+readonly HOST_PREFIX=""
+BLOCK_SCRIPT=/usr/local/sbin/pmos-metadata-block
+BLOCK_CONF=/etc/pmos/metadata-block.conf
+BLOCK_STATUS=/run/pmos/metadata-block.status
+BLOCK_DROPIN=/etc/systemd/system/docker.service.d/pmos-metadata-block.conf
+BLOCK_SERVICE=/etc/systemd/system/pmos-metadata-block.service
+BLOCK_TIMER=/etc/systemd/system/pmos-metadata-block.timer
+# `-`: a failure of the block never stops Docker from starting; the timer applies it within a
+# minute, and H-METADATA fails meanwhile.
+BLOCK_DROPIN_TEXT='[Service]
+ExecStartPost=-/usr/local/sbin/pmos-metadata-block apply'
+BLOCK_SERVICE_TEXT='[Unit]
+Description=PM OS: keep containers from the cloud metadata services (deploy/pmos-admin host-firewall)
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pmos-metadata-block apply'
+BLOCK_TIMER_TEXT='[Unit]
+Description=PM OS: re-apply the metadata block every minute (deploy/pmos-admin host-firewall)
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=1min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target'
+ACK_LOG=/var/log/pmos/host-acknowledgements.log
+
+require_root() { # what to run with sudo
+  [ "$(id -u)" = 0 ] && return 0
+  say "$1 changes files only root may change: run it with sudo: sudo deploy/pmos-admin $1" >&2
+  exit 1
+}
+# Write standard input to a root-owned file with the given mode, by a rename.
+install_root_file() { # destination mode
+  local dest=$HOST_PREFIX$1 tmp
+  mkdir -p -- "$(dirname "$dest")"
+  tmp=$(mktemp "$(dirname "$dest")/.pmos.XXXXXX")
+  cat >"$tmp"
+  chmod "$2" "$tmp"
+  chown 0:0 "$tmp" || { rm -f -- "$tmp"; say "couldn't give $1 to root" >&2; exit 1; }
+  mv -f -- "$tmp" "$dest"
+}
+# Everything wrong with the block, one line each (check and status). The rules can be read only
+# as root; otherwise the status the timer's run writes every minute stands for them.
+host_firewall_problems() {
+  local P=$HOST_PREFIX st t now
+  if [ ! -f "$P$BLOCK_CONF" ]; then
+    echo "the block was never applied (no $BLOCK_CONF): sudo deploy/pmos-admin host-firewall apply"
+    return
+  fi
+  [ -x "$P$BLOCK_SCRIPT" ] || echo "$BLOCK_SCRIPT is missing"
+  if [ "$(id -u)" = 0 ]; then
+    if [ -x "$P$BLOCK_SCRIPT" ]; then "$P$BLOCK_SCRIPT" check || true; fi
+  else
+    st=$(cat -- "$P$BLOCK_STATUS" 2>/dev/null || true)
+    t=${st#ok }
+    now=$(date +%s)
+    if [[ "$st" != "ok "* ]] || ! [[ "$t" =~ ^[0-9]+$ ]] || [ $((now - t)) -gt 180 ]; then
+      echo "the rules weren't confirmed in the last 3 minutes ($BLOCK_STATUS: ${st:-missing}); sudo deploy/pmos-admin host-firewall check reads them"
+    fi
+  fi
+  [ "$(cat -- "$P$BLOCK_DROPIN" 2>/dev/null)" = "$BLOCK_DROPIN_TEXT" ] || echo "the docker.service drop-in $BLOCK_DROPIN is missing or changed"
+  [ "$(cat -- "$P$BLOCK_SERVICE" 2>/dev/null)" = "$BLOCK_SERVICE_TEXT" ] || echo "$BLOCK_SERVICE is missing or changed"
+  [ "$(cat -- "$P$BLOCK_TIMER" 2>/dev/null)" = "$BLOCK_TIMER_TEXT" ] || echo "$BLOCK_TIMER is missing or changed"
+  [ "$(systemctl is-enabled pmos-metadata-block.timer 2>/dev/null || true)" = enabled ] || echo "pmos-metadata-block.timer isn't enabled"
+  [ "$(systemctl is-active pmos-metadata-block.timer 2>/dev/null || true)" = active ] || echo "pmos-metadata-block.timer isn't active"
+}
+host_firewall_apply() {
+  local subnet
+  require_root "host-firewall apply"
+  network_settings_problems >&2 || exit 2
+  for t in iptables systemctl; do
+    command -v "$t" >/dev/null || { say "$t isn't installed: host-firewall needs it" >&2; exit 1; }
+  done
+  subnet=${PMOS_NETWORK_SUBNET:-$NETWORK_SUBNET_DEFAULT}
+  printf 'SUBNET=%s\n' "$subnet" | install_root_file "$BLOCK_CONF" 644
+  install_root_file "$BLOCK_SCRIPT" 755 <"$DEPLOY/pmos-metadata-block"
+  "$HOST_PREFIX$BLOCK_SCRIPT" apply
+  printf '%s\n' "$BLOCK_DROPIN_TEXT" | install_root_file "$BLOCK_DROPIN" 644
+  printf '%s\n' "$BLOCK_SERVICE_TEXT" | install_root_file "$BLOCK_SERVICE" 644
+  printf '%s\n' "$BLOCK_TIMER_TEXT" | install_root_file "$BLOCK_TIMER" 644
+  systemctl daemon-reload
+  systemctl enable --now pmos-metadata-block.timer
+  say "applied: the metadata block for $subnet (pmos0) and docker0, the docker.service drop-in and pmos-metadata-block.timer"
+}
+host_firewall_remove() {
+  local P=$HOST_PREFIX
+  require_root "host-firewall remove"
+  if [ -x "$P$BLOCK_SCRIPT" ] && [ -f "$P$BLOCK_CONF" ]; then "$P$BLOCK_SCRIPT" remove; fi
+  systemctl disable --now pmos-metadata-block.timer 2>/dev/null || true
+  rm -f -- "$P$BLOCK_TIMER" "$P$BLOCK_SERVICE" "$P$BLOCK_DROPIN" "$P$BLOCK_SCRIPT" "$P$BLOCK_CONF" "$P$BLOCK_STATUS"
+  rmdir -- "$(dirname "$P$BLOCK_DROPIN")" 2>/dev/null || true
+  systemctl daemon-reload
+  say "removed: the metadata block's rules, the drop-in, the timer and $BLOCK_SCRIPT. H-METADATA fails until the cloud's own setting keeps containers away (docs/openshell-any-host-spec.md §3.2)."
+}
+
+# Acknowledgements and attestations (§3.2): a deploy/.env line and a line in a root-owned,
+# append-only log, both written only here, with sudo. The log's lines are tab-separated:
+#   <time>\t<login>\t<check>\t<acknowledge|attest|clear>\t<what it saw>\t<fingerprint>\t<reason>
+# The fingerprint and what was seen come from the preflight (--fingerprint), the one place each is
+# measured.
+ack_login() {
+  local who=${SUDO_USER:-}
+  [ -n "$who" ] || who=$(id -un)
+  if ! [[ "$who" =~ ^[a-z_][a-z0-9_.-]{0,31}$ ]]; then
+    say "the login \"$who\" can't be recorded (it must match ^[a-z_][a-z0-9_.-]{0,31}\$): run this with sudo as a named user" >&2
+    exit 2
+  fi
+  printf '%s\n' "$who"
+}
+# A reason: 1 to 200 printable characters, no tab or line break (it is one field of one line).
+valid_reason() { (LC_ALL=C && [[ "$1" =~ ^[[:print:]]{1,200}$ ]] && [[ "$1" == *[![:space:]]* ]]); }
+ack_log() { # check action saw fingerprint reason
+  local logf=$HOST_PREFIX$ACK_LOG new=0 who
+  who=$(ack_login) || exit 2
+  mkdir -p -- "$(dirname "$logf")"
+  chmod 755 -- "$(dirname "$logf")"
+  [ -e "$logf" ] || new=1
+  (umask 022 && printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$who" "$1" "$2" "$3" "$4" "$5" >>"$logf") ||
+    { say "couldn't write $ACK_LOG; nothing was recorded" >&2; exit 1; }
+  if [ "$new" = 1 ]; then
+    chown 0:0 -- "$logf" 2>/dev/null || true
+    chmod 644 -- "$logf"
+    # Append-only where the filesystem supports it (ext4, xfs): not even root rewrites a line
+    # without first removing the attribute.
+    if command -v chattr >/dev/null; then
+      chattr +a -- "$logf" 2>/dev/null || say "note: $ACK_LOG couldn't be made append-only (chattr +a); its filesystem may not support it" >&2
+    fi
+  fi
+}
+# Remove KEY from deploy/.env (under the lock, by a rename, as set_env).
+unset_env() {
+  local tmp
+  only_chars "$1" "$ENV_KEY_CHARS" || exit 2
+  lock_env
+  tmp=$(mktemp "$DEPLOY/.env.XXXXXX")
+  ENV_TMP=$tmp
+  if awk -v k="$1" -F= '$1 != k' "$ENV" >"$tmp"; then
+    replace_env "$tmp"
+    ENV_TMP=""
+  else
+    rm -f "$tmp"
+    ENV_TMP=""
+    say "couldn't write deploy/.env; it is unchanged" >&2
+    exit 1
+  fi
+}
+# The preflight's measurement for an acknowledgement or an attestation: "<fingerprint>\t<saw>".
+measure_for() { # h-private|local-gpu
+  local out code=0
+  out=$("$PREFLIGHT" --env-file "$ENV" --fingerprint "$1") || code=$?
+  [ "$code" = 0 ] || exit "$code"
+  [[ "$out" =~ ^[0-9a-f]{64}$'\t' ]] || { say "the preflight measured nothing usable" >&2; exit 1; }
+  printf '%s\n' "$out"
+}
+host_cmd() {
+  local sub=${1:-} target reason="" clear=0 owner=0 m fp saw
+  host_usage() {
+    say "usage: sudo deploy/pmos-admin host acknowledge H-PRIVATE --reason <text> | host acknowledge --clear H-PRIVATE" >&2
+    say "       sudo deploy/pmos-admin host attest local-gpu --owner-controls --reason <text> | host attest local-gpu --clear" >&2
+    exit 2
+  }
+  [ $# -ge 1 ] && shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --reason) [ $# -ge 2 ] || host_usage; reason=$2; shift 2 ;;
+      --clear) clear=1; shift ;;
+      --owner-controls) owner=1; shift ;;
+      -*) host_usage ;;
+      *) [ -z "${target:-}" ] || host_usage; target=$1; shift ;;
+    esac
+  done
+  case "$sub" in
+    acknowledge)
+      # Only H-PRIVATE takes an acknowledgement: anything else is refused before anything is
+      # measured, written or logged (P-8).
+      if [ "${target:-}" != H-PRIVATE ]; then
+        say "pmos-admin host acknowledge: only H-PRIVATE takes an acknowledgement, not $(printf '%q' "${target:-}"); every other check must pass (docs/openshell-any-host-spec.md §3.2)" >&2
+        exit 2
+      fi
+      [ "$owner" = 0 ] || host_usage
+      require_root "host acknowledge"
+      if [ "$clear" = 1 ]; then
+        [ -z "$reason" ] || valid_reason "$reason" || { say "--reason: 1 to 200 printable characters, on one line" >&2; exit 2; }
+        ack_log H-PRIVATE clear "-" "-" "${reason:-cleared}"
+        unset_env PMOS_HOST_ACK_H_PRIVATE
+        say "cleared the acknowledgement of H-PRIVATE (logged in $ACK_LOG)"
+        return
+      fi
+      valid_reason "$reason" || { say "host acknowledge needs --reason: 1 to 200 printable characters on one line, saying why this host may be declared private" >&2; exit 2; }
+      if [ "${PMOS_EXPOSURE:-public}" != private ]; then
+        say "PMOS_EXPOSURE isn't private in deploy/.env: there is nothing to acknowledge" >&2
+        exit 2
+      fi
+      m=$(measure_for h-private)
+      fp=${m%%$'\t'*}
+      saw=${m#*$'\t'}
+      ack_log H-PRIVATE acknowledge "$saw" "$fp" "$reason"
+      set_env PMOS_HOST_ACK_H_PRIVATE "$fp"
+      say "acknowledged H-PRIVATE ($saw); logged in $ACK_LOG. status shows it every time; it lapses when the host shows something else."
+      ;;
+    attest)
+      [ "${target:-}" = local-gpu ] || { say "pmos-admin host attest: only local-gpu can be attested" >&2; exit 2; }
+      require_root "host attest"
+      if [ "$clear" = 1 ]; then
+        [ "$owner" = 0 ] || host_usage
+        [ -z "$reason" ] || valid_reason "$reason" || { say "--reason: 1 to 200 printable characters, on one line" >&2; exit 2; }
+        ack_log local-gpu clear "-" "-" "${reason:-cleared}"
+        unset_env PMOS_HOST_ATTEST_LOCAL_GPU
+        say "cleared the local-gpu attestation (logged in $ACK_LOG)"
+        return
+      fi
+      [ "$owner" = 1 ] || { say "host attest local-gpu needs --owner-controls: you state that the owner controls this GPU host (decision D1)" >&2; exit 2; }
+      valid_reason "$reason" || { say "host attest needs --reason: 1 to 200 printable characters on one line" >&2; exit 2; }
+      if [ "${PMOS_MODEL_SOURCE:-local}" != local ] || [ -z "${PMOS_MODEL_SOURCE:-}" ]; then
+        say "PMOS_MODEL_SOURCE isn't local in deploy/.env (set it explicitly): the attestation is for a local model on this host" >&2
+        exit 2
+      fi
+      m=$(measure_for local-gpu)
+      fp=${m%%$'\t'*}
+      saw=${m#*$'\t'}
+      ack_log local-gpu attest "$saw" "$fp" "$reason"
+      set_env PMOS_HOST_ATTEST_LOCAL_GPU "$fp"
+      say "attested: the owner controls this GPU host ($saw); logged in $ACK_LOG. It lapses on another machine or GPU."
+      ;;
+    *) host_usage ;;
+  esac
+}
+
+# --- Bots: names, tokens, sandboxes and their workers ---------------------------------------
+# docs/openshell-any-host-spec.md §3.7 (slice H0).
+# shellcheck source=deploy/sandbox-create.sh
+. "$DEPLOY/sandbox-create.sh"
+
+# PM OS's own rule for a bot name, the same as `valid_name` in crates/contract/src/bots.rs:
+# lowercase ASCII letters, digits and single hyphens, not starting or ending with one, 1 to 32
+# characters. The letters are listed one by one, so no locale widens them. `add-bot`, `sandbox`,
+# `pause` and `resume` check it before the name reaches deploy/.env, a path, a lookup, an
+# OpenShell argument or a systemd unit name.
+BOT_NAME_CHARS=abcdefghijklmnopqrstuvwxyz0123456789-
+valid_bot_name() {
+  [ -n "$1" ] && [ ${#1} -le 32 ] && only_chars "$1" "$BOT_NAME_CHARS" || return 1
+  case "$1" in -* | *- | *--*) return 1 ;; esac
+}
+require_bot_name() { # command name
+  valid_bot_name "$2" && return 0
+  say "pmos-admin $1: $(printf '%q' "$2") isn't a bot name (lowercase letters, digits and single hyphens, at most 32 characters)" >&2
+  exit 2
+}
+
+# A PM's handle, the same rule as `valid_handle` in crates/contract/src/model.rs: a lowercase
+# letter or digit, then lowercase letters, digits, `.`, `_` and `-`, at most 64 characters. So
+# `.`, `..` and anything with a `/` are refused before they reach a URL path, where curl would
+# collapse `..` (`revoke .. reindex` would have sent DELETE /internal/reindex).
+HANDLE_FIRST_CHARS=abcdefghijklmnopqrstuvwxyz0123456789
+HANDLE_CHARS=abcdefghijklmnopqrstuvwxyz0123456789._-
+require_handle() { # command handle
+  if [ -n "$2" ] && [ ${#2} -le 64 ] && only_chars "${2:0:1}" "$HANDLE_FIRST_CHARS" &&
+    only_chars "$2" "$HANDLE_CHARS"; then
+    return 0
+  fi
+  say "pmos-admin $1: $(printf '%q' "$2") isn't a handle (lowercase letters, digits, . _ -, starting with a letter or digit)" >&2
+  exit 2
+}
+
+# The bring-up personal worker (deploy/compose.yaml, worker-personal): one PM's personal bot as a
+# plain container, NOT isolated, for a host without OpenShell and fake data only. Its two tokens
+# are found by exact key in deploy/.env's lists (add-bot made them) and reach Compose through
+# this process's environment, never a command line.
+bringup_personal() {
+  local bot=${PMOS_BRINGUP_PERSONAL_BOT:-} rt gw
+  [ -n "$bot" ] || return 0
+  if ! valid_bot_name "$bot" || [ "$bot" = docs ]; then
+    say "PMOS_BRINGUP_PERSONAL_BOT=$(printf '%q' "$bot"): name one personal bot, such as pm-<handle> (the Docs bot has worker-docs)" >&2
+    return 1
+  fi
+  rt=$(list_value "${PMOS_RT_WORKER_TOKENS:-}" "worker-$bot")
+  gw=$(list_value "${PMOS_GW_BOT_TOKENS:-}" "bot-$bot")
+  if [ -z "$rt" ] || [ -z "$gw" ]; then
+    say "PMOS_BRINGUP_PERSONAL_BOT=$bot has no tokens yet: run deploy/pmos-admin add-bot $bot first" >&2
+    return 1
+  fi
+  export PMOS_BRINGUP_PERSONAL_RT_TOKEN=$rt PMOS_BRINGUP_PERSONAL_GW_TOKEN=$gw
+  say "bring-up worker for $bot (NOT isolated: fake data only)"
+}
+
+# The stack's services, as Docker Compose lists them from deploy/compose.yaml with every
+# profile. `logs` and `restart` take only one of these (never an option, never anything else).
+# The models profile only with PMOS_VLLM_IMAGE set: it has no default (slice H4), and Compose
+# refuses to load a project in which an enabled service has no image, so with it blank `status`,
+# `logs`, `restart` and `down` would all fail on every stack without the local model servers
+# (the stub, hosted-test). None of them can be running then, as `up --models` needs the image;
+# for model servers left from before it was cleared, see stray_model_servers.
+ALL_PROFILES=(--profile slack --profile console --profile web --profile bringup --profile bringup-personal)
+[ -z "${PMOS_VLLM_IMAGE:-}" ] || ALL_PROFILES+=(--profile models)
+MODEL_SERVICES=(vllm-default vllm-extraction)
+# The model server containers of this stack (project pmos) Compose can't see because
+# PMOS_VLLM_IMAGE is blank now: their ids, one per line. Empty with the image set.
+stray_model_servers() {
+  [ -z "${PMOS_VLLM_IMAGE:-}" ] || return 0
+  local s
+  for s in "${MODEL_SERVICES[@]}"; do
+    docker ps -aq --filter label=com.docker.compose.project=pmos --filter "label=com.docker.compose.service=$s" 2>/dev/null || true
+  done
+}
+require_service() { # command service
+  local list
+  case "$2" in
+    '' | -*) say "usage: pmos-admin $1 <service> (a service name, not $(printf '%q' "$2"))" >&2; exit 2 ;;
+  esac
+  list=$(compose "${ALL_PROFILES[@]}" config --services 2>/dev/null) || {
+    say "couldn't list the stack's services (docker compose config failed on deploy/compose.yaml or deploy/.env)" >&2
+    exit 1
+  }
+  grep -qxF -- "$2" <<<"$list" && return 0
+  say "pmos-admin $1: no service $(printf '%q' "$2"); the services are: $(tr '\n' ' ' <<<"$list")" >&2
+  exit 2
+}
+
+# The value for KEY in a `key=value,key=value` list (PMOS_RT_WORKER_TOKENS, PMOS_GW_BOT_TOKENS),
+# by an exact match of the whole key: the key is never a pattern.
+list_value() { # list key
+  tr ',' '\n' <<<"$1" | LIST_KEY=$2 awk -F= '$1 == ENVIRON["LIST_KEY"] { print substr($0, length($1) + 2); exit }'
+}
+
+# The worker unit (deploy/systemd/pmos-worker@.service), installed as a user unit of the user
+# whose OpenShell gateway runs (OpenShell's gateway is a systemd user service:
+# about/installation.mdx in OpenShell's docs).
+WORKER_UNIT_TEMPLATE="$DEPLOY/systemd/pmos-worker@.service"
+user_unit_dir() { printf '%s\n' "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"; }
+# The instance's unit name: systemd-escape turns `pm-ana` into `pm\x2dana`; the unit reads the
+# name back with %I.
+worker_unit() { # bot
+  local escaped
+  escaped=$(systemd-escape -- "$1")
+  printf 'pmos-worker@%s.service\n' "$escaped"
+}
+# Only the path of `openshell` on the template's ExecStart line is replaced, with the absolute
+# path on this PATH; a path with any character outside a plain set (a `%` would be a systemd
+# specifier, a space would split the command) is refused.
+PATH_CHARS='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_./+-'
+install_worker_unit() {
+  local openshell dir
+  openshell=$(command -v openshell)
+  case "$openshell" in /*) ;; *) say "openshell isn't an absolute path on PATH ($openshell)" >&2; exit 1 ;; esac
+  if ! only_chars "$openshell" "$PATH_CHARS"; then
+    say "the path of openshell, $(printf '%q' "$openshell"), has characters a unit file can't hold" >&2
+    exit 1
+  fi
+  # The quick preflight (slice H1) by its absolute path, with openshell's directory on its PATH
+  # (O-GATEWAY asks openshell where its gateway is).
+  if ! only_chars "$PREFLIGHT" "$PATH_CHARS"; then
+    say "the path of the preflight, $(printf '%q' "$PREFLIGHT"), has characters a unit file can't hold: move the checkout" >&2
+    exit 1
+  fi
+  dir=$(user_unit_dir)
+  mkdir -p "$dir"
+  OPENSHELL_PATH=$openshell PREFLIGHT_LINE="ExecStartPre=/usr/bin/env PATH=$(dirname "$openshell"):/usr/local/bin:/usr/bin:/bin $PREFLIGHT --stage quick" awk '
+    index($0, "ExecStart=/usr/bin/openshell ") == 1 { print "ExecStart=" ENVIRON["OPENSHELL_PATH"] substr($0, length("ExecStart=/usr/bin/openshell") + 1); next }
+    $0 == "ExecStartPre=/opt/pmos/deploy/preflight.sh --stage quick" { print ENVIRON["PREFLIGHT_LINE"]; next }
+    { print }
+  ' "$WORKER_UNIT_TEMPLATE" >"$dir/.pmos-worker@.service.new"
+  mv "$dir/.pmos-worker@.service.new" "$dir/pmos-worker@.service"
+}
+# What a worker unit needs before it is installed or started: a user's systemd (not root's) and
+# lingering, without which the user's services, OpenShell's gateway included, stop at logout and
+# don't start at boot (bot decision D2: "After a reboot, in-flight tasks resume"). The check is
+# from OpenShell's and systemd's docs (`loginctl enable-linger`); that it is enough to bring the
+# gateway and every worker back after a reboot is check E-5 on a real host.
+worker_unit_checks() {
+  local me linger
+  if [ "$(id -u)" = 0 ]; then
+    say "run this as the user whose OpenShell gateway runs, not as root: the worker is that user's systemd unit" >&2
+    exit 1
+  fi
+  for t in systemctl systemd-escape loginctl; do
+    command -v "$t" >/dev/null || { say "$t is not installed: the worker runs as a systemd user unit" >&2; exit 1; }
+  done
+  me=$(id -un)
+  linger=$(loginctl show-user "$me" -p Linger --value 2>/dev/null || true)
+  if [ "$linger" != yes ]; then
+    say "lingering is off for $me: OpenShell's gateway and the bots' workers would stop at logout and" >&2
+    say "not start after a reboot. Turn it on once, then run this again:" >&2
+    say "  sudo loginctl enable-linger $me" >&2
+    exit 1
+  fi
+}
+
+# A sandbox's provider, made or brought up to date (see `sandbox` for what this rests on). The
+# token is already in the environment under the variable's name ($3); only the name is passed.
+provider_upsert() { # name type variable
+  if openshell provider get "$1" >/dev/null 2>&1; then
+    openshell provider update "$1" --credential "$3"
+  else
+    openshell provider create --name "$1" --type "$2" --credential "$3"
+  fi
 }
 
 cmd=${1:-help}
 shift || true
+# pause and host-names never read deploy/.env (above); help runs nothing. down only warns
+# (env_problem).
+case "$cmd" in pause | host-names | help | -h | --help) ;; *)
+  # The uid check is for commands that start a container as PMOS_UID:PMOS_GID. These don't
+  # (they talk to the running stack, or only stop or read it), so a PMOS_UID=0 left by an older
+  # install must not stop `revoke` in the middle of an incident. Every other command, anything
+  # that can create or recreate a container, keeps the check (`up` refuses).
+  case "$cmd" in status | logs | backup | reindex | revoke | preflight | host-firewall | host | route | routes | usage | upstream-key) ;; *) uid_checks ;; esac
+  port_checks
+  ;;
+esac
 case "$cmd" in
   build)
-    args=(--build-arg "HTTPS_PROXY=${HTTPS_PROXY:-}" --build-arg "NO_PROXY=${NO_PROXY:-}")
+    use_last=0
+    for arg in "$@"; do
+      case "$arg" in
+        --use-last-fetch) use_last=1 ;;
+        *) say "usage: deploy/pmos-admin build [--use-last-fetch]" >&2; exit 2 ;;
+      esac
+    done
+    # Slice H12 (X5): the commit and the merged branch's commit are compiled into the gateway
+    # and reported in /readyz. Under hosted the image is built only when the approved list and
+    # the gateway's code are the merged branch's; elsewhere a failed fetch is a warning.
+    PMOS_BUILD_COMMIT=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)
+    PMOS_BUILD_MERGED_COMMIT=""
+    PMOS_BUILD_LIST_CHECKED_AT=""
+    if [ "${PMOS_MODEL_SOURCE:-}" = hosted ]; then
+      checked=$(build_release_checks "$use_last") || exit 2
+      PMOS_BUILD_MERGED_COMMIT=${checked%% *}
+      PMOS_BUILD_LIST_CHECKED_AT=${checked#* }
+    elif ref=$(fetch_release_ref); then
+      PMOS_BUILD_MERGED_COMMIT=$(git -C "$ROOT" rev-parse "$ref")
+    else
+      say "warning: couldn't fetch the merged branch; the gateway reports no merged commit (it serves no approved list under ${PMOS_MODEL_SOURCE:-this source})" >&2
+    fi
+    export PMOS_BUILD_COMMIT PMOS_BUILD_MERGED_COMMIT PMOS_BUILD_LIST_CHECKED_AT
+    # The proxy settings by name only: Docker takes each value from this environment, so a proxy
+    # URL with a password in it isn't on docker's command line (the security review of 6bb806f).
+    export HTTPS_PROXY="${HTTPS_PROXY:-}" NO_PROXY="${NO_PROXY:-}"
+    args=(--build-arg HTTPS_PROXY --build-arg NO_PROXY --build-arg PMOS_BUILD_COMMIT
+      --build-arg PMOS_BUILD_MERGED_COMMIT --build-arg PMOS_BUILD_LIST_CHECKED_AT)
     if [ -n "${HTTPS_PROXY:-}" ]; then args+=(--network host); fi
     if [ -n "${PMOS_BUILD_CA:-}" ]; then args+=(--secret "id=ca,src=$PMOS_BUILD_CA"); fi
     tag=${PMOS_VERSION:-local}
@@ -150,53 +2135,274 @@ case "$cmd" in
     ;;
 
   up)
-    mapfile -t prof < <(profiles "$@")
+    # The web app's doors first (slice H10): nothing else matters while pmos-web would refuse them.
+    for arg in "$@"; do
+      [ "$arg" != --web ] || web_door_checks || exit 2
+    done
+    brief_url_checks || exit 2
+    for arg in "$@"; do
+      if [ "$arg" = --console ]; then
+        console_checks || exit 2
+        client_settings console || exit 2
+      fi
+      if [ "$arg" = --web ]; then
+        client_settings web || exit 2
+        password_web_checks || exit 2
+      fi
+    done
+    # Not a process substitution: a refusal in `profiles` (an unknown option, a web app with no
+    # sign-in) must stop `up` here, and its exit would be lost in one.
+    profile_lines=$(profiles "$@") || exit $?
+    prof=()
+    [ -z "$profile_lines" ] || mapfile -t prof <<<"$profile_lines"
+    assertion_checks || exit 2
+    model_source_checks || exit 2
+    if [[ " ${prof[*]} " == *" bringup-personal "* ]]; then bringup_personal || exit 2; fi
+    # The pinned addresses (slice H2): the settings hold them, and a network made earlier with
+    # other settings is re-created first. Last, so the refusals above stay docker-free.
+    network_checks || exit 2
+    # The host preflight (slice H1, docs/openshell-any-host-spec.md §3.2), every time, before
+    # anything starts: a kernel or Docker update can turn Landlock off or reset a firewall rule.
+    # H-LOCAL refuses live connectors or GitHub memory under `local` without the attestation.
+    pf=(--stage run --starting)
+    for arg in "$@"; do [ "$arg" != --web ] || pf+=(--web); done
+    run_preflight up "${pf[@]}"
     if [ -z "${PMOS_SLACK_APP_TOKEN:-}" ] || [ -z "${PMOS_SLACK_BOT_TOKEN:-}" ]; then
       say "note: the Slack bot is off until PMOS_SLACK_APP_TOKEN and PMOS_SLACK_BOT_TOKEN are set"
     fi
+    # `route disable` writes here and the gateway reads it (slice MP8); made before Compose
+    # would make it as root.
+    if [ -d "${PMOS_STATE_DIR:-}" ]; then
+      mkdir -p "$PMOS_STATE_DIR/route-control" && chmod 755 "$PMOS_STATE_DIR/route-control"
+    fi
+    if [ "${PMOS_MODEL_SOURCE:-}" = hosted-test ] && [ "${PMOS_HOSTED_TEST_ROUTES:-0}" = 1 ]; then
+      say "== checking the route config (pmos-gateway --check-config)"
+      compose run --rm --no-deps -T gateway pmos-gateway --check-config /etc/pmos/gateway.yaml ||
+        { say "the gateway refuses the route config; nothing was started" >&2; exit 2; }
+    fi
     compose "${prof[@]}" up -d
+    # Slice H12 (X5): under hosted, the running gateway's approved list must be the merged
+    # branch's; one that differs is stopped at once.
+    if [ "${PMOS_MODEL_SOURCE:-}" = hosted ]; then
+      for _ in $(seq 1 30); do
+        [ -n "$(gateway_ready_field approved_list_sha256 || true)" ] && break
+        sleep 2
+      done
+      if ! line=$(list_comparison); then
+        say "$line: stopping the gateway (docker compose kill gateway)" >&2
+        compose kill gateway >/dev/null 2>&1 || true
+        exit 1
+      fi
+      say "$line"
+    fi
     say "started; check with: deploy/pmos-admin status"
     ;;
 
   down)
-    compose --profile slack --profile console --profile models --profile bringup down
+    # Model servers started before PMOS_VLLM_IMAGE was cleared: Compose can't stop them without
+    # the models profile (which needs the image), and they would keep the network in use.
+    stray=$(stray_model_servers)
+    if [ -n "$stray" ]; then
+      say "stopping model servers started before PMOS_VLLM_IMAGE was cleared in deploy/.env"
+      # shellcheck disable=SC2086 # container ids, one per line
+      docker rm -f $stray >/dev/null || say "WARNING: couldn't remove them: docker ps --filter label=com.docker.compose.project=pmos" >&2
+    fi
+    compose "${ALL_PROFILES[@]}" down || {
+      say "docker compose couldn't stop the stack (it may not be able to read deploy/.env either)." >&2
+      down_advice
+      exit 1
+    }
     ;;
 
   status)
     say "== containers"
-    compose --profile slack --profile console --profile models --profile bringup ps \
+    compose "${ALL_PROFILES[@]}" ps \
       --format 'table {{.Service}}\t{{.Status}}'
+    if [ -n "$(stray_model_servers)" ]; then
+      row models WARN "model server containers exist but PMOS_VLLM_IMAGE is blank in deploy/.env: set it back, or deploy/pmos-admin down"
+    fi
+    # The pinned addresses and the host names (slice H2): what sandboxes reach.
+    say "== network and host names"
+    if problems=$(network_settings_problems); then
+      live=$(live_network)
+      if [ -z "$live" ]; then
+        row network "-" "$NETWORK_NAME not found (not made yet, or docker can't be asked); up makes it"
+      elif [ "$live" = "$(expected_network)" ]; then
+        row network ok "$NETWORK_NAME: $live (subnet gateway ip_range;bridge)"
+      else
+        row network FAIL "$NETWORK_NAME is $live, deploy/.env says $(expected_network): deploy/pmos-admin down && deploy/pmos-admin up"
+      fi
+    else
+      while IFS= read -r p; do row network FAIL "$p"; done <<<"$problems"
+    fi
+    if problems=$(host_names_problems); then
+      while IFS= read -r p; do row names ok "$p"; done < <(host_names_ok_lines)
+    else
+      while IFS= read -r p; do row names FAIL "$p"; done <<<"$problems"
+    fi
+    # The host preflight (slice H1): every check that doesn't pass, then each acknowledgement and
+    # attestation in force, on its own line every time (§3.2).
+    say "== host"
+    pf_code=0
+    pf_json=$("$PREFLIGHT" --env-file "$ENV" --stage run --json 2>/dev/null) || pf_code=$?
+    if [ "$pf_code" -ge 2 ] || [ -z "$pf_json" ]; then
+      row preflight FAIL "the host preflight couldn't run: deploy/pmos-admin preflight shows why"
+    else
+      python3 -I -c '
+import json, sys
+d = json.loads(sys.stdin.read())
+bad = [c for c in d["checks"] if c["status"] in ("fail", "warn")]
+for c in bad:
+    print("%-17s %-5s %s%s" % (c["id"], "FAIL" if c["status"] == "fail" else "WARN", c["measured"][:150],
+          ("; " + c["hint"][:150]) if c["hint"] else ""))
+if not bad:
+    print("%-17s %-5s %s" % ("preflight", "ok", "%d checks pass (deploy/pmos-admin preflight)" % len(d["checks"])))
+for a in d["acknowledgements"]:
+    print("host: PMOS_EXPOSURE=private acknowledged on %s by %s: %s; \"%s\"" % (a["at"], a["by"], a["saw"], a["reason"]))
+for a in d["attestations"]:
+    print("host: PMOS_MODEL_SOURCE=local attested (local-gpu) on %s by %s: %s; \"%s\"" % (a["at"], a["by"], a["saw"], a["reason"]))
+' <<<"$pf_json" | sed 's/^/  /' || row preflight FAIL "the host preflight's answer couldn't be read"
+    fi
+    # A worker whose unit failed, its quick preflight (ExecStartPre) included.
+    if [ "$(id -u)" != 0 ] && command -v systemctl >/dev/null; then
+      while read -r u _; do
+        [ -n "$u" ] || continue
+        row worker FAIL "$u failed (its ExecStartPre preflight or the worker): journalctl --user -u '$u'; then deploy/pmos-admin resume <bot>"
+      done < <(systemctl --user list-units 'pmos-worker@*' --state=failed --no-legend --plain 2>/dev/null || true)
+    fi
     say "== readiness"
+    case "${PMOS_MODEL_SOURCE:-}" in
+      hosted-test) row model WARN "PMOS_MODEL_SOURCE=hosted-test: TESTING ONLY, prompts leave this host (fake data only)" ;;
+      hosted)
+        # Slice H12: the entry, the stop file, the key, the ceiling, and the list's digest
+        # against the merged branch's (X5). Labels and digests only.
+        row model ok "PMOS_MODEL_SOURCE=hosted: $(gateway_ready_field model_source || echo 'the gateway is not answering'), ceiling $(gateway_ready_field max_data_class || echo unknown)"
+        if [ -e "$(hosted_stop_file)" ]; then
+          row hosted STOPPED "$(head -c 200 "$(hosted_stop_file)" 2>/dev/null | tr -d '\n')"
+        fi
+        [ -s "$DEPLOY/$HOSTED_KEY_REL" ] || row hosted FAIL "no key: deploy/pmos-admin hosted-key set"
+        if line=$(list_comparison); then
+          row "list" ok "$line"
+        else
+          row "list" FAIL "$line"
+          status_failed=1
+        fi
+        ;;
+      local) row model ok "PMOS_MODEL_SOURCE=local: model servers on this host" ;;
+      *) row model FAIL "PMOS_MODEL_SOURCE=$(printf '%q' "${PMOS_MODEL_SOURCE:-}"): run deploy/setup.sh (every service refuses a blank or unknown source)" ;;
+    esac
+    case "${PMOS_EXPOSURE:-}" in
+      private | public) row exposure ok "PMOS_EXPOSURE=$PMOS_EXPOSURE" ;;
+      *) row exposure FAIL "PMOS_EXPOSURE=$(printf '%q' "${PMOS_EXPOSURE:-}"): run deploy/setup.sh (pmos-web refuses a blank one)" ;;
+    esac
+    # A bring-up worker running on a stack that could hold real data (slice H4).
+    running=$(compose "${ALL_PROFILES[@]}" ps --status running --services 2>/dev/null || true)
+    for w in worker-docs worker-personal; do
+      grep -qx "$w" <<<"$running" || continue
+      if problems=$(bringup_problems); then
+        row "$w" WARN "running: a bring-up worker, NOT isolated (fake data only)"
+      else
+        while IFS= read -r p; do row "$w" FAIL "running on a stack that isn't fake-data only: $p; stop it: deploy/pmos-admin down, then up without --bringup"; done <<<"$problems"
+        status_failed=1
+      fi
+    done
     check() { # name url
       local body code
       body=$(curl -sS --noproxy '*' -m 5 -w '\n%{http_code}' "$2" 2>/dev/null) || { row "$1" DOWN "no answer from $2"; return; }
       code=${body##*$'\n'}
       body=${body%$'\n'*}
       if [ "$code" = 200 ]; then row "$1" ok "${body:0:90}"; else row "$1" "$code" "${body:0:90}"; fi
+      # A readiness warning (the web app's GL3: password requests refused proxy_not_trusted
+      # in the last 15 minutes): ready, but every browser behind that proxy is refused.
+      if [[ "$body" == *'"warnings":["'* ]]; then
+        local w=${body#*\"warnings\":[}
+        w=${w%%]*}
+        row "$1" WARN "${w//\"/}"
+        if [[ "$w" == *untrusted_proxy_refusals* ]]; then
+          row "" "" "password sign-ins are refused proxy_not_trusted: PMOS_WEB_TRUSTED_PROXIES must be"
+          row "" "" "where the reverse proxy reaches the web app from (docs/password-sign-in.md)"
+        fi
+      fi
     }
-    check toolserver http://127.0.0.1:8710/readyz
-    check gateway http://127.0.0.1:8740/readyz
-    check bots http://127.0.0.1:8750/readyz
+    check toolserver "http://127.0.0.1:$PMOS_TOOLSERVER_PORT/readyz"
+    check gateway "http://127.0.0.1:$PMOS_GATEWAY_PORT/readyz"
+    # G2: the gateway's /readyz says its class and whether the stub model is on.
+    gw=$(curl -sS --noproxy '*' -m 5 "http://127.0.0.1:$PMOS_GATEWAY_PORT/readyz" 2>/dev/null) || gw=""
+    if [[ "$gw" == *'"stub":true'* ]]; then
+      row gateway WARN "the STUB model answers every call (PMOS_GATEWAY_STUB=1): set it to 0 once the model servers are up (docs/runbooks/install.md)"
+    elif [[ "$gw" == *'"class":"'* && "$gw" != *'"class":"production"'* ]]; then
+      row gateway WARN "not a production-class gateway: its eval runs don't count (deploy/gateway.yaml has class: production; docs/gateway.md)"
+    fi
+    # Slice MP8: each role ok, degraded (on fallback) or down, from /readyz's counts (no labels).
+    if [ -n "$gw" ] && command -v python3 >/dev/null; then
+      python3 -I -c '
+import json, sys
+try:
+    d = json.JSONDecoder().raw_decode(sys.stdin.read().strip())[0]
+except ValueError:
+    sys.exit(0)
+if not isinstance(d, dict):
+    sys.exit(0)
+for role, r in sorted((d.get("upstreams") or {}).items()):
+    if not isinstance(r, dict):
+        continue
+    hops, usable = r.get("hops"), r.get("hops_usable")
+    if r.get("status") != "ok":
+        state, note = "DOWN", "no model of its route is usable"
+    elif isinstance(hops, int) and isinstance(usable, int) and usable < hops:
+        state, note = "WARN", "degraded (on fallback): %d of %d models usable" % (usable, hops)
+    else:
+        state, note = "ok", ("%d models usable" % hops) if isinstance(hops, int) else "ok"
+    print("  %-12s %-6s %s" % ("role " + role[:7], state, note))
+' <<<"$gw" || true
+    fi
+    check bots "http://127.0.0.1:$PMOS_BOTS_PORT/readyz"
     if compose --profile console ps --status running --services 2>/dev/null | grep -qx console; then
-      check console http://127.0.0.1:8760/healthz
+      check console "http://127.0.0.1:$PMOS_CONSOLE_PORT/healthz"
+    fi
+    if compose --profile web ps --status running --services 2>/dev/null | grep -qx web; then
+      # /readyz: with Entra sign-in on it includes `entra_link`, whether the tool server
+      # validates first-link tokens for the same tenant and client id (docs/entra-sign-in.md).
+      check web "http://127.0.0.1:$PMOS_WEB_PORT/readyz"
     fi
     if compose exec -T docs curl -fsS -m 5 http://127.0.0.1:8730/readyz >/dev/null 2>&1; then
       row docs ok "ready"
     else
       row docs "not" "ready (normal until the first sync finishes; or no docs site set in PMOS_DOCS_BASE_URL)"
     fi
+    # Slice H4: a bring-up worker on a stack that could hold real data fails `status`.
+    [ "${status_failed:-0}" = 0 ] || exit 1
     ;;
 
   logs)
     [ $# -ge 1 ] || { say "usage: pmos-admin logs <service> [-f]" >&2; exit 2; }
     svc=$1
     shift
-    compose --profile slack --profile console --profile models --profile bringup logs --tail 200 "$@" "$svc"
+    require_service logs "$svc"
+    opts=()
+    for a in "$@"; do
+      case "$a" in
+        -f | --follow | -t | --timestamps) opts+=("$a") ;;
+        *) say "usage: pmos-admin logs <service> [-f] [-t]" >&2; exit 2 ;;
+      esac
+    done
+    compose "${ALL_PROFILES[@]}" logs --tail 200 "${opts[@]}" "$svc"
     ;;
 
   restart)
-    [ $# -eq 1 ] || { say "usage: pmos-admin restart <service>" >&2; exit 2; }
-    compose --profile slack --profile console --profile models --profile bringup restart "$1"
+    # `restart gateway --signal HUP` (slice H12): the gateway reads its key files afresh.
+    if [ $# -eq 3 ] && [ "$1" = gateway ] && [ "$2" = --signal ] && [ "$3" = HUP ]; then
+      compose kill -s HUP gateway
+      say "sent SIGHUP to the gateway: its key files are read afresh on the next call"
+      exit 0
+    fi
+    [ $# -eq 1 ] || { say "usage: pmos-admin restart <service> | restart gateway --signal HUP" >&2; exit 2; }
+    require_service restart "$1"
+    if [ "$1" = gateway ] && [ "${PMOS_MODEL_SOURCE:-}" = hosted ] && [ -e "$(hosted_stop_file)" ]; then
+      say "the hosted model is stopped: the gateway isn't restarted (sudo deploy/pmos-admin hosted start --reason <text>)" >&2
+      exit 2
+    fi
+    compose "${ALL_PROFILES[@]}" restart "$1"
     ;;
 
   backup)
@@ -219,10 +2425,14 @@ case "$cmd" in
     [ $# -eq 1 ] && [ -d "$1" ] || { say "usage: pmos-admin restore <backup dir>" >&2; exit 2; }
     dir=$(cd "$1" && pwd)
     (cd "$dir" && sha256sum -c --quiet SHA256SUMS) || { say "the backup's checksums don't match; not restoring" >&2; exit 1; }
+    # The `up` that follows starts the services from deploy/.env: check now that it will
+    # start them with assertions as configured, before anything is stopped.
+    assertion_checks || exit 2
+    run_preflight restore --stage run --starting
     say "This replaces every PM OS database with the backup in $dir."
     read -r -p "Type RESTORE to go on: " answer
     [ "$answer" = RESTORE ] || { say "stopped; nothing changed"; exit 1; }
-    compose --profile slack --profile console --profile bringup stop docs toolserver gateway bots slack console worker-docs 2>/dev/null || true
+    compose --profile slack --profile console --profile web --profile bringup --profile bringup-personal stop docs toolserver gateway bots slack console web worker-docs worker-personal 2>/dev/null || true
     compose up -d postgres
     until compose exec -T postgres pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
     for db in toolserver bots docs; do
@@ -241,9 +2451,80 @@ case "$cmd" in
     internal POST /internal/reindex && echo
     ;;
 
+  audit)
+    # Read-only: what the tool server's next daily purge would delete (docs/audit-retention.md).
+    [ "$*" = "purge --dry-run" ] || { say "usage: pmos-admin audit purge --dry-run (the tool server purges daily itself)" >&2; exit 2; }
+    days=${PMOS_AUDIT_RETENTION_DAYS:-90}
+    case "$days" in '' | *[!0-9]*) say "PMOS_AUDIT_RETENTION_DAYS=$days isn't a number of days" >&2; exit 2 ;; esac
+    [ "$days" -ge 90 ] || { say "PMOS_AUDIT_RETENTION_DAYS=$days is under the 90-day minimum" >&2; exit 2; }
+    compose exec -T postgres psql -U postgres -d pmos_toolserver -v ON_ERROR_STOP=1 -At -F ' ' \
+      -c "SELECT count(*), coalesce(min(at)::text, '-') FROM audit_events WHERE at < now() - make_interval(days => $days)" |
+      { read -r n oldest; say "retention $days days: $n events would be deleted (oldest: $oldest); nothing was deleted"; }
+    ;;
+
   revoke)
     [ $# -eq 2 ] || { say "usage: pmos-admin revoke <handle> <atlassian|slack|github>" >&2; exit 2; }
+    require_handle revoke "$1"
+    case "$2" in
+      atlassian | slack | github) ;;
+      *) say "usage: pmos-admin revoke <handle> <atlassian|slack|github> (not $(printf '%q' "$2"))" >&2; exit 2 ;;
+    esac
     internal DELETE "/internal/credentials/$1/$2" && say "revoked $2 for $1"
+    ;;
+
+  users)
+    # The user database's host commands (docs/runbooks/users.md): `pmos-toolserver users …` in a
+    # one-off tool server container, with the database's own access. The OS user who ran it is
+    # passed as PMOS_HOST_USER and recorded with every change; the tool server refuses to run
+    # without it. A one-off container starts no service, so this needs no assertion check
+    # (that is for `up`, `add-bot` and `restore`), and break glass works whatever the mode.
+    users_usage() {
+      say "usage: pmos-admin users <bootstrap-admin|grant-admin|revoke-admin|set-entra|unset-entra|set-sign-in-name|set-atlassian-email|deactivate|reactivate|pilot-exception|password-setup|import|export|list> …" >&2
+      exit 2
+    }
+    [ $# -ge 1 ] || users_usage
+    case "$1" in
+      bootstrap-admin | grant-admin | revoke-admin | set-entra | unset-entra | set-sign-in-name | \
+        set-atlassian-email | deactivate | reactivate | pilot-exception | password-setup | import | \
+        export | list) ;;
+      *) users_usage ;;
+    esac
+    host_user=${SUDO_USER:-$(id -un)}
+    if ! [[ "$host_user" =~ ^[a-z_][a-z0-9_.-]{0,31}$ ]]; then
+      say "the OS user \"$host_user\" can't be recorded (it must match ^[a-z_][a-z0-9_.-]{0,31}\$): run this as a named user" >&2
+      exit 2
+    fi
+    run=(run --rm --no-deps -e "PMOS_HOST_USER=$host_user")
+    # --oid needs the tenant: the web app's.
+    if [ -n "${PMOS_WEB_ENTRA_TENANT_ID:-}" ]; then
+      run+=(-e "PMOS_ENTRA_TENANT_ID=$PMOS_WEB_ENTRA_TENANT_ID")
+    fi
+    # A terminal only when there is one (`import --allow-admins` asks on it; `export > f` has none).
+    if ! [ -t 0 ] || ! [ -t 1 ]; then run+=(-T); fi
+    if [ "$1" = import ]; then
+      # The file the operator names (an old team.yaml, normally read from the content checkout
+      # at a reviewed commit before the pull request that deletes it) is mounted read-only into
+      # the one-off container under a neutral name; never a URL.
+      shift
+      from=""
+      args=(import)
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --from) [ $# -ge 2 ] || users_usage; from=$2; shift 2 ;;
+          *) args+=("$1"); shift ;;
+        esac
+      done
+      [ -n "$from" ] || { say "usage: pmos-admin users import --from <file> [--commit <sha>] [--allow-admins | --bootstrap] [--apply]" >&2; exit 2; }
+      [ -f "$from" ] || { say "no file $from" >&2; exit 2; }
+      from="$(cd "$(dirname "$from")" && pwd)/$(basename "$from")"
+      case "$from" in *:*) say "the path to import can't contain ':'" >&2; exit 2 ;; esac
+      run+=(-v "$from:/run/pmos-import/members.yaml:ro")
+      args+=(--from /run/pmos-import/members.yaml)
+    else
+      args=("$@")
+    fi
+    # The one-off service without the tool server's pinned address (deploy/compose.yaml).
+    compose --profile cli "${run[@]}" toolserver-cli pmos-toolserver users "${args[@]}"
     ;;
 
   ledger)
@@ -271,42 +2552,130 @@ for r in json.load(sys.stdin)["rows"]: print(json.dumps(r))'
 import json, sys
 s = json.load(sys.stdin)
 print(f"drafts since {s.get("since", "?")}: {s["rows"]}, labelled {s["label_coverage"]:.0%} (phase 0 gate: 95%)")
-print(f"  {"bot/skill":<18} {"tool":<26} {"n":>4} {"ok":>4} {"edit":>4} {"rej":>4} {"exp":>4} {"med edit":>8}  reasons")
+fast_s = s.get("fast_approval_seconds", "?")
+print(f"  med dec: median time to a decision; fast: approved unchanged within {fast_s}s, of n timed (a tripwire, never a target)")
+print(f"  {"bot/skill":<18} {"tool":<26} {"n":>4} {"ok":>4} {"edit":>4} {"rej":>4} {"exp":>4} {"med edit":>8} {"med dec":>7} {"fast":>10}  reasons")
+def took(sec):
+    if sec is None: return "-"
+    if sec < 60: return f"{sec:.1f}s"
+    if sec < 3600: return f"{sec / 60:.0f}m"
+    return f"{sec / 3600:.1f}h"
 for g in s["groups"]:
     c = g["counts"]
     med = g.get("median_edit_distance")
+    share, base = g.get("fast_approval_share"), g.get("fast_approval_rows", 0)
+    fast = f"{share:.0%} of {base}" if share is not None else "-"
     reasons = ", ".join(f"{k} {v}" for k, v in sorted(g.get("reasons", {}).items()) if v)
     who = g.get("bot") or g.get("skill") or "?"
-    print(f"  {who:<18} {g["tool"]:<26} {g["rows"]:>4} {c.get("approved",0):>4} {c.get("edited",0):>4} {c.get("rejected",0):>4} {c.get("expired",0):>4} {(f"{med:.0%}" if med is not None else "-"):>8}  {reasons}")
+    print(f"  {who:<18} {g["tool"]:<26} {g["rows"]:>4} {c.get("approved",0):>4} {c.get("edited",0):>4} {c.get("rejected",0):>4} {c.get("expired",0):>4} {(f"{med:.0%}" if med is not None else "-"):>8} {took(g.get("median_decision_seconds")):>7} {fast:>10}  {reasons}")
 '
     ;;
 
   add-bot)
     [ $# -eq 1 ] || { say "usage: pmos-admin add-bot <bot>" >&2; exit 2; }
     bot=$1
+    # Checked before anything: the name goes into deploy/.env (`worker-<bot>=<token>`), where a
+    # comma or `=` would add or override another bot's token.
+    require_bot_name add-bot "$bot"
     if [ "$bot" = docs ]; then
       say "the Docs bot's tokens are built in (PMOS_RT_DOCS_WORKER_TOKEN)"
       exit 0
     fi
-    if [[ ",${PMOS_RT_WORKER_TOKENS:-}," == *",worker-$bot="* ]]; then
+    # Read deploy/.env again under the lock, so another add-bot's tokens, written since the
+    # top of this script, are kept.
+    lock_env
+    load_env
+    if [ -n "$(list_value "${PMOS_RT_WORKER_TOKENS:-}" "worker-$bot")" ]; then
       say "$bot already has tokens"
       exit 0
     fi
+    # The runtime is recreated with deploy/.env as it is, assertions included: the web app and
+    # the console may be running against it. Checked before anything is written.
+    assertion_checks || exit 2
+    model_source_checks || exit 2
+    run_preflight add-bot --stage run --starting
     rt=$(openssl rand -hex 24)
     gw=$(openssl rand -hex 24)
     set_env PMOS_RT_WORKER_TOKENS "${PMOS_RT_WORKER_TOKENS:+$PMOS_RT_WORKER_TOKENS,}worker-$bot=$rt"
     set_env PMOS_GW_BOT_TOKENS "${PMOS_GW_BOT_TOKENS:+$PMOS_GW_BOT_TOKENS,}bot-$bot=$gw"
+    # Read deploy/.env again: compose prefers this process's environment over --env-file, so
+    # the values read at the top would hide the new tokens.
+    load_env
     compose up -d bots gateway
     say "tokens added for $bot; the runtime and gateway were restarted with them."
     say "next: deploy/pmos-admin sandbox $bot"
     ;;
 
   sandbox)
-    # Verify on the Spark: the OpenShell command names and flags (`--image`, keeping the worker
-    # running after `sandbox exec`), as listed in docs/sandbox-policies.md.
-    [ $# -eq 1 ] || { say "usage: pmos-admin sandbox <bot>" >&2; exit 2; }
-    bot=$1
-    command -v openshell >/dev/null || { say "openshell is not installed" >&2; exit 1; }
+    # What each step rests on (slice H0; docs/openshell-any-host-spec.md §3.7). Nothing here
+    # has run on a real OpenShell yet; the acceptance run (§6) checks each "verify" below.
+    # - `sandbox create --from <image>`: OpenShell's sandbox page documents `--from` with "an
+    #   explicit OCI image reference" built and tagged "with the container engine used by your
+    #   local gateway" (the earlier `--image` isn't documented). Verify on a real host: that it
+    #   takes the local tag pmos-worker:<version> without a registry.
+    # - The worker runs as the systemd user unit deploy/systemd/pmos-worker@.service (no more
+    #   `&` from the operator's shell, which died at logout and never came back after a reboot).
+    #   Verify on a real host: that `sandbox exec` stays in the foreground for the worker's life,
+    #   and the name of OpenShell's gateway unit (see the unit file).
+    # - `--policy`, `--provider` and `--upload`: as in docs/sandbox-policies.md.
+    # - The providers (provider_upsert): OpenShell's providers page (how-it-works/providers/
+    #   overview.mdx, read 2026-11-22) makes providers their own resources, attached to
+    #   sandboxes and deleted separately ("first detach the providers from any sandboxes that
+    #   still use them. Then delete the providers"), and documents `provider get <name>` and
+    #   `provider update <name> --credential <VAR>` (it replaces the credential, and attached
+    #   sandboxes apply it for new processes). So a provider survives `sandbox delete`, and
+    #   creating it again would collide: an existing one is updated with the token from
+    #   deploy/.env instead, which is also how a rotated token reaches it (docs/runbooks/
+    #   incidents.md). `--credential <VAR>` without a value reads the token from the
+    #   environment, never the command line (the same page: a value there is in "the host
+    #   process table"). Verify on a real host: that `provider get` exits non-zero only for a
+    #   provider that doesn't exist, and that `provider create` refuses an existing name.
+    sandbox_usage() { say "usage: pmos-admin sandbox <bot> [--dry-run]" >&2; exit 2; }
+    dry=0
+    names=()
+    for a in "$@"; do
+      case "$a" in
+        --dry-run) dry=1 ;;
+        -*) sandbox_usage ;;
+        *) names+=("$a") ;;
+      esac
+    done
+    [ ${#names[@]} -eq 1 ] || sandbox_usage
+    bot=${names[0]}
+    require_bot_name sandbox "$bot"
+    # Slice H2 (docs/openshell-any-host-spec.md §3.3): no sandbox starts while the three names
+    # don't resolve on this host to their pinned addresses (a missing, stale or loopback entry,
+    # or the red team's temporary line, RT-13b), with --dry-run too, which shows what would run.
+    if ! problems=$(host_names_problems); then
+      {
+        say "pmos-admin sandbox: the service names fail their check, so the sandbox couldn't reach"
+        say "the services by them, or would reach something else:"
+        sed 's/^/  /' <<<"$problems"
+        say "Fix it, then run this again: sudo deploy/pmos-admin host-names apply"
+      } >&2
+      exit 2
+    fi
+    # Fake-data mode (slice H4): nothing is uploaded from a checkout that isn't test content,
+    # with --dry-run too.
+    if [ "${PMOS_MODEL_SOURCE:-}" = hosted-test ] && ! problems=$(test_content_problems); then
+      {
+        say "pmos-admin sandbox: PMOS_MODEL_SOURCE=hosted-test allows fake data only, and the content checkout isn't test content, so nothing is uploaded:"
+        sed 's/^/  /' <<<"$problems"
+      } >&2
+      exit 2
+    fi
+    # And the same check in the image (`pmos content check-test`, slice H4), as the services
+    # run it, before anything is created.
+    if [ "${PMOS_MODEL_SOURCE:-}" = hosted-test ] && [ "$dry" != 1 ]; then
+      pmos_cli pmos content check-test --root content >&2 || {
+        say "pmos-admin sandbox: the content check refused the checkout (above); nothing was uploaded" >&2
+        exit 2
+      }
+    fi
+    [ "$dry" = 1 ] || command -v openshell >/dev/null || { say "openshell is not installed" >&2; exit 1; }
+    # The host preflight with the OpenShell checks, two canary sandboxes included (slice H1).
+    # --dry-run creates nothing, so it runs the host checks only.
+    if [ "$dry" = 1 ]; then run_preflight sandbox --stage run; else run_preflight sandbox --stage run --openshell; fi
     spec="$PMOS_CONTENT_CHECKOUT/policies/bots/$bot.sandbox.yaml"
     policy="$PMOS_CONTENT_CHECKOUT/policies/bots/$bot.yaml"
     [ -f "$spec" ] && [ -f "$policy" ] || { say "no generated policy for $bot in the content checkout; run pmos policy generate and merge it" >&2; exit 1; }
@@ -314,38 +2683,392 @@ for g in s["groups"]:
       rt=$PMOS_RT_DOCS_WORKER_TOKEN
       gw=$PMOS_GW_DOCS_BOT_TOKEN
     else
-      rt=$(tr ',' '\n' <<<"${PMOS_RT_WORKER_TOKENS:-}" | sed -n "s/^worker-$bot=//p")
-      gw=$(tr ',' '\n' <<<"${PMOS_GW_BOT_TOKENS:-}" | sed -n "s/^bot-$bot=//p")
+      rt=$(list_value "${PMOS_RT_WORKER_TOKENS:-}" "worker-$bot")
+      gw=$(list_value "${PMOS_GW_BOT_TOKENS:-}" "bot-$bot")
       [ -n "$rt" ] && [ -n "$gw" ] || { say "run deploy/pmos-admin add-bot $bot first" >&2; exit 1; }
     fi
+    [ "$dry" = 1 ] || worker_unit_checks
     sandbox="pmos-$bot"
+    unit=$(worker_unit "$bot")
     # Uploads come from the generated spec: `from` is relative to the content root.
     uploads=()
+    # Slice H12 (spec §3.6, V11): under hosted with a data-class ceiling below restricted, master
+    # context counts as restricted unless its first line is a sensitivity marker, and a file
+    # above the ceiling isn't uploaded (named with its class, never its text).
+    ceiling=""
+    if [ "${PMOS_MODEL_SOURCE:-}" = hosted ]; then
+      ceiling=${PMOS_HOSTED_MAX_DATA_CLASS:-$(sed -n 's/^[[:space:]]*max_data_class:[[:space:]]*"\{0,1\}\([a-z]*\).*/\1/p' "$ROOT/$APPROVED_LIST" 2>/dev/null | head -1)}
+    fi
     while read -r from to; do
+      if [ -n "$ceiling" ] && [ "$ceiling" != restricted ] && [[ "$from" == master/* ]]; then
+        cls=restricted
+        case "$(head -n 1 "$PMOS_CONTENT_CHECKOUT/content/$from" 2>/dev/null)" in
+          '<!-- sensitivity: public -->') cls=public ;;
+          '<!-- sensitivity: internal -->') cls=internal ;;
+        esac
+        if [ "$cls" = restricted ] || { [ "$cls" = internal ] && [ "$ceiling" = public ]; }; then
+          say "pmos-admin sandbox: content/$from counts as $cls data, above the hosted model's data-class ceiling ($ceiling); nothing was uploaded. If it holds less, mark its first line <!-- sensitivity: public --> or <!-- sensitivity: internal -->" >&2
+          exit 2
+        fi
+      fi
       uploads+=(--upload "$PMOS_CONTENT_CHECKOUT/content/$from:$to")
     done < <(awk '/^  - from: /{f=$3} /^    to: /{print f, $2}' "$spec")
-    PMOS_GATEWAY_TOKEN=$gw openshell provider create --name "$sandbox-gateway" --type pmos-gateway --credential PMOS_GATEWAY_TOKEN
-    PMOS_WORKER_TOKEN=$rt openshell provider create --name "$sandbox-worker" --type pmos-worker --credential PMOS_WORKER_TOKEN
-    openshell sandbox create --name "$sandbox" --image "pmos-worker:${PMOS_VERSION:-local}" --policy "$policy" \
+    pmos_sandbox_create_cmd "$sandbox" "${PMOS_VERSION:-local}" "$policy" \
       --provider "$sandbox-gateway" --provider "$sandbox-worker" "${uploads[@]}"
-    openshell sandbox exec -n "$sandbox" --workdir /sandbox/workspace -- env \
-      PMOS_BOTS_URL=http://bots.pmos.internal:8750 PMOS_WORKER_BOT="$bot" \
-      PMOS_GATEWAY_URL=http://gateway.pmos.internal:8740/v1 \
-      PMOS_TOOLSERVER_MCP_URL=http://toolserver.pmos.internal:8710/mcp \
-      PMOS_CONTENT_ROOT=/sandbox \
-      /usr/local/bin/node /opt/pmos/harness/dist/main.js &
-    say "sandbox $sandbox created and its worker started"
+    create=("${SANDBOX_CREATE[@]}")
+    if [ "$dry" = 1 ]; then
+      # What would run; the tokens are never printed.
+      say "openshell provider get $sandbox-gateway: if it exists, openshell provider update $sandbox-gateway --credential PMOS_GATEWAY_TOKEN; else openshell provider create --name $sandbox-gateway --type pmos-gateway --credential PMOS_GATEWAY_TOKEN  (the token from deploy/.env, in the environment)"
+      say "openshell provider get $sandbox-worker: if it exists, openshell provider update $sandbox-worker --credential PMOS_WORKER_TOKEN; else openshell provider create --name $sandbox-worker --type pmos-worker --credential PMOS_WORKER_TOKEN  (the token from deploy/.env, in the environment)"
+      say "openshell ${create[*]}"
+      say "install $WORKER_UNIT_TEMPLATE as $(user_unit_dir)/pmos-worker@.service"
+      say "systemctl --user daemon-reload"
+      say "systemctl --user enable --now $unit"
+      exit 0
+    fi
+    PMOS_GATEWAY_TOKEN=$gw provider_upsert "$sandbox-gateway" pmos-gateway PMOS_GATEWAY_TOKEN
+    PMOS_WORKER_TOKEN=$rt provider_upsert "$sandbox-worker" pmos-worker PMOS_WORKER_TOKEN
+    openshell "${create[@]}"
+    install_worker_unit
+    systemctl --user daemon-reload
+    systemctl --user enable --now "$unit"
+    say "sandbox $sandbox created; its worker runs as the user unit $unit"
+    say "check it with: systemctl --user status '$unit'"
+    say "next: deploy/pmos-admin policy prove $bot (OpenShell's prover on the policy the sandbox enforces)"
     ;;
 
   pause)
+    # The unit is disabled as well as stopped, so a paused bot stays paused after a reboot.
+    # A pause is the first step of an incident (docs/runbooks/incidents.md). So (the security
+    # review of 6bb806f, S2): as root it refuses, as `sandbox` and `resume` do, because root's
+    # `systemctl --user` and openshell aren't the gateway user's, and the worker unit would stay
+    # enabled and start the worker again; when the unit can't be found or stopped it says so
+    # plainly; and the sandbox is stopped whatever happened to the unit. Anything left undone is
+    # listed at the end, and then the exit is 1.
     [ $# -eq 1 ] || { say "usage: pmos-admin pause <bot>" >&2; exit 2; }
-    openshell sandbox stop -n "pmos-$1"
-    say "pmos-$1 stopped; its queued tasks wait (and fail after their retry) until resume"
+    bot=$1
+    require_bot_name pause "$bot"
+    if command -v systemd-escape >/dev/null; then
+      unit=$(worker_unit "$bot")
+    else
+      unit="pmos-worker@<systemd-escape -- $bot>.service"
+    fi
+    if [ "$(id -u)" = 0 ]; then
+      say "run pause as the user whose OpenShell gateway runs, not as root or with sudo: root's systemctl --user" >&2
+      say "and openshell aren't that user's, so the worker unit would stay enabled and start the worker again." >&2
+      say "As that user: deploy/pmos-admin pause $bot" >&2
+      say "or by hand: systemctl --user disable --now '$unit'; openshell sandbox stop -n pmos-$bot" >&2
+      exit 1
+    fi
+    left=()
+    if ! command -v systemctl >/dev/null || ! command -v systemd-escape >/dev/null; then
+      left+=("systemctl or systemd-escape isn't installed, so no worker unit was stopped: if pmos-$bot's worker runs, stop it (pgrep -af 'openshell sandbox exec -n pmos-$bot')")
+    elif systemctl --user disable --now "$unit"; then
+      # Tried whether or not the template is under this caller's XDG_CONFIG_HOME: the user's
+      # systemd may have it from another directory (the review of eb49991).
+      say "worker unit $unit stopped and disabled"
+    elif [ ! -f "$(user_unit_dir)/pmos-worker@.service" ]; then
+      say "couldn't stop and disable $unit, and no worker unit is installed for $(id -un) ($(user_unit_dir)/pmos-worker@.service is missing); stopping the sandbox anyway" >&2
+      left+=("no worker unit was found for $(id -un): if pmos-$bot's worker was started another way (with & before slice H0, or as another user), find and stop it: pgrep -af 'openshell sandbox exec -n pmos-$bot'")
+    else
+      say "couldn't stop and disable $unit; stopping the sandbox anyway" >&2
+      left+=("the worker unit $unit may still be enabled or running: systemctl --user status '$unit', then systemctl --user disable --now '$unit'")
+    fi
+    if ! command -v openshell >/dev/null; then
+      left+=("openshell isn't on PATH, so the sandbox pmos-$bot was NOT stopped: openshell sandbox stop -n pmos-$bot (or openshell sandbox delete pmos-$bot)")
+    elif openshell sandbox stop -n "pmos-$bot"; then
+      say "pmos-$bot stopped; its queued tasks wait (and fail after their retry) until resume"
+    else
+      left+=("the sandbox pmos-$bot was NOT stopped: openshell sandbox stop -n pmos-$bot (or openshell sandbox delete pmos-$bot), then check openshell sandbox list")
+    fi
+    if [ ${#left[@]} -gt 0 ]; then
+      say "pause of $bot is NOT complete. Left to do:" >&2
+      for l in "${left[@]}"; do say "  - $l" >&2; done
+      exit 1
+    fi
     ;;
 
   resume)
+    # Also how a sandbox made before the worker unit existed gets one (docs/runbooks/upgrade.md).
     [ $# -eq 1 ] || { say "usage: pmos-admin resume <bot>" >&2; exit 2; }
+    require_bot_name resume "$1"
+    command -v openshell >/dev/null || { say "openshell is not installed" >&2; exit 1; }
+    worker_unit_checks
+    # The service names (slice H2's check, which resume skipped) and the rest of the host, with
+    # the OpenShell checks (slice H1).
+    if ! problems=$(host_names_problems); then
+      {
+        say "pmos-admin resume: the service names fail their check:"
+        sed 's/^/  /' <<<"$problems"
+        say "Fix it, then run this again: sudo deploy/pmos-admin host-names apply"
+      } >&2
+      exit 2
+    fi
+    run_preflight resume --stage run --openshell
+    unit=$(worker_unit "$1")
     openshell sandbox start -n "pmos-$1"
+    install_worker_unit
+    systemctl --user daemon-reload
+    # A unit that hit its start limit stays failed until this.
+    systemctl --user reset-failed "$unit" 2>/dev/null || true
+    systemctl --user enable --now "$unit"
+    say "pmos-$1 started; its worker runs as the user unit $unit"
+    say "next: deploy/pmos-admin policy prove $1 (OpenShell's prover on the policy the sandbox now enforces)"
+    ;;
+
+  policy)
+    # OpenShell's policy prover on what each sandbox enforces (slice A3;
+    # docs/openshell-prover-and-sandbox-audit-spec.md §A.1 and §A.5). Run as the user whose
+    # OpenShell gateway runs (as `sandbox` requires), never as root. For each bot:
+    #   1. `openshell sandbox get pmos-<bot> --policy-only` into a mode-600 file in a mode-700
+    #      directory (verify on a real host: that it prints a policy the prover reads, and that it
+    #      equals the checked-in one for PM OS's endpointless providers);
+    #   2. `pmos policy prove --candidate …` in the pmos image, as this user, with no network, the
+    #      checkout, the candidate, the prover and the pin mounted read-only: it checks the prover's
+    #      SHA-256 (against PMOS_PROVER_BUILD_RECORD, the record of a build of the pinned source
+    #      commit, or a hash in the lock) and version against deploy/openshell-prover.lock, builds
+    #      the network view and
+    #      classifies the answer (only `proved` passes). The prover runs with an empty environment
+    #      and holds no provider token; no sandbox and no service is involved;
+    #   3. `pmos-toolserver policy-proof record` in a one-off tool server container records the
+    #      result with PMOS_HOST_USER (table policy_proofs and an audit event policy.prove).
+    # No prover on this host (PMOS_PROVER in deploy/.env, else openshell-prover on PATH) is
+    # recorded as `not_available`, never skipped.
+    policy_usage() { say "usage: pmos-admin policy prove <bot> | --all" >&2; exit 2; }
+    [ $# -eq 2 ] && [ "$1" = prove ] || policy_usage
+    if [ "$(id -u)" = 0 ]; then
+      say "run policy prove as the user whose OpenShell gateway runs, not as root or with sudo: the prover never runs as root" >&2
+      exit 2
+    fi
+    host_user=$(id -un)
+    if ! [[ "$host_user" =~ ^[a-z_][a-z0-9_.-]{0,31}$ ]]; then
+      say "the OS user \"$host_user\" can't be recorded (it must match ^[a-z_][a-z0-9_.-]{0,31}\$): run this as a named user" >&2
+      exit 2
+    fi
+    bots=()
+    if [ "$2" = --all ]; then
+      for f in "$PMOS_CONTENT_CHECKOUT"/policies/bots/*.yaml; do
+        [ -f "$f" ] || continue
+        b=$(basename "$f" .yaml)
+        case "$b" in *.sandbox) continue ;; esac
+        if valid_bot_name "$b"; then bots+=("$b"); else say "skipping $(printf '%q' "$b"): not a bot name" >&2; fi
+      done
+      [ ${#bots[@]} -gt 0 ] || { say "no bot policies under $PMOS_CONTENT_CHECKOUT/policies/bots" >&2; exit 1; }
+    else
+      require_bot_name "policy prove" "$2"
+      bots=("$2")
+    fi
+    [ -f "$PMOS_CONTENT_CHECKOUT/policies/boundary/pmos-bot.yaml" ] ||
+      { say "no boundary at $PMOS_CONTENT_CHECKOUT/policies/boundary/pmos-bot.yaml" >&2; exit 1; }
+    command -v openshell >/dev/null || { say "openshell is not installed" >&2; exit 1; }
+    prover=${PMOS_PROVER:-}
+    [ -n "$prover" ] || prover=$(command -v openshell-prover || true)
+    case "$prover" in *:*) say "PMOS_PROVER can't contain ':'" >&2; exit 2 ;; esac
+    PROVE_TMP=$(umask 077 && mktemp -d "${TMPDIR:-/tmp}/pmos-prove.XXXXXX")
+    chmod 700 "$PROVE_TMP"
+    mounts=(-v "$PMOS_CONTENT_CHECKOUT:/srv/content-repo:ro" -v "$PROVE_TMP:/run/pmos-prove:ro"
+      -v "$DEPLOY/openshell-prover.lock:/run/pmos-prove-lock/openshell-prover.lock:ro")
+    if [ -n "$prover" ] && [ -f "$prover" ]; then
+      mounts+=(-v "$prover:/run/pmos-prover/openshell-prover:ro")
+    else
+      say "no prover on this host (set PMOS_PROVER, or install openshell-prover): every bot is recorded not_available" >&2
+    fi
+    # A prover built on this host from the pinned source (scripts/build-openshell-prover.sh) has
+    # no SHA-256 in the lock: its build record (PMOS_PROVER_BUILD_RECORD) names the commit, the
+    # version and the binary's SHA-256, and `pmos policy prove` checks all three against the pin.
+    record=${PMOS_PROVER_BUILD_RECORD:-}
+    record_args=()
+    case "$record" in *:*) say "PMOS_PROVER_BUILD_RECORD can't contain ':'" >&2; exit 2 ;; esac
+    if [ -n "$record" ]; then
+      [ -f "$record" ] || { say "PMOS_PROVER_BUILD_RECORD names no file: $record" >&2; exit 2; }
+      mounts+=(-v "$record:/run/pmos-prover-record/build.record:ro")
+      record_args=(--build-record /run/pmos-prover-record/build.record)
+    fi
+    failed=0
+    for bot in "${bots[@]}"; do
+      if ! (umask 077 && openshell sandbox get "pmos-$bot" --policy-only >"$PROVE_TMP/$bot.yaml"); then
+        say "openshell couldn't print pmos-$bot's policy: recorded as an error" >&2
+        rm -f "$PROVE_TMP/$bot.yaml"
+      fi
+      code=0
+      docker run --rm --network none --user "$(id -u):$(id -g)" "${mounts[@]}" -w /srv/content-repo \
+        "pmos:${PMOS_VERSION:-local}" pmos policy prove --root content \
+        --boundary policies/boundary/pmos-bot.yaml --prover /run/pmos-prover/openshell-prover \
+        --lock /run/pmos-prove-lock/openshell-prover.lock "${record_args[@]}" --candidate "/run/pmos-prove/$bot.yaml" \
+        --bot "$bot" --format json >"$PROVE_TMP/$bot.json" || code=$?
+      if [ "$code" -gt 1 ] || ! [ -s "$PROVE_TMP/$bot.json" ]; then
+        say "pmos policy prove couldn't run for $bot (exit $code): nothing recorded for it" >&2
+        failed=1
+        continue
+      fi
+      compose --profile cli run --rm --no-deps -T -e "PMOS_HOST_USER=$host_user" toolserver-cli \
+        pmos-toolserver policy-proof record <"$PROVE_TMP/$bot.json" || { failed=1; continue; }
+      [ "$code" = 0 ] || failed=1
+    done
+    [ "$failed" = 0 ] && say "every bot proved" || say "not every bot is proved: only \`proved\` passes (Policy Admin shows each result)" >&2
+    exit "$failed"
+    ;;
+
+  sandbox-audit)
+    # OpenShell's own sandbox decisions into the audit log (slice B3;
+    # docs/openshell-prover-and-sandbox-audit-spec.md Part B). Off unless configured.
+    #   configure  make the collector's tool-server token (PMOS_SANDBOX_AUDIT_TOKEN in
+    #              deploy/.env) and OpenShell's header token (the headers file, mode 640), and
+    #              print the gateway.toml lines; no token is printed
+    #   check      the tokens are there and OpenShell's gateway.toml has every line, and no trace
+    #              export; exits 1 naming each problem
+    #   up         after check: (re)start the tool server with the token and the collector
+    # Verify on a real host (slice B6): the gateway.toml path (PMOS_OPENSHELL_GATEWAY_TOML, else
+    # ~/.config/openshell/gateway.toml), and that OpenShell reads `headers_file` as written here.
+    audit_usage() { say "usage: pmos-admin sandbox-audit configure|check|up" >&2; exit 2; }
+    [ $# -eq 1 ] || audit_usage
+    headers="${PMOS_STATE_DIR:?run deploy/setup.sh first}/secrets/otlp-ocsf.headers"
+    port=${PMOS_SANDBOX_AUDIT_PORT:-8780}
+    toml=${PMOS_OPENSHELL_GATEWAY_TOML:-${XDG_CONFIG_HOME:-$HOME/.config}/openshell/gateway.toml}
+    expected_lines() {
+      printf '%s\n' '[openshell.gateway.otlp.ocsf]' 'enabled = true' \
+        "endpoint = \"http://127.0.0.1:$port\"" 'protocol = "http/protobuf"' \
+        "headers_file = \"$headers\""
+    }
+    audit_problems() {
+      local probs=() line section
+      is_set PMOS_SANDBOX_AUDIT_TOKEN && token_ok PMOS_SANDBOX_AUDIT_TOKEN 2>/dev/null ||
+        probs+=("PMOS_SANDBOX_AUDIT_TOKEN isn't set in deploy/.env: run deploy/pmos-admin sandbox-audit configure")
+      if [ ! -f "$headers" ]; then
+        probs+=("no headers file at $headers: run deploy/pmos-admin sandbox-audit configure")
+      else
+        case "$(stat -c %a "$headers")" in 600 | 640 | 400 | 440) ;; *) probs+=("$headers must be mode 640 or stricter (it holds OpenShell's header token)") ;; esac
+        grep -qE '^authorization=Bearer [0-9a-f]{48}$' "$headers" || probs+=("$headers isn't one line authorization=Bearer <token>")
+      fi
+      if [ ! -f "$toml" ]; then
+        probs+=("no OpenShell gateway configuration at $toml (set PMOS_OPENSHELL_GATEWAY_TOML)")
+      else
+        # The section's own lines, as data: from its header to the next section.
+        section=$(awk '/^[[:space:]]*\[/ { on = ($0 ~ /^[[:space:]]*\[openshell\.gateway\.otlp\.ocsf\][[:space:]]*$/) } on { sub(/[[:space:]]*#.*/, ""); gsub(/^[[:space:]]+|[[:space:]]+$/, ""); gsub(/[[:space:]]*=[[:space:]]*/, " = "); if ($0 != "") print }' "$toml")
+        while IFS= read -r line; do
+          grep -qxF -- "$line" <<<"$section" || probs+=("$toml lacks: $line")
+        done < <(expected_lines)
+        # No trace or agent-trace export: [openshell.gateway.otlp] with an endpoint.
+        if awk '/^[[:space:]]*\[/ { on = ($0 ~ /^[[:space:]]*\[openshell\.gateway\.otlp\][[:space:]]*$/) } on && /^[[:space:]]*endpoint[[:space:]]*=/ { f = 1 } END { exit !f }' "$toml"; then
+          probs+=("$toml sets [openshell.gateway.otlp] endpoint: no traces may be exported, only [openshell.gateway.otlp.ocsf]")
+        fi
+      fi
+      [ ${#probs[@]} -eq 0 ] || { printf '%s\n' "${probs[@]}"; return 1; }
+    }
+    case "$1" in
+      configure)
+        if is_set PMOS_SANDBOX_AUDIT_TOKEN; then
+          say "PMOS_SANDBOX_AUDIT_TOKEN in deploy/.env is kept"
+        else
+          set_env PMOS_SANDBOX_AUDIT_TOKEN "$(openssl rand -hex 24)"
+          say "wrote PMOS_SANDBOX_AUDIT_TOKEN to deploy/.env (the collector's own token; not shown)"
+        fi
+        if [ -f "$headers" ] && grep -qE '^authorization=Bearer [0-9a-f]{48}$' "$headers"; then
+          say "$headers is kept"
+        else
+          mkdir -p "$(dirname "$headers")"
+          if ! (umask 027 && printf 'authorization=Bearer %s\n' "$(openssl rand -hex 24)" >"$headers.new" &&
+            chmod 640 "$headers.new" && mv -f "$headers.new" "$headers"); then
+            rm -f "$headers.new"
+            say "couldn't write $headers" >&2
+            exit 1
+          fi
+          say "wrote $headers (OpenShell's header token, mode 640; not shown)"
+        fi
+        # The collector reads it as group ${PMOS_GID:-10001}; OpenShell's gateway as its owner.
+        chgrp "${PMOS_GID:-10001}" "$headers" 2>/dev/null ||
+          say "couldn't give $headers to group ${PMOS_GID:-10001}: run sudo chgrp ${PMOS_GID:-10001} '$headers'" >&2
+        say ""
+        say "Add this to OpenShell's gateway configuration ($toml), with no [openshell.gateway.otlp]"
+        say "endpoint (no traces), then restart OpenShell's gateway and run deploy/pmos-admin sandbox-audit check:"
+        say ""
+        expected_lines
+        ;;
+      check)
+        if ! problems=$(audit_problems); then
+          say "pmos-admin sandbox-audit check: OpenShell's export to the collector isn't set up:" >&2
+          sed 's/^/  /' <<<"$problems" >&2
+          exit 1
+        fi
+        say "sandbox-audit: the tokens are set and $toml exports OCSF records (and only them) to 127.0.0.1:$port"
+        ;;
+      up)
+        if ! problems=$(audit_problems); then
+          say "pmos-admin sandbox-audit up: refused, the check fails:" >&2
+          sed 's/^/  /' <<<"$problems" >&2
+          exit 1
+        fi
+        compose --profile sandbox-audit up -d toolserver sandbox-audit
+        say "the collector is up on 127.0.0.1:$port; the tool server accepts its token"
+        ;;
+      *) audit_usage ;;
+    esac
+    ;;
+
+  host-names)
+    # Slice H2 (docs/openshell-any-host-spec.md §3.3 step 4). No argument beyond the action: the
+    # block always holds the pinned addresses, and there is no override of them or of the file.
+    hn_usage() { say "usage: sudo deploy/pmos-admin host-names apply, or deploy/pmos-admin host-names check (nothing else: the block always holds the pinned addresses)" >&2; exit 2; }
+    [ $# -eq 1 ] || hn_usage
+    case "$1" in
+      apply) host_names_apply ;;
+      check)
+        if problems=$(host_names_problems); then
+          host_names_ok_lines | sed 's/^/  ok    /'
+        else
+          sed 's/^/  FAIL  /' <<<"$problems"
+          exit 1
+        fi
+        ;;
+      *) hn_usage ;;
+    esac
+    ;;
+
+  preflight)
+    # By hand: every argument goes to deploy/preflight.sh (see its --help); deploy/.env is this
+    # deployment's. Its exit status is the preflight's.
+    code=0
+    "$PREFLIGHT" --env-file "$ENV" "$@" || code=$?
+    exit "$code"
+    ;;
+
+  host-firewall)
+    hf_usage() { say "usage: sudo deploy/pmos-admin host-firewall apply|remove, or deploy/pmos-admin host-firewall check" >&2; exit 2; }
+    [ $# -eq 1 ] || hf_usage
+    case "$1" in
+      apply)
+        host_firewall_apply
+        if problems=$(host_firewall_problems) && [ -n "$problems" ]; then
+          sed 's/^/  FAIL  /' <<<"$problems" >&2
+          exit 1
+        fi
+        ;;
+      remove) host_firewall_remove ;;
+      check)
+        problems=$(host_firewall_problems)
+        if [ -n "$problems" ]; then
+          sed 's/^/  FAIL  /' <<<"$problems"
+          exit 1
+        fi
+        say "  ok    the metadata block's rules, the docker.service drop-in and pmos-metadata-block.timer are in place"
+        ;;
+      *) hf_usage ;;
+    esac
+    ;;
+
+  host)
+    host_cmd "$@"
+    ;;
+
+  hosted)
+    hosted_cmd "$@"
+    ;;
+
+  hosted-key)
+    # Slice H12: the hosted model's key, from standard input (never an argument, never printed),
+    # into deploy/secrets/hosted-model.key (dir 700, file 600), mounted into the gateway only.
+    [ $# -eq 1 ] && [ "$1" = set ] || { say "usage: deploy/pmos-admin hosted-key set (the key on standard input)" >&2; exit 2; }
+    hosted_key_set
     ;;
 
   lint)
@@ -359,9 +3082,11 @@ for g in s["groups"]:
   evals)
     # The benchmarks and load test (docs/evals.md), run in the image on the stack's network.
     # Reports are written to evals/reports in the content checkout; commit them.
-    docker run --rm --user "${PMOS_UID:-10001}:${PMOS_GID:-10001}" --network pmos_pmos \
-      -v "$PMOS_CONTENT_CHECKOUT:/srv/content-repo" -w /srv/content-repo \
-      -e PMOS_BOTS_URL=http://bots.pmos.internal:8750 -e PMOS_EVALS_TOKEN="$PMOS_RT_EVALS_TOKEN" \
+    # The token by name only (`-e NAME`): docker takes the value from this environment, so it
+    # isn't on docker's command line (the security review of 6bb806f, S1).
+    PMOS_EVALS_TOKEN=${PMOS_RT_EVALS_TOKEN:-} docker run --rm --user "${PMOS_UID:-10001}:${PMOS_GID:-10001}" \
+      --network pmos_pmos -v "$PMOS_CONTENT_CHECKOUT:/srv/content-repo" -w /srv/content-repo \
+      -e PMOS_BOTS_URL=http://bots.pmos.internal:8750 -e PMOS_EVALS_TOKEN \
       -e PMOS_EVALS_ROOT=evals "pmos:${PMOS_VERSION:-local}" pmos-evals "$@"
     ;;
 
@@ -400,6 +3125,11 @@ for g in s["groups"]:
         *) gate_usage ;;
       esac
     done
+    # The base goes to `git diff` and `git archive` as a revision: one that starts with `-` would
+    # be read as an option (`--output=<file>`, `--remote=…`). So it is refused here, and both git
+    # commands also get it after `--end-of-options` (git 2.24 and later), which ends their
+    # options without making what follows a path, as `--` would.
+    case "$base" in -* | '') say "--base must name a revision, not $(printf '%q' "$base")" >&2; exit 2 ;; esac
     [ -d "$checkout" ] || { say "no directory $checkout" >&2; exit 2; }
     checkout=$(cd "$checkout" && pwd)
     if [ "$dry" = 1 ]; then
@@ -408,7 +3138,7 @@ for g in s["groups"]:
       say "base=$base"
       exit 0
     fi
-    changed=$(git -C "$checkout" diff --name-only "$base"...HEAD)
+    changed=$(git -C "$checkout" diff --name-only --end-of-options "$base"...HEAD)
     eval_stack_up "$checkout"
     mapfile -t categories < <(printf '%s\n' "$changed" | evals_runner affected --content content)
     if [ ${#categories[@]} -eq 0 ]; then
@@ -416,7 +3146,7 @@ for g in s["groups"]:
       exit 0
     fi
     # The baseline: the base branch's committed reports, unpacked where the runner can read them.
-    git -C "$checkout" archive "$base" evals/reports | tar -x -C "$PMOS_EVAL_BASELINE"
+    git -C "$checkout" archive --end-of-options "$base" evals/reports | tar -x -C "$PMOS_EVAL_BASELINE"
     worst=0
     for c in "${categories[@]}"; do
       code=0
@@ -430,22 +3160,148 @@ for g in s["groups"]:
 
   smoke)
     # One Docs-bot question through the whole stack, as the Slack bot would send it.
-    [ $# -eq 1 ] || { say "usage: pmos-admin smoke <handle in team.yaml>" >&2; exit 2; }
-    auth=(-H "Authorization: Bearer $PMOS_RT_SLACK_TOKEN" -H "X-Pmos-User: $1")
-    body=$(printf '{"bot":"docs","requested_by":"%s","text":"What does the docs site say about getting started?","source":"slack","slack":{"channel":"smoke","thread_ts":"0.0"}}' "$1")
-    task=$(curl -sS --noproxy '*' -X POST http://127.0.0.1:8750/v1/tasks "${auth[@]}" -H 'content-type: application/json' -d "$body")
+    [ $# -eq 1 ] || { say "usage: pmos-admin smoke <handle of an active user>" >&2; exit 2; }
+    handle=$1
+    require_handle smoke "$handle"
+    token_ok PMOS_RT_SLACK_TOKEN || exit 2
+    # The Slack runtime token on curl's standard input (bearer_config), never its command line.
+    rt_curl() {
+      { bearer_config PMOS_RT_SLACK_TOKEN; printf 'header = "X-Pmos-User: %s"\n' "$handle"; } |
+        curl --config - -sS --noproxy '*' "$@"
+    }
+    # The task's JSON from a real encoder (jq, or python3 where jq isn't installed).
+    if command -v jq >/dev/null; then
+      body=$(jq -cn --arg who "$handle" '{bot: "docs", requested_by: $who,
+        text: "What does the docs site say about getting started?", source: "slack",
+        slack: {channel: "smoke", thread_ts: "0.0"}}')
+    elif command -v python3 >/dev/null; then
+      body=$(python3 -I -c 'import json, sys
+print(json.dumps({"bot": "docs", "requested_by": sys.argv[1],
+  "text": "What does the docs site say about getting started?", "source": "slack",
+  "slack": {"channel": "smoke", "thread_ts": "0.0"}}, separators=(",", ":")))' "$handle")
+    else
+      say "smoke needs jq or python3 to write the task's JSON" >&2
+      exit 1
+    fi
+    task=$(rt_curl -X POST "http://127.0.0.1:$PMOS_BOTS_PORT/v1/tasks" -H 'content-type: application/json' -d "$body")
     id=$(sed -n 's/.*"id":"\(tsk_[0-9a-f]*\)".*/\1/p' <<<"$task")
     [ -n "$id" ] || { say "the runtime refused the task: $task" >&2; exit 1; }
     say "task $id queued; waiting up to 3 minutes for a worker"
     status=queued
     for _ in $(seq 1 90); do
-      status=$(curl -sS --noproxy '*' "http://127.0.0.1:8750/v1/tasks/$id" "${auth[@]}" | sed -n 's/.*"status":"\([a-z_]*\)".*/\1/p')
+      status=$(rt_curl "http://127.0.0.1:$PMOS_BOTS_PORT/v1/tasks/$id" | sed -n 's/.*"status":"\([a-z_]*\)".*/\1/p')
       case "$status" in done|failed|cancelled|needs_approval) break ;; esac
       sleep 2
     done
-    curl -sS --noproxy '*' "http://127.0.0.1:8750/v1/tasks/$id/events" "${auth[@]}" | tr '{' '\n' | sed -n 's/.*"kind":"\([a-z_]*\)".*"text":"\([^"]*\)".*/  \1: \2/p'
+    rt_curl "http://127.0.0.1:$PMOS_BOTS_PORT/v1/tasks/$id/events" | tr '{' '\n' | sed -n 's/.*"kind":"\([a-z_]*\)".*"text":"\([^"]*\)".*/  \1: \2/p'
     echo
     if [ "$status" = done ]; then say "smoke test passed"; else say "smoke test ended as: $status" >&2; exit 1; fi
+    ;;
+
+  upstream-key)
+    # Slice MP2 (docs/model-providers-spec.md §4.11): one key per upstream, read from standard
+    # input (never an argument, never printed), into deploy/secrets/upstream-<u>.key (dir 700,
+    # file 600), which `up` mounts into the gateway only.
+    [ $# -eq 2 ] && [ "$1" = set ] || { say "usage: pmos-admin upstream-key set <upstream> (the key on standard input)" >&2; exit 2; }
+    u=$2
+    [[ "$u" =~ $UPSTREAM_NAME_RE ]] || { say "an upstream's name is 1 to 32 lowercase letters, digits and inner hyphens (as in the route config's upstreams:)" >&2; exit 2; }
+    dir="$DEPLOY/secrets"
+    (umask 077 && mkdir -p "$dir") && chmod 700 "$dir"
+    if [ -t 0 ]; then
+      printf 'key for upstream %s (not shown): ' "$u" >&2
+      IFS= read -rs key || true
+      printf '\n' >&2
+    else
+      IFS= read -r key || true
+    fi
+    key=${key%$'\r'}
+    if [ -z "$key" ] || [[ "$key" == *[[:space:]]* ]]; then
+      say "no key was read, or it has spaces in it; nothing was written" >&2
+      exit 2
+    fi
+    dest="$dir/upstream-$u.key"
+    (umask 077 && printf '%s\n' "$key" >"$dest.new") && chmod 600 "$dest.new" && mv -f "$dest.new" "$dest" ||
+      { rm -f "$dest.new"; say "couldn't write $dest" >&2; exit 1; }
+    unset key
+    say "wrote deploy/secrets/upstream-$u.key (mode 600); the gateway reads a changed key within a second, or restart it to mount a new upstream's"
+    ;;
+
+  route)
+    # Slice MP8 (§4.11): $PMOS_STATE_DIR/route-control/disabled-<label>, which the gateway looks
+    # at before every call, takes that model out of every route without a restart; each change
+    # is a line in route-control/log.
+    usage_route() { say "usage: pmos-admin route disable <label> --reason <text> | route enable <label>" >&2; exit 2; }
+    [ $# -ge 2 ] || usage_route
+    action=$1 label=$2
+    shift 2
+    [ ${#label} -le 64 ] && [ -n "$label" ] && only_chars "$label" "$LABEL_CHARS" || { say "a label is 1 to 64 letters, digits, . _ and -" >&2; exit 2; }
+    [ -d "${PMOS_STATE_DIR:-}" ] || { say "PMOS_STATE_DIR isn't a directory: run deploy/setup.sh" >&2; exit 2; }
+    dir="$PMOS_STATE_DIR/route-control"
+    mkdir -p "$dir" && chmod 755 "$dir"
+    who=${SUDO_USER:-$(id -un)}
+    case "$action" in
+      disable)
+        [ $# -eq 2 ] && [ "$1" = --reason ] || usage_route
+        reason=$2
+        valid_reason "$reason" || { say "a reason is 1 to 200 printable characters on one line" >&2; exit 2; }
+        (umask 022 && printf 'at=%s by=%s reason=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$who" "$reason" >"$dir/disabled-$label")
+        (umask 022 && printf '%s\t%s\tdisable\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$who" "$label" "$reason" >>"$dir/log")
+        say "disabled $label: no route uses it from the gateway's next call (a role with no other model answers 503)"
+        ;;
+      enable)
+        [ $# -eq 0 ] || usage_route
+        rm -f -- "$dir/disabled-$label"
+        (umask 022 && printf '%s\t%s\tenable\t%s\t\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$who" "$label" >>"$dir/log")
+        say "enabled $label"
+        ;;
+      *) usage_route ;;
+    esac
+    ;;
+
+  routes)
+    # Slice MP8 (§4.12): GET /v1/pmos/routes as the gateway's read-only admin client, whose
+    # token is read by curl from standard input, never its arguments.
+    [ $# -eq 0 ] || { say "usage: pmos-admin routes" >&2; exit 2; }
+    token_ok PMOS_GW_ADMIN_TOKEN || { say "set PMOS_GW_ADMIN_TOKEN in deploy/.env (openssl rand -hex 24) and restart the gateway" >&2; exit 2; }
+    bearer_config PMOS_GW_ADMIN_TOKEN | curl -sS --noproxy '*' -m 10 --config - "http://127.0.0.1:${PMOS_GATEWAY_PORT:-8740}/v1/pmos/routes"
+    echo
+    ;;
+
+  usage)
+    # Slice MP8 (§4.9): the gateway records tokens, never money. Tokens per model label from
+    # the usage log, times $PMOS_STATE_DIR/prices.yaml (`<label>: <price per million tokens>`,
+    # outside the repository: prices can identify a vendor) when it exists.
+    [ $# -eq 1 ] && [ "$1" = --by-label ] || { say "usage: pmos-admin usage --by-label" >&2; exit 2; }
+    log="${PMOS_STATE_DIR:-}/usage/usage.jsonl"
+    [ -f "$log" ] || { say "no usage log at $log yet" >&2; exit 1; }
+    python3 -I - "$log" "${PMOS_STATE_DIR:-}/prices.yaml" <<'PY'
+import json, os, re, sys
+log, prices_path = sys.argv[1], sys.argv[2]
+prices = {}
+if os.path.isfile(prices_path):
+    for line in open(prices_path, encoding="utf-8"):
+        m = re.match(r"^\s*([A-Za-z0-9._-]{1,64})\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*(#.*)?$", line)
+        if m:
+            prices[m.group(1)] = float(m.group(2))
+totals = {}
+for line in open(log, encoding="utf-8"):
+    try:
+        e = json.loads(line)
+    except ValueError:
+        continue
+    if not isinstance(e, dict):
+        continue
+    label = e.get("model") or "?"
+    t = totals.setdefault(label, [0, 0, 0])
+    t[0] += 1
+    t[1] += e.get("prompt_tokens") or 0
+    t[2] += e.get("completion_tokens") or 0
+print("%-24s %8s %14s %14s %12s" % ("label", "attempts", "prompt", "completion", "cost"))
+for label in sorted(totals):
+    n, p, c = totals[label]
+    cost = "%.4f" % ((p + c) / 1e6 * prices[label]) if label in prices else "-"
+    print("%-24s %8d %14d %14d %12s" % (label[:24], n, p, c, cost))
+PY
     ;;
 
   help|-h|--help)

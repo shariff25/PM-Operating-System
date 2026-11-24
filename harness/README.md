@@ -22,6 +22,25 @@ One worker per bot sandbox, serving one bot. It loops:
 2. **Run:** it builds a fresh agent for the task:
    - **Model:** the gateway at `PMOS_GATEWAY_URL`, model `pmos/<role's model>`, with headers
      `X-Pmos-User` (the PM who asked), `X-Pmos-Run` (the task id) and `X-Pmos-Priority`.
+     The client sets `maxRetries: 0`: the gateway retries `429`, `503` and connection failures
+     (3 tries in a 20 s budget, `docs/gateway.md`), and a second layer would multiply them. A
+     final `429`/`503` fails the task as "still busy after several tries" when the gateway's
+     `X-Pmos-Upstream-Attempts` header shows it retried, and as "busy right now" otherwise.
+   - **Streamed model calls:** every model call, the review panel's sub-agents' included,
+     asks for a streamed answer (`stream: true` with `stream_options.include_usage`), so
+     bytes flow while the model writes and no hop beyond the gateway sees a silent
+     connection (eval run E3 lost 45 attempts to a `502` at about 300 s on non-streamed
+     calls). `StreamedCompletions` (`src/agent.ts`) assembles the stream into the message a
+     whole answer gives: text, tool calls from their streamed pieces, finish reason, the
+     gateway's token counts (LangChain's own `streaming: true` would download a tokenizer to
+     estimate them, which a sandbox can't reach). `checkedStreamFetch`
+     (`src/model-stream.ts`) fails the call (`ModelStreamError`) when a stream stalls (no
+     byte for 180 s, `STREAM_IDLE_MS`, longer than the gateway's own 120 s), ends before
+     `[DONE]` or without a finish reason, its connection breaks, or an event carries
+     `error`; the task then fails with "The model gateway's answer was cut off / went silent
+     / reported an error before it finished", never completing with part of an answer. An
+     error status (`429`, `503`, `409`) is unchanged. There is no setting to turn streaming
+     off.
    - **Tools:** the tool server's MCP tools for the claimed `session_token` (sent as
      `Authorization: Bearer`, never in a URL), through the official MCP TypeScript SDK client
      (`@modelcontextprotocol/sdk`), wrapped as LangChain tools.
@@ -87,5 +106,8 @@ Logs are JSON lines on stderr. They never include tokens or task text.
 `test/worker.test.ts` runs the worker against in-process fakes (`test/fakes.ts`): the bot
 runtime (node `http`), a real MCP SDK server with a read tool, a write tool that answers
 `pending_approval` and a refused tool, and an OpenAI-compatible gateway. The model is the
-`ScriptedModel`, except in the gateway test, which checks the headers the real
-`gatewayModel` sends.
+`ScriptedModel`, except in the gateway tests, which run the real `gatewayModel` against the
+fake gateway's streamed answers (text, and a tool call split over several events).
+`test/model-stream.test.ts` plays scripted event streams to the real client: a whole answer
+with usage, a tool call cut at arbitrary byte boundaries, a stall, an end without `[DONE]` or
+a finish reason, a broken connection and an error event mid-stream.

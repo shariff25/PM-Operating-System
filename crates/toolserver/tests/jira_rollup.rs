@@ -541,7 +541,11 @@ async fn the_fake_fixtures_through_the_tool_server() {
         f.slack.clone(),
         Arc::new(FakeConnector::docs()),
     ];
-    f.svc = Arc::new(ToolService::new(catalog, f.stores.clone(), connectors).unwrap());
+    f.svc = Arc::new(
+        ToolService::new(catalog, f.stores.clone(), connectors)
+            .unwrap()
+            .with_open_directory(),
+    );
     let s = f
         .svc
         .create_session("ana", "rollup-test", "r1", None, now())

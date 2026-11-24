@@ -1,0 +1,60 @@
+# PM OS's web app on a public host, behind nginx (docs/openshell-any-host-spec.md §3.8, slice H10;
+# docs/runbooks/install.md, "The web app on a public host"). Copy into nginx's http block (for
+# example /etc/nginx/conf.d/pmos.conf), with pmos-proxy.conf beside it in /etc/nginx/, and set the
+# name, the addresses and the certificate paths. scripts/check-nginx-examples.sh runs `nginx -t`
+# on it (CI's deploy job, when the runner has nginx).
+#
+# One key per client address. For IPv6 this is one key per address, not per /64: a client
+# with a /64 can use many addresses and get a bucket for each. nginx has no built-in way to
+# key on a prefix, and a regex on $remote_addr fails on compressed addresses (2001:db8::1).
+# If that matters more than IPv6 reach, drop the two `listen [::]:…` lines below.
+limit_req_zone  $binary_remote_addr zone=pmos_signin:10m rate=10r/m;
+limit_req_zone  $binary_remote_addr zone=pmos_api:10m    rate=20r/s;
+limit_conn_zone $binary_remote_addr zone=pmos_conn:10m;
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name pmos.example.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    # `listen … http2` rather than `http2 on;`: Ubuntu 24.04's nginx (1.24) predates `http2 on`
+    # (1.25.1), which newer ones prefer (they warn, and still serve).
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name pmos.example.com;
+    ssl_certificate     /etc/ssl/pmos/fullchain.pem;
+    ssl_certificate_key /etc/ssl/pmos/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    client_max_body_size  2m;      # axum's default; pmos-web's own limits are lower on most routes
+    client_header_timeout 15s;
+    client_body_timeout   15s;
+    keepalive_timeout     30s;
+    limit_conn pmos_conn 20;
+    limit_req_status 429;
+    limit_conn_status 429;
+
+    # Never forwarded (§3.8).
+    location = /healthz    { return 404; }
+    location = /readyz     { return 404; }
+    location ^~ /internal/ { return 404; }
+
+    # Sign-in: Entra's redirect and callback, password sign-in and its second step. pmos-web
+    # answers password sign-in from outside PMOS_WEB_PASSWORD_CLIENTS with 403 itself.
+    location ^~ /api/auth/ {
+        limit_req zone=pmos_signin burst=5 nodelay;
+        include /etc/nginx/pmos-proxy.conf;
+    }
+
+    # The admin routes: decision D3 (b). They are served only on the admin door (8772), never
+    # through this proxy; pmos-web answers 404 for them on 8770 as well.
+    location ^~ /api/admin/ { return 404; }
+
+    location / {
+        limit_req zone=pmos_api burst=40 nodelay;
+        include /etc/nginx/pmos-proxy.conf;
+    }
+}

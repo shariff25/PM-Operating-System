@@ -1,32 +1,41 @@
 //! Onboarding in Slack (`docs/onboarding-spec.md` §4).
 //!
-//! 1. **Request access.** Someone not in `team.yaml` DMs PM OS or uses `/docs` and gets a
-//!    note with **Request access**. A tap reads their name and email from `users.info` and
-//!    files the request with the tool server.
-//! 2. **The platform owners decide.** Each admin in `team.yaml` gets a DM card with
-//!    **Approve**, **Approve with another handle** and **Reject**. The bot keeps every card's
-//!    `(channel, ts)` by request id, in memory, so once someone decides, all the cards show
-//!    the outcome. The tool server commits the change to the content repo with the deciding
-//!    admin's GitHub account.
+//! 1. **Request access.** Someone not in the user directory DMs PM OS or uses `/docs` and
+//!    gets a note with **Request access**. A tap reads their name and email from `users.info`
+//!    and files the request with the tool server. A deactivated person gets a plain note
+//!    instead (`docs/user-database-spec.md` §4).
+//! 2. **The platform owners decide.** Each active admin in the user directory gets a DM card
+//!    with **Approve**, **Approve with another handle** and **Reject**. The bot keeps every
+//!    card's `(channel, ts)` by request id, in memory, so once someone decides, all the cards
+//!    show the outcome. The tool server creates the user (`pm` only from Slack) and commits
+//!    their personal bot with the deciding admin's GitHub account.
+//!
+//! Who is an admin comes from the directory on a snapshot at most 30 seconds old; past that,
+//! every decision, `requests` and `remove` is refused here ("can't check") and nothing is sent
+//! to the tool server, which decides again from its own tables anyway.
 //! 3. **The new member sets up.** They get a welcome DM and the setup checklist, which
 //!    `setup` (or `status`, `onboarding`) shows again: Jira and Confluence, Slack and GitHub
 //!    links, the memory repo, and their bot.
 //!
 //! Platform owners also have `requests` (the pending requests, as cards) and
-//! `remove <handle>` (with a confirmation).
+//! `remove <handle>` (with a confirmation): since slice U3 a **deactivation** through the tool
+//! server, refused for an Admin or Auditor from Slack (`403 protected_not_from_slack`) and
+//! capped (`429 deactivation_limit`); each refusal is its own sentence (`access_copy.rs`).
 
 use std::sync::Mutex;
 use std::time::Duration;
 
-use pmos_contract::model::{valid_handle, valid_slack_id, TeamFile};
+use pmos_contract::model::{valid_handle, valid_slack_id};
 use pmos_contract::onboarding::{personal_bot_name, valid_new_handle};
 use serde_json::{json, Value};
 
+use crate::access_copy as copy;
 use crate::bots::{Bots, Click, Dm};
 use crate::bounded::Bounded;
 use crate::cards;
 use crate::commands::{FollowUp, NOT_A_MEMBER};
-use crate::member_cards::{self as mc, action, Setup, HANDLE_BLOCK, REPO_BLOCK};
+use crate::member_cards::{self as mc, action, RemoveTarget, Setup, HANDLE_BLOCK, REPO_BLOCK};
+use crate::people::{self as directory, AdminCheck, Identity, TargetCheck};
 use crate::toolserver::{request_id_ok, request_of, ApiError, PROVIDERS};
 
 /// How long the memory-repo modal waits for the tool server: the answer has to be in the
@@ -50,8 +59,12 @@ pub enum DmCommand {
 
 /// The DM command `text` is, if any. `requests` and `remove` are commands for admins only;
 /// for anyone else they are ordinary messages to their bot. `remove <@U…>` names the member
-/// by their Slack mention.
-pub fn dm_command(text: &str, admin: bool, team: &TeamFile) -> Option<DmCommand> {
+/// by their Slack mention, which `handle_of` maps to a handle (the user directory).
+pub fn dm_command(
+    text: &str,
+    admin: bool,
+    handle_of: impl Fn(&str) -> Option<String>,
+) -> Option<DmCommand> {
     let t = text
         .trim()
         .trim_end_matches(['?', '.', '!'])
@@ -75,9 +88,7 @@ pub fn dm_command(text: &str, admin: bool, team: &TeamFile) -> Option<DmCommand>
     let who = who.trim_end_matches(['?', '.', '!']);
     if let Some(id) = who.strip_prefix("<@").and_then(|w| w.strip_suffix('>')) {
         let id = id.split('|').next().unwrap_or_default();
-        return team
-            .by_slack_id(id)
-            .map(|m| DmCommand::Remove(m.handle.clone()));
+        return handle_of(id).map(DmCommand::Remove);
     }
     let handle = who.trim_start_matches('@').to_lowercase();
     valid_handle(&handle).then_some(DmCommand::Remove(handle))
@@ -201,15 +212,24 @@ impl Bots {
     }
 
     pub(crate) async fn request_access(&self, click: Click) {
-        let team = self.team();
-        if team.by_slack_id(&click.user).is_some() {
-            self.answer_note(
-                &click,
-                "You're already a PM OS member. DM me `setup` to see what's left to set up.",
-                true,
-            )
-            .await;
-            return;
+        match self.people().identify(&click.user) {
+            Identity::Stranger => {}
+            Identity::Member(_) => {
+                self.answer_note(
+                    &click,
+                    "You're already a PM OS member. DM me `setup` to see what's left to set up.",
+                    true,
+                )
+                .await;
+                return;
+            }
+            other => {
+                tracing::info!(who = other.kind(), "access request refused");
+                let replace = other != Identity::CantCheck;
+                self.answer_note(&click, directory::refusal(&other, NOT_A_MEMBER), replace)
+                    .await;
+                return;
+            }
         }
         let info = match self.slack().user_info(&click.user).await {
             Ok(info) => info,
@@ -254,7 +274,7 @@ impl Bots {
         {
             Ok((true, request)) => {
                 tracing::info!(request = %request["id"], "access request filed");
-                let told = self.tell_admins(&team, &request).await;
+                let told = self.tell_admins(&request).await;
                 let text = if told > 0 {
                     "Sent to the platform owners. I'll DM you when it's decided."
                 } else {
@@ -280,6 +300,7 @@ impl Bots {
                             .to_string(),
                         true,
                     ),
+                    Some("deactivated") => (copy::DEACTIVATED.to_string(), true),
                     Some("too_many_pending") => (
                         "Too many access requests are waiting right now. Try again later."
                             .to_string(),
@@ -306,14 +327,21 @@ impl Bots {
         }
     }
 
-    /// DM every admin a card for `request`. Returns how many got one.
-    async fn tell_admins(&self, team: &TeamFile, request: &Value) -> usize {
+    /// DM every active admin a card for `request`, on a directory snapshot at most 30 seconds
+    /// old (an older one could name someone no longer an admin, who'd see the requester's
+    /// name and email). Returns how many got one; past the bound, none: the admins see the
+    /// request in `requests`.
+    async fn tell_admins(&self, request: &Value) -> usize {
+        let Some(admins) = self.people().admins() else {
+            tracing::warn!("the user directory isn't fresh; no admin was told about a request");
+            return 0;
+        };
         let mut told = 0;
-        for admin in team.admins() {
-            if !valid_slack_id(&admin.slack_id) {
+        for admin in admins {
+            let Some(slack_id) = admin.slack_id.filter(|id| valid_slack_id(id)) else {
                 continue;
-            }
-            let channel = match self.slack().open_dm(&admin.slack_id).await {
+            };
+            let channel = match self.slack().open_dm(&slack_id).await {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!(error = %e, admin = %admin.handle, "couldn't open a DM with an admin");
@@ -337,14 +365,23 @@ impl Bots {
 
     // ---- Deciding ----
 
-    /// The clicker's handle if they are an admin; anyone else gets a private note.
+    /// The clicker's handle if they are an active admin on a directory snapshot at most
+    /// 30 seconds old; anyone else gets a private note (`refusal`, or "can't check").
     async fn admin(&self, user: &str, channel: &str, refusal: &str) -> Option<String> {
-        let team = self.team();
-        match team.by_slack_id(user) {
-            Some(m) if m.is_admin() => Some(m.handle.clone()),
-            _ => {
-                tracing::info!(slack_id = user, "member decision by a non-admin; refused");
+        match self.people().admin(user) {
+            AdminCheck::Admin(m) => Some(m.handle),
+            AdminCheck::No => {
+                tracing::info!(slack_id = user, "admin action by a non-admin; refused");
                 self.private(channel, user, None, refusal).await;
+                None
+            }
+            AdminCheck::CantCheck => {
+                tracing::warn!(
+                    slack_id = user,
+                    "admin action refused: the user directory isn't fresh"
+                );
+                self.private(channel, user, None, copy::CANT_CHECK_ADMIN)
+                    .await;
                 None
             }
         }
@@ -385,6 +422,8 @@ impl Bots {
         match outcome {
             Ok(request) => {
                 tracing::info!(request = id, status = %request["status"], "access request decided");
+                // A new user: poll the directory now, so they can use PM OS at once.
+                self.people().refresh().await;
                 self.show_member_decision(&request, &admin, (channel, ts))
                     .await;
             }
@@ -518,6 +557,11 @@ impl Bots {
         match status {
             "approved" => {
                 let handle = str_of(request, "handle");
+                if self.onboarding_v2() {
+                    self.onboarding_hello(&channel, str_of(request, "name"), handle)
+                        .await;
+                    return;
+                }
                 self.post(
                     &channel,
                     None,
@@ -600,7 +644,6 @@ impl Bots {
     /// the field; the approval itself runs after the ack.
     pub(crate) fn submit_handle(&self, payload: &Value) -> (Option<Value>, Option<FollowUp>) {
         let handle = input_value(payload, HANDLE_BLOCK).to_lowercase();
-        let team = self.team();
         if !valid_new_handle(&handle) {
             return (
                 Some(field_error(
@@ -611,7 +654,8 @@ impl Bots {
                 None,
             );
         }
-        if team.by_handle(&handle).is_some() {
+        // A hint only, on a fresh snapshot; the tool server checks again (`bad_handle`).
+        if self.people().handle_taken(&handle) == Some(true) {
             return (
                 Some(field_error(
                     HANDLE_BLOCK,
@@ -646,6 +690,13 @@ impl Bots {
     // ---- Admin commands ----
 
     pub(crate) async fn list_requests(&self, dm: &Dm) {
+        if self
+            .admin(&dm.user, &dm.channel, ONLY_ADMINS)
+            .await
+            .is_none()
+        {
+            return;
+        }
         let thread = dm.in_thread.then_some(dm.thread_ts.as_str());
         match self.toolserver().pending_requests().await {
             Ok(requests) if requests.is_empty() => {
@@ -679,40 +730,45 @@ impl Bots {
         }
     }
 
-    pub(crate) async fn confirm_remove(&self, dm: &Dm, admin: &str, who: &str) {
+    /// `remove <handle>` from an admin: the confirmation card, or why not. Checked here on a
+    /// directory snapshot at most 30 seconds old, then again by the tool server.
+    pub(crate) async fn confirm_remove(&self, dm: &Dm, who: &str) {
         let thread = dm.in_thread.then_some(dm.thread_ts.as_str());
-        let team = self.team();
-        let note = if who == admin {
-            Some("You can't remove yourself; ask another platform owner.".to_string())
-        } else if team.by_handle(who).is_none() {
-            Some(format!(
-                "`{}` isn't a PM OS member.",
-                crate::blocks::escape(who)
-            ))
-        } else {
-            None
+        let Some(admin) = self
+            .admin(&dm.user, &dm.channel, copy::REMOVE_NOT_ADMIN)
+            .await
+        else {
+            return;
+        };
+        let say = |copy: &str| mc::remove_note(copy, who);
+        let note = match self.people().target(who) {
+            TargetCheck::CantCheck => Some(copy::CANT_CHECK_ADMIN.to_string()),
+            _ if who == admin => Some(copy::REMOVE_SELF.to_string()),
+            TargetCheck::Nobody => Some(say(copy::REMOVE_NOBODY)),
+            TargetCheck::Found(t) if !t.active => Some(say(copy::REMOVE_ALREADY)),
+            TargetCheck::Found(t) if t.protected => Some(say(copy::REMOVE_PROTECTED)),
+            TargetCheck::Found(t) => {
+                let card = mc::remove_confirm(RemoveTarget {
+                    handle: &t.handle,
+                    display_name: &t.display_name,
+                    slack_id: t.slack_id.as_deref().unwrap_or_default(),
+                });
+                self.post(&dm.channel, thread, None, card).await;
+                None
+            }
         };
         if let Some(note) = note {
+            tracing::info!(target = who, "remove refused before asking the tool server");
             self.post(&dm.channel, thread, None, cards::note(&note))
                 .await;
-            return;
         }
-        let slack_id = team
-            .by_handle(who)
-            .map(|m| m.slack_id.clone())
-            .unwrap_or_default();
-        self.post(
-            &dm.channel,
-            thread,
-            None,
-            mc::remove_confirm(who, &slack_id),
-        )
-        .await;
     }
 
     pub(crate) async fn remove_member(&self, click: Click, confirm: bool) {
-        let refusal = "Only platform owners can remove members.";
-        let Some(admin) = self.admin(&click.user, &click.channel, refusal).await else {
+        let Some(admin) = self
+            .admin(&click.user, &click.channel, copy::REMOVE_NOT_ADMIN)
+            .await
+        else {
             return;
         };
         let handle = click.value.clone();
@@ -725,11 +781,17 @@ impl Bots {
             .await;
             return;
         }
-        let slack_id = self
-            .team()
-            .by_handle(&handle)
-            .map(|m| m.slack_id.clone())
-            .unwrap_or_default();
+        // The card again, should the tool server refuse: the name and Slack id as the
+        // directory has them now (none if it can't say).
+        let (display_name, slack_id) = match self.people().target(&handle) {
+            TargetCheck::Found(t) => (t.display_name, t.slack_id.unwrap_or_default()),
+            _ => (String::new(), String::new()),
+        };
+        let target = RemoveTarget {
+            handle: &handle,
+            display_name: &display_name,
+            slack_id: &slack_id,
+        };
         // Take the buttons away at once, so a second tap can't remove twice.
         self.update(
             &click.channel,
@@ -737,41 +799,35 @@ impl Bots {
             mc::remove_closed(&handle, ":hourglass_flowing_sand: Removing…"),
         )
         .await;
+        let closed = |copy: &str| mc::remove_closed(&handle, &mc::remove_note(copy, &handle));
         let card = match self.toolserver().remove_member(&handle, &admin).await {
-            Ok(done) => {
-                tracing::info!(member = %handle, "member removed");
-                mc::remove_closed(
-                    &handle,
-                    &mc::removed_line(&handle, &admin, str_of(&done, "commit")),
-                )
+            Ok(_) => {
+                tracing::info!(member = %handle, "member deactivated");
+                // Poll the directory now, so their next message is refused at once.
+                self.people().refresh().await;
+                mc::remove_closed(&handle, &mc::removed_line(&handle, &admin))
             }
-            Err(e) if e.status() == Some(404) => mc::remove_closed(
-                &handle,
-                &format!(
-                    "`{}` isn't a PM OS member any more; nothing to remove.",
-                    crate::blocks::escape(&handle)
-                ),
-            ),
-            Err(e) if e.status() == Some(403) => mc::remove_retry(
-                &handle,
-                &slack_id,
-                "The tool server refused: only platform owners can remove members, and not \
-                 themselves.",
-            ),
-            Err(ApiError::Unavailable) => mc::remove_retry(&handle, &slack_id, TOOLSERVER_DOWN),
             Err(e) => {
-                let why = match e.code() {
-                    Some("github_not_linked") => {
-                        "Removing commits to the content repo as you: link GitHub first (DM \
-                         me `setup`)."
-                            .to_string()
+                tracing::info!(member = %handle, code = e.code().unwrap_or_default(), status = e.status(), "remove refused");
+                match (e.status(), e.code()) {
+                    (_, Some("protected_not_from_slack")) => closed(copy::REMOVE_PROTECTED),
+                    (_, Some("already_deactivated")) => closed(copy::REMOVE_ALREADY),
+                    (_, Some("not_a_member")) | (Some(404), _) => closed(copy::REMOVE_NOBODY),
+                    (_, Some("self_removal" | "self_change")) => closed(copy::REMOVE_SELF),
+                    (_, Some("last_admin")) => closed(copy::REMOVE_LAST_ADMIN),
+                    (_, Some("deactivation_limit")) | (Some(429), _) => closed(copy::REMOVE_LIMIT),
+                    (_, Some("owns_bots")) => {
+                        mc::remove_retry(target, &mc::remove_note(copy::REMOVE_OWNS_BOTS, &handle))
                     }
-                    Some("no_push") => {
-                        "Your GitHub account can't push to the content repo.".to_string()
+                    (_, Some("not_admin")) | (Some(403), _) => {
+                        mc::remove_retry(target, copy::REMOVE_NOT_ADMIN)
                     }
-                    _ => format!("That didn't go through: {e}"),
-                };
-                mc::remove_retry(&handle, &slack_id, &why)
+                    (Some(503), _) | (None, _) => mc::remove_retry(target, TOOLSERVER_DOWN),
+                    _ => mc::remove_retry(
+                        target,
+                        &format!("That didn't go through: {}", cards_escape(&e)),
+                    ),
+                }
             }
         };
         self.update(&click.channel, &click.message_ts, card).await;
@@ -822,9 +878,10 @@ impl Bots {
     }
 
     pub(crate) async fn refresh_setup(&self, click: Click) {
-        let Some(member) = self.team().by_slack_id(&click.user).cloned() else {
-            self.private(&click.channel, &click.user, None, NOT_A_MEMBER)
-                .await;
+        let Some(member) = self
+            .member_or_refuse(&click.channel, &click.user, None, NOT_A_MEMBER)
+            .await
+        else {
             return;
         };
         let setup = self.setup(&member.handle).await;
@@ -833,9 +890,10 @@ impl Bots {
     }
 
     pub(crate) async fn open_memory_modal(&self, click: Click) {
-        let Some(member) = self.team().by_slack_id(&click.user).cloned() else {
-            self.private(&click.channel, &click.user, None, NOT_A_MEMBER)
-                .await;
+        let Some(member) = self
+            .member_or_refuse(&click.channel, &click.user, None, NOT_A_MEMBER)
+            .await
+        else {
             return;
         };
         let view = mc::memory_modal(
@@ -864,8 +922,15 @@ impl Bots {
         payload: Value,
     ) -> (Option<Value>, Option<FollowUp>) {
         let user = str_of(&payload["user"], "id").to_string();
-        let Some(member) = self.team().by_slack_id(&user).cloned() else {
-            return (Some(field_error(REPO_BLOCK, NOT_A_MEMBER)), None);
+        let who = self.people().identify(&user);
+        let Some(member) = who.member().cloned() else {
+            return (
+                Some(field_error(
+                    REPO_BLOCK,
+                    directory::refusal(&who, NOT_A_MEMBER),
+                )),
+                None,
+            );
         };
         let org = self.onboarding().github_org.clone();
         let repo = input_value(&payload, REPO_BLOCK);
@@ -941,30 +1006,27 @@ mod tests {
 
     #[test]
     fn commands_typed_alone() {
-        let team = TeamFile::from_yaml(
-            "members:\n  - {handle: ana, slack-id: U0ANA, roles: [pm, admin]}\n  - {handle: ben, slack-id: U0BEN, roles: [pm]}\n",
-        )
-        .unwrap();
+        let team = |id: &str| (id == "U0BEN").then(|| "ben".to_string());
         for t in ["setup", "Status", " onboarding? "] {
-            assert_eq!(dm_command(t, false, &team), Some(DmCommand::Setup), "{t}");
+            assert_eq!(dm_command(t, false, team), Some(DmCommand::Setup), "{t}");
         }
-        assert_eq!(dm_command("docs: setup", false, &team), None);
-        assert_eq!(dm_command("setup my week", false, &team), None);
+        assert_eq!(dm_command("docs: setup", false, team), None);
+        assert_eq!(dm_command("setup my week", false, team), None);
         assert_eq!(
-            dm_command("requests", true, &team),
+            dm_command("requests", true, team),
             Some(DmCommand::Requests)
         );
-        assert_eq!(dm_command("requests", false, &team), None, "admins only");
+        assert_eq!(dm_command("requests", false, team), None, "admins only");
         assert_eq!(
-            dm_command("remove ben", true, &team),
+            dm_command("remove ben", true, team),
             Some(DmCommand::Remove("ben".into()))
         );
         assert_eq!(
-            dm_command("remove <@U0BEN>", true, &team),
+            dm_command("remove <@U0BEN>", true, team),
             Some(DmCommand::Remove("ben".into()))
         );
-        assert_eq!(dm_command("remove <@U0NOBODY>", true, &team), None);
-        assert_eq!(dm_command("remove ben", false, &team), None);
-        assert_eq!(dm_command("remove duplicate rows", true, &team), None);
+        assert_eq!(dm_command("remove <@U0NOBODY>", true, team), None);
+        assert_eq!(dm_command("remove ben", false, team), None);
+        assert_eq!(dm_command("remove duplicate rows", true, team), None);
     }
 }

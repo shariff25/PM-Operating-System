@@ -10,6 +10,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use pmos_contract::model_source::ModelSource;
 use pmos_gateway::config::{Client, Config, Limits, Models, UpstreamKind};
 use pmos_gateway::scheduler::Priority;
 use pmos_gateway::usage::UsageLog;
@@ -23,6 +24,8 @@ const TOKEN: &str = "gateway-test-token-0123456789abcdef";
 #[derive(Default)]
 struct Vllm {
     seen: Mutex<Vec<(String, String)>>,
+    /// Per call, in order: whether it asked for a stream, and whether it had `stream_options`.
+    streamed: Mutex<Vec<(bool, bool)>>,
 }
 
 fn last_user(body: &Value) -> String {
@@ -41,6 +44,10 @@ async fn mock_chat(State(v): State<Arc<Vllm>>, body: Bytes) -> Response {
         .lock()
         .unwrap()
         .push((body["model"].as_str().unwrap().to_string(), asked.clone()));
+    v.streamed.lock().unwrap().push((
+        body["stream"] == json!(true),
+        body.get("stream_options").is_some(),
+    ));
     if asked.starts_with("slow") {
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
@@ -52,9 +59,16 @@ async fn mock_chat(State(v): State<Arc<Vllm>>, body: Bytes) -> Response {
             .into_response();
     }
     if body["stream"] == json!(true) {
-        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n\
-                   data: {\"choices\":[{\"delta\":{\"content\":\" there\"}}]}\n\n\
-                   data: [DONE]\n\n";
+        let mut sse = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n\
+                   data: {\"choices\":[{\"delta\":{\"content\":\" there\"}}]}\n\n"
+            .to_string();
+        if body["stream_options"]["include_usage"] == json!(true) {
+            // Split across two writes would be the same to the caller; one event here.
+            sse.push_str(
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2,\"total_tokens\":9}}\n\n",
+            );
+        }
+        sse.push_str("data: [DONE]\n\n");
         return ([("content-type", "text/event-stream")], sse).into_response();
     }
     Json(json!({
@@ -108,6 +122,8 @@ struct Gw {
     base: String,
     usage: Arc<UsageLog>,
     stop: CancellationToken,
+    /// The source it serves: `stub` with the stub on, else `local`.
+    source: &'static str,
 }
 
 async fn start_gateway(upstream: &str, limits: Limits, stub: bool, workarounds_on: bool) -> Gw {
@@ -116,8 +132,15 @@ async fn start_gateway(upstream: &str, limits: Limits, stub: bool, workarounds_o
          roles:\n  default: {{upstream: a, model: qwen-test, workarounds: [strip-think]}}\n  \
          reasoning: {{upstream: a, model: qwen-test, workarounds: [strip-think]}}\n  \
          extraction: {{upstream: a, model: nemo-test}}\n  embedding: {{upstream: a, model: embed-test}}\n\
-         limits: {{max-in-flight: {}, per-user: {}, max-queue: {}}}\n",
-        limits.max_in_flight, limits.per_user, limits.max_queue
+         limits: {{max-in-flight: {}, per-user: {}, max-queue: {}}}\n\
+         clients: {{runtime: {{trusted: true, max-in-flight: {}, max-queue: {}}}}}\n",
+        limits.max_in_flight,
+        limits.per_user,
+        limits.max_queue,
+        limits.max_in_flight,
+        // The one client here stands for every caller, so it may fill the whole queue; the
+        // per-client cap on waiting calls has its own tests (limits.rs).
+        limits.max_queue
     );
     let models = Models::from_yaml(&yaml).unwrap();
     let usage = Arc::new(UsageLog::new(None).unwrap());
@@ -132,9 +155,22 @@ async fn start_gateway(upstream: &str, limits: Limits, stub: bool, workarounds_o
         workarounds_on,
         anthropic_key: "test-key".into(),
         remote_key: String::new(),
+        retry: Default::default(),
+        // Readiness probes afresh each time here, so a test sees a model server go away at
+        // once; the probe cache has its own test (`readiness_reuses_its_probe_for_a_while`).
+        timeouts: pmos_gateway::Timeouts {
+            ready_cache: Duration::ZERO,
+            ..Default::default()
+        },
+        model_source: ModelSource::Local,
     });
     let (base, stop) = serve(app).await;
-    Gw { base, usage, stop }
+    Gw {
+        base,
+        usage,
+        stop,
+        source: if stub { "stub" } else { "local" },
+    }
 }
 
 fn wide() -> Limits {
@@ -142,11 +178,12 @@ fn wide() -> Limits {
         max_in_flight: 8,
         per_user: 8,
         max_queue: 16,
+        ..Limits::default()
     }
 }
 
 fn chat(gw: &Gw, model: &str, text: &str) -> reqwest::RequestBuilder {
-    reqwest::Client::new()
+    http_as(gw.source)
         .post(format!("{}/v1/chat/completions", gw.base))
         .bearer_auth(TOKEN)
         .json(&json!({"model": model, "messages": [{"role": "user", "content": text}]}))
@@ -156,7 +193,7 @@ fn chat(gw: &Gw, model: &str, text: &str) -> reqwest::RequestBuilder {
 async fn roles_route_to_their_local_model_and_nothing_else_gets_through() {
     let (up, vllm, stop_up) = start_vllm().await;
     let gw = start_gateway(&up, wide(), false, true).await;
-    let http = reqwest::Client::new();
+    let http = http();
 
     // No token, or a wrong one.
     let res = http
@@ -323,7 +360,7 @@ async fn workarounds_apply_per_role_and_switch_off_together() {
         .starts_with("<think>"));
 
     // The registry is visible, with each entry's delete-when test.
-    let reg: Value = reqwest::Client::new()
+    let reg: Value = http()
         .get(format!("{}/v1/pmos/workarounds", on.base))
         .bearer_auth(TOKEN)
         .send()
@@ -350,12 +387,13 @@ async fn workarounds_apply_per_role_and_switch_off_together() {
 
 #[tokio::test]
 async fn streams_pass_through_and_are_logged_when_they_end() {
-    let (up, _vllm, stop_up) = start_vllm().await;
+    let (up, vllm, stop_up) = start_vllm().await;
     let gw = start_gateway(&up, wide(), false, true).await;
-    let res = reqwest::Client::new()
+    // `extraction` has no workaround, so its stream passes through as the model server sent it.
+    let res = http()
         .post(format!("{}/v1/chat/completions", gw.base))
         .bearer_auth(TOKEN)
-        .json(&json!({"model": "pmos/default", "stream": true,
+        .json(&json!({"model": "pmos/extraction", "stream": true,
                       "messages": [{"role": "user", "content": "hi"}]}))
         .send()
         .await
@@ -368,7 +406,93 @@ async fn streams_pass_through_and_are_logged_when_they_end() {
     let ev = gw.usage.recent().pop().unwrap();
     assert!(ev.stream);
     assert_eq!(ev.status, 200);
+    // No usage in the stream: none on the line.
+    assert_eq!((ev.prompt_tokens, ev.completion_tokens), (None, None));
+    assert_eq!(vllm.streamed.lock().unwrap().last(), Some(&(true, false)));
+
+    // Asked with `include_usage`, the stream's token counts reach the usage line, as a whole
+    // answer's do, and the event passes on untouched.
+    let res = http()
+        .post(format!("{}/v1/chat/completions", gw.base))
+        .bearer_auth(TOKEN)
+        .json(&json!({"model": "pmos/extraction", "stream": true,
+                      "stream_options": {"include_usage": true},
+                      "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    let text = res.text().await.unwrap();
+    assert!(text.contains("\"prompt_tokens\":7") && text.ends_with("data: [DONE]\n\n"));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let ev = gw.usage.recent().pop().unwrap();
+    assert!(ev.stream);
+    assert_eq!((ev.prompt_tokens, ev.completion_tokens), (Some(7), Some(2)));
     gw.stop.cancel();
+    stop_up.cancel();
+}
+
+/// A streamed call to a role whose workaround needs the whole answer (`default`, strip-think):
+/// the model server is asked for a whole answer (no `stream`, no `stream_options`), the
+/// workaround applies, and the caller gets it as an event stream with a finish reason, the
+/// usage and `[DONE]`. With workarounds off, the stream passes through as before.
+#[tokio::test]
+async fn a_streamed_call_to_a_role_with_a_workaround_gets_the_whole_answer_as_a_stream() {
+    let (up, vllm, stop_up) = start_vllm().await;
+    let on = start_gateway(&up, wide(), false, true).await;
+    let ask = json!({"model": "pmos/default", "stream": true,
+                     "stream_options": {"include_usage": true},
+                     "messages": [{"role": "user", "content": "q"}]});
+    let res = http()
+        .post(format!("{}/v1/chat/completions", on.base))
+        .bearer_auth(TOKEN)
+        .json(&ask)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.headers()["content-type"], "text/event-stream");
+    assert_eq!(res.headers()["x-pmos-upstream-attempts"], "1");
+    let text = res.text().await.unwrap();
+    assert_eq!(vllm.streamed.lock().unwrap().last(), Some(&(false, false)));
+    assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+    let events: Vec<Value> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter(|d| *d != "[DONE]")
+        .map(|d| serde_json::from_str(d).unwrap())
+        .collect();
+    assert_eq!(events[0]["choices"][0]["delta"]["content"], "The answer.");
+    assert_eq!(
+        events[0]["choices"][0]["delta"]["reasoning_content"],
+        "reasoning here"
+    );
+    assert!(!text.contains("<think>"));
+    let last = events.last().unwrap();
+    assert_eq!(last["choices"][0]["finish_reason"], "stop");
+    assert_eq!(last["usage"]["prompt_tokens"], 12);
+    let ev = on.usage.recent().pop().unwrap();
+    assert!(ev.stream);
+    assert_eq!(ev.workarounds, vec!["strip-think"]);
+    assert_eq!(
+        (ev.prompt_tokens, ev.completion_tokens),
+        (Some(12), Some(3))
+    );
+
+    let off = start_gateway(&up, wide(), false, false).await;
+    let text = http_as(off.source)
+        .post(format!("{}/v1/chat/completions", off.base))
+        .bearer_auth(TOKEN)
+        .json(&ask)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(text.contains("Hello") && text.contains(" there"), "{text}");
+    assert_eq!(vllm.streamed.lock().unwrap().last(), Some(&(true, true)));
+    on.stop.cancel();
+    off.stop.cancel();
     stop_up.cancel();
 }
 
@@ -382,6 +506,7 @@ async fn interactive_work_overtakes_background_work() {
                 max_in_flight: 1,
                 per_user: 4,
                 max_queue: 8,
+                ..Limits::default()
             },
             false,
             true,
@@ -435,6 +560,7 @@ async fn one_person_cant_hold_every_slot_and_a_full_queue_says_busy() {
                 max_in_flight: 2,
                 per_user: 1,
                 max_queue: 1,
+                ..Limits::default()
             },
             false,
             true,
@@ -529,7 +655,7 @@ async fn the_stub_model_needs_no_model_server() {
         body["choices"][0]["message"]["content"],
         "Stub reply to: Critique this PRD"
     );
-    let text = reqwest::Client::new()
+    let text = http_as("stub")
         .post(format!("{}/v1/chat/completions", gw.base))
         .bearer_auth(TOKEN)
         .json(&json!({"model": "pmos/default", "stream": true,
@@ -541,7 +667,7 @@ async fn the_stub_model_needs_no_model_server() {
         .await
         .unwrap();
     assert!(text.contains("Stub") && text.ends_with("data: [DONE]\n\n"));
-    let emb: Value = reqwest::Client::new()
+    let emb: Value = http()
         .post(format!("{}/v1/embeddings", gw.base))
         .bearer_auth(TOKEN)
         .json(&json!({"model": "pmos/embedding", "input": ["a", "a"]}))
@@ -682,9 +808,12 @@ async fn the_claude_test_upstream_needs_its_switch_and_translates_both_ways() {
         workarounds_on: true,
         anthropic_key: "sk-test-placeholder".into(),
         remote_key: String::new(),
+        retry: Default::default(),
+        timeouts: Default::default(),
+        model_source: ModelSource::Local,
     }))
     .await;
-    let http = reqwest::Client::new();
+    let http = http();
     let ask = json!({
         "model": "pmos/default",
         "temperature": 0,
@@ -879,6 +1008,7 @@ async fn a_remote_test_upstream_needs_its_switch_and_forwards_as_is_with_its_key
         let token = token.clone();
         Config::from_lookup(move |k| match k {
             "PMOS_GATEWAY_TOKENS" => Some(format!("runtime={token}")),
+            "PMOS_MODEL_SOURCE" => Some("local".into()),
             "PMOS_GATEWAY_CLOUD_TEST" => Some("1".into()),
             "PMOS_GATEWAY_REMOTE_KEY" => key.map(String::from),
             _ => None,
@@ -903,9 +1033,12 @@ async fn a_remote_test_upstream_needs_its_switch_and_forwards_as_is_with_its_key
         workarounds_on: true,
         anthropic_key: String::new(),
         remote_key: REMOTE_KEY.into(),
+        retry: Default::default(),
+        timeouts: Default::default(),
+        model_source: ModelSource::Local,
     }))
     .await;
-    let http = reqwest::Client::new();
+    let http = http();
     let ask = json!({
         "model": "pmos/default",
         "temperature": 0,
@@ -971,7 +1104,9 @@ async fn a_remote_test_upstream_needs_its_switch_and_forwards_as_is_with_its_key
         (events[0].role.as_str(), events[0].model.as_str()),
         ("default", "remote-model")
     );
-    assert_eq!(events[0].upstream, "127.0.0.1");
+    // Slice H12 (spec §3.6, "The usage log"): a remote test upstream is logged by its kind,
+    // labelled or not, never by its host.
+    assert_eq!(events[0].upstream, "remote-test");
     assert_eq!(
         (events[0].prompt_tokens, events[0].completion_tokens),
         (Some(21), Some(5))
@@ -1044,6 +1179,19 @@ async fn a_remote_test_upstream_needs_its_switch_and_forwards_as_is_with_its_key
         .unwrap();
     assert_eq!(ready["ready"], true);
     assert_eq!(ready["cloud_test"], true);
+    // Labels only, by role: never the remote provider's or the local server's address (the
+    // route needs no token; review at 6bb806f).
+    assert_eq!(
+        ready["upstreams"],
+        json!({"default": {"upstream": "remote-test", "status": "ok"},
+               "extraction": {"upstream": "local", "status": "ok"}})
+    );
+    for addr in [&remote, &local] {
+        let host = addr.trim_start_matches("http://");
+        let host = host.split('/').next().unwrap();
+        assert!(!ready.to_string().contains(host), "{ready}");
+    }
+    assert!(!ready.to_string().contains("127.0.0.1"), "{ready}");
     {
         let seen = seen_remote.seen.lock().unwrap();
         let (_, headers, _) = seen.iter().find(|s| s.0 == "models").unwrap();
@@ -1062,6 +1210,329 @@ async fn a_remote_test_upstream_needs_its_switch_and_forwards_as_is_with_its_key
 
     stop_gw.cancel();
     stop_local.cancel();
+}
+
+/// `/readyz` needs no token, so anything that reaches the gateway's port can read it: its
+/// `200` and `503` bodies carry labels only (role names, upstream kinds, `ok`/`down`), never an
+/// upstream's base URL, host, port or path, the config's name for it, a model id or a key
+/// (G8b, after the review at 6bb806f; `docs/openshell-any-host-spec.md` §3.6). Every upstream
+/// kind is covered: a local model server, a remote test upstream with its key, and a Claude
+/// test upstream that doesn't answer.
+#[tokio::test]
+async fn readiness_names_no_upstream_host_url_model_or_key() {
+    const ANTHROPIC_KEY: &str = "anthropic-test-key-never-in-readyz-77";
+    let (local, _seen_local, stop_local) = start_recorder("/secret-local-path/v1").await;
+    let (remote, _seen_remote, stop_remote) = start_recorder("/secret-remote-path/openai").await;
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_port = dead.local_addr().unwrap().port();
+    drop(dead);
+    let claude = format!("http://127.0.0.1:{dead_port}/secret-claude-path");
+    let yaml = format!(
+        "upstreams: {{secret-remote-server: 'openai+{remote}', secret-local-server: '{local}', \
+                      secret-claude-server: 'anthropic+{claude}'}}\n\
+         roles:\n  default: {{upstream: secret-remote-server, model: secret-remote-model}}\n  \
+         extraction: {{upstream: secret-local-server, model: secret-local-model}}\n  \
+         reasoning: {{upstream: secret-claude-server, model: secret-claude-model}}\n"
+    );
+    let start = |yaml: String| async move {
+        serve(router(GatewayConfig {
+            models: Models::parse(&yaml, true).unwrap(),
+            clients: vec![Client {
+                name: "worker".into(),
+                token: TOKEN.into(),
+            }],
+            usage: Arc::new(UsageLog::new(None).unwrap()),
+            stub: false,
+            workarounds_on: true,
+            anthropic_key: ANTHROPIC_KEY.into(),
+            remote_key: REMOTE_KEY.into(),
+            retry: Default::default(),
+            // Fresh probes, so the remote upstream going away shows at once.
+            timeouts: pmos_gateway::Timeouts {
+                ready_cache: Duration::ZERO,
+                ..Default::default()
+            },
+            model_source: ModelSource::Local,
+        }))
+        .await
+    };
+    // Nothing from the config but labels: each base URL, its host and port, its path, the
+    // config's names for the servers, the model ids, both keys and any URL at all.
+    let mut forbidden: Vec<String> = vec![
+        REMOTE_KEY.into(),
+        ANTHROPIC_KEY.into(),
+        TOKEN.into(),
+        "127.0.0.1".into(),
+        "localhost".into(),
+        "http".into(),
+        "://".into(),
+        "secret".into(),
+        "openai+".into(),
+        "anthropic+".into(),
+        dead_port.to_string(),
+    ];
+    for base in [&local, &remote, &claude] {
+        let url = reqwest::Url::parse(base).unwrap();
+        forbidden.push(base.to_string());
+        forbidden.push(url.port().unwrap().to_string());
+        forbidden.push(url.path().to_string());
+    }
+    let check = |body: &str| {
+        for f in &forbidden {
+            assert!(!body.contains(f.as_str()), "/readyz carries `{f}`: {body}");
+        }
+    };
+    let ready = |gw: String| async move {
+        let res = reqwest::get(format!("{gw}/readyz")).await.unwrap();
+        let status = res.status().as_u16();
+        let text = res.text().await.unwrap();
+        let v: Value = serde_json::from_str(&text).unwrap();
+        (status, text, v)
+    };
+
+    // The Claude test upstream doesn't answer: 503, each role by its label.
+    let (gw, stop_gw) = start(yaml.clone()).await;
+    let (status, text, v) = ready(gw).await;
+    assert_eq!(status, 503, "{text}");
+    check(&text);
+    assert_eq!(
+        v["upstreams"],
+        json!({"default": {"upstream": "remote-test", "status": "ok"},
+               "extraction": {"upstream": "local", "status": "ok"},
+               "reasoning": {"upstream": "claude-test", "status": "down"}})
+    );
+    assert_eq!((&v["class"], &v["stub"]), (&json!("test"), &json!(false)));
+    assert_eq!(v["cloud_test"], true);
+    stop_gw.cancel();
+
+    // Without it, both upstreams answer: 200.
+    let two = yaml
+        .lines()
+        .filter(|l| !l.contains("reasoning:"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (gw, stop_gw) = start(two.clone()).await;
+    let (status, text, v) = ready(gw.clone()).await;
+    assert_eq!(status, 200, "{text}");
+    check(&text);
+    assert_eq!(v["upstreams"]["default"]["status"], "ok");
+    // The remote one goes away. A remote test upstream's probe is reused for at least 30
+    // seconds (slice H4), so this gateway still answers from its cache; a fresh one says 503,
+    // and still nothing but labels.
+    stop_remote.cancel();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (status, _, _) = ready(gw).await;
+    assert_eq!(status, 200, "answered from the 30-second cache");
+    stop_gw.cancel();
+    let (gw, stop_gw) = start(two).await;
+    let (status, text, v) = ready(gw).await;
+    assert_eq!(status, 503, "{text}");
+    check(&text);
+    assert_eq!(
+        v["upstreams"]["default"],
+        json!({"upstream": "remote-test", "status": "down"})
+    );
+    assert_eq!(v["upstreams"]["extraction"]["status"], "ok");
+    stop_gw.cancel();
+    stop_local.cancel();
+}
+
+/// The shipped production config (`deploy/gateway.yaml`, model servers at
+/// `<service>.pmos.internal`) with the stub on, as a first install runs it: `/readyz` names
+/// none of its hosts, server names or model ids.
+#[tokio::test]
+async fn readiness_of_the_shipped_config_names_none_of_its_hosts() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let text = std::fs::read_to_string(root.join("deploy/gateway.yaml")).unwrap();
+    let models = Models::from_yaml(&text).unwrap();
+    let (gw, stop_gw) = serve(router(GatewayConfig {
+        models,
+        clients: vec![Client {
+            name: "runtime".into(),
+            token: TOKEN.into(),
+        }],
+        usage: Arc::new(UsageLog::new(None).unwrap()),
+        stub: true,
+        workarounds_on: true,
+        anthropic_key: String::new(),
+        remote_key: String::new(),
+        retry: Default::default(),
+        timeouts: Default::default(),
+        model_source: ModelSource::Local,
+    }))
+    .await;
+    let res = reqwest::get(format!("{gw}/readyz")).await.unwrap();
+    assert_eq!(res.status(), 200);
+    let body = res.text().await.unwrap();
+    for f in [
+        "pmos.internal",
+        "vllm",
+        "8000",
+        "http",
+        "qwen",
+        "nemotron",
+        TOKEN,
+    ] {
+        assert!(!body.contains(f), "/readyz carries `{f}`: {body}");
+    }
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!((&v["class"], &v["stub"]), (&json!("test"), &json!(true)));
+    stop_gw.cancel();
+}
+
+/// The Low on unauthenticated probes (review at c78b5fb): `/readyz` needs no token, so it
+/// reuses its probe of the model servers for `ready_cache` (5 s by default) instead of
+/// probing every upstream on each request; `running` and `waiting` are still read afresh.
+/// A short cache here, so the test needn't wait 5 s.
+#[tokio::test]
+async fn readiness_reuses_its_probe_for_a_while() {
+    assert_eq!(pmos_gateway::READY_CACHE, Duration::from_secs(5));
+    assert_eq!(
+        pmos_gateway::Timeouts::default().ready_cache,
+        pmos_gateway::READY_CACHE
+    );
+    let (up, seen, stop_up) = start_recorder("/v1").await;
+    let probes = || {
+        seen.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _, _)| path == "models")
+            .count()
+    };
+    let cache = Duration::from_secs(1);
+    let yaml = format!(
+        "upstreams: {{a: '{up}'}}\nroles: {{default: {{upstream: a, model: m}}}}\n\
+         clients: {{runtime: {{trusted: true}}}}\n"
+    );
+    let (gw, stop_gw) = serve(router(GatewayConfig {
+        models: Models::from_yaml(&yaml).unwrap(),
+        clients: vec![Client {
+            name: "runtime".into(),
+            token: TOKEN.into(),
+        }],
+        usage: Arc::new(UsageLog::new(None).unwrap()),
+        stub: false,
+        workarounds_on: true,
+        anthropic_key: String::new(),
+        remote_key: String::new(),
+        retry: Default::default(),
+        timeouts: pmos_gateway::Timeouts {
+            ready_cache: cache,
+            ..Default::default()
+        },
+        model_source: ModelSource::Local,
+    }))
+    .await;
+    let ready = async || {
+        let res = reqwest::get(format!("{gw}/readyz")).await.unwrap();
+        let status = res.status().as_u16();
+        let v: Value = res.json().await.unwrap();
+        (status, v)
+    };
+    // Twenty requests at once, and more after: one probe.
+    let burst: Vec<_> = (0..20)
+        .map(|_| {
+            let gw = gw.clone();
+            tokio::spawn(
+                async move { reqwest::get(format!("{gw}/readyz")).await.unwrap().status() },
+            )
+        })
+        .collect();
+    for h in burst {
+        assert_eq!(h.await.unwrap(), 200);
+    }
+    for _ in 0..5 {
+        assert_eq!(ready().await.0, 200);
+    }
+    assert_eq!(
+        probes(),
+        1,
+        "one probe for every request within the cache's life"
+    );
+    // The model server goes away: still the cached answer until the cache runs out...
+    stop_up.cancel();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (status, v) = ready().await;
+    assert_eq!(status, 200, "{v}");
+    // ...while the load is always live.
+    assert_eq!((&v["running"], &v["waiting"]), (&json!(0), &json!(0)));
+    // ...and then a new probe, which finds it down.
+    tokio::time::sleep(cache).await;
+    let (status, v) = ready().await;
+    assert_eq!(status, 503, "{v}");
+    assert_eq!(v["upstreams"]["default"]["status"], "down");
+    stop_gw.cancel();
+}
+
+/// The Low on `/readyz` (review at 52dbae2): a caller that hangs up mid-probe no longer leaves
+/// the cache unfilled. The probe runs in a task of its own, so it completes and fills the
+/// cache anyway; before, it ran in the caller's request and was cancelled with it, so a
+/// client that connected and hung up over and over kept a probe round in flight forever.
+#[tokio::test]
+async fn a_caller_that_hangs_up_mid_probe_still_fills_the_readiness_cache() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let probes = Arc::new(AtomicUsize::new(0));
+    // A model server whose `/models` takes 300 ms to answer.
+    let app = Router::new()
+        .route(
+            "/v1/models",
+            get(|State(n): State<Arc<AtomicUsize>>| async move {
+                n.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                Json(json!({"data": []}))
+            }),
+        )
+        .with_state(probes.clone());
+    let (up, stop_up) = serve(app).await;
+    let yaml = format!(
+        "upstreams: {{a: '{up}/v1'}}\nroles: {{default: {{upstream: a, model: m}}}}\n\
+         clients: {{runtime: {{trusted: true}}}}\n"
+    );
+    let (gw, stop_gw) = serve(router(GatewayConfig {
+        models: Models::from_yaml(&yaml).unwrap(),
+        clients: vec![Client {
+            name: "runtime".into(),
+            token: TOKEN.into(),
+        }],
+        usage: Arc::new(UsageLog::new(None).unwrap()),
+        stub: false,
+        workarounds_on: true,
+        anthropic_key: String::new(),
+        remote_key: String::new(),
+        retry: Default::default(),
+        timeouts: pmos_gateway::Timeouts {
+            ready_cache: Duration::from_secs(30),
+            ..Default::default()
+        },
+        model_source: ModelSource::Local,
+    }))
+    .await;
+    // Five callers, one after another, each hanging up 50 ms into the probe.
+    for _ in 0..5 {
+        let hung_up = tokio::time::timeout(
+            Duration::from_millis(50),
+            reqwest::get(format!("{gw}/readyz")),
+        )
+        .await;
+        assert!(
+            hung_up.is_err(),
+            "the probe answered before the caller left"
+        );
+    }
+    // The first probe went on without its caller and filled the cache: the next caller is
+    // answered from it at once, and no other probe was ever sent.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let t = std::time::Instant::now();
+    let res = reqwest::get(format!("{gw}/readyz")).await.unwrap();
+    assert_eq!(res.status(), 200);
+    assert!(
+        t.elapsed() < Duration::from_millis(200),
+        "answered from the cache"
+    );
+    assert_eq!(probes.load(Ordering::SeqCst), 1, "one probe in all");
+    stop_gw.cancel();
+    stop_up.cancel();
 }
 
 /// The real binary: it won't start without the remote key, says at start-up that a remote
@@ -1084,8 +1555,8 @@ async fn the_gateway_binary_needs_the_remote_key_and_never_logs_it() {
     std::fs::write(
         &config,
         format!(
-            "upstreams: {{r: 'openai+http://127.0.0.1:{dead_port}/v1'}}\n\
-             roles: {{default: {{upstream: r, model: remote-model}}}}\n"
+            "upstreams: {{r: 'openai+http://127.0.0.1:{dead_port}/secret-path/v1'}}\n\
+             roles: {{default: {{upstream: r, model: remote-model, label: remote-label}}}}\n"
         ),
     )
     .unwrap();
@@ -1096,6 +1567,7 @@ async fn the_gateway_binary_needs_the_remote_key_and_never_logs_it() {
             .env("PMOS_GATEWAY_CONFIG", &config)
             .env("PMOS_GATEWAY_BIND", bind.to_string())
             .env("PMOS_GATEWAY_CLOUD_TEST", "1")
+            .env("PMOS_MODEL_SOURCE", "hosted-test")
             .env("RUST_BACKTRACE", "0")
             .env("RUST_LOG", "debug")
             .stdout(Stdio::piped())
@@ -1130,7 +1602,7 @@ async fn the_gateway_binary_needs_the_remote_key_and_never_logs_it() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(up, "the gateway didn't start: {:?}", lines.lock().unwrap());
-    let res = reqwest::Client::new()
+    let res = http_as("hosted-test")
         .post(format!("{base}/v1/chat/completions"))
         .bearer_auth(TOKEN)
         .json(&json!({"model": "pmos/default", "messages": [{"role": "user", "content": "hi"}]}))
@@ -1148,5 +1620,416 @@ async fn the_gateway_binary_needs_the_remote_key_and_never_logs_it() {
     assert!(log.contains("a remote test upstream is on"), "{log}");
     assert!(log.contains("model server unreachable"), "{log}");
     assert!(!log.contains(REMOTE_KEY), "{log}");
+    // V3 (slice H4): no line names the upstream's URL, host, port, path or model id, the
+    // start-up lines and the refused connection's warning included.
+    for f in ["secret-path", "remote-model", "http://"] {
+        assert!(!log.contains(f), "the log carries `{f}`: {log}");
+    }
+    // The port is a random five-digit number, and the log legitimately holds long runs of
+    // digits (a role's `model_sha256`, timestamps), so it is looked for as a number of its own:
+    // an occurrence inside a longer run of letters or digits is not the port (CI at 943a302
+    // failed when the port's digits happened to occur inside the model hash).
+    let port = dead_port.to_string();
+    let alone = log.match_indices(&port).any(|(at, _)| {
+        let before = log[..at].chars().next_back();
+        let after = log[at + port.len()..].chars().next();
+        !before.is_some_and(|c| c.is_ascii_alphanumeric())
+            && !after.is_some_and(|c| c.is_ascii_alphanumeric())
+    });
+    assert!(!alone, "the log carries the port `{port}`: {log}");
     std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---- Retry of 429 / 503 (`retry.rs`) ----
+
+use pmos_gateway::retry::RetryPolicy;
+
+/// One scripted answer of the mock upstream.
+#[derive(Clone)]
+enum Step {
+    Refuse(u16, Option<&'static str>, &'static str),
+    Answer,
+    /// A 200 stream that sends one event and then breaks.
+    BrokenStream,
+}
+
+#[derive(Default)]
+struct Scripted {
+    steps: Vec<Step>,
+    calls: Mutex<Vec<std::time::Instant>>,
+}
+
+async fn mock_scripted(State(s): State<Arc<Scripted>>, _body: Bytes) -> Response {
+    let n = {
+        let mut c = s.calls.lock().unwrap();
+        c.push(std::time::Instant::now());
+        c.len()
+    };
+    // Past the script, the last step repeats.
+    match s.steps[(n - 1).min(s.steps.len() - 1)].clone() {
+        Step::Refuse(status, retry_after, body) => {
+            let mut res = (
+                StatusCode::from_u16(status).unwrap(),
+                [("content-type", "application/json")],
+                body,
+            )
+                .into_response();
+            if let Some(v) = retry_after {
+                res.headers_mut().insert("retry-after", v.parse().unwrap());
+            }
+            res
+        }
+        Step::Answer => Json(json!({
+            "id": "x", "object": "chat.completion", "model": "qwen-test",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "Done."}}],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 1},
+        }))
+        .into_response(),
+        Step::BrokenStream => {
+            use futures_util::StreamExt;
+            let first = futures_util::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n",
+            ))]);
+            // The break comes after the first event has had time to reach the caller.
+            let broken = futures_util::stream::once(async {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                Err(std::io::Error::other("upstream died"))
+            });
+            (
+                [("content-type", "text/event-stream")],
+                axum::body::Body::from_stream(first.chain(broken)),
+            )
+                .into_response()
+        }
+    }
+}
+
+const RATE: &str = r#"{"error":{"code":"rate_limit_exceeded","message":"Rate limit reached"}}"#;
+
+/// A gateway with one slot in front of a scripted upstream.
+async fn retry_gateway(steps: Vec<Step>, retry: RetryPolicy) -> (Gw, Arc<Scripted>) {
+    let s = Arc::new(Scripted {
+        steps,
+        calls: Mutex::default(),
+    });
+    let app = Router::new()
+        .route("/v1/chat/completions", post(mock_scripted))
+        .with_state(s.clone());
+    let (base, _stop) = serve(app).await;
+    let models = Models::from_yaml(&format!(
+        "upstreams: {{a: '{base}/v1'}}\nroles:\n  default: {{upstream: a, model: qwen-test}}\n\
+         limits: {{max-in-flight: 1, per-user: 1, max-queue: 8}}\n"
+    ))
+    .unwrap();
+    let usage = Arc::new(UsageLog::new(None).unwrap());
+    let (gw, stop) = serve(router(GatewayConfig {
+        models,
+        clients: vec![Client {
+            name: "runtime".into(),
+            token: TOKEN.into(),
+        }],
+        usage: usage.clone(),
+        stub: false,
+        workarounds_on: true,
+        anthropic_key: String::new(),
+        remote_key: String::new(),
+        retry,
+        timeouts: Default::default(),
+        model_source: ModelSource::Local,
+    }))
+    .await;
+    (
+        Gw {
+            base: gw,
+            usage,
+            stop,
+            source: "local",
+        },
+        s,
+    )
+}
+
+fn quick(max_attempts: u32, budget_ms: u64) -> RetryPolicy {
+    RetryPolicy {
+        max_attempts,
+        budget: Duration::from_millis(budget_ms),
+        base: Duration::from_millis(20),
+    }
+}
+
+fn streamed(gw: &Gw) -> reqwest::RequestBuilder {
+    http()
+        .post(format!("{}/v1/chat/completions", gw.base))
+        .bearer_auth(TOKEN)
+        .json(&json!({"model": "pmos/default", "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]}))
+}
+
+#[tokio::test]
+async fn a_429_is_retried_and_the_second_attempt_answers() {
+    let (gw, up) = retry_gateway(
+        vec![Step::Refuse(429, None, RATE), Step::Answer],
+        quick(3, 5000),
+    )
+    .await;
+    let res = chat(&gw, "pmos/default", "secret prompt text")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.headers()["x-pmos-upstream-attempts"], "2");
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "Done.");
+    assert_eq!(up.calls.lock().unwrap().len(), 2);
+
+    // One usage line per attempt, the failed one marked, never any text.
+    let events = gw.usage.recent();
+    assert_eq!(events.len(), 2);
+    let seen: Vec<_> = events
+        .iter()
+        .map(|e| (e.status, e.attempt, e.retrying))
+        .collect();
+    assert_eq!(seen, vec![(429, 1, true), (200, 2, false)]);
+    assert_eq!(events[1].attempts, 2);
+    assert_eq!(events[1].completion_tokens, Some(1));
+    let logged = serde_json::to_string(&events).unwrap();
+    assert!(!logged.contains("secret prompt") && !logged.contains("Done."));
+    gw.stop.cancel();
+}
+
+#[tokio::test]
+async fn retry_after_is_honoured() {
+    let (gw, up) = retry_gateway(
+        vec![Step::Refuse(503, Some("1"), "{}"), Step::Answer],
+        quick(3, 5000),
+    )
+    .await;
+    let res = chat(&gw, "pmos/default", "hi").send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    let calls = up.calls.lock().unwrap();
+    let gap = calls[1] - calls[0];
+    assert!(gap >= Duration::from_millis(990), "waited only {gap:?}");
+    gw.stop.cancel();
+}
+
+#[tokio::test]
+async fn it_gives_up_within_the_budget_and_returns_the_upstreams_answer() {
+    // Retry-After (2 s) is beyond the 1 s budget: no wait is started at all.
+    let (gw, up) = retry_gateway(vec![Step::Refuse(429, Some("2"), RATE)], quick(3, 1000)).await;
+    let t = std::time::Instant::now();
+    let res = chat(&gw, "pmos/default", "hi").send().await.unwrap();
+    assert!(t.elapsed() < Duration::from_millis(900));
+    assert_eq!(res.status(), 429);
+    assert_eq!(res.headers()["x-pmos-upstream-attempts"], "1");
+    assert_eq!(res.headers()["retry-after"], "2");
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "rate_limit_exceeded");
+    assert_eq!(up.calls.lock().unwrap().len(), 1);
+    gw.stop.cancel();
+
+    // With backoff only, it uses every attempt and then returns the upstream's status.
+    let (gw, up) = retry_gateway(vec![Step::Refuse(503, None, RATE)], quick(3, 1000)).await;
+    let t = std::time::Instant::now();
+    let res = chat(&gw, "pmos/default", "hi").send().await.unwrap();
+    assert!(t.elapsed() < Duration::from_millis(1000));
+    assert_eq!(res.status(), 503);
+    assert_eq!(res.headers()["x-pmos-upstream-attempts"], "3");
+    assert_eq!(up.calls.lock().unwrap().len(), 3);
+    let events = gw.usage.recent();
+    assert_eq!(
+        events.iter().map(|e| e.retrying).collect::<Vec<_>>(),
+        vec![true, true, false]
+    );
+    assert!(events.iter().all(|e| e.status == 503));
+    gw.stop.cancel();
+}
+
+#[tokio::test]
+async fn a_daily_quota_fails_fast() {
+    let daily = r#"[{"error":{"status":"RESOURCE_EXHAUSTED","details":[{"violations":[{"quotaId":"GenerateRequestsPerDayPerProjectPerModel-FreeTier"}]}]}}]"#;
+    let (gw, up) = retry_gateway(vec![Step::Refuse(429, None, daily)], quick(3, 5000)).await;
+    let res = chat(&gw, "pmos/default", "hi").send().await.unwrap();
+    assert_eq!(res.status(), 429);
+    assert_eq!(res.headers()["x-pmos-upstream-attempts"], "1");
+    assert_eq!(res.text().await.unwrap(), daily);
+    assert_eq!(up.calls.lock().unwrap().len(), 1);
+    gw.stop.cancel();
+}
+
+#[tokio::test]
+async fn a_400_is_never_retried() {
+    let bad = r#"{"error":{"message":"maximum context length exceeded"}}"#;
+    for status in [400, 401, 404, 422] {
+        let (gw, up) = retry_gateway(
+            vec![Step::Refuse(status, None, bad), Step::Answer],
+            quick(3, 5000),
+        )
+        .await;
+        let res = chat(&gw, "pmos/default", "hi").send().await.unwrap();
+        assert_eq!(res.status(), status);
+        assert_eq!(res.headers()["x-pmos-upstream-attempts"], "1");
+        assert_eq!(up.calls.lock().unwrap().len(), 1, "{status}");
+        gw.stop.cancel();
+    }
+}
+
+#[tokio::test]
+async fn nothing_is_retried_once_streaming_has_begun() {
+    let (gw, up) = retry_gateway(vec![Step::BrokenStream, Step::Answer], quick(3, 5000)).await;
+    let res = streamed(&gw).send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.headers()["x-pmos-upstream-attempts"], "1");
+    // The stream breaks after its first event; the caller sees that, not a second try.
+    let _ = res.bytes().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(up.calls.lock().unwrap().len(), 1);
+    let events = gw.usage.recent();
+    assert_eq!(events.len(), 1);
+    assert_eq!((events[0].attempts, events[0].retrying), (1, false));
+    gw.stop.cancel();
+
+    // A streamed request refused before its first byte is retried like any other.
+    let (gw, up) = retry_gateway(
+        vec![Step::Refuse(429, None, RATE), Step::BrokenStream],
+        quick(3, 5000),
+    )
+    .await;
+    let res = streamed(&gw).send().await.unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.headers()["x-pmos-upstream-attempts"], "2");
+    assert_eq!(up.calls.lock().unwrap().len(), 2);
+    gw.stop.cancel();
+}
+
+#[tokio::test]
+async fn a_waiting_retry_gives_its_slot_to_the_queue() {
+    // One slot. The first call is refused and waits a second to retry; a second call must
+    // not be stuck behind that wait.
+    let (gw, up) = retry_gateway(
+        vec![Step::Refuse(429, Some("1"), RATE), Step::Answer],
+        quick(3, 5000),
+    )
+    .await;
+    let first = chat(&gw, "pmos/default", "first").send();
+    let first = tokio::spawn(async move { first.await.unwrap() });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let t = std::time::Instant::now();
+    let second = chat(&gw, "pmos/default", "second").send().await.unwrap();
+    assert_eq!(second.status(), 200);
+    assert!(t.elapsed() < Duration::from_millis(500));
+    assert_eq!(first.await.unwrap().status(), 200);
+    assert_eq!(up.calls.lock().unwrap().len(), 3);
+    gw.stop.cancel();
+}
+
+/// A model server that answers after `delay`, whole or streamed.
+async fn slow_upstream(delay: Duration) -> (String, CancellationToken) {
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move |body: Bytes| async move {
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            tokio::time::sleep(delay).await;
+            if body["stream"] == json!(true) {
+                let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n\
+                           data: [DONE]\n\n";
+                return ([("content-type", "text/event-stream")], sse).into_response();
+            }
+            Json(json!({
+                "id": "x", "object": "chat.completion", "model": body["model"],
+                "choices": [{"index": 0, "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": "A long answer."}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            }))
+            .into_response()
+        }),
+    );
+    let (base, stop) = serve(app).await;
+    (format!("{base}/v1"), stop)
+}
+
+/// A long generation that isn't streamed sends nothing until it's whole: it must not be cut
+/// off by the silence limit meant for streams (a real run on a remote model lost every call
+/// over 120 s as a `502`). A stream that goes silent that long still fails, and a whole
+/// answer still has its own limit.
+#[tokio::test]
+async fn a_whole_answer_may_take_longer_than_a_stream_may_stay_silent() {
+    let (up, stop_up) = slow_upstream(Duration::from_millis(1500)).await;
+    let start = |timeouts: pmos_gateway::Timeouts| {
+        let models = Models::from_yaml(&format!(
+            "upstreams: {{a: '{up}'}}\nroles:\n  default: {{upstream: a, model: qwen-test}}\n"
+        ))
+        .unwrap();
+        router(GatewayConfig {
+            models,
+            clients: vec![Client {
+                name: "runtime".into(),
+                token: TOKEN.into(),
+            }],
+            usage: Arc::new(UsageLog::new(None).unwrap()),
+            stub: false,
+            workarounds_on: true,
+            anthropic_key: String::new(),
+            remote_key: String::new(),
+            retry: Default::default(),
+            timeouts,
+            model_source: ModelSource::Local,
+        })
+    };
+    let ask = |gw: &str, stream: bool| {
+        http()
+            .post(format!("{gw}/v1/chat/completions"))
+            .bearer_auth(TOKEN)
+            .header("X-Pmos-User", "ana")
+            .json(&json!({"model": "pmos/default", "stream": stream,
+                "messages": [{"role": "user", "content": "Draft the PRD"}]}))
+            .send()
+    };
+    let (gw, stop) = serve(start(pmos_gateway::Timeouts {
+        stream_silence: Duration::from_millis(500),
+        whole_answer: Duration::from_secs(10),
+        ..Default::default()
+    }))
+    .await;
+    let whole = ask(&gw, false).await.unwrap();
+    assert_eq!(whole.status(), 200);
+    let body: Value = whole.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "A long answer.");
+    assert_eq!(ask(&gw, true).await.unwrap().status(), 502);
+    stop.cancel();
+
+    let (gw, stop) = serve(start(pmos_gateway::Timeouts {
+        stream_silence: Duration::from_secs(10),
+        whole_answer: Duration::from_millis(500),
+        ..Default::default()
+    }))
+    .await;
+    assert_eq!(ask(&gw, false).await.unwrap().status(), 502);
+    assert_eq!(ask(&gw, true).await.unwrap().status(), 200);
+    stop.cancel();
+    stop_up.cancel();
+}
+
+/// A client that names the model source the gateways here serve (`local`; X4, slice H4).
+fn http() -> reqwest::Client {
+    http_as("local")
+}
+
+/// A client that names `source` on every call.
+fn http_as(source: &str) -> reqwest::Client {
+    let mut h = reqwest::header::HeaderMap::new();
+    h.insert(
+        "x-pmos-model-source",
+        reqwest::header::HeaderValue::from_str(source).unwrap(),
+    );
+    // Under `local` and `hosted` every model call names its task (slice H12); a call that
+    // names its own run keeps it.
+    h.insert(
+        "x-pmos-run",
+        reqwest::header::HeaderValue::from_static("test-run"),
+    );
+    reqwest::Client::builder()
+        .default_headers(h)
+        .build()
+        .unwrap()
 }

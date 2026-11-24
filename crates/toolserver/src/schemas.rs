@@ -78,10 +78,11 @@ pub const MAX_VERSION_COMMENT: u64 = 500;
 pub const MAX_JIRA_SUMMARY: u64 = 255;
 pub const MAX_JIRA_DESCRIPTION: u64 = 32_000;
 
-/// Arguments that say where a write goes, by tool: a decision of `edit` from the Slack bot
-/// must leave each one as drafted, or it is refused (`422 target_changed`). The Slack bot
-/// names the deciding PM without anything signed, so its edits may change what a draft
-/// says, never where it goes. The orchestrator's edits are not limited.
+/// Arguments that say where a write goes, by tool: a decision of `edit` from any client but
+/// the orchestrator (the Slack bot, `pmos-web`) must leave each one as drafted, or it is
+/// refused (`422 target_changed`). The Slack bot names the deciding PM without anything
+/// signed, and `pmos-web` edits only a draft's title and body, so their edits may change
+/// what a draft says, never where it goes. The orchestrator's edits are not limited.
 ///
 /// The names are the schemas' own (below); a unit test checks each one is in its tool's
 /// schema. An optional one missing from both the draft and the edit is unchanged. Keep
@@ -96,7 +97,7 @@ pub const EDIT_IMMUTABLE_ARGS: &[(&str, &[&str])] = &[
     ("bets.record", &["key"]),
 ];
 
-/// The arguments of `tool` that an edit from the Slack bot can't change.
+/// The arguments of `tool` that an edit from the Slack bot or `pmos-web` can't change.
 pub fn edit_immutable_args(tool: &str) -> &'static [&'static str] {
     EDIT_IMMUTABLE_ARGS
         .iter()

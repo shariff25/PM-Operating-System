@@ -1,0 +1,35 @@
+# TESTING ONLY: an EXAMPLE of the gateway config for PMOS_MODEL_SOURCE=hosted-test
+# (docs/openshell-any-host-spec.md §3.6, "hosted-test, and fake-data mode"; docs/gateway.md).
+# Every role on one hosted OpenAI-compatible model nobody approved, so prompts leave this host
+# and the stack takes fake data only.
+#
+# deploy/pmos-admin does not read this file: it writes the real one, with the same shape, from
+# PMOS_HOSTED_TEST_URL, PMOS_HOSTED_TEST_MODEL and PMOS_HOSTED_TEST_LABEL in deploy/.env to
+# $PMOS_STATE_DIR/gateway.hosted-test.yaml, outside the repository (it names the provider's URL and
+# model id, which no committed file may). The host and model id below are placeholders under
+# `.invalid`, which never resolves. The key is never in a config file: it is
+# PMOS_GATEWAY_REMOTE_KEY in deploy/.env (or a placeholder an egress proxy replaces).
+#
+# What the gateway itself requires of a hosted-test config (slice H4, `Config::check_source`):
+# no `class: production` (this is a `test` gateway, the only kind that takes a remote test
+# upstream, and its eval runs never count), PMOS_GATEWAY_CLOUD_TEST=1 unless the stub is on, and a
+# `label:` on every role, so the gateway reports and logs the label, never the model id.
+upstreams:
+  remote: "openai+https://models.example.invalid/v1"
+roles:
+  default: {upstream: remote, model: "example-model-id", label: hosted-model-a}
+  reasoning: {upstream: remote, model: "example-model-id", label: hosted-model-a}
+  extraction: {upstream: remote, model: "example-model-id", label: hosted-model-a}
+limits:
+  max-in-flight: 4
+  per-user: 2
+  max-queue: 64
+  queue-wait-secs: 300
+  stream-max-secs: 900
+  max-answer-bytes: 16777216
+  per-user-queue: 4
+clients:
+  runtime: {trusted: true, max-in-flight: 2}
+  bot-pm-*: {trusted: true, max-in-flight: 3, user: from-name}
+  bot-*: {trusted: true, max-in-flight: 3}
+  evals: {max-in-flight: 1, priority: personal, route: pin}

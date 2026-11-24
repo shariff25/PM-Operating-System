@@ -13,7 +13,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Form, Router};
 use futures_util::future::join_all;
-use pmos_contract::model::TeamFile;
+use pmos_directory::resolve::ResolveClient;
 use serde::Deserialize;
 
 use crate::audit;
@@ -25,9 +25,18 @@ use crate::upstream::{BotDetail, BotSummary, Routine, Task, Upstream, UpstreamEr
 /// How many recent tasks the Activity screen lists.
 pub const RECENT_TASKS: u32 = 50;
 
+/// What a list shows in place of the text of someone else's task or routine: the runtime sends
+/// the console only its metadata.
+pub const HIDDEN_TEXT: &str = "<span class=\"muted\">text hidden</span>";
+
+/// The code on the page when the user database can't answer (spec §2, "When the store is
+/// unavailable": sign-in fails closed).
+pub const USERS_UNAVAILABLE: &str = "users_unavailable";
+
 struct Inner {
     identity: Identity,
-    content_root: PathBuf,
+    /// The user database, through the tool server's `resolve` route (10-second cache).
+    directory: Arc<ResolveClient>,
     bots: Upstream,
     toolserver: Upstream,
     audit_log: Option<PathBuf>,
@@ -39,12 +48,29 @@ struct Inner {
 #[derive(Clone)]
 pub struct AppState(Arc<Inner>);
 
-pub fn router(config: Config) -> Router {
-    let http = reqwest::Client::builder()
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .expect("an HTTP client with default TLS");
+        .expect("an HTTP client with default TLS")
+}
+
+/// The console, looking people up at the tool server named in `config` with its own tool
+/// server token (`PMOS_CONSOLE_TS_TOKEN` there), on the system clock.
+pub fn router(config: Config) -> Router {
+    let directory = ResolveClient::http(
+        http_client(),
+        &config.toolserver_url,
+        config.toolserver_token.token(),
+    );
+    router_with_directory(config, Arc::new(directory))
+}
+
+/// The console with a given resolve client (tests inject a clock or a transport).
+pub fn router_with_directory(config: Config, directory: Arc<ResolveClient>) -> Router {
+    let http = http_client();
     let state = AppState(Arc::new(Inner {
+        directory,
         bots: Upstream::new(
             http.clone(),
             &config.bots_url,
@@ -58,7 +84,6 @@ pub fn router(config: Config) -> Router {
             "tool server",
         ),
         identity: config.identity,
-        content_root: config.content_root,
         audit_log: config.audit_log,
         slack_url: config.slack_url,
         public_url: config.public_url,
@@ -97,7 +122,8 @@ async fn through_the_proxy(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    if req.uri().path() == "/healthz" || auth::from_proxy(&state.0.identity, req.headers()) {
+    let health_check = req.method() == axum::http::Method::GET && req.uri().path() == "/healthz";
+    if health_check || auth::from_proxy(&state.0.identity, req.headers()) {
         return next.run(req).await;
     }
     tracing::warn!(path = %req.uri().path(), "refused: no valid X-Pmos-Proxy-Secret");
@@ -177,46 +203,75 @@ fn upstream_failed(viewer: &Viewer, screen: Screen, err: UpstreamError) -> Respo
     )
 }
 
-/// The person using the console, checked against `team.yaml` on every request.
+/// The person using the console, looked up in the user database for this request (an answer
+/// at most 10 seconds old; none when the tool server can't give one).
 pub struct Signed {
     pub viewer: Viewer,
-    pub team: TeamFile,
 }
 
 impl FromRequestParts<AppState> for Signed {
     type Rejection = Response;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Response> {
-        let team = TeamFile::load(&state.0.content_root).map_err(|e| {
-            tracing::error!(error = %e, "team.yaml can't be read");
+        auth::viewer(&state.0.identity, &parts.headers, &state.0.directory)
+            .await
+            .map(|viewer| Self { viewer })
+            .map_err(refused)
+    }
+}
+
+/// The page for a person the console won't serve. Logs say why by kind only: never the
+/// handle or sign-in name presented.
+fn refused(why: AuthError) -> Response {
+    let forbidden = |reason: &'static str, title: &str, text: &str| {
+        tracing::info!(reason, "refused a console viewer");
+        message(StatusCode::FORBIDDEN, None, title, text)
+    };
+    match why {
+        AuthError::NotFromProxy => not_from_proxy(),
+        AuthError::NoUser => message(
+            StatusCode::UNAUTHORIZED,
+            None,
+            "Not signed in",
+            "Open the console through the PM OS sign-in.",
+        ),
+        AuthError::NotMember => forbidden(
+            "not_a_member",
+            "Not a PM OS user",
+            "You aren't a PM OS user, so the console can't show you anything. Ask an admin \
+             to add you.",
+        ),
+        AuthError::Deactivated => forbidden(
+            "deactivated",
+            "Account deactivated",
+            "Your PM OS account is deactivated. Ask an admin if this is a mistake.",
+        ),
+        AuthError::SignInUnconfirmed => forbidden(
+            "sign_in_unconfirmed",
+            "Sign-in not confirmed yet",
+            "An admin hasn't confirmed your sign-in name yet. Ask an admin to confirm it in \
+             the web app's Team page.",
+        ),
+        AuthError::NoConsole => forbidden(
+            "no_console_role",
+            "Not for auditors",
+            "The console is for PMs and admins; the audit log is in the web app.",
+        ),
+        AuthError::Unavailable => {
+            tracing::warn!(
+                code = USERS_UNAVAILABLE,
+                "refused: the user database can't be checked"
+            );
             message(
                 StatusCode::SERVICE_UNAVAILABLE,
                 None,
                 "Can't check who you are",
-                "The team list can't be read. Tell a platform owner.",
+                &format!(
+                    "PM OS can't check who you are right now, so the console shows nothing. \
+                     Try again in a minute; if it keeps happening, tell a platform owner. \
+                     ({USERS_UNAVAILABLE})"
+                ),
             )
-        })?;
-        match auth::viewer(&state.0.identity, &parts.headers, &team) {
-            Ok(viewer) => Ok(Self { viewer, team }),
-            Err(AuthError::NotFromProxy) => Err(not_from_proxy()),
-            Err(AuthError::NoUser) => Err(message(
-                StatusCode::UNAUTHORIZED,
-                None,
-                "Not signed in",
-                "Open the console through the PM OS sign-in.",
-            )),
-            Err(AuthError::NotMember(who)) => {
-                tracing::info!(user = %who, "refused: not in team.yaml");
-                Err(message(
-                    StatusCode::FORBIDDEN,
-                    None,
-                    "Not on the team",
-                    &format!(
-                        "{who} isn't in team.yaml, so the console can't show you anything. \
-                         Ask a platform owner to add you."
-                    ),
-                ))
-            }
         }
     }
 }
@@ -244,13 +299,13 @@ fn list(items: &[String]) -> String {
 // Bots.
 
 async fn bots(State(state): State<AppState>, Signed { viewer, .. }: Signed) -> Response {
-    let mut roster: Vec<BotSummary> = match state.0.bots.bots().await {
+    let mut roster: Vec<BotSummary> = match state.0.bots.bots(&viewer).await {
         Ok(b) => b,
         Err(e) => return upstream_failed(&viewer, Screen::Bots, e),
     };
     roster.retain(|b| viewer.sees_bot(&b.scope, &b.owner));
     roster.sort_by(|a, b| (a.scope != "team", &a.name).cmp(&(b.scope != "team", &b.name)));
-    let details = join_all(roster.iter().map(|b| state.0.bots.bot(&b.name))).await;
+    let details = join_all(roster.iter().map(|b| state.0.bots.bot(&viewer, &b.name))).await;
 
     let mut body = String::from(
         "<p class=\"muted\">Each bot's job, what it may read, and what happens when it \
@@ -388,7 +443,7 @@ async fn visible_routines(
     viewer: &Viewer,
 ) -> Result<Vec<Routine>, UpstreamError> {
     let owner = (!viewer.admin).then_some(viewer.handle.as_str());
-    let mut items = state.0.bots.routines(owner).await?;
+    let mut items = state.0.bots.routines(viewer, owner).await?;
     items.retain(|r| viewer.sees_own(&r.owner));
     Ok(items)
 }
@@ -419,10 +474,14 @@ fn routine_row(r: &Routine, token: &str) -> Vec<String> {
             " class=\"danger\""
         )
     );
+    let prompt = if r.hidden {
+        HIDDEN_TEXT.to_string()
+    } else {
+        esc(&clip(&r.prompt, 160))
+    };
     vec![
         format!(
-            "{}<br><span class=\"muted\"><code>{}</code></span>",
-            esc(&clip(&r.prompt, 160)),
+            "{prompt}<br><span class=\"muted\"><code>{}</code></span>",
             Esc(&r.id)
         ),
         esc(&r.bot),
@@ -497,9 +556,9 @@ async fn routine_action(
         Err(e) => return upstream_failed(&viewer, Screen::Routines, e),
     }
     let done = match action.as_str() {
-        "pause" => state.0.bots.set_routine_enabled(&id, false).await,
-        "resume" => state.0.bots.set_routine_enabled(&id, true).await,
-        _ => state.0.bots.delete_routine(&id).await,
+        "pause" => state.0.bots.set_routine_enabled(&viewer, &id, false).await,
+        "resume" => state.0.bots.set_routine_enabled(&viewer, &id, true).await,
+        _ => state.0.bots.delete_routine(&viewer, &id).await,
     };
     match done {
         Ok(()) => {
@@ -518,25 +577,55 @@ async fn routine_action(
 
 // Approvals.
 
-async fn approvals(State(state): State<AppState>, Signed { viewer, team }: Signed) -> Response {
+/// Whose inboxes an admin's Approvals screen reads: every active user who may hold drafts,
+/// from the tool server's admin listing for the console (`GET /internal/console/members`,
+/// handles only, for an active admin, signed as the viewer; slice U5a), plus the admin. The
+/// tool server decides again that the viewer is an admin; the console's own admin view only
+/// chooses to ask.
+async fn admin_inboxes(state: &AppState, viewer: &Viewer) -> Result<Vec<String>, UpstreamError> {
+    let mut users: std::collections::BTreeSet<String> = state
+        .0
+        .toolserver
+        .members(viewer)
+        .await?
+        .into_iter()
+        .filter(|h| pmos_contract::model::valid_handle(h))
+        .collect();
+    users.insert(viewer.handle.clone());
+    Ok(users.into_iter().collect())
+}
+
+async fn approvals(State(state): State<AppState>, Signed { viewer }: Signed) -> Response {
     let users: Vec<String> = if viewer.admin {
-        team.members.iter().map(|m| m.handle.clone()).collect()
+        match admin_inboxes(&state, &viewer).await {
+            Ok(users) => users,
+            Err(e) => return upstream_failed(&viewer, Screen::Approvals, e),
+        }
     } else {
         vec![viewer.handle.clone()]
     };
     let mut items = Vec::new();
-    for result in join_all(
-        users
-            .iter()
-            .map(|u| state.0.toolserver.pending_approvals(u)),
-    )
-    .await
-    {
+    // Inboxes the tool server cut at its safety cap: (PM, how many are pending in all).
+    let mut cut: Vec<(String, usize)> = Vec::new();
+    for (user, result) in users.iter().zip(
+        join_all(
+            users
+                .iter()
+                .map(|u| state.0.toolserver.pending_approvals(&viewer, u)),
+        )
+        .await,
+    ) {
         match result {
-            Ok(mut found) => items.append(&mut found),
+            Ok(mut page) => {
+                if page.truncated {
+                    cut.push((user.clone(), page.total_pending));
+                }
+                items.append(&mut page.items);
+            }
             Err(e) => return upstream_failed(&viewer, Screen::Approvals, e),
         }
     }
+    cut.retain(|(u, _)| viewer.sees_own(u));
     items.retain(|a| viewer.sees_own(&a.user));
     items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
@@ -549,13 +638,23 @@ async fn approvals(State(state): State<AppState>, Signed { viewer, team }: Signe
          <strong>Approve</strong>, <strong>Edit</strong> and <strong>Reject</strong> in its \
          task's thread, and only its own PM can decide it. This queue is read-only.{slack}</p>"
     );
+    for (user, total) in &cut {
+        let _ = write!(
+            body,
+            "<p class=\"error\" role=\"status\">{}'s inbox has {total} pending drafts; the tool \
+             server listed only the newest. The rest are still pending.</p>",
+            Esc(user)
+        );
+    }
     if items.is_empty() {
         body.push_str(&empty("Nothing is waiting for approval."));
     } else {
         let rows: Vec<Vec<String>> = items
             .iter()
             .map(|a| {
-                let args = serde_json::to_string(&a.args).unwrap_or_default();
+                // As it will be written: without the draft's source markers (`[[src-…]]`).
+                let args = serde_json::to_string(&pmos_contract::cite::strip_json(&a.args))
+                    .unwrap_or_default();
                 let task = if valid_id(&a.run_id) {
                     format!("<a href=\"/tasks/{id}\">{id}</a>", id = Esc(&a.run_id))
                 } else {
@@ -587,7 +686,7 @@ async fn approvals(State(state): State<AppState>, Signed { viewer, team }: Signe
 
 async fn activity(State(state): State<AppState>, Signed { viewer, .. }: Signed) -> Response {
     let who = (!viewer.admin).then_some(viewer.handle.as_str());
-    let mut tasks = match state.0.bots.tasks(who, RECENT_TASKS).await {
+    let mut tasks = match state.0.bots.tasks(&viewer, who, RECENT_TASKS).await {
         Ok(t) => t,
         Err(e) => return upstream_failed(&viewer, Screen::Activity, e),
     };
@@ -602,7 +701,13 @@ async fn activity(State(state): State<AppState>, Signed { viewer, .. }: Signed) 
         let rows: Vec<Vec<String>> = tasks
             .iter()
             .map(|t| {
-                let ask = esc(&clip(&t.text, 140));
+                // Someone else's task comes as metadata only: its ask isn't shown here, and
+                // its page answers only its own PM or an admin.
+                let ask = if t.hidden {
+                    HIDDEN_TEXT.to_string()
+                } else {
+                    esc(&clip(&t.text, 140))
+                };
                 vec![
                     when(&t.created_at),
                     esc(&t.bot),
@@ -658,7 +763,7 @@ async fn task(
     if !valid_id(&id) {
         return not_found();
     }
-    let task = match state.0.bots.task(&id).await {
+    let task = match state.0.bots.task(&viewer, &id).await {
         Ok(t) if viewer.sees_own(&t.requested_by) => t,
         Ok(_) | Err(UpstreamError::NotFound) => return not_found(),
         Err(e) => return upstream_failed(&viewer, Screen::Activity, e),
@@ -670,8 +775,8 @@ async fn task(
         }
     };
     let (events, trace, audit) = tokio::join!(
-        state.0.bots.task_events(&task.id),
-        state.0.bots.task_trace(&task.id),
+        state.0.bots.task_events(&viewer, &task.id),
+        state.0.bots.task_trace(&viewer, &task.id),
         audit
     );
 
@@ -725,7 +830,8 @@ async fn task(
         body.push_str("</ul>");
     }
     if let Some(result) = &task.result {
-        let _ = write!(body, "<h2>Result</h2><pre>{}</pre>", Esc(result));
+        let result = pmos_contract::cite::strip(result);
+        let _ = write!(body, "<h2>Result</h2><pre>{}</pre>", Esc(&result));
     }
     if let Some(error) = &task.error {
         let _ = write!(

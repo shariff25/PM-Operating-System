@@ -28,6 +28,13 @@ pub struct RuntimeTask {
     pub attempts: u32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Which labelled models answered the task's calls, as its worker reported them
+    /// (`docs/model-providers-spec.md` §4.9, slice MP7). `None` from a runtime before routes.
+    #[serde(default)]
+    pub models_used: Option<Vec<crate::report::ModelUse>>,
+    /// A call of the task was answered by a fallback model.
+    #[serde(default)]
+    pub fallback_used: Option<bool>,
 }
 
 /// The task statuses (§3).
@@ -50,6 +57,9 @@ impl RuntimeTask {
         )
     }
 }
+
+/// The event the runtime adds to a cancelled task once its worker has been told and let it go.
+pub use pmos_contract::bots::WORKER_STOPPED_EVENT;
 
 /// A task event: `GET /v1/tasks/{id}/events`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -116,9 +126,39 @@ pub struct Runtime {
     /// be tagged with the trace; without one the trace is tried with `token` and skipped if
     /// refused.
     trace_token: Option<String>,
+    /// What each settled task said answered it, by task id ([`Runtime::route_record`]).
+    seen: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, Seen>>>,
 }
 
+type Seen = (Option<Vec<crate::report::ModelUse>>, Option<bool>);
+
 impl Runtime {
+    /// One id per shared record: a runtime and its clones give the same.
+    pub fn record_id(&self) -> usize {
+        std::sync::Arc::as_ptr(&self.seen) as *const () as usize
+    }
+
+    /// Which models answered the settled tasks this client has read (slice MP6): what a run's
+    /// report records in [`crate::report::Report::route`].
+    pub fn route_record(&self) -> crate::report::RouteRecord {
+        let mut r = crate::report::RouteRecord {
+            pinned: "primary".into(),
+            ..Default::default()
+        };
+        for (used, fallback) in self.seen.lock().unwrap_or_else(|p| p.into_inner()).values() {
+            match used {
+                Some(list) => {
+                    for u in list {
+                        r.add(&u.label, u.model_sha256.as_deref(), u.calls, false);
+                    }
+                }
+                None => r.unrecorded += 1,
+            }
+            r.fallback_used |= fallback.unwrap_or(false);
+        }
+        r
+    }
+
     pub fn new(base: &str, token: &str, trace_token: Option<&str>) -> Self {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -129,6 +169,7 @@ impl Runtime {
             base: base.trim_end_matches('/').to_string(),
             token: token.to_string(),
             trace_token: trace_token.map(str::to_string),
+            seen: Default::default(),
         }
     }
 
@@ -203,10 +244,33 @@ impl Runtime {
         text: &str,
         level: Option<&str>,
     ) -> Result<RuntimeTask, ApiError> {
+        self.create_task_in(bot, requested_by, text, level, None, None)
+            .await
+    }
+
+    /// [`Self::create_task`] as a turn of `conversation`, asking `persona` (a marketplace
+    /// bot, docs/bot-marketplace-spec.md §10) when the category names one: tasks with the same
+    /// conversation id, from the same requester for the same bot and persona, are given earlier
+    /// turns as `history`.
+    pub async fn create_task_in(
+        &self,
+        bot: &str,
+        requested_by: &str,
+        text: &str,
+        level: Option<&str>,
+        persona: Option<&str>,
+        conversation: Option<&str>,
+    ) -> Result<RuntimeTask, ApiError> {
         let mut body =
             json!({"bot": bot, "requested_by": requested_by, "text": text, "source": "eval"});
         if let Some(level) = level {
             body["level"] = json!(level);
+        }
+        if let Some(conversation) = conversation {
+            body["conversation"] = json!(conversation);
+        }
+        if let Some(persona) = persona {
+            body["persona"] = json!(persona);
         }
         let v = self
             .send("POST", "/v1/tasks", &self.token, Some(body))
@@ -218,7 +282,24 @@ impl Runtime {
     pub async fn task(&self, id: &str) -> Result<RuntimeTask, ApiError> {
         let path = format!("/v1/tasks/{id}");
         let v = self.send("GET", &path, &self.token, None).await?;
-        Self::decode("GET", &path, v)
+        let t: RuntimeTask = Self::decode("GET", &path, v)?;
+        if t.is_settled() && t.status != status::CANCELLED {
+            self.seen
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(t.id.clone(), (t.models_used.clone(), t.fallback_used));
+        }
+        Ok(t)
+    }
+
+    /// `POST /v1/tasks/{id}/cancel`: an eval task the runner gave up on. The runtime tells its
+    /// worker on the worker's next heartbeat, and records [`WORKER_STOPPED_EVENT`] when it has.
+    pub async fn cancel(&self, id: &str) -> Result<RuntimeTask, ApiError> {
+        let path = format!("/v1/tasks/{id}/cancel");
+        let v = self
+            .send("POST", &path, &self.token, Some(json!({})))
+            .await?;
+        Self::decode("POST", &path, v)
     }
 
     /// `GET /v1/tasks/{id}/events`.
@@ -233,6 +314,27 @@ impl Runtime {
         let path = format!("/v1/tasks/{id}/drafts");
         let v = self.send("GET", &path, &self.token, None).await?;
         Self::decode::<Drafts>("GET", &path, v).map(|d| d.drafts)
+    }
+
+    /// Which models the runtime's own gateway serves, and that gateway's class: the `gateway`
+    /// field the runtime adds to `GET /v1/personas` for client `evals` (review finding R3).
+    /// This is the gateway the runtime and its workers were configured with, not one the
+    /// runner names itself. Never a URL: the field holds model ids and upstream kinds only.
+    pub async fn gateway_models(&self) -> Result<crate::report::GatewayModels, String> {
+        let v = self
+            .send("GET", "/v1/personas", &self.token, None)
+            .await
+            .map_err(|e| e.to_string())?;
+        let g = &v["gateway"];
+        if let Some(why) = g["error"].as_str() {
+            return Err(why.to_string());
+        }
+        if g.is_null() {
+            return Err(
+                "the runtime doesn't report its gateway (a runtime from before 2026-11-22?)".into(),
+            );
+        }
+        crate::report::GatewayModels::from_roles_answer(g)
     }
 
     /// `GET /v1/tasks/{id}/trace`, or `None` when this client may not read it (401, 403) or

@@ -1,0 +1,305 @@
+{
+  "category": "confluence-draft",
+  "bot": "pm-evals",
+  "date": "2026-11-23",
+  "started_at": "2026-11-23T17:26:36.705438918Z",
+  "finished_at": "2026-11-23T17:44:23.268610483Z",
+  "pass_bar": 0.8,
+  "runtime_url": "http://127.0.0.1:8850, http://127.0.0.1:8950, http://127.0.0.1:9050, http://127.0.0.1:9150",
+  "requested_by": "evals",
+  "gateway_workarounds": null,
+  "note": "E3: isolated re-run on the test stack, hosted-model-a, fake fixtures",
+  "gateway_models": {
+    "roles": {
+      "default": "hosted-model-a",
+      "extraction": "hosted-model-a",
+      "reasoning": "hosted-model-a"
+    },
+    "upstreams": {
+      "default": "remote-test",
+      "extraction": "remote-test",
+      "reasoning": "remote-test"
+    },
+    "stub": false,
+    "cloud_test": true,
+    "workarounds": true,
+    "class": "test"
+  },
+  "repeats": 3,
+  "isolation": "a fresh tool server for every attempt (`fresh-toolserver` before each), 4 lanes",
+  "tasks": [
+    {
+      "id": "call-notes-summary",
+      "ask": "Draft a Confluence page in the PM space titled 'Acme Cloud customer asks, October' that summarises what customers asked for in the October Acme Cloud call notes.",
+      "repeat": 1,
+      "cluster": "call-notes-summary",
+      "task_id": "tsk_18e08b6235b44ab5a44327b32b552d9b",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 472.729,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "call-notes-summary",
+      "ask": "Draft a Confluence page in the PM space titled 'Acme Cloud customer asks, October' that summarises what customers asked for in the October Acme Cloud call notes.",
+      "repeat": 2,
+      "cluster": "call-notes-summary",
+      "task_id": "tsk_62b303267a8c4374870aca3bded49528",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 294.303,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "call-notes-summary",
+      "ask": "Draft a Confluence page in the PM space titled 'Acme Cloud customer asks, October' that summarises what customers asked for in the October Acme Cloud call notes.",
+      "repeat": 3,
+      "cluster": "call-notes-summary",
+      "task_id": "tsk_71acab54b55044eb99be4403ad1d88aa",
+      "status": "failed",
+      "passed": false,
+      "failures": [
+        {
+          "check": "status",
+          "expected": "`needs_approval`",
+          "got": "failed"
+        },
+        {
+          "check": "approvals",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "draft_count",
+          "tool": "confluence.create_draft",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "no_answer"
+        }
+      ],
+      "tag": {
+        "tag": "harness",
+        "rule": "interrupted",
+        "reason": "error mentions `gateway`: the model gateway returned an error (502). please try again in a few minutes.",
+        "sub": "harness/interrupted"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 521.324,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "new-page-not-an-edit",
+      "ask": "Draft a new page in the PM space listing next steps for the SSO and audit export asks from the October Acme Cloud call notes. Leave the call notes page itself unchanged.",
+      "repeat": 1,
+      "cluster": "new-page-not-an-edit",
+      "task_id": "tsk_189e6b26448f4e0e8894968d96ac01ce",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 451.693,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "new-page-not-an-edit",
+      "ask": "Draft a new page in the PM space listing next steps for the SSO and audit export asks from the October Acme Cloud call notes. Leave the call notes page itself unchanged.",
+      "repeat": 2,
+      "cluster": "new-page-not-an-edit",
+      "task_id": "tsk_28ccb3c60fe34fcbb53ed7e56ec1e0f3",
+      "status": "failed",
+      "passed": false,
+      "failures": [
+        {
+          "check": "status",
+          "expected": "`needs_approval`",
+          "got": "failed"
+        },
+        {
+          "check": "approvals",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "draft_count",
+          "tool": "confluence.create_draft",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "no_answer"
+        }
+      ],
+      "tag": {
+        "tag": "harness",
+        "rule": "interrupted",
+        "reason": "error mentions `gateway`: the model gateway returned an error (502). please try again in a few minutes.",
+        "sub": "harness/interrupted"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 371.118,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "new-page-not-an-edit",
+      "ask": "Draft a new page in the PM space listing next steps for the SSO and audit export asks from the October Acme Cloud call notes. Leave the call notes page itself unchanged.",
+      "repeat": 3,
+      "cluster": "new-page-not-an-edit",
+      "task_id": "tsk_286b54abbdc64e0cb8c7078ca4f9bfb8",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 301.715,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "prd-from-exemplar",
+      "ask": "Draft anyway, no questions: a first-draft PRD in the PM space for exporting audit logs from the Acme Vault console, using the Key export v2 PRD as the exemplar and the October Acme Cloud call notes for customer asks.",
+      "repeat": 1,
+      "cluster": "prd-from-exemplar",
+      "task_id": "tsk_5258e4223a5742918c858833b62780f2",
+      "status": "failed",
+      "passed": false,
+      "failures": [
+        {
+          "check": "status",
+          "expected": "`needs_approval`",
+          "got": "failed"
+        },
+        {
+          "check": "approvals",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "draft_count",
+          "tool": "confluence.create_draft",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "no_answer"
+        }
+      ],
+      "tag": {
+        "tag": "harness",
+        "rule": "interrupted",
+        "reason": "error mentions `gateway`: the model gateway returned an error (502). please try again in a few minutes.",
+        "sub": "harness/interrupted"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 389.603,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "prd-from-exemplar",
+      "ask": "Draft anyway, no questions: a first-draft PRD in the PM space for exporting audit logs from the Acme Vault console, using the Key export v2 PRD as the exemplar and the October Acme Cloud call notes for customer asks.",
+      "repeat": 2,
+      "cluster": "prd-from-exemplar",
+      "task_id": "tsk_70be84c630d84782aec76eb6f9ec662b",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 342.419,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "prd-from-exemplar",
+      "ask": "Draft anyway, no questions: a first-draft PRD in the PM space for exporting audit logs from the Acme Vault console, using the Key export v2 PRD as the exemplar and the October Acme Cloud call notes for customer asks.",
+      "repeat": 3,
+      "cluster": "prd-from-exemplar",
+      "task_id": "tsk_f7e8524e12b7449bb50c7cbcb744e305",
+      "status": "failed",
+      "passed": false,
+      "failures": [
+        {
+          "check": "status",
+          "expected": "`needs_approval`",
+          "got": "failed"
+        },
+        {
+          "check": "approvals",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "draft_count",
+          "tool": "confluence.create_draft",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "no_answer"
+        }
+      ],
+      "tag": {
+        "tag": "harness",
+        "rule": "interrupted",
+        "reason": "error mentions `gateway`: the model gateway returned an error (502). please try again in a few minutes.",
+        "sub": "harness/interrupted"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 355.944,
+      "attempts": 1,
+      "trace_read": true
+    }
+  ],
+  "summary": {
+    "attempts": 9,
+    "passed": 5,
+    "pass_rate": 0.5555555555555556,
+    "tasks": 3,
+    "tasks_all_attempts_passed": 0,
+    "all_attempts_pass_rate": 0.0,
+    "infra_losses": 4,
+    "pass_rate_excluding_infra": 1.0,
+    "pass_bar": 0.8,
+    "met_bar": false,
+    "by_task": [
+      {
+        "id": "call-notes-summary",
+        "passes": 2,
+        "attempts": 3,
+        "pass_rate": 0.6666666666666666,
+        "all_attempts_passed": false,
+        "infra_losses": 1
+      },
+      {
+        "id": "new-page-not-an-edit",
+        "passes": 2,
+        "attempts": 3,
+        "pass_rate": 0.6666666666666666,
+        "all_attempts_passed": false,
+        "infra_losses": 1
+      },
+      {
+        "id": "prd-from-exemplar",
+        "passes": 1,
+        "attempts": 3,
+        "pass_rate": 0.3333333333333333,
+        "all_attempts_passed": false,
+        "infra_losses": 2
+      }
+    ]
+  }
+}

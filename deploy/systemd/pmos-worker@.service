@@ -1,0 +1,62 @@
+# PM OS: one bot's harness worker, running inside that bot's OpenShell sandbox
+# (docs/sandbox-policies.md, "Creating a bot's sandbox"; docs/openshell-any-host-spec.md §3.7).
+#
+# A systemd *user* unit template; the instance is the bot's name. `deploy/pmos-admin sandbox
+# <bot>` and `deploy/pmos-admin resume <bot>` install it under ~/.config/systemd/user/ for the
+# user whose OpenShell gateway runs, then enable and start
+#   pmos-worker@$(systemd-escape -- <bot>).service
+# The bot name is checked first (PM OS's valid_name: lowercase letters, digits, single hyphens),
+# and this file uses %I, the unescaped instance name, never %i: for pm-ana the instance is
+# `pm\x2dana` and %I is `pm-ana`. pmos-admin replaces only the path of `openshell` on the
+# ExecStart line with the one on its PATH (an absolute path of plain characters); nothing else in
+# this file changes when it is installed.
+#
+# No token is in this file: the worker's two credentials are the sandbox's providers
+# (pmos-<bot>-gateway, pmos-<bot>-worker), which OpenShell injects into the sandbox.
+#
+# From OpenShell's public docs, not yet seen on a real host:
+#   - `openshell sandbox exec -n <sandbox> --workdir <dir> -- <command>` runs a command in a
+#     running sandbox (how-it-works/sandboxes/overview.mdx);
+#   - the Linux package runs OpenShell's gateway as the systemd user service
+#     `openshell-gateway`, and `loginctl enable-linger` keeps user services running after
+#     logout and starts them at boot (about/installation.mdx).
+# Verify on a real host (the acceptance run, docs/openshell-any-host-spec.md §6; fixed in slice
+# H5 if they differ):
+#   - that `sandbox exec` stays in the foreground for the worker's whole life, so that systemd
+#     supervises the worker and not a short-lived client (the docs call it "one-shot" and say
+#     nothing about long-running commands);
+#   - that stopping this unit (which ends the `sandbox exec` client) stops the worker inside the
+#     sandbox; `pmos-admin pause` also stops the sandbox itself, so a pause holds either way;
+#   - the name of OpenShell's own user unit (`openshell-gateway.service` here).
+#
+# ExecStartPre (slice H1) runs the quick host preflight (deploy/preflight.sh --stage quick: Landlock,
+# seccomp, Docker's seccomp profile, the service names and OpenShell's gateway) before every start
+# and at boot, so a host that lost Landlock or seccomp after an update doesn't start the worker;
+# StartLimit* then stops the retries and `pmos-admin status` lists the failed unit. pmos-admin
+# replaces this line with the checkout's own preflight path, run through /usr/bin/env with
+# openshell's directory on PATH.
+
+[Unit]
+Description=PM OS worker for bot %I (OpenShell sandbox pmos-%I)
+Documentation=https://github.com/NVIDIA/OpenShell/blob/main/docs/how-it-works/sandboxes/overview.mdx
+After=openshell-gateway.service
+Wants=openshell-gateway.service
+# A worker that fails at once stops after five tries in ten minutes, instead of restarting
+# forever; `systemctl --user status` then shows it failed, and `pmos-admin resume` clears it.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=exec
+ExecStartPre=/opt/pmos/deploy/preflight.sh --stage quick
+ExecStart=/usr/bin/openshell sandbox exec -n pmos-%I --workdir /sandbox/workspace -- \
+  env PMOS_BOTS_URL=http://bots.pmos.internal:8750 PMOS_WORKER_BOT=%I \
+  PMOS_GATEWAY_URL=http://gateway.pmos.internal:8740/v1 \
+  PMOS_TOOLSERVER_MCP_URL=http://toolserver.pmos.internal:8710/mcp \
+  PMOS_CONTENT_ROOT=/sandbox \
+  /usr/local/bin/node /opt/pmos/harness/dist/main.js
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

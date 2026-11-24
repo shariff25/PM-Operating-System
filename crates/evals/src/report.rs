@@ -38,12 +38,50 @@ pub struct Report {
     /// declared it. The runner can't see the gateway's own setting.
     #[serde(default)]
     pub gateway_workarounds: Option<String>,
-    /// Free text saying why this run happened ("weekly", "model swap to …").
+    /// Free text saying why this run happened ("weekly", "model swap to …"). Never read by
+    /// any rule: which models a run measured is [`Report::gateway_models`].
     #[serde(default)]
     pub note: Option<String>,
+    /// The models the gateway said it served each role with, asked at the start of the run
+    /// and again at its end, never typed by the operator; model ids, upstream kinds and the
+    /// gateway's class only, never an address. Since review finding R3 they come from the
+    /// runtime under test (every lane's), which asks its own gateway (`GET /v1/pmos/roles`),
+    /// so they are the models of the gateway the bots used. `None`: a runtime couldn't say,
+    /// the lanes' runtimes disagreed, or the answer changed during the run. A run counts
+    /// towards a bar only with this field, from a `production` gateway, matching the
+    /// production role models ([`crate::history::counts`]); reports before 2026-11-22 have
+    /// none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway_models: Option<GatewayModels>,
+    /// Which models answered the run's calls, as the gateway's answers said
+    /// (`docs/model-providers-spec.md` §4.10, slice MP6): the runner pins every call to each
+    /// role's primary (`X-Pmos-Fallback: off` on judge calls; the runtime pins every `eval`
+    /// task's calls), and records what came back. A run with a fallback answer, or a label
+    /// that isn't the primary's, counts towards no bar ([`crate::history::counts`]). `None` in
+    /// reports from before routes (2026-11-24).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<RouteRecord>,
+    /// The version (`version:` in `PERSONA.md`) of the persona the category's tasks asked,
+    /// read from the content the run used. For display only: what counts is
+    /// [`Report::persona_hash`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona_version: Option<String>,
+    /// A hash of the persona's files in the content the run used: its `PERSONA.md`, its
+    /// role's `ROLE.md`, and every file of every skill the role lists
+    /// ([`crate::history::persona_hash`]). A persona category's run counts towards
+    /// `benchmarked: true` only while the hash of those files is still this one, so an edit
+    /// that doesn't bump `version:` still starts the streak again. Reports before 2026-11-22
+    /// have none, and count for no persona.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona_hash: Option<String>,
     /// How many times each task ran.
     #[serde(default = "one")]
     pub repeats: u32,
+    /// How attempts were kept apart, when they were ([`crate::isolate`]): "a fresh tool server
+    /// for every attempt …". `None`: every attempt shared one tool server, so a draft or record
+    /// one attempt left could change a later one (reports before 2026-11-22 are all so).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<String>,
     /// The judges that applied, and whether each was blocking in this run.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub judges: Vec<JudgeStatus>,
@@ -53,7 +91,283 @@ pub struct Report {
     pub tasks: Vec<TaskReport>,
 }
 
-/// One attempt's line in a report.
+/// Which models answered a run's calls ([`Report::route`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RouteRecord {
+    /// What the runner pinned each role to: `primary` (the default, and the only one built).
+    pub pinned: String,
+    /// Each label that answered, with its model hash and how many calls it answered.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub answered: BTreeMap<String, Answered>,
+    /// A call came back marked `x-pmos-fallback: 1` (should be impossible with the pin).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fallback_used: bool,
+    /// Finished tasks whose runtime didn't say which models answered them.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unrecorded: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// One label's share of a run's calls ([`RouteRecord::answered`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct Answered {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_sha256: Option<String>,
+    pub calls: u64,
+}
+
+/// One label's calls for one task, as the harness reports them (`models_used`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelUse {
+    pub label: String,
+    #[serde(default)]
+    pub model_sha256: Option<String>,
+    pub calls: u64,
+}
+
+impl RouteRecord {
+    /// Adds one answer (or one task's `models_used`).
+    pub fn add(&mut self, label: &str, model_sha256: Option<&str>, calls: u64, fallback: bool) {
+        let a = self.answered.entry(label.to_string()).or_default();
+        if a.model_sha256.is_none() {
+            a.model_sha256 = model_sha256.map(str::to_string);
+        } else if model_sha256.is_some() && a.model_sha256.as_deref() != model_sha256 {
+            // One label, two models: never a primary's run.
+            self.fallback_used = true;
+        }
+        a.calls += calls;
+        self.fallback_used |= fallback;
+    }
+
+    pub fn merge(&mut self, other: &RouteRecord) {
+        for (label, a) in &other.answered {
+            self.add(label, a.model_sha256.as_deref(), a.calls, false);
+        }
+        self.fallback_used |= other.fallback_used;
+        self.unrecorded += other.unrecorded;
+    }
+}
+
+/// What the gateway said about its roles for one run ([`Report::gateway_models`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayModels {
+    /// Role name (`default`) to the model id that served it, or the neutral `label:` the
+    /// gateway reports in its place (`docs/gateway.md`).
+    pub roles: BTreeMap<String, String>,
+    /// Role name to a neutral label for its upstream: `local` (a model server on PM OS's host),
+    /// `claude-test` or `remote-test` (testing-only upstreams off the machine). Never a host.
+    pub upstreams: BTreeMap<String, String>,
+    /// The gateway answered with its stub model.
+    pub stub: bool,
+    /// A testing-only upstream was on (prompts left the machine).
+    pub cloud_test: bool,
+    /// The gateway's own workaround switch (`PMOS_GATEWAY_WORKAROUNDS`).
+    pub workarounds: bool,
+    /// The gateway's class (`class:` in its config): `production` only for the deployment's
+    /// own gateway (`deploy/gateway.yaml`), `test` otherwise, and for a gateway too old to say.
+    /// Only a `production` class counts towards a bar (review finding R3).
+    #[serde(default = "test_class")]
+    pub class: String,
+    /// For each labelled role (one the gateway reports by a neutral `label:`), the lowercase
+    /// hex SHA-256 of the real model id behind the label, as the gateway reported it
+    /// (`model_sha256`), so a model swapped behind an unchanged label shows
+    /// ([`crate::history::counts`]). Empty in reports written before the gateway reported it
+    /// (2026-11-23), and for roles without a label.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_sha256: BTreeMap<String, String>,
+}
+
+fn test_class() -> String {
+    "test".into()
+}
+
+/// Lowercase hex SHA-256 of `text`, as the gateway hashes a labelled role's model id.
+pub fn sha256_hex(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// A SHA-256 in lowercase hex: 64 of `0-9a-f`.
+pub fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+impl GatewayModels {
+    /// From the gateway's `GET /v1/pmos/roles` answer.
+    pub fn from_roles_answer(v: &serde_json::Value) -> Result<Self, String> {
+        let flag = |k: &str| {
+            v[k].as_bool()
+                .ok_or_else(|| format!("the gateway's roles answer has no `{k}`"))
+        };
+        let list = v["roles"]
+            .as_array()
+            .ok_or("the gateway's roles answer has no `roles`")?;
+        let mut roles = BTreeMap::new();
+        let mut upstreams = BTreeMap::new();
+        let mut model_sha256 = BTreeMap::new();
+        for r in list {
+            let (Some(role), Some(model), Some(up)) = (
+                r["role"].as_str(),
+                r["model"].as_str(),
+                r["upstream"].as_str(),
+            ) else {
+                return Err(
+                    "a role in the gateway's roles answer lacks role, model or upstream".into(),
+                );
+            };
+            // A label, never an address: anything else the gateway might send is refused.
+            if !matches!(up, "local" | "claude-test" | "remote-test" | "hosted") {
+                return Err(format!("the gateway named an unknown upstream kind `{up}`"));
+            }
+            // A labelled role's model hash: a SHA-256 in hex, never anything else.
+            match r.get("model_sha256") {
+                None | Some(serde_json::Value::Null) => {}
+                Some(h) => match h.as_str().filter(|h| is_sha256_hex(h)) {
+                    Some(h) => {
+                        model_sha256.insert(role.to_string(), h.to_string());
+                    }
+                    None => {
+                        return Err(format!(
+                            "the gateway's model_sha256 for role `{role}` isn't a SHA-256 in hex"
+                        ))
+                    }
+                },
+            }
+            roles.insert(role.to_string(), model.to_string());
+            upstreams.insert(role.to_string(), up.to_string());
+        }
+        if roles.is_empty() {
+            return Err("the gateway reported no roles".into());
+        }
+        let class = match v["class"].as_str() {
+            None | Some("test") => "test",
+            Some("production") => "production",
+            Some(c) => return Err(format!("the gateway named an unknown class `{c}`")),
+        };
+        Ok(Self {
+            roles,
+            upstreams,
+            stub: flag("stub")?,
+            cloud_test: flag("cloud_test")?,
+            workarounds: flag("workarounds")?,
+            class: class.to_string(),
+            model_sha256,
+        })
+    }
+
+    /// `default: qwen3.6-35b-a3b (local), extraction: …`, plus the stub or test flags.
+    pub fn describe(&self) -> String {
+        let mut parts: Vec<String> = self
+            .roles
+            .iter()
+            .map(|(role, model)| {
+                let up = self.upstreams.get(role).map(String::as_str).unwrap_or("?");
+                match self.model_sha256.get(role) {
+                    Some(h) => format!("{role}: `{model}` ({up}, model sha256 {}…)", &h[..12]),
+                    None => format!("{role}: `{model}` ({up})"),
+                }
+            })
+            .collect();
+        if self.stub {
+            parts.push("STUB model".into());
+        }
+        if self.cloud_test {
+            parts.push("testing-only upstream on".into());
+        }
+        if !self.workarounds {
+            parts.push("workarounds off".into());
+        }
+        parts.push(format!("{} gateway", self.class));
+        parts.join(", ")
+    }
+}
+
+/// What the runner did about a task it timed out: it cancels the task on the runtime and waits
+/// a while for the task's worker to let it go, so the next attempt on that lane doesn't wait
+/// behind it (`docs/evals.md`, "Timeouts").
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Cancel {
+    /// The runtime cancelled the task. `false`: the cancel failed (`error` says why), or the
+    /// task had settled in the meantime.
+    pub cancelled: bool,
+    /// The runtime said the task's worker let it go within the wait. `None`: not waited for
+    /// (the task was still queued when last seen, or wasn't cancelled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_stopped: Option<bool>,
+    /// Seconds from the timeout to the end of the cancel and the wait.
+    pub secs: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl Cancel {
+    /// One line for the report.
+    pub fn describe(&self) -> String {
+        let what = match (self.cancelled, self.worker_stopped) {
+            (false, _) => format!(
+                "the runner timed out and couldn't cancel it ({})",
+                self.error.as_deref().unwrap_or("no reason given")
+            ),
+            (true, None) => "the runner timed out and cancelled it (it was still queued)".into(),
+            (true, Some(true)) => "the runner timed out and cancelled it; its worker stopped".into(),
+            (true, Some(false)) => {
+                "the runner timed out and cancelled it; its worker hadn't said it stopped when the runner went on"
+                    .into()
+            }
+        };
+        format!("{what} ({:.1} s)", self.secs)
+    }
+}
+
+/// One turn of a thread attempt. The report keeps no answer text.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TurnReport {
+    /// The turn's place in the thread, from 1.
+    pub turn: u32,
+    pub ask: String,
+    /// The turn has an `expect`, so it was graded.
+    pub graded: bool,
+    /// The turn was never asked, because an earlier turn didn't settle.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub skipped: bool,
+    pub passed: bool,
+    pub task_id: Option<String>,
+    pub status: Option<String>,
+    pub failures: Vec<Check>,
+    pub tag: Option<Tagged>,
+    pub queue_secs: Option<f64>,
+    pub total_secs: Option<f64>,
+    /// The turn timed out: what the runner did about it ([`Cancel`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel: Option<Cancel>,
+}
+
+impl TurnReport {
+    /// `pass`, `FAIL`, `not graded` or `not run`.
+    pub fn verdict(&self) -> &'static str {
+        if self.skipped {
+            "not run"
+        } else if !self.graded && self.passed {
+            "not graded"
+        } else if self.passed {
+            "pass"
+        } else {
+            "FAIL"
+        }
+    }
+}
+
+/// One attempt's line in a report. For a thread task, it is the whole thread: `failures` and
+/// `tag` are those of the first failed turn, `failed_turn` says which, and `turns` has each.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TaskReport {
     pub id: String,
@@ -80,6 +394,69 @@ pub struct TaskReport {
     pub trace_read: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub judges: Vec<JudgeVerdict>,
+    /// A thread task: each turn's result, in order. Empty for a single `ask`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub turns: Vec<TurnReport>,
+    /// A thread task that failed: the first turn that failed, from 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_turn: Option<u32>,
+    /// The attempt (for a thread, the turn that timed out) timed out: what the runner did
+    /// about it ([`Cancel`]). Reports from before 2026-11-24 have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel: Option<Cancel>,
+}
+
+/// The sub-tag of an attempt lost to the model provider or the infrastructure: the model
+/// endpoint unreachable or busy after the gateway's retries, a restart, or the worker or its
+/// sandbox going away (rule `interrupted`, `docs/evals.md`). Not the bot's doing, so the
+/// headline shows it apart; the bar still counts it as a failure.
+pub const INFRA_LOSS: &str = "harness/interrupted";
+
+/// One task's line in [`Summary`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TaskSummaryLine {
+    pub id: String,
+    pub passes: u32,
+    pub attempts: u32,
+    /// `passes / attempts`.
+    pub pass_rate: f64,
+    /// Every attempt passed.
+    pub all_attempts_passed: bool,
+    /// Attempts lost to the provider or infrastructure ([`INFRA_LOSS`]).
+    pub infra_losses: u32,
+}
+
+/// The run's numbers, written into the `.json` beside the lines as `summary` (computed from
+/// them, never read back). What each means is in `docs/evals.md`, "Reading a report".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Summary {
+    pub attempts: usize,
+    pub passed: usize,
+    /// The average: passes over every attempt. The bar is judged on this.
+    pub pass_rate: f64,
+    pub tasks: usize,
+    /// Tasks where every attempt passed (pass^k).
+    pub tasks_all_attempts_passed: usize,
+    /// `tasks_all_attempts_passed / tasks`: the stricter number, what a PM who asks k times
+    /// sees go right every time.
+    pub all_attempts_pass_rate: f64,
+    /// Attempts lost to the provider or infrastructure ([`INFRA_LOSS`]).
+    pub infra_losses: usize,
+    /// The pass rate over the attempts that weren't lost that way: what the bot did when it
+    /// got to answer. For information only; the bar uses `pass_rate`.
+    pub pass_rate_excluding_infra: Option<f64>,
+    /// The bar and whether `pass_rate` met it; `None` with no bar.
+    pub pass_bar: Option<f64>,
+    pub met_bar: Option<bool>,
+    pub by_task: Vec<TaskSummaryLine>,
+}
+
+/// The `.json` as written: the report, then its summary.
+#[derive(Serialize)]
+struct Written<'a> {
+    #[serde(flatten)]
+    report: &'a Report,
+    summary: Summary,
 }
 
 /// Whether `passed` of `total` meets `bar`.
@@ -110,6 +487,47 @@ impl Report {
     pub fn met_bar(&self) -> Option<bool> {
         self.pass_bar
             .map(|bar| meets(self.passed(), self.total(), bar))
+    }
+
+    /// Attempts lost to the provider or infrastructure ([`INFRA_LOSS`]).
+    pub fn infra_losses(&self) -> usize {
+        self.tasks.iter().filter(|t| is_infra_loss(t)).count()
+    }
+
+    /// The run's numbers: the average, the all-attempts-pass rate, and the losses that
+    /// weren't the bot's.
+    pub fn summary(&self) -> Summary {
+        let tasks = summaries(self);
+        let all = tasks.iter().filter(|t| t.all_passed()).count();
+        let infra = self.infra_losses();
+        let counted = self.total() - infra;
+        Summary {
+            attempts: self.total(),
+            passed: self.passed(),
+            pass_rate: self.pass_rate(),
+            tasks: tasks.len(),
+            tasks_all_attempts_passed: all,
+            all_attempts_pass_rate: pass_hat_k(&tasks).unwrap_or(0.0),
+            infra_losses: infra,
+            pass_rate_excluding_infra: (counted > 0).then(|| self.passed() as f64 / counted as f64),
+            pass_bar: self.pass_bar,
+            met_bar: self.met_bar(),
+            by_task: tasks
+                .iter()
+                .map(|t| TaskSummaryLine {
+                    id: t.id.clone(),
+                    passes: t.passes,
+                    attempts: t.runs,
+                    pass_rate: t.rate(),
+                    all_attempts_passed: t.all_passed(),
+                    infra_losses: self
+                        .tasks
+                        .iter()
+                        .filter(|l| l.id == t.id && is_infra_loss(l))
+                        .count() as u32,
+                })
+                .collect(),
+        }
     }
 
     /// Failures per tag, the biggest bottleneck first; ties in [`Tag::ALL`] order.
@@ -199,6 +617,33 @@ impl Report {
                 );
             }
         }
+        let summary = self.summary();
+        if self.repeats > 1 {
+            let _ = writeln!(
+                s,
+                "**All attempts passed** for {} of {} tasks ({}): the share of tasks that passed every one of their {} attempts, the stricter number. The average above counts each attempt on its own; the bar is judged on the average.\n",
+                summary.tasks_all_attempts_passed,
+                summary.tasks,
+                pct(summary.all_attempts_pass_rate),
+                self.repeats
+            );
+        }
+        if summary.infra_losses > 0 {
+            let without = match summary.pass_rate_excluding_infra {
+                Some(r) => format!(
+                    "without them, {passed} of {} attempts passed ({})",
+                    total - summary.infra_losses,
+                    pct(r)
+                ),
+                None => "no attempt was left to grade".to_string(),
+            };
+            let _ = writeln!(
+                s,
+                "**Lost to the model provider or infrastructure:** {} attempt{} (`{INFRA_LOSS}`: the model endpoint unreachable or busy after retries, a restart, or the worker going away), not the bot's answer; {without}. They still count as failures for the bar.\n",
+                summary.infra_losses,
+                if summary.infra_losses == 1 { "" } else { "s" },
+            );
+        }
         let _ = writeln!(s, "| | |\n| --- | --- |");
         let _ = writeln!(s, "| Bot | `{}` |", self.bot);
         let _ = writeln!(s, "| Runtime | {} |", self.runtime_url);
@@ -211,9 +656,31 @@ impl Report {
                 None => "not declared".to_string(),
             }
         );
+        let _ = writeln!(
+            s,
+            "| Models (reported by the gateway) | {} |",
+            match &self.gateway_models {
+                Some(m) => cell(&m.describe()),
+                None => "not recorded, so this run counts towards no bar".to_string(),
+            }
+        );
+        if let Some(v) = &self.persona_version {
+            let _ = writeln!(s, "| Persona version | `{}` |", cell(v));
+        }
+        if let Some(h) = &self.persona_hash {
+            let _ = writeln!(s, "| Persona files | `{}` |", cell(h));
+        }
         if let Some(note) = &self.note {
             let _ = writeln!(s, "| Note | {} |", cell(note));
         }
+        let _ = writeln!(
+            s,
+            "| Isolation | {} |",
+            match &self.isolation {
+                Some(how) => cell(how),
+                None => "none: every attempt shared one tool server, so a draft one attempt left could change a later one".to_string(),
+            }
+        );
         let _ = writeln!(
             s,
             "| Ran | {} to {} UTC |",
@@ -227,7 +694,7 @@ impl Report {
             };
             let _ = writeln!(
                 s,
-                "| Pass rate | {} ± {} (standard error, {how}) |",
+                "| Pass rate (average over attempts) | {} ± {} (standard error, {how}) |",
                 pct1(self.pass_rate()),
                 pct1(se.se)
             );
@@ -237,7 +704,7 @@ impl Report {
                 let all = tasks.iter().filter(|t| t.all_passed()).count();
                 let _ = writeln!(
                     s,
-                    "| pass^{} | {} ({all} of {} tasks passed every run) |",
+                    "| All attempts passed (pass^{}) | {} ({all} of {} tasks passed every run) |",
                     self.repeats,
                     pct(k),
                     tasks.len()
@@ -291,7 +758,7 @@ impl Report {
             if !self.judges.is_empty() {
                 let _ = writeln!(
                     s,
-                    "| Judge | Status | Yes | No | No verdict |\n| --- | --- | --- | --- | --- |"
+                    "| Judge | Status | Yes | No | Unknown | No verdict |\n| --- | --- | --- | --- | --- | --- |"
                 );
                 for j in &self.judges {
                     let verdicts = self
@@ -299,17 +766,18 @@ impl Report {
                         .iter()
                         .flat_map(|t| t.judges.iter())
                         .filter(|v| v.name == j.name);
-                    let (mut yes, mut no, mut none) = (0, 0, 0);
+                    let (mut yes, mut no, mut unknown, mut none) = (0, 0, 0, 0);
                     for v in verdicts {
                         match v.verdict {
                             Some(true) => yes += 1,
                             Some(false) => no += 1,
+                            None if v.unknown => unknown += 1,
                             None => none += 1,
                         }
                     }
                     let _ = writeln!(
                         s,
-                        "| `{}` | {} | {yes} | {no} | {none} |",
+                        "| `{}` | {} | {yes} | {no} | {unknown} | {none} |",
                         j.name,
                         cell(&j.reason)
                     );
@@ -321,7 +789,11 @@ impl Report {
         if self.repeats > 1 {
             let _ = writeln!(
                 s,
-                "| Task | Passes | Failure tags | Why (latest failure) |\n| --- | --- | --- | --- |"
+                "Passes counts the attempts that passed; All passed says whether every attempt did.\n"
+            );
+            let _ = writeln!(
+                s,
+                "| Task | Passes | All passed | Failure tags | Why (latest failure) |\n| --- | --- | --- | --- | --- |"
             );
             for t in &tasks {
                 let mine: Vec<&TaskReport> = self.tasks.iter().filter(|l| l.id == t.id).collect();
@@ -349,8 +821,9 @@ impl Report {
                 };
                 let _ = writeln!(
                     s,
-                    "| `{}` | {passes} | {} | {} |",
+                    "| `{}` | {passes} | {} | {} | {} |",
                     t.id,
+                    if t.all_passed() { "yes" } else { "no" },
                     cell(&tags),
                     cell(&why)
                 );
@@ -380,6 +853,26 @@ impl Report {
             }
         }
 
+        let threads: Vec<&TaskReport> = self.tasks.iter().filter(|t| !t.turns.is_empty()).collect();
+        if !threads.is_empty() {
+            let _ = writeln!(s, "\n## Threads\n");
+            let _ = writeln!(
+                s,
+                "Each turn is its own runtime task in one conversation. A thread passes only if every graded turn does.\n"
+            );
+            for t in threads {
+                let result = if t.passed { "pass" } else { "**FAIL**" };
+                if self.repeats > 1 {
+                    let _ = writeln!(s, "- `{}`, run {}: {result}", t.id, t.repeat);
+                } else {
+                    let _ = writeln!(s, "- `{}`: {result}", t.id);
+                }
+                for line in turn_lines(t) {
+                    let _ = writeln!(s, "  - {}", cell(&line));
+                }
+            }
+        }
+
         if let Some((name, prev)) = previous {
             let _ = writeln!(s, "\n## Compared with the previous run\n");
             let _ = writeln!(s, "Previous run: `{name}` ({}).\n", prev.date);
@@ -399,6 +892,9 @@ impl Report {
                 if let Some(id) = &t.task_id {
                     let _ = writeln!(s, "- **Task:** `{id}` (attempts: {})", t.attempts);
                 }
+                if let Some(c) = &t.cancel {
+                    let _ = writeln!(s, "- **Timed out:** {}", cell(&c.describe()));
+                }
                 if let Some(tagged) = &t.tag {
                     let _ = writeln!(
                         s,
@@ -407,6 +903,9 @@ impl Report {
                         tagged.rule,
                         cell(&tagged.reason)
                     );
+                }
+                if let Some(n) = t.failed_turn {
+                    let _ = writeln!(s, "- **Failed at:** turn {n} of {}", t.turns.len());
                 }
                 for f in &t.failures {
                     let _ = writeln!(s, "- {}", cell(&f.to_string()));
@@ -418,17 +917,58 @@ impl Report {
     }
 }
 
+fn is_infra_loss(t: &TaskReport) -> bool {
+    !t.passed
+        && t.tag
+            .as_ref()
+            .is_some_and(|x| x.sub.as_deref() == Some(INFRA_LOSS))
+}
+
 /// A tag as a report shows it: the sub-tag when there is one, else the bottleneck.
 fn tag_label(t: &Tagged) -> String {
     t.sub.clone().unwrap_or_else(|| t.tag.to_string())
 }
 
 fn why(t: &TaskReport) -> String {
-    t.failures
+    let checks = t
+        .failures
         .iter()
         .map(ToString::to_string)
         .collect::<Vec<_>>()
-        .join("; ")
+        .join("; ");
+    match t.failed_turn {
+        Some(n) => format!("turn {n}: {checks}"),
+        None => checks,
+    }
+}
+
+/// One line per turn of a thread attempt.
+fn turn_lines(t: &TaskReport) -> Vec<String> {
+    t.turns
+        .iter()
+        .map(|u| {
+            let mut line = format!("turn {}: {}", u.turn, u.verdict());
+            if let Some(x) = &u.tag {
+                line.push_str(&format!(" ({})", tag_label(x)));
+            }
+            if let Some(st) = &u.status {
+                line.push_str(&format!(", {st}"));
+            }
+            if let Some(n) = &u.total_secs {
+                line.push_str(&format!(", {n:.1} s"));
+            }
+            if !u.failures.is_empty() {
+                let f = u
+                    .failures
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                line.push_str(&format!(": {f}"));
+            }
+            line
+        })
+        .collect()
 }
 
 fn pct(x: f64) -> String {
@@ -477,7 +1017,11 @@ pub fn write_with(
         }
         n += 1;
     };
-    let body = serde_json::to_string_pretty(report).map_err(std::io::Error::other)?;
+    let written = Written {
+        report,
+        summary: report.summary(),
+    };
+    let body = serde_json::to_string_pretty(&written).map_err(std::io::Error::other)?;
     std::fs::write(&json, body + "\n")?;
     std::fs::write(&md, report.to_markdown_with(previous))?;
     Ok(md)

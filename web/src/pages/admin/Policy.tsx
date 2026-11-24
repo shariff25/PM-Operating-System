@@ -1,0 +1,953 @@
+import { useCallback, useId, useMemo, useState } from 'react';
+import type { KeyboardEvent } from 'react';
+import { canEditContent, canEditPolicy } from '../../admin/access';
+import { usePending, useLeaveGuard } from '../../admin/pending';
+import { destinationOf, handEdits, readsOf, toolSystem } from '../../admin/policyView';
+import { applySpecPatch, parseRawPatch, patchSize, specPatch, splitTools, stableKey } from '../../admin/proposals';
+import { unifiedDiff } from '../../admin/unified';
+import { useLoad } from '../../admin/useLoad';
+import { useProposalFlow } from '../../admin/useProposalFlow';
+import type { Issue, PolicyBot, PolicySpec, PolicyView, ProverRow, SandboxAuditState, SandboxDenial, SpecPatch } from '../../api';
+import { useApp } from '../../app-context';
+import { Empty, ErrorNote, Skeleton, systemTone } from '../../components/bits';
+import { Icon } from '../../components/icons';
+import { copy } from '../../copy';
+import type { PolicyPart } from '../../url';
+import { McpSection } from './McpServers';
+import { AdminHead, NoAccess } from './parts';
+import {
+  CheckResult,
+  DiffView,
+  IssueList,
+  ProblemNote,
+  ProposalDone,
+  ProposalsCard,
+  ProposeBar,
+  ProposeDialog,
+  ProtectionNotes,
+  ProtectionTile,
+  RevisionChip,
+  StatusTile,
+  useCheckProposals,
+} from './proposal';
+
+const T = copy.admin.policy;
+const B = T.bots;
+const PROPOSALS_ID = 'policy-proposals';
+
+// ---------- What each bot may do ----------
+
+function Chips({ items, mono, tone, label }: { items: string[]; mono?: boolean; tone?: boolean; label: string }) {
+  return (
+    <ul className="chip-list" aria-label={label}>
+      {items.map((t) => (
+        <li key={t} className={`mini-chip ${mono ? 'mono-val' : ''} ${tone ? `mini-chip-${systemTone(toolSystem(t))} sys-${toolSystem(t)}` : ''}`}>{t}</li>
+      ))}
+    </ul>
+  );
+}
+
+// ---------- OpenShell's prover, per bot (spec §A.5) ----------
+
+const P = B.prover;
+
+/** What a proof never covers (the server's list; this copy only if an older server sends none). */
+const NOT_PROVED_FALLBACK = [
+  'which paths are readable (the boundary allows reading /; `fs-readable` covers it)',
+  'the MCP methods and tool allowlist (`net-tools`)',
+  'credential bindings (`cred-binding`, `cred-providers`)',
+  'uploads and the launch spec (`fs-uploads`, `spec-*`)',
+  'name resolution (the prover does not resolve hostnames)',
+  'what a running sandbox enforces',
+];
+
+const PROVED_DOMAINS = 5;
+
+/**
+ * The text and tone of a bot's Prover row. Only a current `proved` reads as proved; every other
+ * state (stale, missing, unknown, and each failure) says what it is and is never a pass.
+ */
+export function proverLine(p: ProverRow | undefined): { text: string; sub: string | null; tone: 'good' | 'bad' | 'warn' } {
+  const reason = p?.reason ?? p?.reason_code ?? 'no reason given';
+  const when = p?.at ? P.when(new Date(p.at).toLocaleString()) : null;
+  switch (p?.state) {
+    case 'proved':
+      return {
+        text: P.proved(Math.min(p.coverage?.length ?? 0, PROVED_DOMAINS), PROVED_DOMAINS),
+        sub: P.provedSub(p.prover_version ?? 'unknown version', p.at ? new Date(p.at).toLocaleString() : 'unknown time'),
+        tone: 'good',
+      };
+    case 'stale':
+      return { text: P.stale, sub: p.stale_reason === 'policy_loaded_after' ? P.staleLoaded : P.staleChanged, tone: 'warn' };
+    case 'exceeds':
+      return { text: p.counterexample ? P.exceeds(p.counterexample) : P.exceedsNone, sub: when, tone: 'bad' };
+    case 'unsupported':
+      return { text: P.unsupported(reason), sub: when, tone: 'warn' };
+    case 'inconclusive':
+      return { text: P.inconclusive, sub: p.reason ?? when, tone: 'warn' };
+    case 'error':
+      return { text: P.error, sub: p.reason ?? p.reason_code ?? when, tone: 'bad' };
+    case 'not_available':
+      return { text: P.notAvailable, sub: when, tone: 'warn' };
+    case 'version_mismatch':
+      return { text: P.versionMismatch(reason), sub: when, tone: 'warn' };
+    case 'missing':
+      return { text: P.missing, sub: null, tone: 'warn' };
+    default:
+      return { text: P.unknown, sub: null, tone: 'warn' };
+  }
+}
+
+function ProverFact({ bot, notProved }: { bot: PolicyBot; notProved: string[] }) {
+  const line = proverLine(bot.prover);
+  const proved = bot.prover?.state === 'proved';
+  return (
+    <div className="bot-fact bot-fact-wide bot-prover" data-state={bot.prover?.state ?? 'unknown'}>
+      <dt>{P.label}</dt>
+      <dd>
+        <span className={`pill pill-${line.tone}`}>
+          <span className="pill-dot" aria-hidden="true" />
+          {line.text}
+        </span>
+        {line.sub && <span className="fact-quiet small bot-prover-sub">{line.sub}</span>}
+        {proved && <span className="fact-quiet small bot-prover-sub">{copy.admin.policy.bots.prover.viewNote}</span>}
+        <details className="bot-sentences bot-prover-limits">
+          <summary>
+            <Icon name="chevronRight" size={14} className="disclose-icon" />
+            {P.notProvedHeading}
+            <span className="sr-only"> {bot.bot}</span>
+          </summary>
+          <ul aria-label={`${P.notProvedHeading}, ${bot.bot}`}>
+            {notProved.map((n) => <li key={n}>{n}</li>)}
+          </ul>
+        </details>
+      </dd>
+    </div>
+  );
+}
+
+/** Where a denial went: the host and port for an admin, the destination class for an auditor. */
+export function denialDest(d: SandboxDenial): string {
+  const where = d.dest_host ?? d.dest_class ?? 'unknown destination';
+  const port = d.dest_port !== null && d.dest_port !== undefined ? `:${d.dest_port}` : '';
+  const path = d.http_method && d.http_path ? ` (${d.http_method} ${d.http_path})` : '';
+  return `${where}${port}${path}`;
+}
+
+/** The sandbox's latest denials OpenShell recorded (spec §B.5): rule, destination, time. */
+function DenialsFact({ bot, audit }: { bot: PolicyBot; audit: SandboxAuditState | undefined }) {
+  const list = bot.sandbox_denials ?? [];
+  const note = !audit || !audit.available
+    ? P.denialsUnknown
+    : !audit.configured
+      ? P.denialsOff
+      : audit.silent_since
+        ? P.denialsSilent(new Date(audit.silent_since).toLocaleString())
+        : list.length === 0
+          ? P.denialsNone
+          : null;
+  return (
+    <div className="bot-fact bot-fact-wide bot-denials">
+      <dt>{P.denialsLabel}</dt>
+      <dd>
+        {note && <span className="fact-quiet small">{note}</span>}
+        {list.length > 0 && (
+          <ul className="path-list" aria-label={`${P.denialsLabel}, ${bot.bot}`}>
+            {list.map((d) => (
+              <li key={`${d.at}-${d.action}-${d.rule ?? ''}-${denialDest(d)}`}>
+                <span className="mono-val">
+                  {d.action === 'sandbox.deny_summary' ? P.denialSummary : d.action === 'sandbox.finding' ? P.denialFinding : P.denialLine(d.rule ?? '-', denialDest(d))}
+                </span>{' '}
+                <span className="fact-quiet small">{new Date(d.at).toLocaleString()}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </dd>
+    </div>
+  );
+}
+
+function BotCard({
+  bot,
+  owner,
+  violations,
+  notProved,
+  sandboxAudit,
+  open,
+  onToggle,
+}: {
+  bot: PolicyBot;
+  owner: string | null;
+  violations: Issue[];
+  notProved: string[];
+  sandboxAudit: SandboxAuditState | undefined;
+  open: boolean;
+  onToggle: () => void;
+}) {
+  const id = useId();
+  const a = bot.allowances;
+  const edits = a ? handEdits(a) : [];
+  const reads = a ? readsOf(a) : null;
+  const unassigned = owner === null || owner === 'TODO';
+  const flagged = edits.length > 0 || violations.length > 0;
+  return (
+    <article className={`bot-card ${flagged ? 'bot-card-flag' : ''}`} aria-labelledby={`${id}-h`}>
+      <header className="bot-head">
+        <span className="bot-mark" aria-hidden="true"><Icon name="cpu" size={16} /></span>
+        <div className="bot-title">
+          <h3 id={`${id}-h`} className="mono-val">{bot.bot}</h3>
+          {a && <span className="bot-glance">{B.glance(bot.tools.length, a.network.length, a.filesystem.read_write.length)}</span>}
+        </div>
+        <span className={`pill ${bot.scope === 'personal' ? 'pill-accent' : ''}`}>
+          <span className="pill-dot" aria-hidden="true" />
+          {bot.scope === 'personal' ? B.personal : B.team}
+        </span>
+      </header>
+      {edits.length > 0 && (
+        <div className="bot-flag" role="note">
+          <span className="flag-tag"><Icon name="alert" size={12} weight={2.25} />{B.handEdit}</span>
+          <p>{B.handEditBody}</p>
+          <ul>
+            {edits.map((e) => <li key={e} className="mono-val">{e}</li>)}
+          </ul>
+        </div>
+      )}
+      {violations.length > 0 && (
+        <div className="bot-flag" role="note">
+          <span className="flag-tag"><Icon name="alert" size={12} weight={2.25} />{B.ruleBroken}</span>
+          <p>{B.ruleBrokenBody}</p>
+          <ul>
+            {violations.map((v) => <li key={`${v.code}-${v.message}`}>{v.message}</li>)}
+          </ul>
+        </div>
+      )}
+      <dl className="bot-grid">
+        <div className="bot-fact">
+          <dt>{B.role}</dt>
+          <dd className="mono-val">{bot.role}</dd>
+        </div>
+        <div className="bot-fact">
+          <dt>{B.owner}</dt>
+          <dd className={unassigned ? 'fact-quiet' : ''}>{unassigned ? B.ownerNone : `@${owner}`}</dd>
+        </div>
+        <div className="bot-fact bot-fact-wide">
+          <dt>{B.skills}</dt>
+          <dd><Chips items={bot.skills} label={`${B.skills}, ${bot.bot}`} /></dd>
+        </div>
+        <div className="bot-fact bot-fact-wide">
+          <dt>{B.tools}</dt>
+          <dd>{bot.tools.length ? <Chips items={bot.tools} mono tone label={`${B.tools}, ${bot.bot}`} /> : <span className="fact-quiet">{B.toolsNone}</span>}</dd>
+        </div>
+        <ProverFact bot={bot} notProved={notProved} />
+        <DenialsFact bot={bot} audit={sandboxAudit} />
+      </dl>
+      {!a && <p className="bot-missing"><Icon name="alert" size={14} /> {B.noAllowances}</p>}
+      {a && (
+        <div className="bot-more">
+          <button type="button" className="bot-toggle" aria-expanded={open} aria-controls={`${id}-more`} onClick={onToggle}>
+            <Icon name="chevronRight" size={14} className="disclose-icon" />
+            {open ? B.hideDetails : B.showDetails}
+            <span className="sr-only"> {bot.bot}</span>
+          </button>
+        </div>
+      )}
+      {a && (
+        <div id={`${id}-more`} className="bot-details" hidden={!open}>
+          <dl className="bot-grid">
+            <div className="bot-fact bot-fact-wide">
+              <dt>{B.talksTo}</dt>
+              <dd>
+                <ul className="dest-list">
+                  {a.network.map((n) => {
+                    const d = destinationOf(n);
+                    return (
+                      <li key={n.rule} className={d.unknown ? 'dest dest-unknown' : 'dest'}>
+                        <span className="dest-name">{d.name}</span>
+                        <span className="mono-val dest-where">{d.where}</span>
+                        <span className="mono-val dest-proto">{d.protocol}</span>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </dd>
+            </div>
+            <div className="bot-fact">
+              <dt>{B.reads}</dt>
+              <dd>
+                <ul className="path-list">
+                  {reads!.content.map((p) => <li key={p} className="mono-val">{p}</li>)}
+                </ul>
+                {reads!.system > 0 && <span className="fact-quiet small">{B.system(reads!.system)}</span>}
+              </dd>
+            </div>
+            <div className="bot-fact">
+              <dt>{B.writes}</dt>
+              <dd>
+                <ul className="path-list">
+                  {a.filesystem.read_write.map((p) => <li key={p} className="mono-val">{p}</li>)}
+                </ul>
+              </dd>
+            </div>
+          </dl>
+          {a.summary.length > 0 && (
+            <details className="bot-sentences">
+              <summary>
+                <Icon name="chevronRight" size={14} className="disclose-icon" />
+                {B.sentences}
+              </summary>
+              <ul>
+                {a.summary.map((s) => <li key={s}>{s}</li>)}
+              </ul>
+            </details>
+          )}
+        </div>
+      )}
+      <footer className="bot-foot">
+        <span className="bot-file mono-val" title={bot.allowances_from === 'generated' ? B.fromGenerated : undefined}>{bot.policy_file}</span>
+      </footer>
+    </article>
+  );
+}
+
+/** A bot's own rule violations: the ones whose file is this bot's policy file. */
+const violationsOf = (bot: PolicyBot, all: Issue[]) => all.filter((v) => v.path === bot.policy_file || v.path === bot.launch_spec_file);
+
+/** A card opens by itself when it carries a hand edit or a broken rule. */
+const opensByDefault = (bot: PolicyBot, all: Issue[]) => (bot.allowances ? handEdits(bot.allowances).length > 0 : false) || violationsOf(bot, all).length > 0;
+
+function BotsSection({ data }: { data: PolicyView }) {
+  const [only, setOnly] = useState<string | null>(null);
+  // What the person chose per card; a card they have not touched follows its default.
+  const [chosen, setChosen] = useState<Record<string, boolean>>({});
+  const shown = only ? data.bots.filter((b) => b.bot === only) : data.bots;
+  const isOpen = (b: PolicyBot) => chosen[b.bot] ?? opensByDefault(b, data.drift.violations);
+  const setAll = (value: boolean) => setChosen(Object.fromEntries(data.bots.map((b) => [b.bot, value])));
+  return (
+    <section className="card" aria-labelledby="policy-bots">
+      <div className="card-head card-head-sub">
+        <h2 id="policy-bots">
+          {B.heading}
+          <span className="card-count">{data.bots.length}</span>
+        </h2>
+        <div className="bot-tools">
+          {data.bots.length > 1 && (
+            <div className="seg-filter" role="group" aria-label={B.filterLabel}>
+              <button type="button" className="seg-btn" aria-pressed={only === null} onClick={() => setOnly(null)}>{B.all}</button>
+              {data.bots.map((b) => (
+                <button key={b.bot} type="button" className="seg-btn mono-val" aria-pressed={only === b.bot} onClick={() => setOnly(only === b.bot ? null : b.bot)}>
+                  {b.bot}
+                </button>
+              ))}
+            </div>
+          )}
+          {data.bots.length > 0 && (
+            <div className="bot-all">
+              <button type="button" className="btn btn-sm btn-ghost" onClick={() => setAll(true)}>{B.expandAll}</button>
+              <button type="button" className="btn btn-sm btn-ghost" onClick={() => setAll(false)}>{B.collapseAll}</button>
+            </div>
+          )}
+        </div>
+      </div>
+      {data.bots.length === 0 ? (
+        <Empty icon="cpu" small>{B.noBots}</Empty>
+      ) : (
+        <div className="bot-cards">
+          {shown.map((b) => (
+            <BotCard
+              key={b.bot}
+              bot={b}
+              owner={data.spec.bots[b.bot]?.owner ?? null}
+              violations={violationsOf(b, data.drift.violations)}
+              notProved={data.prover_notes?.not_proved ?? NOT_PROVED_FALLBACK}
+              sandboxAudit={data.sandbox_audit}
+              open={isOpen(b)}
+              onToggle={() => setChosen((c) => ({ ...c, [b.bot]: !isOpen(b) }))}
+            />
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+// ---------- Fixed parts and files ----------
+
+function FixedSection({ data }: { data: PolicyView }) {
+  const F = T.fixed;
+  const f = data.fixed;
+  return (
+    <details className="card disclose-card">
+      <summary className="card-head">
+        <h2>
+          <Icon name="chevronRight" size={15} className="disclose-icon" />
+          {F.heading}
+        </h2>
+        <span className="tag"><Icon name="lock" size={12} />&nbsp;{F.badge}</span>
+      </summary>
+      <div className="card-body stack stack-tight">
+        <p className="muted small">{F.note(f.source)}</p>
+        <dl className="facts">
+          <dt>{F.destinations}</dt>
+          <dd>
+            <ul className="fact-lines">
+              {f.services.map((s) => (
+                <li key={s.rule}>
+                  <strong>{B.services[s.service] ?? s.service}</strong>{' '}
+                  <span className="mono-val">{s.host}:{s.port}</span>{' '}
+                  <span className="mono-val muted">{F.pinnedAt(s.allowed_ips.join(', '))}</span>{' '}
+                  <span className="mono-val muted">{s.protocol}{s.routes ? `, ${F.routes(s.routes.length)}` : ''}, {s.credential_profile ?? F.noCredential}</span>
+                </li>
+              ))}
+            </ul>
+          </dd>
+          <dt>{F.mcp}</dt>
+          <dd className="mono-val">{F.mcpLine(f.mcp_path, f.mcp_methods.length, f.mcp_versions.join(', '))}</dd>
+          <dt>{F.worker}</dt>
+          <dd className="mono-val">{f.worker_binary}</dd>
+          <dt>{F.workspace}</dt>
+          <dd className="mono-val">{f.workspace}</dd>
+          <dt>{F.content}</dt>
+          <dd className="mono-val">{f.content_mount}</dd>
+          <dt>{F.shared}</dt>
+          <dd className="mono-val">{f.shared_content.join(', ')}</dd>
+          <dt>{F.sysRo}</dt>
+          <dd className="mono-val">{f.system_read_only.join(', ')}</dd>
+          <dt>{F.sysRw}</dt>
+          <dd className="mono-val">{f.system_read_write.join(', ')}</dd>
+          <dt>{F.runAs}</dt>
+          <dd className="mono-val">{f.run_as}</dd>
+          <dt>{F.landlock}</dt>
+          <dd className="mono-val">{f.landlock}</dd>
+        </dl>
+      </div>
+    </details>
+  );
+}
+
+const STATE_TONE: Record<string, string> = { same: 'pill-good', differs: 'pill-warn', missing: 'pill-warn', orphan: 'pill-warn', unknown: '' };
+
+function FilesSection({ data }: { data: PolicyView }) {
+  const F = T.files;
+  const off = data.files.filter((f) => f.state !== 'same').length;
+  return (
+    <details className="card disclose-card">
+      <summary className="card-head">
+        <h2>
+          <Icon name="chevronRight" size={15} className="disclose-icon" />
+          {F.heading}
+          <span className="card-count">{data.files.length}</span>
+        </h2>
+        {off > 0 && <span className="pill pill-warn"><span className="pill-dot" aria-hidden="true" />{T.strip.drift(off)}</span>}
+      </summary>
+      <ul className="rows" aria-label={F.tableLabel}>
+        {data.files.map((f) => (
+          <li key={f.path} className="file-state-row">
+            <div className="row file-row">
+              <span className="mono-val row-main file-path">{f.path}</span>
+              <span className="fact-quiet small file-hint">{F.stateHints[f.state] ?? ''}</span>
+              <span className={`pill ${STATE_TONE[f.state] ?? ''}`}><span className="pill-dot" aria-hidden="true" />{F.states[f.state] ?? f.state}</span>
+            </div>
+            {f.state === 'differs' && (
+              <details className="fdiff fdiff-inline">
+                <summary>
+                  <Icon name="chevronRight" size={14} className="disclose-icon" />
+                  <span>{F.showDiff(f.path)}</span>
+                </summary>
+                <DiffView path={f.path} diff={unifiedDiff(f.path, f.checked_in, f.generated)} />
+              </details>
+            )}
+          </li>
+        ))}
+      </ul>
+    </details>
+  );
+}
+
+// ---------- Proposing a change ----------
+
+type Tab = 'bots' | 'roles' | 'skills' | 'raw';
+
+/** Where a patch changes something, as short mono paths: `bots.docs.owner`. */
+function changedPaths(patch: SpecPatch): string[] {
+  const out: string[] = [];
+  for (const [b, f] of Object.entries(patch.bots ?? {})) for (const k of Object.keys(f)) out.push(`bots.${b}.${k}`);
+  for (const r of Object.keys(patch.roles ?? {})) out.push(`roles.${r}.skills`);
+  for (const s of Object.keys(patch.skills ?? {})) out.push(`skills.${s}.tools`);
+  return out;
+}
+
+/** What is wrong with the tool names in a list: names PM OS does not know, and names listed twice. */
+export function toolIssues(tools: string[], known: ReadonlySet<string>): { unknown: string[]; twice: string[] } {
+  const seen = new Set<string>();
+  const unknown: string[] = [];
+  const twice: string[] = [];
+  for (const t of tools) {
+    if (known.size > 0 && !known.has(t) && !unknown.includes(t)) unknown.push(t);
+    if (seen.has(t) && !twice.includes(t)) twice.push(t);
+    seen.add(t);
+  }
+  return { unknown, twice };
+}
+
+/** Known tools that complete the word being typed, never ones already in the list. */
+export function suggestTools(text: string, known: readonly string[], limit = 6): string[] {
+  if (/\s$|,$/.test(text) || text.trim() === '') return [];
+  const words = splitTools(text);
+  const word = words[words.length - 1]!;
+  if (known.includes(word)) return [];
+  const last = word.toLowerCase();
+  const have = new Set(words.slice(0, -1));
+  return known
+    .filter((k) => !have.has(k) && k.toLowerCase().includes(last))
+    .sort((x, y) => Number(y.toLowerCase().startsWith(last)) - Number(x.toLowerCase().startsWith(last)))
+    .slice(0, limit);
+}
+
+function ToolsInput({
+  skill,
+  tools,
+  known,
+  changed,
+  onChange,
+}: {
+  skill: string;
+  tools: string[];
+  known: readonly string[];
+  changed: boolean;
+  onChange: (tools: string[]) => void;
+}) {
+  // The words as typed, so a space at the end survives until the next word.
+  const [text, setText] = useState(tools.join(' '));
+  const [active, setActive] = useState(-1);
+  const [closed, setClosed] = useState(false);
+  const E = T.editor;
+  const id = useId();
+  const knownSet = useMemo(() => new Set(known), [known]);
+  const { unknown, twice } = toolIssues(splitTools(text), knownSet);
+  const options = closed ? [] : suggestTools(text, known);
+  const listId = `${id}-list`;
+  const change = (value: string) => {
+    setText(value);
+    setActive(-1);
+    setClosed(false);
+    onChange(splitTools(value));
+  };
+  const accept = (name: string) => change(`${[...splitTools(text).slice(0, -1), name].join(' ')} `);
+  const onKey = (e: KeyboardEvent<HTMLInputElement>) => {
+    if (options.length === 0) return;
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      setActive((i) => (i + 1) % options.length);
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      setActive((i) => (i <= 0 ? options.length - 1 : i - 1));
+    } else if ((e.key === 'Enter' || e.key === 'Tab') && active >= 0) {
+      e.preventDefault();
+      accept(options[active]!);
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      setClosed(true);
+      setActive(-1);
+    }
+  };
+  const problems = [...unknown.map((t) => ({ t, kind: 'unknown' as const })), ...twice.map((t) => ({ t, kind: 'twice' as const }))];
+  return (
+    <div className="tools-field">
+      <input
+        type="text"
+        role="combobox"
+        aria-autocomplete="list"
+        aria-expanded={options.length > 0}
+        aria-controls={options.length > 0 ? listId : undefined}
+        aria-activedescendant={active >= 0 && options[active] ? `${id}-o${active}` : undefined}
+        aria-invalid={unknown.length > 0 || undefined}
+        aria-describedby={problems.length > 0 ? `${id}-problems` : undefined}
+        className={`mono-input ${changed ? 'is-edited' : ''} ${unknown.length > 0 ? 'is-unknown' : ''}`}
+        aria-label={E.toolsOf(skill)}
+        value={text}
+        spellCheck={false}
+        autoComplete="off"
+        onChange={(e) => change(e.target.value)}
+        onKeyDown={onKey}
+      />
+      {options.length > 0 && (
+        <ul id={listId} role="listbox" className="tool-options" aria-label={E.toolSuggestions}>
+          {options.map((o, i) => (
+            <li
+              key={o}
+              id={`${id}-o${i}`}
+              role="option"
+              aria-selected={i === active}
+              className={`tool-option mono-val ${i === active ? 'on' : ''}`}
+              onMouseDown={(e) => {
+                e.preventDefault();
+                accept(o);
+              }}
+            >
+              {o}
+            </li>
+          ))}
+        </ul>
+      )}
+      {problems.length > 0 && (
+        <ul id={`${id}-problems`} className="tool-problems">
+          {problems.map((p) => (
+            <li key={`${p.kind}-${p.t}`} className="field-error small">
+              <span className="tool-bad mono-val">{p.t}</span>
+              {' '}
+              {(p.kind === 'unknown' ? E.toolUnknown(p.t) : E.toolTwice(p.t)).slice(p.t.length).trim()}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function Editor({ data, onOpened, proposalsVersion }: { data: PolicyView; onOpened: () => void; proposalsVersion: () => void }) {
+  const { api } = useApp();
+  const E = T.editor;
+  const base = data.spec;
+  const [patch, setPatch] = usePending<SpecPatch>(api, 'policy.patch', {});
+  const [raw, setRaw] = usePending<string | null>(api, 'policy.raw', null);
+  const [rawError, setRawError] = useState<string | null>(null);
+  const [tab, setTab] = useState<Tab>(raw !== null ? 'raw' : 'bots');
+  const [resetKey, setResetKey] = useState(0);
+  const edited = useMemo(() => applySpecPatch(base, patch), [base, patch]);
+  const size = patchSize(patch);
+  const key = stableKey(patch);
+  // The tool names PM OS knows: every one the spec's skills use today.
+  const known = useMemo(() => [...new Set(Object.values(base.skills).flatMap((k) => k.tools))].sort(), [base]);
+  const blocked = useMemo(() => {
+    const set = new Set(known);
+    return Object.keys(patch.skills ?? {}).some((sk) => toolIssues(edited.skills[sk]?.tools ?? [], set).unknown.length > 0);
+  }, [known, patch, edited]);
+  const empty = size === 0 || rawError !== null || blocked;
+  useLeaveGuard(size > 0);
+
+  const validate = useCallback(() => api.adminPolicyValidate(patch), [api, patch]);
+  const propose = useCallback((title: string, reason: string) => api.adminPolicyPropose({ spec: patch, title, reason }), [api, patch]);
+  const flow = useProposalFlow({
+    key,
+    empty,
+    validate,
+    propose,
+    onOpened: () => {
+      setPatch({});
+      setRaw(null);
+      setResetKey((k) => k + 1);
+      onOpened();
+    },
+  });
+  const closeAndShowList = useCallback(() => {
+    flow.closeDialog();
+    window.location.hash = '/admin/policy/proposals';
+  }, [flow]);
+  const checkProposals = useCheckProposals(PROPOSALS_ID, proposalsVersion, closeAndShowList);
+
+  const update = (next: PolicySpec) => {
+    setPatch(specPatch(base, next));
+    setRaw(null);
+  };
+  const discard = () => {
+    setPatch({});
+    setRaw(null);
+    setRawError(null);
+    setResetKey((k) => k + 1);
+    flow.reset();
+  };
+  const choose = (t: Tab) => {
+    if (t === 'raw' && raw === null) setRaw(JSON.stringify(patch, null, 2));
+    setTab(t);
+  };
+
+  const was = (bot: string, f: 'role' | 'scope' | 'owner') => patch.bots?.[bot]?.[f] !== undefined;
+  const roles = Object.keys(edited.roles);
+  const skills = Object.keys(edited.skills);
+  const usedBy = (skill: string) => roles.filter((r) => edited.roles[r]!.skills.includes(skill));
+  const paths = changedPaths(patch);
+  const tabs: Tab[] = ['bots', 'roles', 'skills', 'raw'];
+
+  return (
+    <section className="card propose-card" aria-labelledby="policy-propose">
+      <div className="card-head card-head-sub">
+        <h2 id="policy-propose">
+          <Icon name="edit" size={15} />
+          {E.heading}
+        </h2>
+        {size > 0 && <span className="pill pill-accent"><span className="pill-dot" aria-hidden="true" />{E.changes(size)}</span>}
+      </div>
+      <div className="card-body propose-intro">
+        <p className="muted small">{E.lede}</p>
+      </div>
+      <div className="card-tabs">
+        <div className="tabs" role="tablist" aria-label={E.tabsLabel}>
+          {tabs.map((t) => (
+            <button key={t} type="button" role="tab" id={`ptab-${t}`} aria-controls={`ppanel-${t}`} aria-selected={tab === t} className="tab" onClick={() => choose(t)}>
+              {E.tabs[t]}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div className="tabpanel" role="tabpanel" id={`ppanel-${tab}`} aria-labelledby={`ptab-${tab}`} key={`${tab}-${resetKey}`}>
+        {tab === 'bots' && (
+          <div className="table-scroll">
+            <table className="dtable edit-table">
+              <thead>
+                <tr>
+                  <th scope="col">{E.cols.bot}</th>
+                  <th scope="col">{E.cols.role}</th>
+                  <th scope="col">{E.cols.scope}</th>
+                  <th scope="col">{E.cols.owner}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {Object.entries(edited.bots).map(([bot, b]) => (
+                  <tr key={bot}>
+                    <th scope="row" className="mono-val">{bot}</th>
+                    <td>
+                      <select className={was(bot, 'role') ? 'is-edited' : ''} aria-label={E.roleLabel(bot)} value={b.role} onChange={(e) => update({ ...edited, bots: { ...edited.bots, [bot]: { ...b, role: e.target.value } } })}>
+                        {[...new Set([...roles, b.role])].map((r) => <option key={r} value={r}>{r}</option>)}
+                      </select>
+                    </td>
+                    <td>
+                      <select className={was(bot, 'scope') ? 'is-edited' : ''} aria-label={E.scopeLabel(bot)} value={b.scope} onChange={(e) => update({ ...edited, bots: { ...edited.bots, [bot]: { ...b, scope: e.target.value } } })}>
+                        {[...new Set(['team', 'personal', b.scope])].map((s) => <option key={s} value={s}>{E.scopes[s] ?? s}</option>)}
+                      </select>
+                    </td>
+                    <td>
+                      <input type="text" className={`mono-input ${was(bot, 'owner') ? 'is-edited' : ''}`} aria-label={E.ownerLabel(bot)} title={E.ownerHint} value={b.owner} spellCheck={false} onChange={(e) => update({ ...edited, bots: { ...edited.bots, [bot]: { ...b, owner: e.target.value.trim() } } })} />
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+        {tab === 'roles' && (
+          <ul className="role-edit">
+            {roles.map((role) => {
+              const have = edited.roles[role]!.skills;
+              const order = [...have, ...skills.filter((s) => !have.includes(s))];
+              return (
+                <li key={role} className={`role-edit-row ${patch.roles?.[role] ? 'is-edited-row' : ''}`}>
+                  <span className="mono-val role-edit-name">{role}</span>
+                  <fieldset className="skill-boxes">
+                    <legend className="sr-only">{E.skillsOf(role)}</legend>
+                    {order.map((s) => (
+                      <label key={s} className={`skill-box ${have.includes(s) ? 'on' : ''}`}>
+                        <input
+                          type="checkbox"
+                          checked={have.includes(s)}
+                          onChange={(e) => {
+                            const next = e.target.checked ? [...have, s] : have.filter((x) => x !== s);
+                            update({ ...edited, roles: { ...edited.roles, [role]: { skills: next } } });
+                          }}
+                        />
+                        <span className="mono-val">{s}</span>
+                      </label>
+                    ))}
+                  </fieldset>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+        {tab === 'skills' && (
+          <div className="table-scroll">
+            <table className="dtable edit-table skills-edit">
+              <thead>
+                <tr>
+                  <th scope="col" className="c-skill">{copy.admin.policy.bots.skills}</th>
+                  <th scope="col">{copy.admin.policy.bots.tools}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {skills.map((s) => {
+                  const users = usedBy(s);
+                  return (
+                    <tr key={s}>
+                      <th scope="row">
+                        <span className="mono-val block">{s}</span>
+                        <span className="fact-quiet small">{users.length ? E.usedBy(users.join(', ')) : E.unused}</span>
+                      </th>
+                      <td>
+                        <ToolsInput
+                          skill={s}
+                          tools={edited.skills[s]!.tools}
+                          known={known}
+                          changed={patch.skills?.[s] !== undefined}
+                          onChange={(tools) => update({ ...edited, skills: { ...edited.skills, [s]: { tools } } })}
+                        />
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+            <p className="field-hint edit-hint">{E.toolsHint}</p>
+          </div>
+        )}
+        {tab === 'raw' && (
+          <div className="card-body raw-edit">
+            <label className="field-label" htmlFor="policy-raw">{E.rawLabel}</label>
+            <textarea
+              id="policy-raw"
+              className="code-area"
+              rows={12}
+              spellCheck={false}
+              aria-describedby="policy-raw-hint"
+              value={raw ?? JSON.stringify(patch, null, 2)}
+              onChange={(e) => {
+                setRaw(e.target.value);
+                const r = parseRawPatch(e.target.value);
+                if ('patch' in r) {
+                  setPatch(r.patch);
+                  setRawError(null);
+                } else setRawError(r.error);
+              }}
+            />
+            <p id="policy-raw-hint" className={`field-hint ${rawError ? 'field-error' : ''}`} role={rawError ? 'alert' : undefined}>{rawError ?? E.rawHint}</p>
+          </div>
+        )}
+      </div>
+      <div className="propose-foot">
+        <div className="change-line">
+          {size === 0 ? (
+            <span className="muted small">{E.noChanges}</span>
+          ) : (
+            <>
+              <ul className="chip-list" aria-label={E.changes(size)}>
+                {paths.map((p) => <li key={p} className="mini-chip mono-val mini-chip-edit">{p}</li>)}
+              </ul>
+              <button type="button" className="btn btn-sm btn-ghost" onClick={discard}>
+                <Icon name="x" size={14} />
+                {E.discard}
+              </button>
+            </>
+          )}
+        </div>
+        {!(flow.done && size === 0) && <ProposeBar flow={flow} empty={empty} configured={data.proposals_configured} />}
+        {blocked && <p className="propose-hint field-error" role="status">{E.toolsBlocked}</p>}
+        {flow.checkProblem && <ProblemNote problem={flow.checkProblem} onCheckProposals={checkProposals} />}
+        <CheckResult flow={flow} headingId="policy-check" />
+        {flow.done && <ProposalDone result={flow.done} onAnother={flow.reset} />}
+      </div>
+      {flow.dialogOpen && <ProposeDialog kind="policy" flow={flow} onCheckProposals={checkProposals} />}
+    </section>
+  );
+}
+
+// ---------- The page ----------
+
+function PartSwitch({ part, parts }: { part: PolicyPart | 'overview'; parts: (PolicyPart | 'overview')[] }) {
+  const C = T.parts;
+  const href = (p: PolicyPart | 'overview') => (p === 'overview' ? '#/admin/policy' : `#/admin/policy/${p}`);
+  return (
+    <nav className="card-tabs part-switch" aria-label={C.label}>
+      <div className="tabs">
+        {parts.map((p) => (
+          <a key={p} href={href(p)} className="tab" aria-current={part === p ? 'page' : undefined}>
+            {C[p]}
+          </a>
+        ))}
+      </div>
+    </nav>
+  );
+}
+
+function PolicyBody({ data, part }: { data: PolicyView; part: PolicyPart | undefined }) {
+  const { api, me } = useApp();
+  const [version, setVersion] = useState(0);
+  const bump = useCallback(() => setVersion((v) => v + 1), []);
+  const S = T.strip;
+  const drifted = data.files.filter((f) => f.state !== 'same' && f.state !== 'unknown').length;
+  const violations = data.drift.violations.length;
+  const tools = new Set(data.bots.flatMap((b) => b.tools)).size;
+  const editable = canEditPolicy(me);
+  const loadProposals = useCallback(() => api.adminPolicyProposals(), [api]);
+  // Someone who cannot propose has no form to land on: that address shows the overview.
+  const current: PolicyPart | 'overview' = part === 'propose' && !editable ? 'overview' : (part ?? 'overview');
+  const parts: (PolicyPart | 'overview')[] = editable ? ['overview', 'propose', 'proposals'] : ['overview', 'proposals'];
+
+  return (
+    <>
+      <div className="stats status-strip" role="group" aria-label={S.label}>
+        {data.drift.checked_in_available ? (
+          <StatusTile
+            label={S.files}
+            value={drifted === 0 ? S.inSync : S.drift(drifted)}
+            sub={drifted === 0 ? S.inSyncSub : S.driftSub}
+            tone={drifted === 0 ? 'good' : 'warn'}
+            text
+          />
+        ) : (
+          <StatusTile label={S.files} value={S.noRoot} sub={S.noRootSub} text />
+        )}
+        <StatusTile label={S.rules} value={violations} sub={violations ? S.rulesSub : S.rulesSub0} tone={violations ? 'bad' : undefined} />
+        <ProtectionTile protection={data.protection} configured={data.proposals_configured} />
+        <StatusTile label={S.bots} value={data.bots.length} sub={S.botsSub(tools)} />
+      </div>
+      <ProtectionNotes protection={data.protection} configured={data.proposals_configured} />
+      <PartSwitch part={current} parts={parts} />
+      {current === 'overview' && (
+        <>
+          {data.generate_errors.length > 0 && (
+            <section className="card" aria-labelledby="policy-gen">
+              <div className="card-head"><h2 id="policy-gen">{T.generateHeading}</h2></div>
+              <div className="card-body stack stack-tight">
+                <p className="muted small">{T.generateBody}</p>
+                <IssueList issues={data.generate_errors} label={T.generateHeading} />
+              </div>
+            </section>
+          )}
+          {violations > 0 && (
+            <section className="card card-alert" aria-labelledby="policy-violations">
+              <div className="card-head"><h2 id="policy-violations"><Icon name="alert" size={15} />{T.violationsHeading}<span className="card-count">{violations}</span></h2></div>
+              <IssueList issues={data.drift.violations} label={T.violationsHeading} compact />
+            </section>
+          )}
+          <BotsSection data={data} />
+          {!editable && <p className="meta-line"><Icon name="lock" size={15} /><span>{copy.admin.repo.readOnly}</span></p>}
+          <McpSection mcp={data.mcp} editable={canEditContent(me)} />
+          <FixedSection data={data} />
+          <FilesSection data={data} />
+        </>
+      )}
+      {editable && (
+        // Kept on the page while another part shows, so a half-made change and its check are not lost.
+        <div hidden={current !== 'propose'}>
+          {!data.proposals_configured && (
+            <p className="meta-line"><Icon name="info" size={15} /><span>{copy.admin.repo.proposalsOff}</span></p>
+          )}
+          <p className="meta-line prover-not-here"><Icon name="info" size={15} /><span>{B.prover.notRunHere}</span></p>
+          <Editor data={data} onOpened={bump} proposalsVersion={bump} />
+        </div>
+      )}
+      <div hidden={current !== 'proposals'}>
+        <p className="meta-line prover-not-here"><Icon name="info" size={15} /><span>{B.prover.notRunHere}</span></p>
+        <ProposalsCard kind="policy" id={PROPOSALS_ID} load={loadProposals} version={version} />
+      </div>
+    </>
+  );
+}
+
+/** Admins and auditors: what each bot may do, what is fixed, and (admins) a way to propose a change. */
+export function Policy({ part }: { part?: PolicyPart }) {
+  const { api } = useApp();
+  const load = useCallback(() => api.adminPolicy(), [api]);
+  const { data, error, forbidden, reload } = useLoad(load, T.loadFailed);
+  if (forbidden) return <NoAccess />;
+  return (
+    <div className="page page-wide">
+      <AdminHead section="policy" title={copy.admin.sections.policy} lede={T.lede}>
+        {data && <RevisionChip revision={data.revision} />}
+      </AdminHead>
+      {error && <ErrorNote actionLabel={copy.errors.retry} onAction={reload}>{error}</ErrorNote>}
+      {!data && !error && <Skeleton rows={4} label={T.loading} variant="cards" />}
+      {data && <PolicyBody data={data} part={part} />}
+    </div>
+  );
+}

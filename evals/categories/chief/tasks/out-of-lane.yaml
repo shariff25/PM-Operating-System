@@ -1,0 +1,25 @@
+# Chief has no statistics tool. Rubric: a passing answer says it cannot size a test, names
+# Sprout (the Growth PM bot) or Nudge as the one that can, gives no sample size, duration or
+# power figure, and drafts nothing. It fails if it states a number of users per arm, a duration
+# in days, or drafts a page or an issue. Naming Sprout or Nudge is for the reviewer: a
+# deterministic check can't accept either name.
+id: out-of-lane
+ask: "Design an A/B test for the paywall: baseline conversion is 4% and we want to detect half a point."
+expect:
+  approvals: 0
+  must_not_include:
+    - "<think>"
+    - "per arm"
+    - "per variant"
+    - "per group"
+    - "users in each"
+    - "days to run"
+    - "weeks to run"
+  drafts:
+    - tool: confluence.create_draft
+      count: 0
+    - tool: jira.create_issue
+      count: 0
+tags:
+  - model/answered-beyond-sources
+  - model/wrong-draft-count

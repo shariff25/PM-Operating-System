@@ -3,7 +3,7 @@
 use chrono::{NaiveDate, TimeZone, Utc};
 use pmos_evals::grade::Check;
 use pmos_evals::history::{evaluate, load_reports};
-use pmos_evals::report::{meets, write, Report, TaskReport};
+use pmos_evals::report::{meets, write, GatewayModels, Report, TaskReport};
 use pmos_evals::tag::{Tag, Tagged};
 
 fn line(id: &str, failure: Option<(Tag, &str, Check)>) -> TaskReport {
@@ -26,6 +26,9 @@ fn line(id: &str, failure: Option<(Tag, &str, Check)>) -> TaskReport {
         repeat: 1,
         cluster: None,
         regression: false,
+        turns: Vec::new(),
+        failed_turn: None,
+        cancel: None,
         judges: Vec::new(),
         task_id: Some(format!("tsk_{id}")),
         status: Some(if passed { "done" } else { "failed" }.into()),
@@ -66,9 +69,14 @@ fn report(date: &str, passed: usize, total: usize) -> Report {
         requested_by: "ana".into(),
         gateway_workarounds: None,
         note: None,
+        gateway_models: None,
+        persona_version: None,
+        persona_hash: None,
         repeats: 1,
         judges: Vec::new(),
         judges_skipped: None,
+        isolation: None,
+        route: None,
         tasks,
     }
 }
@@ -429,11 +437,608 @@ fn repeats_show_passes_out_of_k_and_pass_hat_k() {
         "{md}"
     );
     assert!(
-        md.contains("| pass^3 | 50% (1 of 2 tasks passed every run) |"),
+        md.contains("| All attempts passed (pass^3) | 50% (1 of 2 tasks passed every run) |"),
         "{md}"
     );
-    assert!(md.contains("| `t-a` | 3/3 |"), "{md}");
-    assert!(md.contains("| `t-b` | **1/3** | model ×2 |"), "{md}");
+    assert!(md.contains("| `t-a` | 3/3 | yes |"), "{md}");
+    assert!(md.contains("| `t-b` | **1/3** | no | model ×2 |"), "{md}");
     assert!(md.contains("### `t-b`, run 3 of 3"), "{md}");
-    assert!(md.contains("| Pass rate | 66.7% ± "), "{md}");
+    assert!(
+        md.contains("| Pass rate (average over attempts) | 66.7% ± "),
+        "{md}"
+    );
+}
+
+/// The all-attempts-pass rate beside the average, per task and per category, in the markdown
+/// and the `.json`; and attempts lost to the provider or infrastructure shown apart in the
+/// headline, while the bar still counts them.
+#[test]
+fn summary_has_the_all_attempts_rate_and_the_infra_losses_apart() {
+    let mut r = report("2026-11-22", 0, 0);
+    r.repeats = 3;
+    let interrupted = || {
+        let mut l = line(
+            "t-b",
+            Some((
+                Tag::Harness,
+                "interrupted",
+                Check::Status {
+                    expected: "`done`".into(),
+                    got: "failed".into(),
+                },
+            )),
+        );
+        l.tag.as_mut().unwrap().sub = Some("harness/interrupted".into());
+        l
+    };
+    // t-a: 3/3. t-b: 2 passes, 1 lost to the provider. t-c: 1 pass, 2 the bot's failures.
+    let mut push = |mut l: TaskReport, k: u32| {
+        l.repeat = k;
+        r.tasks.push(l);
+    };
+    for k in 1..=3 {
+        push(line("t-a", None), k);
+    }
+    push(line("t-b", None), 1);
+    push(interrupted(), 2);
+    push(line("t-b", None), 3);
+    push(line("t-c", None), 1);
+    for k in 2..=3 {
+        push(
+            line(
+                "t-c",
+                Some((Tag::Model, "model", Check::MissingText { text: "x".into() })),
+            ),
+            k,
+        );
+    }
+    let s = r.summary();
+    assert_eq!((s.attempts, s.passed), (9, 6));
+    assert!((s.pass_rate - 6.0 / 9.0).abs() < 1e-9);
+    assert_eq!((s.tasks, s.tasks_all_attempts_passed), (3, 1));
+    assert!((s.all_attempts_pass_rate - 1.0 / 3.0).abs() < 1e-9);
+    assert_eq!(s.infra_losses, 1);
+    assert!((s.pass_rate_excluding_infra.unwrap() - 6.0 / 8.0).abs() < 1e-9);
+    // The bar (80%) is judged on every attempt, losses included: 6 of 9 is below it, though
+    // 6 of 8 would be closer.
+    assert_eq!(s.met_bar, Some(false));
+    assert_eq!(r.met_bar(), Some(false));
+    let b = &s.by_task[1];
+    assert_eq!(
+        (
+            b.id.as_str(),
+            b.passes,
+            b.attempts,
+            b.all_attempts_passed,
+            b.infra_losses
+        ),
+        ("t-b", 2, 3, false, 1)
+    );
+    assert!(s.by_task[0].all_attempts_passed);
+
+    let md = r.to_markdown();
+    assert!(
+        md.contains("**All attempts passed** for 1 of 3 tasks (33%)"),
+        "{md}"
+    );
+    assert!(md.contains("the bar is judged on the average"), "{md}");
+    assert!(
+        md.contains(
+            "**Lost to the model provider or infrastructure:** 1 attempt (`harness/interrupted`"
+        ),
+        "{md}"
+    );
+    assert!(
+        md.contains("without them, 6 of 8 attempts passed (75%)"),
+        "{md}"
+    );
+    assert!(
+        md.contains("They still count as failures for the bar."),
+        "{md}"
+    );
+    assert!(md.contains("| `t-b` | **2/3** | no |"), "{md}");
+    assert!(md.contains("| `t-a` | 3/3 | yes |"), "{md}");
+    assert!(
+        md.contains("| Isolation | none: every attempt shared one tool server"),
+        "{md}"
+    );
+
+    // The .json carries the summary, and still reads back as the same report.
+    let dir = tempfile::tempdir().unwrap();
+    let path = write(dir.path(), &r).unwrap();
+    let json_path = path.with_extension("json");
+    let raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
+    assert_eq!(raw["summary"]["tasks_all_attempts_passed"], 1);
+    assert_eq!(raw["summary"]["infra_losses"], 1);
+    assert_eq!(raw["summary"]["by_task"][2]["id"], "t-c");
+    assert_eq!(raw["summary"]["by_task"][2]["all_attempts_passed"], false);
+    let back = pmos_evals::report::read(&json_path).unwrap();
+    assert_eq!(back, r);
+
+    // No losses: no such line.
+    let clean = report("2026-11-22", 2, 2);
+    assert!(!clean.to_markdown().contains("Lost to the model provider"));
+    assert_eq!(clean.summary().infra_losses, 0);
+}
+
+/// Copy one of the repository's categories into `root/categories`.
+fn copy_category(root: &std::path::Path, name: &str) {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../evals/categories")
+        .join(name);
+    for entry in walk(&src) {
+        let rel = entry.strip_prefix(&src).unwrap();
+        let dst = root.join("categories").join(name).join(rel);
+        std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        std::fs::copy(&entry, dst).unwrap();
+    }
+}
+
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).unwrap().filter_map(Result::ok) {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(walk(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// The production role models of the test evals directory (its `prod-gateway.yaml`).
+fn production() -> pmos_evals::history::ProductionModels {
+    [("default", "qwen-prod"), ("extraction", "nemo-prod")]
+        .into_iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect::<std::collections::BTreeMap<_, _>>()
+        .into()
+}
+
+/// What a gateway serving the production role models reports.
+fn prod_models() -> GatewayModels {
+    GatewayModels {
+        roles: production().roles,
+        upstreams: production()
+            .roles
+            .keys()
+            .map(|r| (r.clone(), "local".to_string()))
+            .collect(),
+        stub: false,
+        cloud_test: false,
+        workarounds: true,
+        class: "production".into(),
+        model_sha256: Default::default(),
+    }
+}
+
+/// An evals directory (config.yaml naming `prod-gateway.yaml` as the production gateway) and
+/// a content directory with persona `echo` at `version`.
+fn bench_dirs(version: &str) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let evals = dir.path().join("evals");
+    let content = dir.path().join("content");
+    std::fs::create_dir_all(&evals).unwrap();
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../evals");
+    let config = std::fs::read_to_string(repo.join("config.yaml"))
+        .unwrap()
+        .replace(
+            "production_gateway: ../deploy/gateway.yaml",
+            "production_gateway: prod-gateway.yaml",
+        );
+    assert!(config.contains("prod-gateway.yaml"));
+    std::fs::write(evals.join("config.yaml"), config).unwrap();
+    std::fs::write(
+        evals.join("prod-gateway.yaml"),
+        "upstreams: {q: 'http://vllm:8000/v1'}\nroles:\n  default: {upstream: q, model: qwen-prod}\n  extraction: {upstream: q, model: nemo-prod}\n",
+    )
+    .unwrap();
+    set_persona_version(&content, version);
+    (dir, evals, content)
+}
+
+/// Persona `echo` at `version`, with its role `outbound-pm` and the role's skill `battlecard`.
+fn set_persona_version(content: &std::path::Path, version: &str) {
+    std::fs::create_dir_all(content.join("personas/echo")).unwrap();
+    std::fs::write(
+        content.join("personas/echo/PERSONA.md"),
+        format!("---\nname: echo\nrole: outbound-pm\nversion: \"{version}\"\n---\n\n# Echo\n"),
+    )
+    .unwrap();
+    std::fs::create_dir_all(content.join("roles/outbound-pm")).unwrap();
+    std::fs::write(
+        content.join("roles/outbound-pm/ROLE.md"),
+        "---\nname: outbound-pm\nskills: \"battlecard\"\n---\n\n# Outbound\n",
+    )
+    .unwrap();
+    set_skill(content, "Write a battlecard.\n");
+}
+
+fn set_skill(content: &std::path::Path, text: &str) {
+    std::fs::create_dir_all(content.join("skills/battlecard")).unwrap();
+    std::fs::write(
+        content.join("skills/battlecard/SKILL.md"),
+        format!("---\nname: battlecard\n---\n\n{text}"),
+    )
+    .unwrap();
+}
+
+/// `pmos lint`'s `persona-benchmark` input: a persona passes only when every category naming
+/// it has met its bar two weeks in a row (D10), in runs that count: on the production role
+/// models, and on the persona's current version (N5).
+#[test]
+fn a_persona_is_benchmarked_after_two_weeks_at_its_bar() {
+    use pmos_evals::history::benchmarked_personas;
+    // The repository's reports don't count (none recorded its models): no marketplace bot is
+    // benchmarked.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    assert!(benchmarked_personas(&root.join("evals"), &root.join("content")).is_empty());
+    assert!(benchmarked_personas(
+        std::path::Path::new("/nonexistent/evals"),
+        &root.join("content")
+    )
+    .is_empty());
+
+    let (_dir, evals, content) = bench_dirs("0.1.0");
+    copy_category(&evals, "echo");
+    copy_category(&evals, "chief");
+    let reports = evals.join("reports");
+    let hash = pmos_evals::history::persona_hash(&content, "echo").unwrap();
+    assert!(
+        hash.starts_with("sha256:") && hash.len() == 7 + 64,
+        "{hash}"
+    );
+    let run = |date: &str, passed: usize| {
+        let mut r = report(date, passed, 10);
+        r.category = "echo".into();
+        r.pass_bar = Some(0.7);
+        r.gateway_models = Some(prod_models());
+        r.persona_version = Some("0.1.0".into());
+        r.persona_hash = Some(hash.clone());
+        write(&reports, &r).unwrap();
+    };
+    // One week at the bar is not enough.
+    run("2026-11-09", 8);
+    assert!(benchmarked_personas(&evals, &content).is_empty());
+    // Two weeks in a row: Echo passes; Chief, with no report, does not.
+    run("2026-11-16", 7);
+    let set = benchmarked_personas(&evals, &content);
+    assert_eq!(
+        set.into_iter().collect::<Vec<_>>(),
+        vec!["echo".to_string()]
+    );
+    // A new version of the persona needs its own two weeks.
+    set_persona_version(&content, "0.2.0");
+    assert!(benchmarked_personas(&evals, &content).is_empty());
+    set_persona_version(&content, "0.1.0");
+    assert_eq!(benchmarked_personas(&evals, &content).len(), 1);
+    // So does an edit that leaves `version:` alone: to the role's skill, to the role, or a
+    // new file in the persona's folder.
+    set_skill(&content, "Write a sharper battlecard.\n");
+    assert!(benchmarked_personas(&evals, &content).is_empty());
+    set_skill(&content, "Write a battlecard.\n");
+    assert_eq!(benchmarked_personas(&evals, &content).len(), 1);
+    let role = content.join("roles/outbound-pm/ROLE.md");
+    let role_text = std::fs::read_to_string(&role).unwrap();
+    std::fs::write(&role, format!("{role_text}Be bolder.\n")).unwrap();
+    assert!(benchmarked_personas(&evals, &content).is_empty());
+    std::fs::write(&role, role_text).unwrap();
+    std::fs::write(content.join("personas/echo/notes.md"), "x").unwrap();
+    assert!(benchmarked_personas(&evals, &content).is_empty());
+    std::fs::remove_file(content.join("personas/echo/notes.md")).unwrap();
+    assert_eq!(benchmarked_personas(&evals, &content).len(), 1);
+    // A missing skill folder: nothing can be hashed, so nothing counts.
+    std::fs::remove_dir_all(content.join("skills/battlecard")).unwrap();
+    assert!(pmos_evals::history::persona_hash(&content, "echo").is_err());
+    assert!(benchmarked_personas(&evals, &content).is_empty());
+    set_skill(&content, "Write a battlecard.\n");
+    // A role (or persona) that isn't a plain name is never joined into a path (the Low on
+    // the persona's role, review at 2544d01).
+    let persona_md = content.join("personas/echo/PERSONA.md");
+    let persona_text = std::fs::read_to_string(&persona_md).unwrap();
+    for bad in [
+        "../outbound-pm",
+        "outbound-pm/../outbound-pm",
+        "/etc",
+        "Outbound",
+    ] {
+        std::fs::write(
+            &persona_md,
+            persona_text.replacen("role: outbound-pm", &format!("role: \"{bad}\""), 1),
+        )
+        .unwrap();
+        let err = pmos_evals::history::persona_hash(&content, "echo").unwrap_err();
+        assert!(err.contains("plain role name"), "{bad}: {err}");
+    }
+    std::fs::write(&persona_md, persona_text).unwrap();
+    assert!(pmos_evals::history::persona_hash(&content, "..").is_err());
+    assert!(pmos_evals::history::persona_hash(&content, "echo").is_ok());
+    // A report from a test-class gateway never counts (review finding R3).
+    let mut test_class = prod_models();
+    test_class.class = "test".into();
+    let mut r = report("2026-11-16", 9, 10);
+    r.category = "echo".into();
+    r.gateway_models = Some(test_class);
+    assert!(pmos_evals::history::counts(&r, &production(), None)
+        .unwrap_err()
+        .contains("`test` gateway"));
+    // Without readable production role models, nothing counts.
+    std::fs::remove_file(evals.join("prod-gateway.yaml")).unwrap();
+    assert!(benchmarked_personas(&evals, &content).is_empty());
+    std::fs::write(
+        evals.join("prod-gateway.yaml"),
+        "upstreams: {q: 'http://vllm:8000/v1'}\nroles:\n  default: {upstream: q, model: qwen-prod}\n  extraction: {upstream: q, model: nemo-prod}\n",
+    )
+    .unwrap();
+    assert_eq!(benchmarked_personas(&evals, &content).len(), 1);
+    // Swapping a production model restarts the streak.
+    std::fs::write(
+        evals.join("prod-gateway.yaml"),
+        "upstreams: {q: 'http://vllm:8000/v1'}\nroles:\n  default: {upstream: q, model: qwen-next}\n  extraction: {upstream: q, model: nemo-prod}\n",
+    )
+    .unwrap();
+    assert!(benchmarked_personas(&evals, &content).is_empty());
+    std::fs::write(
+        evals.join("prod-gateway.yaml"),
+        "upstreams: {q: 'http://vllm:8000/v1'}\nroles:\n  default: {upstream: q, model: qwen-prod}\n  extraction: {upstream: q, model: nemo-prod}\n",
+    )
+    .unwrap();
+    // A second category for Echo that hasn't met its bar holds it back.
+    let second = evals.join("categories/echo-launch");
+    std::fs::create_dir_all(second.join("tasks")).unwrap();
+    std::fs::copy(
+        evals.join("categories/echo/category.yaml"),
+        second.join("category.yaml"),
+    )
+    .unwrap();
+    for t in walk(&evals.join("categories/echo/tasks")) {
+        std::fs::copy(&t, second.join("tasks").join(t.file_name().unwrap())).unwrap();
+    }
+    let yaml = std::fs::read_to_string(second.join("category.yaml"))
+        .unwrap()
+        .replace("name: echo\n", "name: echo-launch\n");
+    std::fs::write(second.join("category.yaml"), yaml).unwrap();
+    assert!(benchmarked_personas(&evals, &content).is_empty());
+    // A category that doesn't load still counts against the persona it names.
+    std::fs::write(
+        second.join("category.yaml"),
+        "name: echo-launch\nbot: personal\npersona: echo\nunknown: field\n",
+    )
+    .unwrap();
+    assert!(benchmarked_personas(&evals, &content).is_empty());
+}
+
+/// Review finding N5: only runs whose gateway reported the production role models count, and
+/// the reason a run doesn't is given.
+#[test]
+fn only_runs_on_the_production_role_models_count() {
+    use pmos_evals::history::{counts, split_counting};
+    let prod = production();
+    let mut r = report("2026-11-16", 9, 10);
+    // Before 2026-11-22 (E1): no models recorded, so never counted.
+    assert!(counts(&r, &prod, None)
+        .unwrap_err()
+        .contains("weren't recorded"));
+    r.gateway_models = Some(prod_models());
+    assert_eq!(counts(&r, &prod, None), Ok(()));
+    // A model production doesn't use, on any role.
+    let mut other = prod_models();
+    other
+        .roles
+        .insert("extraction".into(), "some-remote-model".into());
+    r.gateway_models = Some(other);
+    let why = counts(&r, &prod, None).unwrap_err();
+    assert!(
+        why.contains("extraction: `some-remote-model`, production `nemo-prod`"),
+        "{why}"
+    );
+    // A role production doesn't have, or one missing.
+    let mut extra = prod_models();
+    extra.roles.insert("reasoning".into(), "qwen-prod".into());
+    extra.upstreams.insert("reasoning".into(), "local".into());
+    r.gateway_models = Some(extra);
+    assert!(counts(&r, &prod, None).is_err());
+    let mut fewer = prod_models();
+    fewer.roles.remove("extraction");
+    r.gateway_models = Some(fewer);
+    assert!(counts(&r, &prod, None).is_err());
+    // The same model names, but the stub, or a testing-only upstream.
+    for tweak in [
+        |m: &mut GatewayModels| m.stub = true,
+        |m: &mut GatewayModels| m.cloud_test = true,
+        |m: &mut GatewayModels| {
+            m.upstreams.insert("default".into(), "remote-test".into());
+        },
+    ] {
+        let mut m = prod_models();
+        tweak(&mut m);
+        r.gateway_models = Some(m);
+        assert!(counts(&r, &prod, None).is_err());
+    }
+    // R3: the same models from a test-class gateway (or one too old to say) don't count.
+    let mut m = prod_models();
+    m.class = "test".into();
+    r.gateway_models = Some(m);
+    assert!(counts(&r, &prod, None)
+        .unwrap_err()
+        .contains("not the production one"));
+    // For a persona: the hash of its files then must be their hash now; the version is
+    // shown, not compared.
+    r.gateway_models = Some(prod_models());
+    let (then, now) = (
+        "sha256:".to_string() + &"a".repeat(64),
+        "sha256:".to_string() + &"b".repeat(64),
+    );
+    assert!(counts(&r, &prod, Some(&then))
+        .unwrap_err()
+        .contains("hash of the persona's files wasn't recorded"));
+    r.persona_version = Some("0.1.0".into());
+    r.persona_hash = Some(then.clone());
+    assert_eq!(counts(&r, &prod, Some(&then)), Ok(()));
+    let why = counts(&r, &prod, Some(&now)).unwrap_err();
+    assert!(why.contains("version `0.1.0` then"), "{why}");
+    // Splitting a category's reports; with no production models, none counts.
+    let old = report("2026-11-09", 9, 10);
+    let (kept, left) = split_counting(
+        vec![
+            ("old.json".into(), old.clone()),
+            ("new.json".into(), r.clone()),
+        ],
+        &Ok(prod.clone()),
+        None,
+    );
+    assert_eq!((kept.len(), left.len()), (1, 1));
+    assert_eq!(left[0].0, "old.json");
+    let (kept, left) = split_counting(
+        vec![("new.json".into(), r.clone())],
+        &Err("missing".into()),
+        None,
+    );
+    assert!(kept.is_empty() && left[0].2.contains("no production role models"));
+    // The report says which models ran, never a host, and round-trips.
+    let md = r.to_markdown();
+    assert!(md.contains("default: `qwen-prod` (local)"), "{md}");
+    assert!(md.contains("production gateway"), "{md}");
+    assert!(md.contains("Persona files"), "{md}");
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), &r).unwrap();
+    assert_eq!(load_reports(dir.path(), "docs-qa").unwrap()[0], r);
+    let unrecorded = report("2026-11-16", 9, 10).to_markdown();
+    assert!(unrecorded.contains("not recorded, so this run counts towards no bar"));
+}
+
+/// The gateway's roles answer becomes the report's field; an upstream that isn't one of the
+/// neutral labels (an address, say) is refused rather than written into a report.
+#[test]
+fn the_gateways_roles_answer_is_read_as_labels_only() {
+    let v = serde_json::json!({"stub": false, "cloud_test": false, "workarounds": true,
+        "roles": [{"role": "default", "alias": "pmos/default", "model": "qwen-prod", "upstream": "local"}]});
+    let m = GatewayModels::from_roles_answer(&v).unwrap();
+    assert_eq!(m.roles["default"], "qwen-prod");
+    assert_eq!(m.upstreams["default"], "local");
+    // A gateway that doesn't say its class is a test one (R3); an unknown class is refused.
+    assert_eq!(m.class, "test");
+    let mut prod = v.clone();
+    prod["class"] = serde_json::json!("production");
+    assert_eq!(
+        GatewayModels::from_roles_answer(&prod).unwrap().class,
+        "production"
+    );
+    prod["class"] = serde_json::json!("prod");
+    assert!(GatewayModels::from_roles_answer(&prod).is_err());
+    // A report written before the class was recorded reads as a test gateway's.
+    let old: GatewayModels = serde_json::from_value(serde_json::json!({"roles": {"default": "q"},
+        "upstreams": {"default": "local"}, "stub": false, "cloud_test": false, "workarounds": true}))
+    .unwrap();
+    assert_eq!(old.class, "test");
+    let bad = serde_json::json!({"stub": false, "cloud_test": false, "workarounds": true,
+        "roles": [{"role": "default", "model": "m", "upstream": "https://api.example.com"}]});
+    assert!(GatewayModels::from_roles_answer(&bad).is_err());
+    // A labelled role's model hash is recorded, and shown, when it is a SHA-256 in hex; it is
+    // left out of a report that has none, so old reports read and write as they were.
+    assert!(m.model_sha256.is_empty());
+    assert!(!serde_json::to_string(&m).unwrap().contains("model_sha256"));
+    let hash = pmos_evals::report::sha256_hex("hidden-model-x");
+    let mut labelled = v.clone();
+    labelled["roles"][0]["model"] = serde_json::json!("model-a");
+    labelled["roles"][0]["model_sha256"] = serde_json::json!(hash);
+    let m = GatewayModels::from_roles_answer(&labelled).unwrap();
+    assert_eq!(m.model_sha256["default"], hash);
+    assert!(
+        m.describe().contains(&format!(
+            "default: `model-a` (local, model sha256 {}…)",
+            &hash[..12]
+        )),
+        "{}",
+        m.describe()
+    );
+    let back: GatewayModels = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+    assert_eq!(back, m);
+    for bad in [
+        serde_json::json!("hidden-model-x"),
+        serde_json::json!(hash.to_uppercase()),
+        serde_json::json!(&hash[..40]),
+        serde_json::json!(7),
+    ] {
+        let mut v = labelled.clone();
+        v["roles"][0]["model_sha256"] = bad.clone();
+        assert!(GatewayModels::from_roles_answer(&v).is_err(), "{bad}");
+    }
+    assert!(GatewayModels::from_roles_answer(&serde_json::json!({"roles": []})).is_err());
+}
+
+/// A production role with a `label:` is reported by its gateway under that label
+/// (`GET /v1/pmos/roles`), so the production role models read the label for it, and a run
+/// whose gateway reported the label counts; one that reported the real model id doesn't.
+#[test]
+fn a_labelled_production_role_is_compared_by_its_label() {
+    use pmos_evals::history::{counts, production_models};
+    let (_dir, evals, _content) = bench_dirs("1");
+    std::fs::write(
+        evals.join("prod-gateway.yaml"),
+        "upstreams: {q: 'http://vllm:8000/v1'}\nroles:\n  default: {upstream: q, model: hidden-model-x, label: model-a}\n  extraction: {upstream: q, model: nemo-prod}\n",
+    )
+    .unwrap();
+    let prod = production_models(&evals).unwrap();
+    assert_eq!(prod["default"], "model-a");
+    assert_eq!(prod["extraction"], "nemo-prod");
+    // The label hardening (review at 52dbae2): the labelled role also has the hash of its
+    // model id; the unlabelled one none.
+    let hash = pmos_evals::report::sha256_hex("hidden-model-x");
+    assert_eq!(
+        prod.model_sha256,
+        [("default".to_string(), hash.clone())].into()
+    );
+    let mut r = report("2026-11-16", 9, 10);
+    let mut m = prod_models();
+    m.roles.insert("default".into(), "model-a".into());
+    m.model_sha256.insert("default".into(), hash.clone());
+    r.gateway_models = Some(m.clone());
+    assert_eq!(counts(&r, &prod, None), Ok(()));
+    r.gateway_models = Some(prod_models());
+    let why = counts(&r, &prod, None).unwrap_err();
+    assert!(
+        why.contains("(no model hash recorded), production `model-a`"),
+        "{why}"
+    );
+    // The same label over another model: the hash differs, so the run doesn't count.
+    let mut swapped = m.clone();
+    swapped.model_sha256.insert(
+        "default".into(),
+        pmos_evals::report::sha256_hex("other-model"),
+    );
+    r.gateway_models = Some(swapped);
+    let why = counts(&r, &prod, None).unwrap_err();
+    assert!(why.contains("default: `model-a` (model sha256"), "{why}");
+    // A report from before the gateway reported the hash (the label only, as the eval run of
+    // 2026-11-23 records) never matches a labelled production role...
+    let mut no_hash = m.clone();
+    no_hash.model_sha256.clear();
+    r.gateway_models = Some(no_hash.clone());
+    let why = counts(&r, &prod, None).unwrap_err();
+    assert!(why.contains("(no model hash recorded)"), "{why}");
+    // ...still parses as written then...
+    let old = serde_json::json!({"roles": {"default": "model-a", "extraction": "nemo-prod"},
+        "upstreams": {"default": "local", "extraction": "local"}, "stub": false,
+        "cloud_test": false, "workarounds": true, "class": "production"});
+    let old: GatewayModels = serde_json::from_value(old).unwrap();
+    assert_eq!(old, no_hash);
+    // ...and still matches production roles that have no label (so no hash), as before.
+    std::fs::write(
+        evals.join("prod-gateway.yaml"),
+        "upstreams: {q: 'http://vllm:8000/v1'}
+roles:
+  default: {upstream: q, model: model-a}
+  extraction: {upstream: q, model: nemo-prod}
+",
+    )
+    .unwrap();
+    let unlabelled = production_models(&evals).unwrap();
+    assert!(unlabelled.model_sha256.is_empty());
+    assert_eq!(counts(&r, &unlabelled, None), Ok(()));
+    // A hash for a role production doesn't label doesn't match either.
+    r.gateway_models = Some(m);
+    assert!(counts(&r, &unlabelled, None).is_err());
 }

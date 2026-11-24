@@ -161,6 +161,8 @@ async fn decisions_through_the_service_label_their_rows() {
                 args: None,
                 reason: Some(Reason::WrongTarget),
                 confirm_external: false,
+                expected_args_hash: None,
+                hold: None,
             },
             now(),
         )
@@ -237,6 +239,8 @@ async fn a_reason_is_only_accepted_with_reject() {
                     args,
                     reason: Some(Reason::Tone),
                     confirm_external: false,
+                    expected_args_hash: None,
+                    hold: None,
                 },
                 now(),
             )
@@ -282,6 +286,8 @@ async fn the_summary_counts_outcomes_coverage_edits_and_reasons() {
                 args: None,
                 reason: Some(Reason::Incomplete),
                 confirm_external: false,
+                expected_args_hash: None,
+                hold: None,
             },
             now(),
         )
@@ -334,6 +340,80 @@ async fn the_summary_counts_outcomes_coverage_edits_and_reasons() {
         .unwrap();
     assert_eq!(empty.rows, 0);
     assert!(empty.groups.is_empty());
+}
+
+/// Drafts decided 2 s, 4 s, 60 s and 3 s after creation (approve, approve, approve, reject),
+/// one edited after 10 s, one left pending: the summary's decision-time figures.
+async fn check_decision_times(f: &common::Fixture) {
+    let s = skill_session(f, "r1").await;
+    let t0 = now();
+    let mut ids = Vec::new();
+    for name in ["One", "Two", "Three", "Four", "Five", "Six"] {
+        ids.push(draft(f, &s, name).await);
+    }
+    for (id, secs) in [(&ids[0], 2), (&ids[1], 4), (&ids[2], 60)] {
+        f.svc
+            .decide(
+                id,
+                "ana",
+                Decision::Approve,
+                None,
+                t0 + Duration::seconds(secs),
+            )
+            .await
+            .unwrap();
+    }
+    f.svc
+        .decide(
+            &ids[3],
+            "ana",
+            Decision::Reject,
+            None,
+            t0 + Duration::seconds(3),
+        )
+        .await
+        .unwrap();
+    f.svc
+        .decide(
+            &ids[4],
+            "ana",
+            Decision::Edit,
+            Some(issue("Fifty")),
+            t0 + Duration::seconds(10),
+        )
+        .await
+        .unwrap();
+
+    let summary = f.svc.ledger_summary(None, None, t0).await.unwrap();
+    assert_eq!(
+        summary.fast_approval_seconds,
+        pmos_toolserver::ledger::DEFAULT_FAST_APPROVAL_SECONDS
+    );
+    let g = &summary.groups[0];
+    assert_eq!(g.rows, 6);
+    // Decided: 2, 3, 4, 10, 60; the pending row is left out.
+    assert_eq!(g.decision_time_rows, 5);
+    assert_eq!(g.median_decision_seconds, Some(4.0));
+    // Approved unchanged: 2 s and 4 s are within 5 s, 60 s isn't; edits and rejections
+    // don't count.
+    assert_eq!(g.fast_approvals, 2);
+    assert_eq!(g.fast_approval_rows, 3);
+    assert!((g.fast_approval_share.unwrap() - 2.0 / 3.0).abs() < 1e-9);
+}
+
+#[tokio::test]
+async fn the_summary_reports_decision_times_in_memory() {
+    check_decision_times(&fixture()).await;
+}
+
+#[tokio::test]
+async fn the_summary_reports_decision_times_in_postgres() {
+    let Some((f, pg)) = common::pg_fixture().await else {
+        return;
+    };
+    check_decision_times(&f).await;
+    drop(f);
+    pg.drop_schema().await;
 }
 
 // ----- the bounded retry (§2) ---------------------------------------------------------------
@@ -589,8 +669,20 @@ async fn reasons_over_http() {
 #[tokio::test]
 async fn who_may_read_the_ledger() {
     let s = start().await;
-    let session = skill_session(&s.fixture, "r1").await;
-    draft(&s.fixture, &session, "SCIM").await;
+    // The HTTP layer reads the ledger against the real clock, and a pending row older than the
+    // expiry window reads as `expired`: so the draft is made now, not at the fixed test time.
+    let today = chrono::Utc::now();
+    let session = s
+        .fixture
+        .svc
+        .create_session("ana", "meeting-notes", "r1", None, today)
+        .await
+        .unwrap();
+    s.fixture
+        .svc
+        .call(&session, "jira_create_issue", issue("SCIM"), today)
+        .await
+        .unwrap();
 
     let (status, body) = s.get(SERVICE_TOKEN, "/internal/ledger").await;
     assert_eq!(status, 200);
@@ -635,6 +727,15 @@ async fn who_may_read_the_ledger() {
     assert_eq!(summary["rows"], 1);
     assert_eq!(summary["label_coverage"], 0.0);
     assert_eq!(summary["groups"][0]["counts"]["pending"], 1);
+    // The decision-time tripwire: the threshold, and per group the figures with the counts
+    // they are over; with nothing decided, no median and no share.
+    assert_eq!(summary["fast_approval_seconds"], 5);
+    let group = &summary["groups"][0];
+    assert_eq!(group["median_decision_seconds"], Value::Null);
+    assert_eq!(group["decision_time_rows"], 0);
+    assert_eq!(group["fast_approvals"], 0);
+    assert_eq!(group["fast_approval_rows"], 0);
+    assert_eq!(group["fast_approval_share"], Value::Null);
 
     // A sandbox's session token is not an internal token; nor is nothing.
     assert_eq!(s.get(&session.token, "/internal/ledger").await.0, 401);

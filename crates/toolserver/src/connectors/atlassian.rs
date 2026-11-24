@@ -425,11 +425,26 @@ impl Confluence {
     }
 
     fn footer(caller: Caller<'_>) -> String {
-        format!(
-            "<p><em>{DRAFTED_MARKER} · run {}</em></p>",
-            escape_html(caller.run_id)
-        )
+        storage_footer(caller.run_id)
     }
+}
+
+/// The footer every Confluence page PM OS writes ends with (OUT-1).
+fn storage_footer(run_id: &str) -> String {
+    format!(
+        "<p><em>{DRAFTED_MARKER} · run {}</em></p>",
+        escape_html(run_id)
+    )
+}
+
+/// A Confluence page body as PM OS writes it: the markdown as Confluence storage, HTML-escaped,
+/// then the footer. The built-in connector and an MCP server's write (slice M8) send the same.
+pub fn storage_body(markdown: &str, run_id: &str) -> String {
+    format!(
+        "{}{}",
+        markdown_to_storage(markdown),
+        storage_footer(run_id)
+    )
 }
 
 #[async_trait]

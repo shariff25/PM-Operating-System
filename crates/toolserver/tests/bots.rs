@@ -132,7 +132,7 @@ async fn a_personal_bot_serves_only_its_owner() {
 
 #[tokio::test]
 async fn a_team_bot_serves_team_members_only_when_the_team_is_enforced() {
-    let f = common::team_fixture(&["ana", "bo"]);
+    let f = common::team_fixture(&["ana", "bo"]).await;
     for user in ["ana", "bo"] {
         assert!(f
             .svc
@@ -501,7 +501,7 @@ async fn reindex_reloads_bots_and_settings_for_live_sessions() {
 
 #[tokio::test]
 async fn deciders_must_be_in_team_yaml_when_it_is_enforced() {
-    let f = common::team_fixture(&["ana"]);
+    let f = common::team_fixture(&["ana"]).await;
     let s = bot_session(&f, "ana", "scout").await;
     let out = f
         .svc
@@ -529,9 +529,17 @@ async fn deciders_must_be_in_team_yaml_when_it_is_enforced() {
     }
     assert!(f.jira.writes().is_empty());
 
+    let shown = f.svc.approval(&id).await.unwrap().unwrap().args_hash;
     let done = f
         .svc
-        .decide_as(Client::Bot, &id, "ana", Decision::Approve, None, now())
+        .decide_verdict(
+            Client::Bot,
+            &id,
+            "ana",
+            pmos_toolserver::approvals::Verdict::new(Decision::Approve, None)
+                .shown(Some(shown[..16].to_string())),
+            now(),
+        )
         .await
         .unwrap();
     assert_eq!(done.status, Status::Approved);
@@ -694,6 +702,73 @@ async fn bot_sessions_over_http() {
     s.cancel.cancel();
 }
 
+/// A follow-up's session starts at the level its history was built from, and the runtime
+/// reads a run's level back, with the service token only (W6).
+#[tokio::test]
+async fn a_session_starts_at_its_historys_level_over_http() {
+    let s = start(fixture()).await;
+    let get = |token: &'static str, path: String| {
+        let base = s.base.clone();
+        async move {
+            reqwest::Client::new()
+                .get(format!("{base}{path}"))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    let res = post(
+        &s.base,
+        SERVICE_TOKEN,
+        "/internal/sessions",
+        json!({"user": "ana", "bot": "scout", "run_id": "tsk_follow", "history_sensitivity": "restricted"}),
+    )
+    .await;
+    assert_eq!(res.status(), 201);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["session"]["sources_sensitivity"], "restricted");
+    // A level that isn't one is refused, not read as public.
+    let res = post(
+        &s.base,
+        SERVICE_TOKEN,
+        "/internal/sessions",
+        json!({"user": "ana", "bot": "scout", "run_id": "r", "history_sensitivity": "secret"}),
+    )
+    .await;
+    assert!(res.status().is_client_error(), "{}", res.status());
+    // Without one: public, as before.
+    let res = post(
+        &s.base,
+        SERVICE_TOKEN,
+        "/internal/sessions",
+        json!({"user": "ana", "bot": "scout", "run_id": "tsk_fresh"}),
+    )
+    .await;
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["session"]["sources_sensitivity"], "public");
+
+    let res = get(
+        SERVICE_TOKEN,
+        "/internal/runs/tsk_follow/sensitivity".into(),
+    )
+    .await;
+    assert_eq!(res.status(), 200);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(
+        body,
+        json!({"run_id": "tsk_follow", "sensitivity": "restricted"})
+    );
+    let res = get(SERVICE_TOKEN, "/internal/runs/tsk_none/sensitivity".into()).await;
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["sensitivity"], Value::Null);
+    for token in [BOT_TOKEN, CONSOLE_TOKEN] {
+        let res = get(token, "/internal/runs/tsk_follow/sensitivity".into()).await;
+        assert_eq!(res.status(), 403);
+    }
+    s.cancel.cancel();
+}
+
 #[tokio::test]
 async fn mcp_lists_and_calls_only_what_the_bot_may() {
     let s = start(fixture()).await;
@@ -749,7 +824,7 @@ async fn mcp_lists_and_calls_only_what_the_bot_may() {
 
 #[tokio::test]
 async fn the_bot_token_reads_and_decides_one_item() {
-    let s = start(common::team_fixture(&["ana", "bo"])).await;
+    let s = start(common::team_fixture(&["ana", "bo"]).await).await;
     let session = s
         .fixture
         .svc
@@ -816,12 +891,20 @@ async fn the_bot_token_reads_and_decides_one_item() {
 
     let decide = |id: String, who: &'static str, decision: &'static str| {
         let base = s.base.clone();
+        let svc = s.fixture.svc.clone();
         async move {
+            // As the Slack bot sends it: an approve names what its card showed.
+            let mut body = json!({"decided_by": who, "decision": decision});
+            if decision == "approve" {
+                if let Some(item) = svc.approval(&id).await.unwrap() {
+                    body["expected_args_hash"] = json!(item.args_hash[..16]);
+                }
+            }
             post(
                 &base,
                 BOT_TOKEN,
                 &format!("/internal/approvals/{id}/decision"),
-                json!({"decided_by": who, "decision": decision}),
+                body,
             )
             .await
         }
@@ -885,7 +968,7 @@ async fn the_bot_token_reads_and_decides_one_item() {
 
 #[tokio::test]
 async fn an_edit_from_the_bot_cant_change_where_a_draft_goes() {
-    let s = start(common::team_fixture(&["ana", "bo"])).await;
+    let s = start(common::team_fixture(&["ana", "bo"]).await).await;
     let session = s
         .fixture
         .svc
@@ -958,7 +1041,7 @@ async fn an_edit_from_the_bot_cant_change_where_a_draft_goes() {
 
 #[tokio::test]
 async fn the_console_token_reads_approvals_and_nothing_else() {
-    let s = start(common::team_fixture(&["ana", "bo"])).await;
+    let s = start(common::team_fixture(&["ana", "bo"]).await).await;
     let session = s
         .fixture
         .svc

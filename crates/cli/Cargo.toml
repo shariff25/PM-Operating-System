@@ -16,6 +16,8 @@ anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
 pmos-contract.workspace = true
+pmos-evals.workspace = true
 pmos-policy.workspace = true
 serde_json.workspace = true
-serde_norway.workspace = true
+# A scratch directory for the prover's network views (`pmos policy prove`).
+tempfile.workspace = true

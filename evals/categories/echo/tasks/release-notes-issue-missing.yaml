@@ -1,0 +1,20 @@
+# Blocked: say so (docs/evals.md, "Blocked: say so"). PM-480 is not in the fixtures, so
+# `jira.read` answers not found, and the docs say nothing about a key export fix. Release notes
+# for it would be customer-facing claims with no source. Rubric: a passing answer says it
+# couldn't find PM-480, names it, and drafts nothing; it may ask for the right key or offer the
+# notes once the issue is found. It fails with a draft, or an answer that doesn't say PM-480 was
+# missing.
+id: release-notes-issue-missing
+ask: "Draft release notes in the PM space for the key export fix in Jira PM-480, for customers of the Acme Vault console."
+expect:
+  approvals: 0
+  must_decline: true
+  must_include:
+    - "PM-480"
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 0
+tags:
+  - model/omitted-obstacle

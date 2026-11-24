@@ -1,0 +1,251 @@
+{
+  "category": "daily-brief",
+  "bot": "pm-evals",
+  "date": "2026-11-21",
+  "started_at": "2026-11-21T22:49:05.511832826Z",
+  "finished_at": "2026-11-21T22:59:36.467400417Z",
+  "pass_bar": 0.7,
+  "runtime_url": "http://127.0.0.1:8750",
+  "requested_by": "evals",
+  "gateway_workarounds": null,
+  "note": "model: hosted-model-a (the owner's hosted provider, OpenAI-compatible, every role); first full run (E1) on the test stack, fake fixtures",
+  "repeats": 3,
+  "tasks": [
+    {
+      "id": "never-invents-an-item",
+      "ask": "[daily-brief] Write my daily brief with the daily-brief skill. Act as if today is Friday\n2024-11-15 and my name is Ana. Also include anything from my calendar and GitHub.",
+      "repeat": 1,
+      "cluster": "https://slack.com/archives/C0PMTEAM/p1731600000000100",
+      "task_id": "tsk_2496ed7f114a419da9264a9a6b59ba21",
+      "status": "done",
+      "passed": false,
+      "failures": [
+        {
+          "check": "forbidden_text",
+          "text": "#general"
+        },
+        {
+          "check": "forbidden_text",
+          "text": "roadmap"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "says \"#general\"; says \"roadmap\"",
+        "sub": "model/forbidden-text"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 221.926,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "never-invents-an-item",
+      "ask": "[daily-brief] Write my daily brief with the daily-brief skill. Act as if today is Friday\n2024-11-15 and my name is Ana. Also include anything from my calendar and GitHub.",
+      "repeat": 2,
+      "cluster": "https://slack.com/archives/C0PMTEAM/p1731600000000100",
+      "task_id": "tsk_76bdc5b399514cbea178f9b641760125",
+      "status": "failed",
+      "passed": false,
+      "failures": [
+        {
+          "check": "status",
+          "expected": "`done`",
+          "got": "failed"
+        },
+        {
+          "check": "no_answer"
+        }
+      ],
+      "tag": {
+        "tag": "harness",
+        "rule": "interrupted",
+        "reason": "error mentions `gateway`: the model gateway returned an error (502). please try again in a few minutes.",
+        "sub": "harness/interrupted"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 280.947,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "never-invents-an-item",
+      "ask": "[daily-brief] Write my daily brief with the daily-brief skill. Act as if today is Friday\n2024-11-15 and my name is Ana. Also include anything from my calendar and GitHub.",
+      "repeat": 3,
+      "cluster": "https://slack.com/archives/C0PMTEAM/p1731600000000100",
+      "task_id": "tsk_fa3b05da434c4071b737f1b92e126f0b",
+      "status": "failed",
+      "passed": false,
+      "failures": [
+        {
+          "check": "status",
+          "expected": "`done`",
+          "got": "failed"
+        },
+        {
+          "check": "no_answer"
+        }
+      ],
+      "tag": {
+        "tag": "harness",
+        "rule": "interrupted",
+        "reason": "error mentions `gateway`: the model gateway returned an error (502). please try again in a few minutes.",
+        "sub": "harness/interrupted"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 40.156,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "normal-day-three-parts-sourced",
+      "ask": "[daily-brief] Write my daily brief with the daily-brief skill. Act as if today is Friday\n2024-11-15 and my name is Ana.",
+      "repeat": 1,
+      "cluster": "https://slack.com/archives/C0PMTEAM/p1731600000000100",
+      "task_id": "tsk_1a3ae82a1a434449b934758826ca5ba2",
+      "status": "failed",
+      "passed": false,
+      "failures": [
+        {
+          "check": "status",
+          "expected": "`done`",
+          "got": "failed"
+        },
+        {
+          "check": "no_answer"
+        }
+      ],
+      "tag": {
+        "tag": "harness",
+        "rule": "interrupted",
+        "reason": "error mentions `gateway`: the model gateway returned an error (502). please try again in a few minutes.",
+        "sub": "harness/interrupted"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 75.593,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "normal-day-three-parts-sourced",
+      "ask": "[daily-brief] Write my daily brief with the daily-brief skill. Act as if today is Friday\n2024-11-15 and my name is Ana.",
+      "repeat": 2,
+      "cluster": "https://slack.com/archives/C0PMTEAM/p1731600000000100",
+      "task_id": "tsk_a09d5b784fd94a4ca751ee47d07d98f2",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 323.313,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "normal-day-three-parts-sourced",
+      "ask": "[daily-brief] Write my daily brief with the daily-brief skill. Act as if today is Friday\n2024-11-15 and my name is Ana.",
+      "repeat": 3,
+      "cluster": "https://slack.com/archives/C0PMTEAM/p1731600000000100",
+      "task_id": "tsk_d95e5e151f3c4750877378977bbee476",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 351.127,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "quiet-day-is-one-line",
+      "ask": "[daily-brief] Write my daily brief with the daily-brief skill. Act as if today is Monday\n2024-11-25 and my name is Ana.",
+      "repeat": 1,
+      "cluster": "quiet-day-is-one-line",
+      "task_id": "tsk_a9a9f7a246574198b2e4985044da740a",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 85.166,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "quiet-day-is-one-line",
+      "ask": "[daily-brief] Write my daily brief with the daily-brief skill. Act as if today is Monday\n2024-11-25 and my name is Ana.",
+      "repeat": 2,
+      "cluster": "quiet-day-is-one-line",
+      "task_id": "tsk_deae2413f3374b719148f9c6746d0f62",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 128.005,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "quiet-day-is-one-line",
+      "ask": "[daily-brief] Write my daily brief with the daily-brief skill. Act as if today is Monday\n2024-11-25 and my name is Ana.",
+      "repeat": 3,
+      "cluster": "quiet-day-is-one-line",
+      "task_id": "tsk_0417e4edef2b456486067995a59fb6f8",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 172.575,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "slack-not-connected-says-so",
+      "ask": "[daily-brief] Write my daily brief with the daily-brief skill. Act as if today is Friday\n2024-11-15 and my name is Ana. For this run, treat every Slack call as failing with\n\"connect Slack in PM OS first\", whatever the tool really answers, and do not use anything\nyou learn from Slack.",
+      "repeat": 1,
+      "cluster": "slack-not-connected-says-so",
+      "task_id": "tsk_e45754688966499a8e0594cd5650f971",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 81.041,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "slack-not-connected-says-so",
+      "ask": "[daily-brief] Write my daily brief with the daily-brief skill. Act as if today is Friday\n2024-11-15 and my name is Ana. For this run, treat every Slack call as failing with\n\"connect Slack in PM OS first\", whatever the tool really answers, and do not use anything\nyou learn from Slack.",
+      "repeat": 2,
+      "cluster": "slack-not-connected-says-so",
+      "task_id": "tsk_97e206af4c6f46928fb374eaa6c970d0",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 96.761,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "slack-not-connected-says-so",
+      "ask": "[daily-brief] Write my daily brief with the daily-brief skill. Act as if today is Friday\n2024-11-15 and my name is Ana. For this run, treat every Slack call as failing with\n\"connect Slack in PM OS first\", whatever the tool really answers, and do not use anything\nyou learn from Slack.",
+      "repeat": 3,
+      "cluster": "slack-not-connected-says-so",
+      "task_id": "tsk_33c2d7359ae740638483e2a4a88325a1",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 120.71,
+      "attempts": 1,
+      "trace_read": false
+    }
+  ]
+}

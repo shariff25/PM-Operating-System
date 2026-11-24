@@ -1,0 +1,17 @@
+# seed: replace with case cards
+# Look before you ask (content/roles/pm-assistant/ROLE.md): when the sources don't cover it, say
+# so; never invent a fact. From a live test: asked for a PRD on a hardware and deployment topic,
+# the bot asked four questions and searched nothing. No fixture mentions hardware security
+# modules or on-premises deployments (the fake search matches "Acme" and "Vault", so results
+# come back, none on topic). The bot may ask one question or draft with `[unverified]`
+# assumptions; either way its reply must say the sources don't cover the topic.
+# Set regression: true once it passes, so the gate stops it breaking again.
+id: look-first-uncovered-topic-says-so
+ask: "Write a PRD for supporting hardware security modules in on-premises Acme Vault deployments."
+expect:
+  must_decline: true
+  must_not_include:
+    - "<think>"
+cluster: prd-draft
+tags:
+  - model/answered-beyond-sources

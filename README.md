@@ -2,8 +2,10 @@
 
 PM OS is the product team's agent workspace. It turns recurring PM work into one-command skills
 (`/prd-draft`, `/meeting-notes`, `/review` and others), all drawing on one shared context
-library and a panel of reviewer agents. It runs on the team's DGX Spark with open-weight models
-only. Every run is in an NVIDIA OpenShell sandbox, and nothing is written to Jira, Confluence or
+library and a panel of reviewer agents. It runs on one Linux host the team chooses. Its models are
+local open-weight models on a GPU host the owner controls; one hosted model the owner has
+approved may also be used once that path is built (`docs/openshell-any-host-spec.md` §3.6).
+Every run is in an NVIDIA OpenShell sandbox, and nothing is written to Jira, Confluence or
 Slack without the PM's approval.
 
 - Plan and phases: [`docs/implementation-plan.md`](docs/implementation-plan.md)
@@ -51,7 +53,7 @@ and your connected accounts ([how](docs/slack-home.md)).
 | `content/` | Skills, playbooks, context library, master context, reviewer rubrics, templates, tool registry | Markdown, YAML |
 | `crates/contract` | The content contract and its lint | Rust |
 | `crates/cli` | `pmos`, the command line for skill authors | Rust |
-| `crates/gateway` | `pmos-gateway`: one OpenAI-compatible endpoint in front of the local models; roles, fair queueing, usage log ([docs](docs/gateway.md)) | Rust |
+| `crates/gateway` | `pmos-gateway`: one OpenAI-compatible endpoint in front of the deployment's models; roles, fair queueing, usage log ([docs](docs/gateway.md)) | Rust |
 | `crates/runtime` | Small pieces every service shares: constant-time token checks, SIGTERM-aware shutdown | Rust |
 | `crates/toolserver` | The only path from a sandbox to context and systems: MCP, allowlists, approvals, audit ([docs](docs/toolserver.md)) | Rust |
 | `crates/docs` | `pmos-docs`: MCP server over your company's public docs site ([docs](docs/docs-server.md)) | Rust |
@@ -64,10 +66,10 @@ and your connected accounts ([how](docs/slack-home.md)).
 | `policies/` | Generated sandbox policies, provider profiles and the red-team kit | YAML |
 | `evals/` | Benchmark categories, tasks and weekly reports | YAML, Markdown |
 | `harness/` | The agent on LangChain Deep Agents, and the worker that runs it in each bot's sandbox ([docs](harness/README.md)) | TypeScript |
-| `deploy/` | Running PM OS on the Spark: one Compose stack, images, `setup.sh` and `pmos-admin` ([runbooks](docs/runbooks/README.md)) | Docker, Bash |
+| `deploy/` | Running PM OS on one Linux host: one Compose stack, images, `setup.sh` and `pmos-admin` ([runbooks](docs/runbooks/README.md)) | Docker, Bash |
 
-Phase 0 is built. What's left needs the DGX Spark: vLLM serving the models, OpenShell, the
-Slack app, and the first live runs (see the plan's **Status**).
+Phase 0 is built. What's left needs a real host: OpenShell, the models (vLLM on a GPU host
+the owner controls), the Slack app, and the first live runs (see the plan's **Status**).
 
 ## Make it your team's
 
@@ -83,7 +85,7 @@ PM OS isn't tied to one company. To set it up for yours:
    `content/context/exemplars/` with your team's best documents
    ([docs](docs/pm-craft.md#make-the-bar-your-own)).
 
-## Run it on the Spark
+## Run it on a host
 
 ```sh
 deploy/setup.sh --content /srv/pmos/content-repo --clone <content repo>
@@ -91,6 +93,12 @@ deploy/pmos-admin build && deploy/pmos-admin up && deploy/pmos-admin status
 ```
 
 The full install, up to Gate 1, and day-2 operations are in [docs/runbooks](docs/runbooks/README.md).
+People and their roles (Admin, Product Manager, Reviewer, Auditor) live in the tool server's
+user database, not in the content: the first admin is made on the host
+(`deploy/pmos-admin users bootstrap-admin`), and everyone else joins through Slack or an admin's
+invite in the web app ([docs/runbooks/users.md](docs/runbooks/users.md)). Upgrading an install
+that still has a `content/team.yaml`: import it first
+([docs/runbooks/upgrade.md](docs/runbooks/upgrade.md)).
 
 ## Develop
 
@@ -103,12 +111,13 @@ pnpm install
 pnpm typecheck && pnpm test                 # harness
 ```
 
-To try PM OS end to end before the Spark is ready, run it against a test Slack workspace with
+To try PM OS end to end before a host with models is ready, run it against a test Slack workspace with
 a Claude model behind the gateway (testing only): [docs/testing-with-claude.md](docs/testing-with-claude.md).
 
 ## Contributing content
 
-Change anything in `content/` by pull request. CI runs `pmos lint`. Context files need an
+Change anything in `content/` by pull request. CI runs `pmos lint`, which also refuses a
+`team.yaml` (retired: people and roles are in the user database). Context files need an
 owner, a `last-reviewed` date and a sensitivity label, and the file's owner reviews the change.
 To add a skill, copy one from `content/skills/`, rename the folder and its `name`, and declare
 only the tools it needs.

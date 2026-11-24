@@ -15,6 +15,10 @@ use serde_json::Value;
 /// Days a pending row waits before the ledger reports it as `expired`
 /// (`PMOS_LEDGER_EXPIRE_DAYS`).
 pub const DEFAULT_EXPIRE_DAYS: i64 = 7;
+/// An approved-unchanged draft decided within this many seconds of being created counts as
+/// a fast approval in the ledger summary (`PMOS_LEDGER_FAST_APPROVAL_SECONDS`). A tripwire
+/// for rubber-stamping, never a target.
+pub const DEFAULT_FAST_APPROVAL_SECONDS: i64 = 5;
 /// The most rows one `GET /internal/ledger` returns.
 pub const MAX_LIMIT: usize = 1000;
 /// Each side of an edit distance is cut to this many characters first, so one decision
@@ -82,9 +86,14 @@ pub enum Reason {
     Incomplete,
     ShouldNotDraft,
     Other,
+    /// Not a person's choice: the tool server closed the draft because its owner was
+    /// deactivated and not reactivated within the grace (`docs/user-database-spec.md` §6).
+    /// No client may give it with a decision.
+    OwnerDeactivated,
 }
 
 impl Reason {
+    /// The reasons a person may give. [`Reason::OwnerDeactivated`] is the system's own.
     pub const ALL: [Self; 6] = [
         Self::WrongFacts,
         Self::WrongTarget,
@@ -102,10 +111,21 @@ impl Reason {
             Self::Incomplete => "incomplete",
             Self::ShouldNotDraft => "should_not_draft",
             Self::Other => "other",
+            Self::OwnerDeactivated => "owner_deactivated",
         }
     }
 
+    /// Any stored reason, the system's own included. A decision from a client takes only
+    /// [`Reason::ALL`] ([`Reason::chosen`]).
     pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .chain([Self::OwnerDeactivated])
+            .find(|r| r.as_str() == s)
+    }
+
+    /// A reason a person may give with a rejection.
+    pub fn chosen(s: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|r| r.as_str() == s)
     }
 }
@@ -140,6 +160,10 @@ pub struct LedgerRow {
     pub created_at: DateTime<Utc>,
     pub decided_at: Option<DateTime<Utc>>,
     pub decided_by: Option<String>,
+    /// Which backend serves the write: `builtin`, `fake`, or the MCP server record's id
+    /// (`docs/mcp-servers-spec.md` §2.9, slice M8). `None` for rows from before it was kept.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub served_by: Option<String>,
 }
 
 impl LedgerRow {
@@ -294,6 +318,21 @@ pub struct SummaryGroup {
     pub median_edit_distance: Option<f64>,
     /// Rejections by reason; `none` counts rejections without one.
     pub reasons: BTreeMap<&'static str, usize>,
+    /// The median time in seconds from creation to decision, over the rows a person decided
+    /// ([`decision_seconds`]); `None` if there are none. Like approval rate, a tripwire,
+    /// never a target: nothing optimizes for it.
+    pub median_decision_seconds: Option<f64>,
+    /// The rows [`Self::median_decision_seconds`] is over.
+    pub decision_time_rows: usize,
+    /// Of the `approved` (unchanged) rows with a decision time, how many were decided within
+    /// [`Summary::fast_approval_seconds`] of being created.
+    pub fast_approvals: usize,
+    /// The `approved` (unchanged) rows with a decision time: the count
+    /// [`Self::fast_approval_share`] is based on, so a small sample is visible.
+    pub fast_approval_rows: usize,
+    /// `fast_approvals / fast_approval_rows`; `None` if there are no such rows. Like approval
+    /// rate, a tripwire for rubber-stamping, never a target: nothing optimizes for it.
+    pub fast_approval_share: Option<f64>,
 }
 
 /// `GET /internal/ledger/summary`.
@@ -303,7 +342,55 @@ pub struct Summary {
     pub rows: usize,
     /// Over every row in the summary.
     pub label_coverage: f64,
+    /// The threshold for a fast approval (`PMOS_LEDGER_FAST_APPROVAL_SECONDS`, default
+    /// [`DEFAULT_FAST_APPROVAL_SECONDS`]).
+    pub fast_approval_seconds: i64,
     pub groups: Vec<SummaryGroup>,
+}
+
+/// Seconds from a row's creation to its decision, for a row a person decided: it has a
+/// `decided_at`, it is not `expired`, and the tool server did not close it itself
+/// ([`Reason::OwnerDeactivated`]). An approved row whose write is still running (`pending`
+/// with a `decided_at`) counts. `None` for any other row. Never negative.
+pub fn decision_seconds(row: &LedgerRow) -> Option<f64> {
+    let decided_at = row.decided_at?;
+    if row.outcome == LedgerOutcome::Expired || row.reason == Some(Reason::OwnerDeactivated) {
+        return None;
+    }
+    let millis = (decided_at - row.created_at).num_milliseconds().max(0);
+    Some(millis as f64 / 1000.0)
+}
+
+/// One group's decision-time figures.
+struct DecisionTimes {
+    median: Option<f64>,
+    rows: usize,
+    fast: usize,
+    approved: usize,
+    share: Option<f64>,
+}
+
+fn decision_times(rows: &[&LedgerRow], fast_approval_seconds: i64) -> DecisionTimes {
+    let timed: Vec<(LedgerOutcome, f64)> = rows
+        .iter()
+        .filter_map(|r| decision_seconds(r).map(|s| (r.outcome, s)))
+        .collect();
+    let approved: Vec<f64> = timed
+        .iter()
+        .filter(|(o, _)| *o == LedgerOutcome::Approved)
+        .map(|(_, s)| *s)
+        .collect();
+    let fast = approved
+        .iter()
+        .filter(|s| **s <= fast_approval_seconds as f64)
+        .count();
+    DecisionTimes {
+        rows: timed.len(),
+        median: median(timed.into_iter().map(|(_, s)| s).collect()),
+        fast,
+        approved: approved.len(),
+        share: (!approved.is_empty()).then(|| fast as f64 / approved.len() as f64),
+    }
 }
 
 fn coverage(labelled: usize, rows: usize) -> f64 {
@@ -327,8 +414,13 @@ fn median(mut values: Vec<f64>) -> Option<f64> {
     })
 }
 
-/// Summarize reported rows per bot (or skill) and tool, in that order.
-pub fn summarize(since: Option<DateTime<Utc>>, rows: &[LedgerRow]) -> Summary {
+/// Summarize reported rows per bot (or skill) and tool, in that order. An approved-unchanged
+/// row decided within `fast_approval_seconds` counts as a fast approval.
+pub fn summarize(
+    since: Option<DateTime<Utc>>,
+    rows: &[LedgerRow],
+    fast_approval_seconds: i64,
+) -> Summary {
     type Key = (Option<String>, Option<String>, String);
     let mut groups: BTreeMap<Key, Vec<&LedgerRow>> = BTreeMap::new();
     for row in rows {
@@ -351,6 +443,7 @@ pub fn summarize(since: Option<DateTime<Utc>>, rows: &[LedgerRow]) -> Summary {
                 }
             }
             let labelled = rows.iter().filter(|r| r.outcome.is_labelled()).count();
+            let times = decision_times(&rows, fast_approval_seconds);
             SummaryGroup {
                 bot,
                 skill,
@@ -360,6 +453,11 @@ pub fn summarize(since: Option<DateTime<Utc>>, rows: &[LedgerRow]) -> Summary {
                 label_coverage: coverage(labelled, rows.len()),
                 median_edit_distance: median(rows.iter().filter_map(|r| r.edit_distance).collect()),
                 reasons,
+                median_decision_seconds: times.median,
+                decision_time_rows: times.rows,
+                fast_approvals: times.fast,
+                fast_approval_rows: times.approved,
+                fast_approval_share: times.share,
             }
         })
         .collect();
@@ -368,6 +466,7 @@ pub fn summarize(since: Option<DateTime<Utc>>, rows: &[LedgerRow]) -> Summary {
         since,
         rows: rows.len(),
         label_coverage: coverage(labelled, rows.len()),
+        fast_approval_seconds,
         groups,
     }
 }
@@ -470,6 +569,7 @@ mod tests {
             created_at: at,
             decided_at: (outcome != LedgerOutcome::Pending).then_some(at),
             decided_by: None,
+            served_by: None,
         }
     }
 
@@ -512,7 +612,7 @@ mod tests {
             row("x1", LedgerOutcome::Expired, None),
             row("f1", LedgerOutcome::Failed, Some(0.0)),
         ];
-        let s = summarize(None, &rows);
+        let s = summarize(None, &rows, DEFAULT_FAST_APPROVAL_SECONDS);
         assert_eq!(s.rows, 8);
         assert!((s.label_coverage - 7.0 / 8.0).abs() < 1e-9);
         assert_eq!(s.groups.len(), 1);
@@ -524,6 +624,147 @@ mod tests {
         assert_eq!(g.median_edit_distance, Some(0.1));
         assert_eq!(g.reasons["tone"], 1);
         assert_eq!(g.reasons["none"], 1);
-        assert_eq!(summarize(None, &[]).label_coverage, 0.0);
+        assert_eq!(
+            summarize(None, &[], DEFAULT_FAST_APPROVAL_SECONDS).label_coverage,
+            0.0
+        );
+    }
+
+    /// A row created at 10:00:00 and decided `after` seconds later (or never).
+    fn timed(id: &str, outcome: LedgerOutcome, after: Option<i64>) -> LedgerRow {
+        let mut r = row(id, outcome, None);
+        r.decided_at = after.map(|s| r.created_at + chrono::Duration::seconds(s));
+        r
+    }
+
+    #[test]
+    fn decision_seconds_only_for_rows_a_person_decided() {
+        assert_eq!(
+            decision_seconds(&timed("a", LedgerOutcome::Approved, Some(3))),
+            Some(3.0)
+        );
+        // Milliseconds count.
+        let mut r = timed("b", LedgerOutcome::Edited, Some(0));
+        r.decided_at = Some(r.created_at + chrono::Duration::milliseconds(1500));
+        assert_eq!(decision_seconds(&r), Some(1.5));
+        // An approved row whose write is still running.
+        assert_eq!(
+            decision_seconds(&timed("w", LedgerOutcome::Pending, Some(7))),
+            Some(7.0)
+        );
+        // No decided_at, expired, or closed by the tool server: no decision time.
+        assert_eq!(
+            decision_seconds(&timed("p", LedgerOutcome::Pending, None)),
+            None
+        );
+        assert_eq!(
+            decision_seconds(&timed("x", LedgerOutcome::Expired, Some(9))),
+            None
+        );
+        let mut closed = timed("c", LedgerOutcome::Rejected, Some(9));
+        closed.reason = Some(Reason::OwnerDeactivated);
+        assert_eq!(decision_seconds(&closed), None);
+        // A clock step backwards never gives a negative time.
+        assert_eq!(
+            decision_seconds(&timed("n", LedgerOutcome::Rejected, Some(-4))),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn decision_times_empty_and_single_row() {
+        let s = summarize(None, &[], DEFAULT_FAST_APPROVAL_SECONDS);
+        assert!(s.groups.is_empty());
+        assert_eq!(s.fast_approval_seconds, 5);
+
+        // Only undecided rows: no median, no share.
+        let s = summarize(None, &[timed("p", LedgerOutcome::Pending, None)], 5);
+        let g = &s.groups[0];
+        assert_eq!(g.median_decision_seconds, None);
+        assert_eq!(g.decision_time_rows, 0);
+        assert_eq!((g.fast_approvals, g.fast_approval_rows), (0, 0));
+        assert_eq!(g.fast_approval_share, None);
+
+        // One approved row, decided in 2 seconds.
+        let s = summarize(None, &[timed("a", LedgerOutcome::Approved, Some(2))], 5);
+        let g = &s.groups[0];
+        assert_eq!(g.median_decision_seconds, Some(2.0));
+        assert_eq!(g.decision_time_rows, 1);
+        assert_eq!((g.fast_approvals, g.fast_approval_rows), (1, 1));
+        assert_eq!(g.fast_approval_share, Some(1.0));
+
+        // One rejected row: a median, but no approvals to share over.
+        let s = summarize(None, &[timed("r", LedgerOutcome::Rejected, Some(40))], 5);
+        let g = &s.groups[0];
+        assert_eq!(g.median_decision_seconds, Some(40.0));
+        assert_eq!(g.fast_approval_rows, 0);
+        assert_eq!(g.fast_approval_share, None);
+    }
+
+    #[test]
+    fn decision_times_median_and_fast_approval_share() {
+        let rows = vec![
+            // Approved unchanged: 1 s and 5 s are fast (the threshold is inclusive), 6 s isn't.
+            timed("a1", LedgerOutcome::Approved, Some(1)),
+            timed("a2", LedgerOutcome::Approved, Some(5)),
+            timed("a3", LedgerOutcome::Approved, Some(6)),
+            timed("a4", LedgerOutcome::Approved, Some(120)),
+            // Edited and failed rows count for the median, not the fast-approval share.
+            timed("e1", LedgerOutcome::Edited, Some(2)),
+            timed("f1", LedgerOutcome::Failed, Some(3)),
+            // Rows without a decided_at are left out of both.
+            timed("p1", LedgerOutcome::Pending, None),
+            timed("x1", LedgerOutcome::Expired, None),
+        ];
+        let s = summarize(None, &rows, 5);
+        let g = &s.groups[0];
+        // An even count: 1, 2, 3, 5, 6, 120, so (3 + 5) / 2.
+        assert_eq!(g.decision_time_rows, 6);
+        assert_eq!(g.median_decision_seconds, Some(4.0));
+        assert_eq!((g.fast_approvals, g.fast_approval_rows), (2, 4));
+        assert_eq!(g.fast_approval_share, Some(0.5));
+        // Another threshold changes only the share.
+        let g = &summarize(None, &rows, 1).groups[0];
+        assert_eq!(g.median_decision_seconds, Some(4.0));
+        assert_eq!((g.fast_approvals, g.fast_approval_rows), (1, 4));
+        assert_eq!(g.fast_approval_share, Some(0.25));
+        // An odd count: 1, 2, 5, 6, 120.
+        let g = &summarize(None, &rows[..5], 5).groups[0];
+        assert_eq!(g.median_decision_seconds, Some(5.0));
+    }
+
+    #[test]
+    fn decision_times_are_per_bot_and_tool() {
+        let mut other = timed("o", LedgerOutcome::Approved, Some(30));
+        other.bot = Some("growth".into());
+        let rows = vec![timed("a", LedgerOutcome::Approved, Some(1)), other];
+        let s = summarize(None, &rows, 5);
+        assert_eq!(s.groups.len(), 2);
+        let by_bot = |b: &str| {
+            s.groups
+                .iter()
+                .find(|g| g.bot.as_deref() == Some(b))
+                .unwrap()
+        };
+        assert_eq!(by_bot("docs").fast_approval_share, Some(1.0));
+        assert_eq!(by_bot("growth").fast_approval_share, Some(0.0));
+        assert_eq!(by_bot("growth").median_decision_seconds, Some(30.0));
+    }
+
+    #[test]
+    fn summary_json_names_the_decision_time_fields() {
+        let s = summarize(None, &[timed("a", LedgerOutcome::Approved, Some(2))], 5);
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["fast_approval_seconds"], json!(5));
+        let g = &v["groups"][0];
+        assert_eq!(g["median_decision_seconds"], json!(2.0));
+        assert_eq!(g["decision_time_rows"], json!(1));
+        assert_eq!(g["fast_approvals"], json!(1));
+        assert_eq!(g["fast_approval_rows"], json!(1));
+        assert_eq!(g["fast_approval_share"], json!(1.0));
+        let pending = [timed("p", LedgerOutcome::Pending, None)];
+        let empty = serde_json::to_value(summarize(None, &pending, 5)).unwrap();
+        assert_eq!(empty["groups"][0]["median_decision_seconds"], Value::Null);
+        assert_eq!(empty["groups"][0]["fast_approval_share"], Value::Null);
     }
 }

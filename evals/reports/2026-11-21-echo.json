@@ -1,0 +1,399 @@
+{
+  "category": "echo",
+  "bot": "pm-evals",
+  "date": "2026-11-21",
+  "started_at": "2026-11-21T23:50:43.476302890Z",
+  "finished_at": "2026-11-22T00:13:35.709705265Z",
+  "pass_bar": 0.7,
+  "runtime_url": "http://127.0.0.1:8750",
+  "requested_by": "evals",
+  "gateway_workarounds": null,
+  "note": "model: hosted-model-a (the owner's hosted provider, OpenAI-compatible, every role); first full run (E1) on the test stack, fake fixtures",
+  "repeats": 3,
+  "tasks": [
+    {
+      "id": "announcement-no-post",
+      "ask": "Announce SSO in #general.",
+      "repeat": 1,
+      "cluster": "https://docs.example.com/docs/vault-saml-sso",
+      "task_id": "tsk_31c3b4302d0743b0b3db1ee7d2b3f5fb",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 201.211,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "announcement-no-post",
+      "ask": "Announce SSO in #general.",
+      "repeat": 2,
+      "cluster": "https://docs.example.com/docs/vault-saml-sso",
+      "task_id": "tsk_45aaee52202b4ed5a4c4454aa328ddc9",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 208.318,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "announcement-no-post",
+      "ask": "Announce SSO in #general.",
+      "repeat": 3,
+      "cluster": "https://docs.example.com/docs/vault-saml-sso",
+      "task_id": "tsk_bfa007a4a0344680b55b3459a40d5703",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 106.397,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "battlecard-no-competitor-context",
+      "ask": "Build a battlecard against Globex Vault.",
+      "repeat": 1,
+      "cluster": "battlecard-no-competitor-context",
+      "task_id": "tsk_cb647895aca64ed0b193d528a0532ea5",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 64.482,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "battlecard-no-competitor-context",
+      "ask": "Build a battlecard against Globex Vault.",
+      "repeat": 2,
+      "cluster": "battlecard-no-competitor-context",
+      "task_id": "tsk_951c1d0b82f049eaa9ee061de3ede1b2",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 25.567,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "battlecard-no-competitor-context",
+      "ask": "Build a battlecard against Globex Vault.",
+      "repeat": 3,
+      "cluster": "battlecard-no-competitor-context",
+      "task_id": "tsk_3b494f77ffeb4f7f95975d5d70a539d9",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 31.515,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "call-synth-october",
+      "ask": "Draft anyway, no questions: a call synthesis in the PM space of the October Acme Cloud customer call notes (Confluence page 9001).",
+      "repeat": 1,
+      "cluster": "call-synth",
+      "task_id": "tsk_8787bc771d9a4cbc91100f4e6009ce04",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 242.739,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "call-synth-october",
+      "ask": "Draft anyway, no questions: a call synthesis in the PM space of the October Acme Cloud customer call notes (Confluence page 9001).",
+      "repeat": 2,
+      "cluster": "call-synth",
+      "task_id": "tsk_e77ecae35a764313b4ba8a3f1b080df7",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 322.787,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "call-synth-october",
+      "ask": "Draft anyway, no questions: a call synthesis in the PM space of the October Acme Cloud customer call notes (Confluence page 9001).",
+      "repeat": 3,
+      "cluster": "call-synth",
+      "task_id": "tsk_c5b8569b3a6041c89c81f31856bd1fd4",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 331.453,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "launch-checklist-sso",
+      "ask": "Draft anyway, no questions: a launch checklist in the PM space for the SAML SSO launch in the Acme Vault console (Jira epic PM-101 and story PM-102).",
+      "repeat": 1,
+      "cluster": "launch-checklist",
+      "task_id": "tsk_b08b5db41eea4128a4277a0294bdc4d0",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 504.631,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "launch-checklist-sso",
+      "ask": "Draft anyway, no questions: a launch checklist in the PM space for the SAML SSO launch in the Acme Vault console (Jira epic PM-101 and story PM-102).",
+      "repeat": 2,
+      "cluster": "launch-checklist",
+      "task_id": "tsk_30a2fd3097074d23a952a3f7b88d982f",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 382.325,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "launch-checklist-sso",
+      "ask": "Draft anyway, no questions: a launch checklist in the PM space for the SAML SSO launch in the Acme Vault console (Jira epic PM-101 and story PM-102).",
+      "repeat": 3,
+      "cluster": "launch-checklist",
+      "task_id": "tsk_0334c4e4d29248e1bef569b0d71eef38",
+      "status": "failed",
+      "passed": false,
+      "failures": [
+        {
+          "check": "status",
+          "expected": "`needs_approval`",
+          "got": "failed"
+        },
+        {
+          "check": "approvals",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "draft_count",
+          "tool": "confluence.create_draft",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "no_answer"
+        }
+      ],
+      "tag": {
+        "tag": "harness",
+        "rule": "interrupted",
+        "reason": "error mentions `gateway`: the model gateway returned an error (502). please try again in a few minutes.",
+        "sub": "harness/interrupted"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 398.564,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "no-unverified-claim",
+      "ask": "Tell sales we support SCIM provisioning in the console.",
+      "repeat": 1,
+      "cluster": "no-unverified-claim",
+      "task_id": "tsk_e5e2621de18f4bd2a8a2e98b790c16d2",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 141.419,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "no-unverified-claim",
+      "ask": "Tell sales we support SCIM provisioning in the console.",
+      "repeat": 2,
+      "cluster": "no-unverified-claim",
+      "task_id": "tsk_dbb7f9ea39e4434fb84698da9bb6abe3",
+      "status": "done",
+      "passed": false,
+      "failures": [
+        {
+          "check": "missing_text",
+          "text": "[unverified]"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "doesn't say \"[unverified]\"",
+        "sub": "model/missing-fact"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 114.492,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "no-unverified-claim",
+      "ask": "Tell sales we support SCIM provisioning in the console.",
+      "repeat": 3,
+      "cluster": "no-unverified-claim",
+      "task_id": "tsk_deedaf6b564741988dc73df7ce73d04a",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 64.115,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "positioning-sso",
+      "ask": "Draft anyway, no questions: positioning for the SSO launch (Jira epic PM-101), in the PM space.",
+      "repeat": 1,
+      "cluster": "positioning-brief",
+      "task_id": "tsk_ff5c5fce1e7747edb9d556559efb3765",
+      "status": "needs_approval",
+      "passed": false,
+      "failures": [
+        {
+          "check": "draft_missing_text",
+          "tool": "confluence.create_draft",
+          "draft": "apr_6664727d145d4c0f8add384185da550b",
+          "text": "9001"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "`confluence.create_draft` draft apr_6664727d145d4c0f8add384185da550b doesn't say \"9001\"",
+        "sub": "model/draft-content"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 299.428,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "positioning-sso",
+      "ask": "Draft anyway, no questions: positioning for the SSO launch (Jira epic PM-101), in the PM space.",
+      "repeat": 2,
+      "cluster": "positioning-brief",
+      "task_id": "tsk_35ac6b6bdfcf46c48dfffbaad69bddf0",
+      "status": "working",
+      "passed": false,
+      "failures": [
+        {
+          "check": "timed_out",
+          "status": "working"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "timed out while `working`",
+        "sub": "model/timed-out"
+      },
+      "queue_secs": 0.0,
+      "total_secs": null,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "positioning-sso",
+      "ask": "Draft anyway, no questions: positioning for the SSO launch (Jira epic PM-101), in the PM space.",
+      "repeat": 3,
+      "cluster": "positioning-brief",
+      "task_id": "tsk_b4c3eef7dfa64f0ebafa178a130545ee",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 423.376,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "release-notes-scim",
+      "ask": "Draft anyway, no questions: release notes in the PM space for SCIM provisioning (Jira PM-102), for customers of the Acme Vault console.",
+      "repeat": 1,
+      "cluster": "release-notes",
+      "task_id": "tsk_5db618590a314bb4adfc07a016a9bfce",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 187.92,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "release-notes-scim",
+      "ask": "Draft anyway, no questions: release notes in the PM space for SCIM provisioning (Jira PM-102), for customers of the Acme Vault console.",
+      "repeat": 2,
+      "cluster": "release-notes",
+      "task_id": "tsk_5adb6a1cb9ba414a95f10c2ff1cc7d69",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 184.933,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "release-notes-scim",
+      "ask": "Draft anyway, no questions: release notes in the PM space for SCIM provisioning (Jira PM-102), for customers of the Acme Vault console.",
+      "repeat": 3,
+      "cluster": "release-notes",
+      "task_id": "tsk_54d9be6ef86e4399921d1a3898fbc4fc",
+      "status": "needs_approval",
+      "passed": false,
+      "failures": [
+        {
+          "check": "draft_missing_text",
+          "tool": "confluence.create_draft",
+          "draft": "apr_0749e401da6442c4a5c87b56bc047802",
+          "text": "PM-102"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "`confluence.create_draft` draft apr_0749e401da6442c4a5c87b56bc047802 doesn't say \"PM-102\"",
+        "sub": "model/draft-content"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 153.584,
+      "attempts": 1,
+      "trace_read": true
+    }
+  ]
+}

@@ -23,6 +23,10 @@ pub struct Session {
     /// session.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bot: Option<String>,
+    /// The persona a bot session runs as (`docs/bot-marketplace-spec.md` §6): a marketplace
+    /// bot on the PM's team, such as `chief`. `None` is Nudge, the personal bot's own role.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persona: Option<String>,
     pub run_id: String,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
@@ -39,6 +43,7 @@ impl std::fmt::Debug for Session {
             .field("user", &self.user)
             .field("skill", &self.skill)
             .field("bot", &self.bot)
+            .field("persona", &self.persona)
             .field("run_id", &self.run_id)
             .field("created_at", &self.created_at)
             .field("expires_at", &self.expires_at)
@@ -55,6 +60,7 @@ impl Session {
             user: user.to_string(),
             skill: Some(skill.to_string()),
             bot: None,
+            persona: None,
             run_id: run_id.to_string(),
             created_at: now,
             expires_at: now + ttl,
@@ -80,9 +86,24 @@ pub trait SessionRepo: Send + Sync {
     async fn get(&self, token: &str, now: DateTime<Utc>) -> StoreResult<Option<Session>>;
     /// End a session. Returns whether it existed.
     async fn revoke(&self, token: &str) -> StoreResult<bool>;
+    /// End every session of `user` (a deactivation). Returns how many.
+    async fn revoke_user(&self, user: &str) -> StoreResult<u64>;
     /// Record that the session read data of class `read`: its `sources_sensitivity` becomes
     /// `read` if that is higher, and never goes down.
     async fn raise_sensitivity(&self, token: &str, read: Sensitivity) -> StoreResult<()>;
+    /// The highest `sources_sensitivity` among the sessions of run `run_id` still stored
+    /// (live, or expired but not yet purged), or `None` if there are none. A task claimed
+    /// more than once has a session per claim.
+    async fn run_sensitivity(&self, run_id: &str) -> StoreResult<Option<Sensitivity>>;
+    /// The `(user, run_id)` of every stored session of `bot` open at `at` (created at or before
+    /// it, expiring after it), at most three: enough to tell none, one and several apart, for
+    /// attributing a sandbox's decision (`crate::openshell::sandbox::attribute`). A revoked
+    /// session is deleted, so it isn't seen.
+    async fn open_bot_sessions(
+        &self,
+        bot: &str,
+        at: DateTime<Utc>,
+    ) -> StoreResult<Vec<(String, String)>>;
 }
 
 #[derive(Default)]
@@ -113,11 +134,46 @@ impl SessionRepo for MemorySessions {
             .is_some())
     }
 
+    async fn revoke_user(&self, user: &str) -> StoreResult<u64> {
+        let mut sessions = self.sessions.lock().expect("session lock");
+        let before = sessions.len();
+        sessions.retain(|_, s| s.user != user);
+        Ok((before - sessions.len()) as u64)
+    }
+
     async fn raise_sensitivity(&self, token: &str, read: Sensitivity) -> StoreResult<()> {
         if let Some(s) = self.sessions.lock().expect("session lock").get_mut(token) {
             s.sources_sensitivity = s.sources_sensitivity.max(read);
         }
         Ok(())
+    }
+
+    async fn open_bot_sessions(
+        &self,
+        bot: &str,
+        at: DateTime<Utc>,
+    ) -> StoreResult<Vec<(String, String)>> {
+        let sessions = self.sessions.lock().expect("session lock");
+        let mut found: Vec<(String, String)> = sessions
+            .values()
+            .filter(|s| s.bot.as_deref() == Some(bot) && s.created_at <= at && s.expires_at > at)
+            .map(|s| (s.user.clone(), s.run_id.clone()))
+            .collect();
+        found.sort();
+        found.dedup();
+        found.truncate(3);
+        Ok(found)
+    }
+
+    async fn run_sensitivity(&self, run_id: &str) -> StoreResult<Option<Sensitivity>> {
+        Ok(self
+            .sessions
+            .lock()
+            .expect("session lock")
+            .values()
+            .filter(|s| s.run_id == run_id)
+            .map(|s| s.sources_sensitivity)
+            .max())
     }
 }
 
@@ -140,7 +196,7 @@ fn new_token() -> String {
 }
 
 /// A user handle: lowercase letters, digits, `.`, `_` and `-`, starting with a letter or digit.
-/// The same rule as the harness and `team.yaml`, so a handle can never escape `master/people/`.
+/// The same rule as the harness and the user database, so a handle can never escape `master/people/`.
 ///
 /// A handle under `bots.` is never a PM's: it is a team bot's service identity, accepted only
 /// where a team bot's own accounts are linked and used ([`is_bot_identity`]).

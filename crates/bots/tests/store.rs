@@ -255,6 +255,8 @@ async fn transitions_check_their_guards(store: Arc<dyn BotsStore>) {
     assert_eq!(feed[0].requested_by, "ana");
     assert_eq!(feed[0].slack, t.slack);
     assert_eq!(feed[0].approvals, vec!["apr_1", "apr_2"]);
+    // A task no routine created names none.
+    assert_eq!(feed[0].routine_id, None);
     assert_eq!(feed[0].at, later);
     // A refused change writes nothing.
     assert!(store
@@ -263,6 +265,37 @@ async fn transitions_check_their_guards(store: Arc<dyn BotsStore>) {
         .unwrap()
         .is_err());
     assert_eq!(store.notifications(0, 10).await.unwrap().len(), 1);
+    assert_eq!(store.events(&t.id).await.unwrap().len(), 3);
+}
+
+async fn web_tasks_round_trip_and_write_no_notifications(store: Arc<dyn BotsStore>) {
+    let mut t = task("docs", "ana", Source::Web, 1);
+    t.slack = None;
+    assert_eq!(t.priority, pmos_bots::model::Priority::Interactive);
+    store.create_task(&t, "queued").await.unwrap();
+    assert_eq!(store.task(&t.id).await.unwrap().as_ref(), Some(&t));
+    let f = TaskFilter {
+        source: Some(Source::Web),
+        ..all()
+    };
+    assert_eq!(store.tasks(&f).await.unwrap().len(), 1);
+    let now = at(2026, 11, 14, 10, 0);
+    store
+        .claim(None, "w1", now + Duration::seconds(120), now)
+        .await
+        .unwrap()
+        .unwrap();
+    let done = Transition {
+        worker: Some("w1".into()),
+        to: Some(TaskStatus::Done),
+        lease: Lease::Clear,
+        result: Some("Answer.".into()),
+        event: Some(("status".into(), "done".into())),
+        notify: Some(NewNotification::new(NotificationKind::Done, "Answer.")),
+        ..Transition::from(&[TaskStatus::Working])
+    };
+    store.transition(&t.id, &done, now).await.unwrap().unwrap();
+    assert!(store.notifications(0, 10).await.unwrap().is_empty());
     assert_eq!(store.events(&t.id).await.unwrap().len(), 3);
 }
 
@@ -529,6 +562,7 @@ fn routine(owner: &str, minute: u32, next: Option<chrono::DateTime<chrono::Utc>>
         prompt: "Summarize #launch".into(),
         output: Output::dm(),
         approval: "approve".into(),
+        persona: None,
         next_run_at: next,
         last_run_at: None,
         created_at: created,
@@ -560,6 +594,7 @@ async fn routines_crud(store: Arc<dyn BotsStore>) {
                 }),
                 prompt: Some("New prompt".into()),
                 next_run_at: Some(None),
+                persona: Some(Some("chief".into())),
             },
             now,
         )
@@ -571,6 +606,7 @@ async fn routines_crud(store: Arc<dyn BotsStore>) {
     assert_eq!(patched.schedule.tz, "America/New_York");
     assert_eq!(patched.prompt, "New prompt");
     assert_eq!(patched.next_run_at, None);
+    assert_eq!(patched.persona.as_deref(), Some("chief"));
     assert_eq!(patched.updated_at, now);
     // An empty patch changes nothing but the time.
     let same = store
@@ -659,6 +695,9 @@ async fn routine_runs_happen_once(store: Arc<dyn BotsStore>) {
     let feed = store.notifications(0, 10).await.unwrap();
     assert_eq!(feed.len(), 1);
     assert_eq!(feed[0].task_id, last.task.id);
+    // The notification names the routine that created the task (the Slack service counts a
+    // delivered brief by it).
+    assert_eq!(feed[0].routine_id.as_deref(), Some(r.id.as_str()));
 }
 
 async fn member_settings_round_trip(store: Arc<dyn BotsStore>) {
@@ -708,13 +747,149 @@ async fn member_settings_round_trip(store: Arc<dyn BotsStore>) {
     );
 }
 
+fn in_thread(bot: &str, user: &str, thread: &str, minute: u32, status: TaskStatus) -> Task {
+    let mut t = Task::queued(
+        bot,
+        user,
+        Source::Slack,
+        &format!("{user} asks {bot} at {minute}"),
+        Some(SlackRef {
+            channel: "D0ANA".into(),
+            thread_ts: thread.into(),
+        }),
+        None,
+        at(2026, 11, 14, 9, minute),
+    );
+    t.status = status;
+    t.result = (status == TaskStatus::Done).then(|| format!("answer at {minute}"));
+    t
+}
+
+async fn earlier_turns_follow_the_thread(store: Arc<dyn BotsStore>) {
+    use TaskStatus::*;
+    let first = in_thread("docs", "ana", "1731.1", 1, Done);
+    let failed = in_thread("docs", "ana", "1731.1", 2, Failed);
+    let other_thread = in_thread("docs", "ana", "1731.9", 3, Done);
+    let other_user = in_thread("docs", "ben", "1731.1", 4, Done);
+    let other_bot = in_thread("pm-ana", "ana", "1731.1", 5, Done);
+    let still_working = in_thread("docs", "ana", "1731.1", 6, Working);
+    let mut routine = in_thread("docs", "ana", "1731.1", 7, Done);
+    routine.source = Source::Routine;
+    routine.priority = Source::Routine.priority();
+    let now = in_thread("docs", "ana", "1731.1", 10, Working);
+    let later = in_thread("docs", "ana", "1731.1", 12, Done);
+    for t in [
+        &first,
+        &failed,
+        &other_thread,
+        &other_user,
+        &other_bot,
+        &still_working,
+        &routine,
+        &now,
+        &later,
+    ] {
+        store.create_task(t, "queued").await.unwrap();
+    }
+    let since = at(2026, 11, 13, 9, 30);
+    let ids = |v: Vec<Task>| v.into_iter().map(|t| t.id).collect::<Vec<_>>();
+    assert_eq!(
+        ids(store.earlier_turns(&now, since, 10).await.unwrap()),
+        vec![failed.id.clone(), first.id.clone()],
+        "only this requester's finished tasks for this bot in this thread, before it, newest first"
+    );
+    let got = store.earlier_turns(&now, since, 10).await.unwrap();
+    assert_eq!(got[1].result.as_deref(), Some("answer at 1"));
+    assert_eq!(
+        ids(store.earlier_turns(&now, since, 1).await.unwrap()),
+        vec![failed.id.clone()],
+        "the limit keeps the newest"
+    );
+    assert!(
+        store
+            .earlier_turns(&now, at(2026, 11, 14, 9, 2), 10)
+            .await
+            .unwrap()
+            .len()
+            == 1,
+        "nothing before `since`"
+    );
+    assert!(store
+        .earlier_turns(&first, since, 10)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(
+        store
+            .earlier_turns(&other_user, since, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "Ben never sees Ana's turns"
+    );
+    assert!(
+        store
+            .earlier_turns(&routine, since, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a routine run starts fresh"
+    );
+
+    // A web conversation is matched by its id, and never by a Slack thread.
+    let web = |minute: u32, conversation: Option<&str>| {
+        let mut t = Task::queued(
+            "docs",
+            "ana",
+            Source::Web,
+            &format!("web at {minute}"),
+            None,
+            None,
+            at(2026, 11, 14, 11, minute),
+        );
+        t.conversation = conversation.map(String::from);
+        t.status = Done;
+        t
+    };
+    let w1 = web(1, Some("cnv_1"));
+    let w2 = web(2, Some("cnv_2"));
+    let w0 = web(3, None);
+    let mut w3 = web(4, Some("cnv_1"));
+    w3.status = Working;
+    for t in [&w1, &w2, &w0, &w3] {
+        store.create_task(t, "queued").await.unwrap();
+    }
+    assert_eq!(
+        store
+            .task(&w1.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .conversation
+            .as_deref(),
+        Some("cnv_1"),
+        "the conversation id round-trips"
+    );
+    assert_eq!(
+        ids(store.earlier_turns(&w3, since, 10).await.unwrap()),
+        vec![w1.id.clone()]
+    );
+    assert!(store
+        .earlier_turns(&w0, since, 10)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
 both_stores!(
+    earlier_turns_follow_the_thread,
     member_settings_round_trip,
     tasks_round_trip_and_filter,
     claims_go_interactive_first_then_oldest,
     two_workers_never_claim_the_same_task,
     transitions_check_their_guards,
     a_refused_change_leaves_the_task_claimable,
+    web_tasks_round_trip_and_write_no_notifications,
     expired_leases_are_found,
     notifications_are_ordered_and_paged,
     eval_tasks_write_no_notifications,

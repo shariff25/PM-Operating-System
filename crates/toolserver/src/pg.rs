@@ -17,6 +17,7 @@
 //! - The Slack draft sweep picks items `FOR UPDATE SKIP LOCKED`: one a decision holds is
 //!   left to the decision.
 
+use std::collections::BTreeMap;
 use std::time::Duration as StdDuration;
 
 use async_trait::async_trait;
@@ -28,9 +29,12 @@ use sqlx::Row;
 
 use crate::approvals::{
     args_hash, redact_args, reply_message, reply_thread, ApprovalItem, ApprovalRepo, DecideError,
-    Decision, Drafted, NewItem, Status, Verdict, GRANT_TTL_MINUTES, REPLY_TOOL,
+    Decision, Drafted, NewItem, Status, TargetConversation, Verdict, GRANT_TTL_MINUTES, REPLY_TOOL,
 };
-use crate::audit::{AuditEvent, AuditSink};
+use crate::audit::{
+    check_purge, parse_purge_detail, AuditEvent, AuditQuery, AuditSink, Client as AuditClient,
+    LastPurge, Outcome, PurgeBatch, Purged, ReadEvent, RetentionFacts, StoredEvent, PURGE_TOOL,
+};
 use crate::context::{
     query_terms, snippet, ContextDoc, ContextIndex, Hit, ReindexReport, SearchResults,
 };
@@ -40,6 +44,7 @@ use crate::members::{
 };
 use crate::memory::{MemoryResult, MemoryStore, Note, DEFAULT_NOTE_SENSITIVITY};
 use crate::memory_repo::{MemoryRepo, MemoryRepoStore};
+use crate::reviews::{NewRecommendation, RecVerdict, RecommendError, Recommendation};
 use crate::session::{token_hash, Session, SessionRepo};
 use crate::store::{StoreError, StoreResult, Stores};
 use crate::vault::{CredentialStore, Provider, SealedCredential};
@@ -62,6 +67,8 @@ impl From<sqlx::migrate::MigrateError> for StoreError {
 #[derive(Clone)]
 pub struct PgStore {
     pool: PgPool,
+    /// What the user store plans with (`users/pg.rs`).
+    users_rules: crate::users::Rules,
 }
 
 impl PgStore {
@@ -71,11 +78,25 @@ impl PgStore {
             .acquire_timeout(StdDuration::from_secs(5))
             .connect(url)
             .await?;
-        Ok(Self { pool })
+        Ok(Self::from_pool(pool))
     }
 
     pub fn from_pool(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            users_rules: crate::users::Rules::default(),
+        }
+    }
+
+    /// The deactivation cap for the web and Slack clients (`users::Rules`); 1 to 10.
+    pub fn with_deactivation_cap(mut self, per_hour: u32) -> Self {
+        self.users_rules.deactivations_per_hour = per_hour.clamp(1, 10);
+        self
+    }
+
+    /// What the user store plans with.
+    pub fn users_rules(&self) -> crate::users::Rules {
+        self.users_rules
     }
 
     pub fn pool(&self) -> &PgPool {
@@ -85,6 +106,135 @@ impl PgStore {
     /// Apply pending migrations.
     pub async fn migrate(&self) -> StoreResult<()> {
         MIGRATOR.run(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Has this database ever held real data (slice H4)? Never cleared once written.
+    pub async fn held_real_data(&self) -> StoreResult<bool> {
+        let held: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM held_real_data)")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(held)
+    }
+
+    /// Writes the permanent `held_real_data` marker (idempotent).
+    pub async fn mark_held_real_data(&self) -> StoreResult<()> {
+        sqlx::query("INSERT INTO held_real_data (id) VALUES (true) ON CONFLICT (id) DO NOTHING")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// The `held_real_data` rule at start-up (spec §3.6): with live connectors or GitHub memory
+    /// (`real`) the marker is written, whatever the model source; in fake-data mode a database
+    /// that has it is refused.
+    pub async fn check_held_real_data(&self, real: bool, fake_only: bool) -> Result<(), String> {
+        if real {
+            self.mark_held_real_data()
+                .await
+                .map_err(|e| format!("writing the held_real_data marker: {e}"))?;
+        }
+        if fake_only
+            && self
+                .held_real_data()
+                .await
+                .map_err(|e| format!("reading the held_real_data marker: {e}"))?
+        {
+            return Err(pmos_contract::model_source::fake_data_refusal(
+                pmos_contract::model_source::HELD_REAL_DATA,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Slice H12 (r7, X3): records that `source` was served at `now` (first or again); returns
+    /// the source served last before it.
+    pub async fn source_served(
+        &self,
+        source: &str,
+        real: bool,
+        now: DateTime<Utc>,
+    ) -> StoreResult<Option<String>> {
+        let mut tx = self.pool.begin().await?;
+        // One writer at a time, so "the last before it" is the real one.
+        sqlx::query("LOCK TABLE model_source_history IN SHARE ROW EXCLUSIVE MODE")
+            .execute(&mut *tx)
+            .await?;
+        let before: Option<String> = sqlx::query_scalar(
+            "SELECT source FROM model_source_history ORDER BY last_at DESC, source LIMIT 1",
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO model_source_history (source, real, first_at, last_at)
+             VALUES ($1, $2, $3, $3)
+             ON CONFLICT (source) DO UPDATE
+               SET last_at = GREATEST(model_source_history.last_at, EXCLUDED.last_at)",
+        )
+        .bind(source)
+        .bind(real)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(before)
+    }
+
+    /// Every source this database has served.
+    pub async fn source_history(&self) -> StoreResult<Vec<crate::model_source::SourceRecord>> {
+        let rows = sqlx::query(
+            "SELECT source, real, first_at, last_at FROM model_source_history ORDER BY first_at",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(crate::model_source::SourceRecord {
+                    source: r.try_get("source")?,
+                    real: r.try_get("real")?,
+                    first_at: r.try_get("first_at")?,
+                    last_at: r.try_get("last_at")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Every acknowledgement of a switch to a hosted entry.
+    pub async fn source_acknowledgements(
+        &self,
+    ) -> StoreResult<Vec<crate::model_source::Acknowledgement>> {
+        let rows = sqlx::query(
+            "SELECT to_source, by_user, reason, at FROM model_source_acknowledgements ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(crate::model_source::Acknowledgement {
+                    to: r.try_get("to_source")?,
+                    by: r.try_get("by_user")?,
+                    reason: r.try_get("reason")?,
+                    at: r.try_get("at")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Records an acknowledgement (permanent).
+    pub async fn acknowledge_source(
+        &self,
+        ack: &crate::model_source::Acknowledgement,
+    ) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO model_source_acknowledgements (to_source, by_user, reason, at)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(&ack.to)
+        .bind(&ack.by)
+        .bind(&ack.reason)
+        .bind(ack.at)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -99,7 +249,9 @@ impl PgStore {
             audit: s.clone(),
             credentials: s.clone(),
             memory_repos: s.clone(),
-            member_requests: s,
+            member_requests: s.clone(),
+            users: s.clone(),
+            teams: s,
         }
     }
 
@@ -150,6 +302,8 @@ impl PgStore {
             .bind(now)
             .execute(&self.pool)
             .await?;
+        // Password sign-in's pending tokens and setup codes past their expiry.
+        crate::password::store::PasswordStore::prune_passwords(self, now).await?;
         Ok(())
     }
 }
@@ -321,8 +475,8 @@ impl SessionRepo for PgStore {
         sqlx::query(
             "INSERT INTO sessions
                  (token_hash, user_handle, skill, bot, run_id, created_at, expires_at,
-                  sources_sensitivity)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                  sources_sensitivity, persona)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         )
         .bind(token_hash(&session.token))
         .bind(&session.user)
@@ -332,6 +486,7 @@ impl SessionRepo for PgStore {
         .bind(session.created_at)
         .bind(session.expires_at)
         .bind(session.sources_sensitivity.to_string())
+        .bind(&session.persona)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -339,7 +494,8 @@ impl SessionRepo for PgStore {
 
     async fn get(&self, token: &str, now: DateTime<Utc>) -> StoreResult<Option<Session>> {
         let row = sqlx::query(
-            "SELECT user_handle, skill, bot, run_id, created_at, expires_at, sources_sensitivity
+            "SELECT user_handle, skill, bot, persona, run_id, created_at, expires_at,
+                    sources_sensitivity
              FROM sessions WHERE token_hash = $1 AND expires_at > $2",
         )
         .bind(token_hash(token))
@@ -353,6 +509,7 @@ impl SessionRepo for PgStore {
                 user: r.try_get("user_handle")?,
                 skill: r.try_get("skill")?,
                 bot: r.try_get("bot")?,
+                persona: r.try_get("persona")?,
                 run_id: r.try_get("run_id")?,
                 created_at: r.try_get("created_at")?,
                 expires_at: r.try_get("expires_at")?,
@@ -378,6 +535,38 @@ impl SessionRepo for PgStore {
         Ok(())
     }
 
+    async fn run_sensitivity(&self, run_id: &str) -> StoreResult<Option<Sensitivity>> {
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT sources_sensitivity FROM sessions WHERE run_id = $1",
+        )
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut highest = None;
+        for read in rows {
+            let s = Sensitivity::parse(&read).ok_or_else(|| bad_row("sensitivity", &read))?;
+            highest = highest.max(Some(s));
+        }
+        Ok(highest)
+    }
+
+    async fn open_bot_sessions(
+        &self,
+        bot: &str,
+        at: DateTime<Utc>,
+    ) -> StoreResult<Vec<(String, String)>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT DISTINCT user_handle, run_id FROM sessions
+             WHERE bot = $1 AND created_at <= $2 AND expires_at > $2
+             ORDER BY user_handle, run_id LIMIT 3",
+        )
+        .bind(bot)
+        .bind(at)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     async fn revoke(&self, token: &str) -> StoreResult<bool> {
         let done = sqlx::query("DELETE FROM sessions WHERE token_hash = $1")
             .bind(token_hash(token))
@@ -385,6 +574,26 @@ impl SessionRepo for PgStore {
             .await?;
         Ok(done.rows_affected() > 0)
     }
+
+    async fn revoke_user(&self, user: &str) -> StoreResult<u64> {
+        let mut conn = self.pool.acquire().await?;
+        Ok(revoke_user_sessions(&mut conn, user).await?)
+    }
+}
+
+/// Whether an Admin released item `id` from its hold, read inside `tx` (which holds the item's
+/// row lock), so the hold is decided with the decision or the save it guards.
+async fn hold_released_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &str,
+) -> Result<bool, DecideError> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM approval_hold_releases WHERE approval_id = $1)",
+    )
+    .bind(id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|e| DecideError::Store(StoreError::from(e)))
 }
 
 fn item_from_row(r: &PgRow) -> StoreResult<ApprovalItem> {
@@ -395,10 +604,13 @@ fn item_from_row(r: &PgRow) -> StoreResult<ApprovalItem> {
         user: r.try_get("user_handle")?,
         skill: r.try_get("skill")?,
         bot: r.try_get("bot")?,
+        persona: r.try_get("persona")?,
+        draft_notice: r.try_get("draft_notice")?,
         run_id: r.try_get("run_id")?,
         tool: r.try_get("tool")?,
         args: r.try_get("args")?,
         args_hash: r.try_get("args_hash")?,
+        revision: i64::from(r.try_get::<i32, _>("revision")?),
         status: Status::parse(&status).ok_or_else(|| bad_row("status", &status))?,
         created_at: r.try_get("created_at")?,
         decided_at: r.try_get("decided_at")?,
@@ -408,12 +620,56 @@ fn item_from_row(r: &PgRow) -> StoreResult<ApprovalItem> {
             .map(|s| Sensitivity::parse(&s).ok_or_else(|| bad_row("sensitivity", &s)))
             .transpose()?,
         redacted_at: r.try_get("redacted_at")?,
+        drafted_args: r.try_get("drafted_args")?,
+        edited_at: r.try_get("edited_at")?,
+        // Unreadable (written by a newer server): as if never checked.
+        target_conversation: r
+            .try_get::<Option<Value>, _>("target_conversation")?
+            .and_then(|v| serde_json::from_value::<TargetConversation>(v).ok()),
+        upstream_args_hash: r.try_get("upstream_args_hash")?,
     })
 }
 
 const ITEM_COLUMNS: &str = "id, user_handle, skill, bot, run_id, tool, args, args_hash, status, \
                             created_at, decided_at, decided_by, result, sources_sensitivity, \
-                            redacted_at";
+                            redacted_at, drafted_args, edited_at, target_conversation, revision, \
+                            persona, draft_notice, upstream_args_hash";
+
+const REC_COLUMNS: &str = "id, approval_id, reviewer, verdict, note, note_removed_at, \
+                           draft_revision, draft_sha256, created_at, withdrawn_at";
+
+fn rec_from_row(r: &PgRow) -> StoreResult<Recommendation> {
+    let verdict: String = r.try_get("verdict")?;
+    Ok(Recommendation {
+        id: r.try_get("id")?,
+        approval_id: r.try_get("approval_id")?,
+        reviewer: r.try_get("reviewer")?,
+        verdict: RecVerdict::parse(&verdict).ok_or_else(|| bad_row("verdict", &verdict))?,
+        note: r.try_get("note")?,
+        note_removed_at: r.try_get("note_removed_at")?,
+        draft_revision: i64::from(r.try_get::<i32, _>("draft_revision")?),
+        draft_sha256: r.try_get("draft_sha256")?,
+        created_at: r.try_get("created_at")?,
+        withdrawn_at: r.try_get("withdrawn_at")?,
+    })
+}
+
+/// Remove the notes on `id`'s recommendations, inside `tx`: its Slack text is gone.
+async fn remove_notes(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: &str,
+    now: DateTime<Utc>,
+) -> StoreResult<()> {
+    sqlx::query(
+        "UPDATE approval_recommendations SET note = NULL, note_removed_at = $2
+         WHERE approval_id = $1 AND note IS NOT NULL",
+    )
+    .bind(id)
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
 
 /// Insert a new item and its ledger row, inside `tx`.
 async fn insert_item(
@@ -424,8 +680,8 @@ async fn insert_item(
     sqlx::query(
         "INSERT INTO approvals
              (id, user_handle, skill, bot, run_id, tool, args, args_hash, status, created_at,
-              sources_sensitivity)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+              sources_sensitivity, persona, draft_notice)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
     )
     .bind(&item.id)
     .bind(&item.user)
@@ -438,6 +694,8 @@ async fn insert_item(
     .bind(item.status.as_str())
     .bind(item.created_at)
     .bind(item.sources_sensitivity.map(|s| s.to_string()))
+    .bind(&item.persona)
+    .bind(&item.draft_notice)
     .execute(&mut **tx)
     .await?;
     sqlx::query(
@@ -486,11 +744,30 @@ fn ledger_from_row(r: &PgRow) -> StoreResult<LedgerRow> {
         created_at: r.try_get("created_at")?,
         decided_at: r.try_get("decided_at")?,
         decided_by: r.try_get("decided_by")?,
+        served_by: r.try_get("served_by")?,
     })
 }
 
 #[async_trait]
 impl ApprovalRepo for PgStore {
+    async fn note_served_by(&self, id: &str, served_by: &str) -> StoreResult<()> {
+        sqlx::query("UPDATE approvals SET served_by = $2 WHERE id = $1")
+            .bind(id)
+            .bind(served_by)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn note_upstream(&self, id: &str, upstream_args_hash: &str) -> StoreResult<()> {
+        sqlx::query("UPDATE approvals SET upstream_args_hash = $2 WHERE id = $1")
+            .bind(id)
+            .bind(upstream_args_hash)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     async fn add_grant(
         &self,
         session_key: &str,
@@ -601,14 +878,56 @@ impl ApprovalRepo for PgStore {
         let sql = format!(
             "SELECT {ITEM_COLUMNS} FROM approvals
              WHERE user_handle = $1 AND ($2::text IS NULL OR status = $2)
-             ORDER BY created_at DESC, id"
+             ORDER BY created_at DESC, id COLLATE \"C\"
+             LIMIT $3"
         );
         let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(user)
             .bind(status.map(Status::as_str))
+            .bind(crate::approvals::LIST_LIMIT as i64)
             .fetch_all(&self.pool)
             .await?;
         rows.iter().map(item_from_row).collect()
+    }
+
+    async fn inbox(
+        &self,
+        user: &str,
+        pending_cap: usize,
+        decided_limit: usize,
+    ) -> StoreResult<crate::approvals::Inbox> {
+        let page = |pending: bool, limit: usize| {
+            let sql = format!(
+                "SELECT {ITEM_COLUMNS} FROM approvals
+                 WHERE user_handle = $1 AND (status = 'pending') = $2
+                 ORDER BY created_at DESC, id COLLATE \"C\"
+                 LIMIT $3"
+            );
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(user)
+                .bind(pending)
+                .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+                .fetch_all(&self.pool)
+        };
+        let pending = page(true, pending_cap).await?;
+        let decided = page(false, decided_limit).await?;
+        let total: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM approvals WHERE user_handle = $1 AND status = 'pending'",
+        )
+        .bind(user)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(crate::approvals::Inbox {
+            pending: pending
+                .iter()
+                .map(item_from_row)
+                .collect::<StoreResult<_>>()?,
+            total_pending: usize::try_from(total).unwrap_or(0),
+            decided: decided
+                .iter()
+                .map(item_from_row)
+                .collect::<StoreResult<_>>()?,
+        })
     }
 
     async fn decide_with(
@@ -624,11 +943,17 @@ impl ApprovalRepo for PgStore {
         // differs), it is computed again there.
         let early = match (&verdict.decision, &verdict.args) {
             (Decision::Edit, Some(edited)) => {
-                let row = sqlx::query("SELECT args, args_hash FROM approvals WHERE id = $1")
-                    .bind(id)
-                    .fetch_optional(&self.pool)
-                    .await
-                    .map_err(StoreError::from)?;
+                // Measured from the bot's own arguments (`drafted_args` once a person saved an
+                // edit). Under the lock, the same `args_hash` means the same drafted
+                // arguments.
+                let row = sqlx::query(
+                    "SELECT COALESCE(drafted_args, args) AS args, args_hash FROM approvals \
+                     WHERE id = $1",
+                )
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(StoreError::from)?;
                 match row {
                     Some(r) => {
                         let args: Value = r.try_get("args").map_err(StoreError::from)?;
@@ -661,8 +986,19 @@ impl ApprovalRepo for PgStore {
             Some(DecideError::Expired)
         } else if current.status != Status::Pending {
             Some(DecideError::NotPending)
+        } else if !crate::approvals::still_as_shown(&current, verdict.expected_args_hash.as_deref())
+        {
+            Some(DecideError::Stale)
         } else if verdict.decision == Decision::Edit && verdict.args.is_none() {
             Some(DecideError::MissingArgs)
+        } else if verdict.decision != Decision::Reject
+            && verdict
+                .hold
+                .as_deref()
+                .is_some_and(|offered| crate::approvals::held_by(&current, offered, false))
+            && !hold_released_in(&mut tx, id).await?
+        {
+            Some(DecideError::Held)
         } else {
             None
         };
@@ -673,25 +1009,55 @@ impl ApprovalRepo for PgStore {
         let reason = verdict
             .reason
             .filter(|_| verdict.decision == Decision::Reject);
-        let (status, args, distance) = match verdict.decision {
-            Decision::Reject => (Status::Rejected, None, None),
-            Decision::Approve => (Status::Executing, None, Some(0.0)),
+        // As in memory: an edit is measured from the bot's own arguments, so a saved edit
+        // approved as it stands counts as edited.
+        let (status, args, distance, drafted, edited) = match verdict.decision {
+            Decision::Reject => (
+                Status::Rejected,
+                None,
+                None,
+                current.drafted_args.clone(),
+                false,
+            ),
+            Decision::Approve => {
+                let distance = current
+                    .drafted_args
+                    .as_ref()
+                    .map_or(0.0, |d| args_edit_distance(d, &current.args));
+                let edited = current.edited();
+                (
+                    Status::Executing,
+                    None,
+                    Some(distance),
+                    current.drafted_args.clone(),
+                    edited,
+                )
+            }
             Decision::Edit => {
                 // Checked above, before anything changed.
                 let args = verdict.args.ok_or(DecideError::MissingArgs)?;
                 let distance = match early {
                     Some((hash, distance)) if hash == current.args_hash => distance,
-                    _ => args_edit_distance(&current.args, &args),
+                    _ => args_edit_distance(current.drafted(), &args),
                 };
-                (Status::Executing, Some(args), Some(distance))
+                let drafted = crate::approvals::drafted_after(&current, &args);
+                let edited = drafted.is_some();
+                (
+                    Status::Executing,
+                    Some(args),
+                    Some(distance),
+                    drafted,
+                    edited,
+                )
             }
         };
         let new_hash = args.as_ref().map(args_hash);
-        let edited = new_hash.as_ref().is_some_and(|h| h != &current.args_hash);
         let sql = format!(
             "UPDATE approvals
              SET status = $3, args = COALESCE($4, args), args_hash = COALESCE($5, args_hash),
-                 decided_at = $6, decided_by = $2
+                 decided_at = $6, decided_by = $2, drafted_args = $7,
+                 revision = revision + CASE WHEN $5::text IS NOT NULL AND $5 <> args_hash
+                                            THEN 1 ELSE 0 END
              WHERE id = $1 AND user_handle = $2 AND status = 'pending'
              RETURNING {ITEM_COLUMNS}"
         );
@@ -702,6 +1068,7 @@ impl ApprovalRepo for PgStore {
             .bind(&args)
             .bind(&new_hash)
             .bind(now)
+            .bind(&drafted)
             .fetch_optional(&mut *tx)
             .await
             .map_err(StoreError::from)?
@@ -726,6 +1093,85 @@ impl ApprovalRepo for PgStore {
         .map_err(StoreError::from)?;
         tx.commit().await.map_err(StoreError::from)?;
         Ok(item)
+    }
+
+    async fn save_draft_held(
+        &self,
+        id: &str,
+        user: &str,
+        args: Value,
+        raise_to: Option<Sensitivity>,
+        hold: Option<&std::collections::BTreeSet<String>>,
+        now: DateTime<Utc>,
+    ) -> Result<ApprovalItem, DecideError> {
+        let mut tx = self.pool.begin().await.map_err(StoreError::from)?;
+        // The same lock a decision takes: a save and a decision of one item never interleave.
+        let sql = format!("SELECT {ITEM_COLUMNS} FROM approvals WHERE id = $1 FOR UPDATE");
+        let current = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(StoreError::from)?
+            .as_ref()
+            .map(item_from_row)
+            .transpose()?
+            .ok_or(DecideError::NotFound)?;
+        let refused = if current.user != user {
+            Some(DecideError::Forbidden)
+        } else if current.status == Status::Expired {
+            Some(DecideError::Expired)
+        } else if current.status != Status::Pending {
+            Some(DecideError::NotPending)
+        } else if hold.is_some_and(|offered| crate::approvals::held_by(&current, offered, false))
+            && !hold_released_in(&mut tx, id).await?
+        {
+            Some(DecideError::Held)
+        } else {
+            None
+        };
+        if let Some(e) = refused {
+            tx.rollback().await.map_err(StoreError::from)?;
+            return Err(e);
+        }
+        let drafted = crate::approvals::drafted_after(&current, &args);
+        let edited_at = drafted.as_ref().map(|_| now);
+        // Worked out under the row lock, so a concurrent save can't lower it.
+        let level = crate::approvals::raised(current.sources_sensitivity, raise_to);
+        let sql = format!(
+            "UPDATE approvals
+             SET args = $2, args_hash = $3, drafted_args = $4, edited_at = $5,
+                 sources_sensitivity = $6,
+                 revision = revision + CASE WHEN args_hash <> $3 THEN 1 ELSE 0 END
+             WHERE id = $1 AND status = 'pending'
+             RETURNING {ITEM_COLUMNS}"
+        );
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(id)
+            .bind(&args)
+            .bind(args_hash(&args))
+            .bind(&drafted)
+            .bind(edited_at)
+            .bind(level.map(|s| s.to_string()))
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(StoreError::from)?
+            .ok_or(DecideError::NotPending)?;
+        let item = item_from_row(&row)?;
+        tx.commit().await.map_err(StoreError::from)?;
+        Ok(item)
+    }
+
+    async fn set_target_conversation(
+        &self,
+        id: &str,
+        target: &TargetConversation,
+    ) -> StoreResult<bool> {
+        let done = sqlx::query("UPDATE approvals SET target_conversation = $2 WHERE id = $1")
+            .bind(id)
+            .bind(sqlx::types::Json(target))
+            .execute(&self.pool)
+            .await?;
+        Ok(done.rows_affected() > 0)
     }
 
     async fn complete(
@@ -790,6 +1236,7 @@ impl ApprovalRepo for PgStore {
                         CASE WHEN outcome = 'pending' AND decided_at IS NULL AND created_at < $1
                              THEN 'expired' ELSE outcome END AS outcome,
                         edit_distance, reason, created_at, decided_at, decided_by,
+                        (SELECT a.served_by FROM approvals a WHERE a.id = ledger.id) AS served_by,
                         COALESCE(decided_at, created_at) AS activity_at
                  FROM ledger
                  WHERE ($2::timestamptz IS NULL OR COALESCE(decided_at, created_at) >= $2)
@@ -843,7 +1290,8 @@ impl ApprovalRepo for PgStore {
         let mut expired = Vec::with_capacity(due.len());
         for item in due {
             let sql = format!(
-                "UPDATE approvals SET status = 'expired', args = $2, redacted_at = $3
+                "UPDATE approvals
+                 SET status = 'expired', args = $2, redacted_at = $3, drafted_args = NULL
                  WHERE id = $1 AND status = 'pending'
                  RETURNING {ITEM_COLUMNS}"
             );
@@ -857,6 +1305,7 @@ impl ApprovalRepo for PgStore {
                 .bind(&item.id)
                 .execute(&mut *tx)
                 .await?;
+            remove_notes(&mut tx, &item.id, now).await?;
             expired.push(item_from_row(&row)?);
         }
         tx.commit().await?;
@@ -888,15 +1337,203 @@ impl ApprovalRepo for PgStore {
         for row in &due {
             let id: String = row.try_get("id")?;
             let args: Value = row.try_get("args")?;
-            sqlx::query("UPDATE approvals SET args = $2, redacted_at = $3 WHERE id = $1")
-                .bind(&id)
-                .bind(redact_args(&args))
-                .bind(now)
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query(
+                "UPDATE approvals SET args = $2, redacted_at = $3, drafted_args = NULL \
+                 WHERE id = $1",
+            )
+            .bind(&id)
+            .bind(redact_args(&args))
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            remove_notes(&mut tx, &id, now).await?;
         }
         tx.commit().await?;
         Ok(due.len())
+    }
+
+    async fn close_for_owner(&self, user: &str, now: DateTime<Utc>) -> StoreResult<Vec<String>> {
+        let mut tx = self.pool.begin().await?;
+        let ids = close_owner_drafts(&mut tx, user, now).await?;
+        tx.commit().await?;
+        Ok(ids)
+    }
+
+    async fn pending_of(
+        &self,
+        users: &[String],
+        cap: usize,
+    ) -> StoreResult<(Vec<ApprovalItem>, usize)> {
+        if users.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        let sql = format!(
+            "SELECT {ITEM_COLUMNS} FROM approvals
+             WHERE user_handle = ANY($1) AND status = 'pending'
+             ORDER BY created_at DESC, id COLLATE \"C\"
+             LIMIT $2"
+        );
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(users)
+            .bind(i64::try_from(cap).unwrap_or(i64::MAX))
+            .fetch_all(&self.pool)
+            .await?;
+        let total: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM approvals WHERE user_handle = ANY($1) AND status = 'pending'",
+        )
+        .bind(users)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok((
+            rows.iter().map(item_from_row).collect::<StoreResult<_>>()?,
+            usize::try_from(total).unwrap_or(0),
+        ))
+    }
+
+    async fn recommend(
+        &self,
+        new: NewRecommendation<'_>,
+        now: DateTime<Utc>,
+    ) -> Result<Recommendation, RecommendError> {
+        let mut tx = self.pool.begin().await.map_err(StoreError::from)?;
+        // The lock a decision and a saved edit take: none of them interleave on one item.
+        let sql = format!("SELECT {ITEM_COLUMNS} FROM approvals WHERE id = $1 FOR UPDATE");
+        let current = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(new.approval_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(StoreError::from)?
+            .as_ref()
+            .map(item_from_row)
+            .transpose()?;
+        let refused = match &current {
+            None => Err(RecommendError::NotFound),
+            Some(item) => crate::approvals::recommend_refusal(item, &new),
+        };
+        if let Err(e) = refused {
+            tx.rollback().await.map_err(StoreError::from)?;
+            return Err(e);
+        }
+        sqlx::query(
+            "UPDATE approval_recommendations SET withdrawn_at = $3, note = NULL
+             WHERE approval_id = $1 AND reviewer = $2 AND withdrawn_at IS NULL",
+        )
+        .bind(new.approval_id)
+        .bind(new.reviewer)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(StoreError::from)?;
+        let stored = new.into_stored(now);
+        sqlx::query(
+            "INSERT INTO approval_recommendations
+                 (id, approval_id, reviewer, verdict, note, draft_revision, draft_sha256,
+                  created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(&stored.id)
+        .bind(&stored.approval_id)
+        .bind(&stored.reviewer)
+        .bind(stored.verdict.as_str())
+        .bind(&stored.note)
+        .bind(i32::try_from(stored.draft_revision).map_err(|_| bad_row("revision", "too large"))?)
+        .bind(&stored.draft_sha256)
+        .bind(stored.created_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(StoreError::from)?;
+        tx.commit().await.map_err(StoreError::from)?;
+        Ok(stored)
+    }
+
+    async fn persona_counts(
+        &self,
+        user: Option<&str>,
+        since: DateTime<Utc>,
+    ) -> StoreResult<BTreeMap<String, u64>> {
+        let rows = sqlx::query(
+            "SELECT COALESCE(persona, $3) AS persona, count(*) AS n FROM approvals
+             WHERE created_at >= $1 AND ($2::text IS NULL OR user_handle = $2)
+             GROUP BY 1",
+        )
+        .bind(since)
+        .bind(user)
+        .bind(pmos_contract::personas::ALWAYS_ON)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = BTreeMap::new();
+        for r in &rows {
+            let n: i64 = r.try_get("n")?;
+            out.insert(r.try_get("persona")?, u64::try_from(n).unwrap_or(0));
+        }
+        Ok(out)
+    }
+
+    async fn release_hold(&self, id: &str, by: &str, now: DateTime<Utc>) -> StoreResult<bool> {
+        let done = sqlx::query(
+            "INSERT INTO approval_hold_releases (approval_id, released_by, released_at)
+             SELECT id, $2, $3 FROM approvals WHERE id = $1
+             ON CONFLICT (approval_id) DO NOTHING",
+        )
+        .bind(id)
+        .bind(by)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    async fn hold_released(&self, id: &str) -> StoreResult<bool> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM approval_hold_releases WHERE approval_id = $1)",
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
+    async fn unreleased_pending_outside(
+        &self,
+        offered: &[String],
+        cap: usize,
+    ) -> StoreResult<(Vec<ApprovalItem>, usize)> {
+        const WHERE: &str = "status = 'pending' AND persona IS NOT NULL AND persona <> ALL($1)
+             AND NOT EXISTS (SELECT 1 FROM approval_hold_releases r WHERE r.approval_id = approvals.id)";
+        let sql = format!(
+            "SELECT {ITEM_COLUMNS} FROM approvals WHERE {WHERE}
+             ORDER BY created_at DESC, id COLLATE \"C\" LIMIT $2"
+        );
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(offered)
+            .bind(i64::try_from(cap).unwrap_or(i64::MAX))
+            .fetch_all(&self.pool)
+            .await?;
+        let total: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT count(*) FROM approvals WHERE {WHERE}"
+        )))
+        .bind(offered)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok((
+            rows.iter().map(item_from_row).collect::<StoreResult<_>>()?,
+            usize::try_from(total).unwrap_or(0),
+        ))
+    }
+
+    async fn recommendations(&self, approval_ids: &[String]) -> StoreResult<Vec<Recommendation>> {
+        if approval_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT {REC_COLUMNS} FROM approval_recommendations
+             WHERE approval_id = ANY($1) AND withdrawn_at IS NULL
+             ORDER BY created_at, id COLLATE \"C\""
+        );
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(approval_ids)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(rec_from_row).collect()
     }
 }
 
@@ -911,11 +1548,18 @@ fn outcome_str(outcome: crate::audit::Outcome) -> String {
 #[async_trait]
 impl AuditSink for PgStore {
     async fn record(&self, event: AuditEvent) -> StoreResult<()> {
+        // Only the database's purge function records as `system`, so the overview's last
+        // purge can't be one the application wrote.
+        if event.client == AuditClient::System {
+            return Err(StoreError(
+                "`system` events are recorded by the database's purge function only".into(),
+            ));
+        }
         sqlx::query(
             "INSERT INTO audit_events
                  (at, run_id, user_handle, skill, bot, tool, outcome, sources, args_hash,
-                  output_ref, detail, client)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                  output_ref, detail, client, source_titles, persona)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
         )
         .bind(event.at)
         .bind(&event.run_id)
@@ -929,9 +1573,197 @@ impl AuditSink for PgStore {
         .bind(&event.output_ref)
         .bind(&event.detail)
         .bind(event.client.as_str())
+        // Null rather than `{}` when there are none, as for events before the column.
+        .bind(
+            (!event.source_titles.is_empty())
+                .then(|| sqlx::types::Json(event.source_titles.clone())),
+        )
+        .bind(&event.persona)
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    async fn reads(
+        &self,
+        user: &str,
+        run_id: &str,
+        until: DateTime<Utc>,
+        limit: usize,
+    ) -> StoreResult<Option<Vec<ReadEvent>>> {
+        // `audit_events_run` covers `run_id`.
+        let rows = sqlx::query(
+            "SELECT at, tool, sources, source_titles FROM audit_events
+             WHERE run_id = $1 AND user_handle = $2 AND outcome = 'ok'
+               AND cardinality(sources) > 0 AND at <= $3
+             ORDER BY at DESC, id DESC
+             LIMIT $4",
+        )
+        .bind(run_id)
+        .bind(user)
+        .bind(until)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            out.push(ReadEvent {
+                at: r.try_get("at")?,
+                tool: r.try_get("tool")?,
+                sources: r.try_get("sources")?,
+                titles: r
+                    .try_get::<Option<sqlx::types::Json<BTreeMap<String, String>>>, _>(
+                        "source_titles",
+                    )?
+                    .map(|j| j.0)
+                    .unwrap_or_default(),
+            });
+        }
+        Ok(Some(out))
+    }
+
+    async fn search(&self, query: &AuditQuery) -> StoreResult<Option<Vec<StoredEvent>>> {
+        // `audit_events_at` covers the order and the cursor.
+        let rows = sqlx::query(
+            "SELECT id, at, run_id, user_handle, skill, bot, tool, outcome, sources, args_hash,
+                    output_ref, detail, client, source_titles, persona
+             FROM audit_events
+             WHERE ($1::timestamptz IS NULL OR (at, id) < ($1, $2))
+               AND ($3::text IS NULL OR user_handle = $3)
+               AND ($4::text IS NULL OR tool = $4)
+               AND ($5::text IS NULL OR outcome = $5)
+               AND ($6::timestamptz IS NULL OR at >= $6)
+               AND ($7::timestamptz IS NULL OR at < $7)
+               AND ($9::text IS NULL OR persona = $9)
+             ORDER BY at DESC, id DESC
+             LIMIT $8",
+        )
+        .bind(query.before.map(|c| c.at))
+        .bind(query.before.map(|c| c.id).unwrap_or_default())
+        .bind(&query.actor)
+        .bind(&query.action)
+        .bind(query.outcome.map(Outcome::as_str))
+        .bind(query.from)
+        .bind(query.to)
+        .bind(i64::try_from(query.bounded_limit()).unwrap_or(i64::MAX))
+        .bind(&query.persona)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let outcome: String = r.try_get("outcome")?;
+            let client: String = r.try_get("client")?;
+            out.push(StoredEvent {
+                id: r.try_get("id")?,
+                event: AuditEvent {
+                    at: r.try_get("at")?,
+                    client: AuditClient::parse(&client)
+                        .ok_or_else(|| bad_row("client", &client))?,
+                    run_id: r.try_get("run_id")?,
+                    user: r.try_get("user_handle")?,
+                    skill: r.try_get("skill")?,
+                    bot: r.try_get("bot")?,
+                    persona: r.try_get("persona")?,
+                    tool: r.try_get("tool")?,
+                    outcome: Outcome::parse(&outcome)
+                        .ok_or_else(|| bad_row("outcome", &outcome))?,
+                    sources: r.try_get("sources")?,
+                    source_titles: r
+                        .try_get::<Option<sqlx::types::Json<BTreeMap<String, String>>>, _>(
+                            "source_titles",
+                        )?
+                        .map(|j| j.0)
+                        .unwrap_or_default(),
+                    args_hash: r.try_get("args_hash")?,
+                    output_ref: r.try_get("output_ref")?,
+                    detail: r.try_get("detail")?,
+                },
+            });
+        }
+        Ok(Some(out))
+    }
+
+    async fn count_outcomes(
+        &self,
+        since: DateTime<Utc>,
+    ) -> StoreResult<Option<BTreeMap<Outcome, u64>>> {
+        let rows = sqlx::query(
+            "SELECT outcome, count(*) AS n FROM audit_events WHERE at >= $1 GROUP BY outcome",
+        )
+        .bind(since)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut counts = BTreeMap::new();
+        for r in &rows {
+            let outcome: String = r.try_get("outcome")?;
+            let n: i64 = r.try_get("n")?;
+            if let Some(o) = Outcome::parse(&outcome) {
+                counts.insert(o, u64::try_from(n).unwrap_or_default());
+            }
+        }
+        Ok(Some(counts))
+    }
+
+    /// Through `purge_audit_events` (migration 0013), the one way the database lets an
+    /// audit event be deleted: the floor, the cutoff, the batch's own event and the lock
+    /// are all the function's. `now` is unused: the database's clock decides.
+    async fn purge(
+        &self,
+        retention_days: u32,
+        batch: u32,
+        _now: DateTime<Utc>,
+    ) -> StoreResult<Option<Purged>> {
+        check_purge(retention_days, batch)?;
+        let row = sqlx::query(
+            "SELECT deleted, cutoff, more, ran
+             FROM purge_audit_events(make_interval(days => $1), $2)",
+        )
+        .bind(i32::try_from(retention_days).unwrap_or(i32::MAX))
+        .bind(i32::try_from(batch).unwrap_or(i32::MAX))
+        .fetch_one(&self.pool)
+        .await?;
+        if !row.try_get::<bool, _>("ran")? {
+            return Ok(Some(Purged::Busy));
+        }
+        Ok(Some(Purged::Ran(PurgeBatch {
+            deleted: u64::try_from(row.try_get::<i64, _>("deleted")?).unwrap_or_default(),
+            cutoff: row.try_get("cutoff")?,
+            more: row.try_get("more")?,
+        })))
+    }
+
+    async fn retention(&self) -> StoreResult<Option<RetentionFacts>> {
+        // `audit_events_at` gives the oldest; `audit_events_purges` the last purge.
+        let oldest_event_at: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT min(at) FROM audit_events")
+                .fetch_one(&self.pool)
+                .await?;
+        let last = sqlx::query(
+            "SELECT at, detail FROM audit_events
+             WHERE tool = $1 AND client = 'system'
+             ORDER BY at DESC, id DESC
+             LIMIT 1",
+        )
+        .bind(PURGE_TOOL)
+        .fetch_optional(&self.pool)
+        .await?;
+        let last_purge = match last {
+            None => None,
+            Some(r) => {
+                let detail: Option<String> = r.try_get("detail")?;
+                match detail.as_deref().and_then(parse_purge_detail) {
+                    Some((deleted, _)) => Some(LastPurge {
+                        at: r.try_get("at")?,
+                        deleted,
+                    }),
+                    None => None,
+                }
+            }
+        };
+        Ok(Some(RetentionFacts {
+            oldest_event_at,
+            last_purge,
+        }))
     }
 }
 
@@ -949,11 +1781,104 @@ fn sealed_from_row(r: &PgRow) -> StoreResult<SealedCredential> {
         site_url: r.try_get("site_url")?,
         external_id: r.try_get("external_id")?,
         updated_at: r.try_get("updated_at")?,
+        suspended_at: r.try_get("suspended_at")?,
     })
 }
 
 const CREDENTIAL_COLUMNS: &str = "user_handle, provider, key_id, access_token, refresh_token, \
-                                  expires_at, scopes, cloud_id, site_url, external_id, updated_at";
+                                  expires_at, scopes, cloud_id, site_url, external_id, updated_at, \
+                                  suspended_at";
+
+/// Suspend `user`'s credentials (deactivation), on `conn`: the user store runs it inside the
+/// deactivation's own transaction.
+pub(crate) async fn suspend_credentials(
+    conn: &mut sqlx::PgConnection,
+    user: &str,
+    at: DateTime<Utc>,
+) -> Result<u64, sqlx::Error> {
+    Ok(sqlx::query(
+        "UPDATE credentials SET suspended_at = $2 WHERE user_handle = $1 AND suspended_at IS NULL",
+    )
+    .bind(user)
+    .bind(at)
+    .execute(conn)
+    .await?
+    .rows_affected())
+}
+
+/// Make `user`'s suspended credentials usable again (reactivation within the grace).
+pub(crate) async fn restore_credentials(
+    conn: &mut sqlx::PgConnection,
+    user: &str,
+) -> Result<u64, sqlx::Error> {
+    Ok(sqlx::query(
+        "UPDATE credentials SET suspended_at = NULL
+         WHERE user_handle = $1 AND suspended_at IS NOT NULL",
+    )
+    .bind(user)
+    .execute(conn)
+    .await?
+    .rows_affected())
+}
+
+/// Delete `user`'s suspended credentials (the grace is over).
+pub(crate) async fn delete_suspended_credentials(
+    conn: &mut sqlx::PgConnection,
+    user: &str,
+) -> Result<u64, sqlx::Error> {
+    Ok(
+        sqlx::query("DELETE FROM credentials WHERE user_handle = $1 AND suspended_at IS NOT NULL")
+            .bind(user)
+            .execute(conn)
+            .await?
+            .rows_affected(),
+    )
+}
+
+/// End every MCP session of `user` (deactivation).
+pub(crate) async fn revoke_user_sessions(
+    conn: &mut sqlx::PgConnection,
+    user: &str,
+) -> Result<u64, sqlx::Error> {
+    Ok(sqlx::query("DELETE FROM sessions WHERE user_handle = $1")
+        .bind(user)
+        .execute(conn)
+        .await?
+        .rows_affected())
+}
+
+/// Close `user`'s pending drafts as the system: `rejected`, ledger reason
+/// `owner_deactivated`. Returns their ids.
+pub(crate) async fn close_owner_drafts(
+    conn: &mut sqlx::PgConnection,
+    user: &str,
+    now: DateTime<Utc>,
+) -> Result<Vec<String>, sqlx::Error> {
+    let ids: Vec<String> = sqlx::query_scalar(
+        "UPDATE approvals SET status = 'rejected', decided_at = $2, decided_by = $3
+         WHERE user_handle = $1 AND status = 'pending'
+         RETURNING id",
+    )
+    .bind(user)
+    .bind(now)
+    .bind(crate::approvals::SYSTEM_DECIDER)
+    .fetch_all(&mut *conn)
+    .await?;
+    if !ids.is_empty() {
+        sqlx::query(
+            "UPDATE ledger
+             SET outcome = 'rejected', reason = 'owner_deactivated', decided_at = $2,
+                 decided_by = $3
+             WHERE id = ANY($1)",
+        )
+        .bind(&ids)
+        .bind(now)
+        .bind(crate::approvals::SYSTEM_DECIDER)
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(ids)
+}
 
 #[async_trait]
 impl CredentialStore for PgStore {
@@ -1040,6 +1965,21 @@ impl CredentialStore for PgStore {
             .fetch_all(&self.pool)
             .await?;
         rows.iter().map(sealed_from_row).collect()
+    }
+
+    async fn suspend(&self, user: &str, at: DateTime<Utc>) -> StoreResult<u64> {
+        let mut conn = self.pool.acquire().await?;
+        Ok(suspend_credentials(&mut conn, user, at).await?)
+    }
+
+    async fn restore(&self, user: &str) -> StoreResult<u64> {
+        let mut conn = self.pool.acquire().await?;
+        Ok(restore_credentials(&mut conn, user).await?)
+    }
+
+    async fn delete_suspended(&self, user: &str) -> StoreResult<u64> {
+        let mut conn = self.pool.acquire().await?;
+        Ok(delete_suspended_credentials(&mut conn, user).await?)
     }
 }
 

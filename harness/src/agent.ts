@@ -28,10 +28,13 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
+import type { CallbackManagerForLLMRun } from "@langchain/core/callbacks/manager";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
+import { AIMessage, type AIMessageChunk, type BaseMessage } from "@langchain/core/messages";
+import type { ChatGenerationChunk, ChatResult } from "@langchain/core/outputs";
 import type { StructuredTool, StructuredToolInterface } from "@langchain/core/tools";
 import type { BaseCheckpointSaver } from "@langchain/langgraph";
-import { ChatOpenAI } from "@langchain/openai";
+import { ChatOpenAI, ChatOpenAICompletions } from "@langchain/openai";
 import {
   CompositeBackend,
   FilesystemBackend,
@@ -40,6 +43,7 @@ import {
   createDeepAgent,
 } from "deepagents";
 import { parse as parseYaml } from "yaml";
+import { ModelStreamError, STREAM_IDLE_MS, checkedStreamFetch } from "./model-stream.js";
 import { buildInterruptOn, harnessToolNames, loadToolRegistry } from "./registry.js";
 
 /** Virtual mount point of the content repo inside the agent's filesystem. */
@@ -57,6 +61,91 @@ export const MODEL_ALIASES = {
 } as const;
 export type ModelRole = keyof typeof MODEL_ALIASES;
 
+/** Thrown by [`ModelSourceGuard`]'s fetch: the gateway serves another model source. */
+export class ModelSourceChangedError extends Error {
+  constructor() {
+    super("model source changed");
+    this.name = "ModelSourceChangedError";
+  }
+}
+
+/**
+ * Keeps one task's model calls on the model source it started under (slice H4,
+ * docs/openshell-any-host-spec.md §3.6, "Keeping every caller on one source"). Every call names
+ * the source in `X-Pmos-Model-Source` (set with the other gateway headers); the gateway refuses
+ * a mismatch with `409` before it forwards anything (X4). As a second line, this checks every
+ * answer: a `409`, or an answer whose `x-pmos-model-source` isn't the task's, marks the task
+ * changed, and from then on no call is sent at all, so no tool result reaches a model of
+ * another source. The review panel's sub-agents share the task's model, and so this guard.
+ */
+export class ModelSourceGuard {
+  changed = false;
+  /** A call of the task was answered by a fallback model (`x-pmos-fallback: 1`). */
+  fallbackUsed = false;
+  private readonly used = new Map<string, ModelUse>();
+
+  constructor(
+    readonly expected: string,
+    private readonly base: typeof fetch = globalThis.fetch,
+  ) {}
+
+  readonly fetch = async (input: string | URL | Request, init?: RequestInit) => {
+    if (this.changed) {
+      throw new ModelSourceChangedError();
+    }
+    const res = await this.base(input, init);
+    if (res.status === 409 || res.headers.get("x-pmos-model-source") !== this.expected) {
+      this.changed = true;
+      await res.body?.cancel().catch(() => {});
+      throw new ModelSourceChangedError();
+    }
+    this.record(res);
+    return res;
+  };
+
+  /**
+   * Which labelled models answered (docs/model-providers-spec.md §4.9, slice MP7): the
+   * gateway's `x-pmos-model`, `x-pmos-model-sha256` and `x-pmos-fallback` on every answer.
+   * Labels and hashes only; anything that isn't one is ignored.
+   */
+  private record(res: Response): void {
+    if (!res.ok) {
+      return;
+    }
+    const label = res.headers.get("x-pmos-model");
+    if (label === null || !LABEL.test(label)) {
+      return;
+    }
+    const sha = res.headers.get("x-pmos-model-sha256");
+    const key = `${label} ${sha ?? ""}`;
+    const entry = this.used.get(key) ?? {
+      label,
+      ...(sha !== null && SHA256.test(sha) ? { model_sha256: sha } : {}),
+      calls: 0,
+    };
+    entry.calls += 1;
+    this.used.set(key, entry);
+    if (res.headers.get("x-pmos-fallback") === "1") {
+      this.fallbackUsed = true;
+    }
+  }
+
+  /** The models that answered the task's calls so far, for the runtime. */
+  modelsUsed(): ModelUse[] {
+    return [...this.used.values()].map((u) => ({ ...u }));
+  }
+}
+
+/** One labelled model's calls for a task (slice MP7). */
+export interface ModelUse {
+  label: string;
+  model_sha256?: string;
+  calls: number;
+}
+
+const LABEL = /^[A-Za-z0-9._-]{1,64}$/;
+const SHA256 = /^[0-9a-f]{64}$/;
+
 export interface GatewayModelOptions {
   /** Base URL of the gateway's OpenAI-compatible API, e.g. `https://gateway.pmos.internal/v1`. */
   gatewayUrl: string;
@@ -71,6 +160,69 @@ export interface GatewayModelOptions {
    * `X-Pmos-Priority` (docs/gateway.md).
    */
   headers?: Record<string, string>;
+  /** Checks every answer's model source (slice H4). */
+  sourceGuard?: ModelSourceGuard;
+  /**
+   * Longest silence inside a streamed answer before the call fails as stalled (default
+   * `STREAM_IDLE_MS`, 180 s; `model-stream.ts`).
+   */
+  streamIdleMs?: number;
+}
+
+/**
+ * The Chat Completions half of `ChatOpenAI`, answering every call from a streamed answer
+ * assembled into one message: the same message a whole answer gives (text, tool calls parsed
+ * from their streamed pieces, the finish reason, and the token counts the last event carries).
+ *
+ * `ChatOpenAI({streaming: true})` would stream too, but afterwards estimates token counts with
+ * a tokenizer it downloads from the internet, which a sandbox can't reach (the call then hangs
+ * or fails); this keeps the gateway's own counts and downloads nothing. It is passed to
+ * `ChatOpenAI` as its `completions`, so the copies `bindTools` and `withConfig` make (they
+ * build a plain `ChatOpenAI` from the same fields) keep it: every agent and sub-agent call
+ * streams.
+ */
+export class StreamedCompletions extends ChatOpenAICompletions {
+  override async _generate(
+    messages: BaseMessage[],
+    options: this["ParsedCallOptions"],
+    runManager?: CallbackManagerForLLMRun,
+  ): Promise<ChatResult> {
+    options.signal?.throwIfAborted();
+    let whole: ChatGenerationChunk | undefined;
+    for await (const chunk of this._streamResponseChunks(messages, options, runManager)) {
+      chunk.message.response_metadata = {
+        ...chunk.generationInfo,
+        ...chunk.message.response_metadata,
+      };
+      whole = whole === undefined ? chunk : whole.concat(chunk);
+    }
+    if (whole === undefined) {
+      throw new ModelStreamError("incomplete", "the answer had no parts");
+    }
+    const part = whole.message as AIMessageChunk;
+    const message = new AIMessage({
+      id: part.id,
+      content: part.content,
+      tool_calls: part.tool_calls,
+      invalid_tool_calls: part.invalid_tool_calls,
+      additional_kwargs: part.additional_kwargs,
+      response_metadata: part.response_metadata,
+      usage_metadata: part.usage_metadata,
+    });
+    const usage = part.usage_metadata;
+    return {
+      generations: [{ text: whole.text, message, generationInfo: whole.generationInfo }],
+      llmOutput: usage
+        ? {
+            tokenUsage: {
+              promptTokens: usage.input_tokens,
+              completionTokens: usage.output_tokens,
+              totalTokens: usage.total_tokens,
+            },
+          }
+        : {},
+    };
+  }
 }
 
 export function gatewayModel({
@@ -78,13 +230,34 @@ export function gatewayModel({
   role = "default",
   apiKey = "pmos-sandbox-placeholder",
   headers,
+  sourceGuard,
+  streamIdleMs = STREAM_IDLE_MS,
 }: GatewayModelOptions): BaseChatModel {
-  return new ChatOpenAI({
+  const fields = {
     model: MODEL_ALIASES[role],
     apiKey,
     temperature: 0,
-    configuration: { baseURL: gatewayUrl, defaultHeaders: headers },
-  });
+    // `streamUsage` asks for the token counts in the last event of a streamed answer
+    // (`stream_options.include_usage`).
+    streamUsage: true,
+    // No client-side retries. The gateway already retries 429, 503 and connection failures
+    // (3 tries inside a 20 s budget, honouring Retry-After; docs/gateway.md, "Retrying a busy
+    // model server"). A LangChain retry here would multiply with it, and a PM would wait far
+    // longer than intended. `maxRetries` is LangChain's own retry count, default 6.
+    maxRetries: 0,
+    configuration: {
+      baseURL: gatewayUrl,
+      defaultHeaders: headers,
+      // Fails a streamed answer that stalls, ends early or carries an error event, so a
+      // cut-off answer is never taken for a whole one (`model-stream.ts`).
+      fetch: checkedStreamFetch(sourceGuard?.fetch ?? globalThis.fetch, streamIdleMs),
+    },
+  };
+  // Every call asks for a streamed answer (`StreamedCompletions`), so bytes flow while the
+  // model writes: a hop that cuts off a connection silent for minutes (eval run E3: a 502 at
+  // about 300 s) never sees one. The review panel's sub-agents share this model, so they
+  // stream too.
+  return new ChatOpenAI({ ...fields, completions: new StreamedCompletions(fields) });
 }
 
 export interface PmosAgentOptions {
@@ -119,6 +292,60 @@ export interface PmosAgentOptions {
 function checkHandle(user: string): void {
   if (!/^[a-z0-9][a-z0-9._-]*$/.test(user)) {
     throw new Error(`invalid user handle: ${user}`);
+  }
+}
+
+export type DataClass = "public" | "internal" | "restricted";
+
+const CLASS_ORDER: Record<DataClass, number> = { public: 0, internal: 1, restricted: 2 };
+
+/**
+ * A master-context file's data class (slice H12, spec §3.6, "An optional data-class ceiling",
+ * V11): `restricted` unless its first line is a `<!-- sensitivity: public -->` or
+ * `<!-- sensitivity: internal -->` marker. Master context carries no front matter, and it
+ * never passes through the tool server, so only this marker can say it holds less.
+ */
+export function masterContextClass(text: string): DataClass {
+  const first = text.split(/\r?\n/, 1)[0] ?? "";
+  const m = /^<!--\s*sensitivity:\s*(public|internal)\s*-->\s*$/.exec(first);
+  return m ? (m[1] as DataClass) : "restricted";
+}
+
+/** A master-context file above the hosted model's ceiling: its path and its class, never its text. */
+export class MasterContextAboveCeilingError extends Error {
+  constructor(
+    readonly file: string,
+    readonly dataClass: DataClass,
+    readonly ceiling: DataClass,
+  ) {
+    super(
+      `${file} counts as ${dataClass} data, above the hosted model's data-class ceiling (${ceiling})`,
+    );
+    this.name = "MasterContextAboveCeilingError";
+  }
+}
+
+/**
+ * Under a ceiling below `restricted` (slice H12, V11): every master-context file this task
+ * would load (the team's, and the PM's own) must be at or below it, by its first-line marker.
+ * With no ceiling, or `restricted` (all data, D1), nothing is checked and no marker is needed.
+ */
+export function checkMasterContext(contentRoot: string, user: string | undefined, ceiling: DataClass | null | undefined): void {
+  if (!ceiling || ceiling === "restricted") {
+    return;
+  }
+  const files = ["master/AGENTS.md"];
+  if (user) {
+    checkHandle(user);
+    if (existsSync(join(contentRoot, "master", "people", user, "AGENTS.md"))) {
+      files.push(`master/people/${user}/AGENTS.md`);
+    }
+  }
+  for (const rel of files) {
+    const cls = masterContextClass(readFileSync(join(contentRoot, rel), "utf8"));
+    if (CLASS_ORDER[cls] > CLASS_ORDER[ceiling]) {
+      throw new MasterContextAboveCeilingError(`content/${rel}`, cls, ceiling);
+    }
   }
 }
 
@@ -157,8 +384,21 @@ export function stageMasterContext(
 }
 
 /**
+ * A skill a role names has no folder in the content the worker sees: in a sandbox, a skill
+ * added (by a new persona) after the sandbox was created. Its uploads are fixed at sandbox
+ * start, so the folder arrives only when a platform owner recreates the sandbox.
+ */
+export class MissingSkillError extends Error {
+  constructor(readonly skill: string) {
+    super(`skill ${skill} not found in the content repo`);
+    this.name = "MissingSkillError";
+  }
+}
+
+/**
  * Copy only the named skills into a fresh directory, so a bot sees its role's skills and no
- * others. Throws on a name that isn't a plain skill name or has no `SKILL.md`.
+ * others. Throws on a name that isn't a plain skill name, and `MissingSkillError` on one with
+ * no `SKILL.md`.
  */
 export function stageSkills(
   contentRoot: string,
@@ -172,7 +412,7 @@ export function stageSkills(
     }
     const source = join(contentRoot, "skills", skill);
     if (!existsSync(join(source, "SKILL.md"))) {
-      throw new Error(`skill ${skill} not found in the content repo`);
+      throw new MissingSkillError(skill);
     }
     cpSync(source, join(staged, skill), { recursive: true });
   }

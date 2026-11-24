@@ -1,0 +1,18 @@
+[package]
+name = "pmos-assertion"
+description = "PM OS user assertion: a short-lived signed statement of who a service is acting for"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version = "1.88"
+
+[dependencies]
+base64.workspace = true
+hmac.workspace = true
+pmos-contract.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+# Not in the workspace list; already in Cargo.lock through other crates.
+getrandom = "0.3"

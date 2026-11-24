@@ -4,7 +4,14 @@
 //! run in it does, so a rerun after a model or harness change that falls below the bar counts
 //! against that week. The category passes when the latest week with a run and the calendar
 //! week right before it both meet the bar. A week with no run breaks the streak.
+//!
+//! Only reports that [`counts`] accepts take part (review finding N5): those whose gateway
+//! reported the production role models (`benchmark.production_gateway` in `config.yaml`,
+//! `deploy/gateway.yaml`), from a `production`-class gateway (review finding R3), with no stub
+//! or testing-only upstream, and, for a persona's category, on the persona's current files
+//! (their hash, [`persona_hash`]). [`evaluate`] itself judges whatever it's given.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -86,6 +93,565 @@ fn load_where(dir: &Path, keep: impl Fn(&Report) -> bool) -> Result<Vec<(String,
     }
     reports.sort_by_key(|(_, r)| (r.date, r.started_at));
     Ok(reports)
+}
+
+/// The production role models ([`production_models`]): what the production gateway reports
+/// for each role, and, for a labelled role, the hash of the model id behind the label.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProductionModels {
+    /// Role name to the model id, or the role's `label` when it has one, since a labelled
+    /// role is reported by its label (`GET /v1/pmos/roles`), so that is what a report records.
+    pub roles: BTreeMap<String, String>,
+    /// For a labelled role only: role name to the lowercase hex SHA-256 of its `model`, as
+    /// the gateway reports it (`model_sha256`), so a model swapped behind an unchanged label
+    /// restarts the streak (the label hardening of the review at 52dbae2).
+    pub model_sha256: BTreeMap<String, String>,
+    /// Some role of the production config has a `route:` (`docs/model-providers-spec.md`
+    /// §4.10): its production model is the route's primary, and a report counts only if it
+    /// recorded which models answered its calls ([`crate::report::Report::route`]).
+    pub routed: bool,
+    /// The production config serves the approved hosted model (slice H12, spec §3.6,
+    /// "Benchmarks under `hosted`"): every role on its `hosted:<name>` upstream, so a report
+    /// counts only when every role was served by the `hosted` kind (never `local`), and each
+    /// role's model hash is the approved entry's one `model_sha256`.
+    pub hosted: bool,
+}
+
+impl From<BTreeMap<String, String>> for ProductionModels {
+    /// Production role models with no labelled role.
+    fn from(roles: BTreeMap<String, String>) -> Self {
+        Self {
+            roles,
+            model_sha256: BTreeMap::new(),
+            routed: false,
+            hosted: false,
+        }
+    }
+}
+
+/// A `hosted:<name>` production config's model hash (slice H12): the approved entry's one
+/// `model_sha256`, from the list the gateway compiles in (`crates/gateway/approved-hosted.yaml`,
+/// beside `evals/`). The committed config names no model id (`host:<ref>`), so this is the only
+/// committed pin. Refused: no entry of that name (the list ships empty), or an entry that pins
+/// several ids (which role uses which isn't in a committed file).
+fn hosted_model_sha(evals_root: &Path, name: &str) -> Result<String, String> {
+    let path = evals_root.join("../crates/gateway/approved-hosted.yaml");
+    let text = std::fs::read_to_string(&path).map_err(|e| {
+        format!(
+            "{}: can't read the approved hosted list: {e}",
+            path.display()
+        )
+    })?;
+    let list: Vec<serde_norway::Value> = if text
+        .lines()
+        .any(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+    {
+        serde_norway::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?
+    } else {
+        Vec::new()
+    };
+    let entry = list
+        .iter()
+        .find(|e| e.get("name").and_then(|n| n.as_str()) == Some(name))
+        .ok_or_else(|| {
+            format!(
+                "the production gateway serves `hosted:{name}`, which has no approved entry \
+                 (the list ships empty; the first entry is the owner's slice H13)"
+            )
+        })?;
+    let shas: Vec<&str> = entry
+        .get("model_sha256")
+        .and_then(|m| m.as_sequence())
+        .map(|s| s.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    match shas.as_slice() {
+        [one] if crate::report::is_sha256_hex(one) => Ok(one.to_string()),
+        _ => Err(format!(
+            "the approved entry `{name}` must pin exactly one model id for its runs to count"
+        )),
+    }
+}
+
+impl std::ops::Index<&str> for ProductionModels {
+    type Output = String;
+    fn index(&self, role: &str) -> &String {
+        &self.roles[role]
+    }
+}
+
+impl ProductionModels {
+    /// `default `model-a` (model sha256 0123456789ab…), extraction `nemo``, for messages.
+    pub fn describe(&self) -> String {
+        self.roles
+            .keys()
+            .map(|r| format!("{r} {}", shown_model(&self.roles, &self.model_sha256, r)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// A role's model as a message shows it: `` `model-a` (model sha256 0123456789ab…) ``, or
+/// `` `none` `` for a missing role.
+fn shown_model(
+    roles: &BTreeMap<String, String>,
+    hashes: &BTreeMap<String, String>,
+    role: &str,
+) -> String {
+    let model = roles.get(role).map(String::as_str).unwrap_or("none");
+    match hashes.get(role) {
+        Some(h) => format!("`{model}` (model sha256 {}…)", &h[..h.len().min(12)]),
+        None => format!("`{model}`"),
+    }
+}
+
+/// The production role models: role name to model id, from the `model` of each role in the
+/// production gateway config that `config.yaml`'s `benchmark.production_gateway` names
+/// (`deploy/gateway.yaml`), or its `label` when it has one, with the hash of its `model`
+/// beside it ([`ProductionModels`]). Only the model ids and labels are read, never an
+/// upstream address.
+pub fn production_models(evals_root: &Path) -> Result<ProductionModels, String> {
+    let config = crate::config::Config::load(evals_root)?;
+    let path = evals_root.join(&config.benchmark.production_gateway);
+    let text = std::fs::read_to_string(&path).map_err(|e| {
+        format!(
+            "{}: can't read the production gateway config: {e}",
+            path.display()
+        )
+    })?;
+    let v: serde_norway::Value =
+        serde_norway::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    let roles = v
+        .get("roles")
+        .and_then(|r| r.as_mapping())
+        .ok_or_else(|| format!("{}: no `roles`", path.display()))?;
+    let mut out = ProductionModels::default();
+    // Slice H12: the `hosted:<name>` upstreams of the config, by key.
+    let hosted_upstreams: BTreeMap<String, String> = v
+        .get("upstreams")
+        .and_then(|u| u.as_mapping())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, u)| {
+                    let url = u
+                        .as_str()
+                        .or_else(|| u.get("url").and_then(|x| x.as_str()))?;
+                    let name = url.strip_prefix("hosted:")?;
+                    Some((k.as_str()?.to_string(), name.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    for (name, role) in roles {
+        if let Some(entry) = role
+            .get("upstream")
+            .and_then(|u| u.as_str())
+            .and_then(|u| hosted_upstreams.get(u))
+        {
+            let (Some(name), Some(label)) =
+                (name.as_str(), role.get("label").and_then(|l| l.as_str()))
+            else {
+                return Err(format!(
+                    "{}: a hosted role without a name or a `label`",
+                    path.display()
+                ));
+            };
+            out.hosted = true;
+            out.roles.insert(name.to_string(), label.to_string());
+            out.model_sha256
+                .insert(name.to_string(), hosted_model_sha(evals_root, entry)?);
+            continue;
+        }
+        if !hosted_upstreams.is_empty() {
+            return Err(format!(
+                "{}: a role isn't on the `hosted:<name>` upstream; a hosted production config \
+                 serves every role from it",
+                path.display()
+            ));
+        }
+        let mut label = role.get("label").and_then(|l| l.as_str());
+        let mut model = role.get("model").and_then(|m| m.as_str());
+        // A routed role (slice MP6): its production model is the route's primary, the first
+        // label of `route:`, whose id is under `models:`. A fallback is never benchmarked by a
+        // run on the primary (§4.10).
+        if let Some(route) = role.get("route").and_then(|r| r.as_sequence()) {
+            out.routed = true;
+            let primary = route
+                .first()
+                .and_then(|l| l.as_str())
+                .ok_or_else(|| format!("{}: a role's `route:` is empty", path.display()))?;
+            label = Some(primary);
+            model = v
+                .get("models")
+                .and_then(|m| m.get(primary))
+                .and_then(|m| m.get("model"))
+                .and_then(|m| m.as_str());
+        }
+        let (Some(name), Some(model)) = (name.as_str(), model) else {
+            return Err(format!(
+                "{}: a role without a name or `model`",
+                path.display()
+            ));
+        };
+        out.roles
+            .insert(name.to_string(), label.unwrap_or(model).to_string());
+        if label.is_some() {
+            out.model_sha256
+                .insert(name.to_string(), crate::report::sha256_hex(model));
+        }
+    }
+    if out.roles.is_empty() {
+        return Err(format!("{}: no roles", path.display()));
+    }
+    Ok(out)
+}
+
+/// The front matter of a `PERSONA.md` or `ROLE.md`.
+fn front_matter(path: &Path) -> Result<serde_norway::Value, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("{}: can't read: {e}", path.display()))?;
+    let front = text
+        .strip_prefix("---")
+        .and_then(|t| t.split("\n---").next())
+        .ok_or_else(|| format!("{}: no front matter", path.display()))?;
+    serde_norway::from_str(front).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Every file under `dir`, as (path relative to `base`, contents), in path order. A file that
+/// can't be read fails it; so does a missing `dir`.
+fn files_under(base: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) -> Result<(), String> {
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .map_err(|e| format!("{}: can't read: {e}", dir.display()))?
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("{}: can't read: {e}", dir.display()))?;
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let kind = entry
+            .file_type()
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        if kind.is_dir() {
+            files_under(base, &path, out)?;
+        } else {
+            let bytes =
+                std::fs::read(&path).map_err(|e| format!("{}: can't read: {e}", path.display()))?;
+            let rel = path
+                .strip_prefix(base)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            out.push((rel, bytes));
+        }
+    }
+    Ok(())
+}
+
+/// What a persona is, as files: `sha256:<hex>` over every file of its folder
+/// (`personas/<persona>/`, `PERSONA.md` included), of its role's folder (`roles/<role>/`) and
+/// of each skill's folder the role lists (`skills/<skill>/`), each as its path relative to the
+/// content root and its bytes. A run of a persona's category counts only while this is the
+/// same as when it ran (replacing the string compare of `version:`, which an edit that didn't
+/// bump it slipped past). `Err` says which file or field is missing; such a persona has no
+/// run that counts.
+pub fn persona_hash(content: &Path, persona: &str) -> Result<String, String> {
+    use pmos_contract::bots::valid_name;
+    use sha2::{Digest, Sha256};
+    // Both are joined into paths under the content root: plain names only, never `..` or a
+    // path (the Low on the persona's role, review at 2544d01).
+    if !valid_name(persona) {
+        return Err(format!(
+            "persona `{persona}` isn't a plain name (lowercase letters, digits and single hyphens)"
+        ));
+    }
+    let dir = content.join("personas").join(persona);
+    let front = front_matter(&dir.join("PERSONA.md"))?;
+    let role = front
+        .get("role")
+        .and_then(|r| r.as_str())
+        .ok_or_else(|| format!("persona `{persona}` names no `role`"))?
+        .to_string();
+    if !valid_name(&role) {
+        return Err(format!(
+            "persona `{persona}`: role `{role}` isn't a plain role name (lowercase letters, \
+             digits and single hyphens)"
+        ));
+    }
+    let role_dir = content.join("roles").join(&role);
+    let role_front = front_matter(&role_dir.join("ROLE.md"))?;
+    let skills: Vec<String> = match role_front.get("skills") {
+        None => Vec::new(),
+        Some(serde_norway::Value::String(s)) => s.split_whitespace().map(String::from).collect(),
+        Some(serde_norway::Value::Sequence(list)) => list
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(String::from)
+                    .ok_or_else(|| format!("role `{role}`: a skill that isn't a name"))
+            })
+            .collect::<Result<_, _>>()?,
+        Some(_) => {
+            return Err(format!(
+                "role `{role}`: `skills` is neither a list nor a string"
+            ))
+        }
+    };
+    let mut files = Vec::new();
+    files_under(content, &dir, &mut files)?;
+    files_under(content, &role_dir, &mut files)?;
+    let mut skills = skills;
+    skills.sort();
+    skills.dedup();
+    for skill in &skills {
+        if skill.is_empty() || skill.contains(['/', '\\', '.']) {
+            return Err(format!(
+                "role `{role}`: skill `{skill}` isn't a folder name"
+            ));
+        }
+        files_under(content, &content.join("skills").join(skill), &mut files)?;
+    }
+    let mut h = Sha256::new();
+    for (path, bytes) in &files {
+        h.update((path.len() as u64).to_le_bytes());
+        h.update(path.as_bytes());
+        h.update((bytes.len() as u64).to_le_bytes());
+        h.update(bytes);
+    }
+    Ok(h.finalize()
+        .iter()
+        .fold(String::from("sha256:"), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        }))
+}
+
+/// The `version:` in `<content>/personas/<persona>/PERSONA.md`'s front matter. For display:
+/// which files a run measured is [`persona_hash`].
+pub fn persona_version(content: &Path, persona: &str) -> Option<String> {
+    let text =
+        std::fs::read_to_string(content.join("personas").join(persona).join("PERSONA.md")).ok()?;
+    let front = text.strip_prefix("---")?.split("\n---").next()?;
+    let v: serde_norway::Value = serde_norway::from_str(front).ok()?;
+    match v.get("version")? {
+        serde_norway::Value::String(s) => Some(s.clone()),
+        serde_norway::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// Whether `report` counts towards its category's bar (review finding N5): its gateway's
+/// models were recorded ([`Report::gateway_models`]), from a `production`-class gateway (R3),
+/// are exactly the production role models (`production`), role for role, came from neither
+/// the stub nor a testing-only upstream; and, for a persona's category, the hash of the
+/// persona's files then (`report.persona_hash`) is their hash now (`persona_now`,
+/// [`persona_hash`]). `Err` says why not. A report without the gateway's models (every one
+/// before 2026-11-22) never counts.
+///
+/// A labelled production role matches only a report that recorded both its label and the
+/// hash of its model id (`model_sha256`), so a model swapped behind an unchanged label
+/// doesn't keep earlier runs counting. A report written before the gateway reported the hash
+/// has none, so it never matches a labelled production role; it still matches a role without
+/// a label (which has no hash either), as it did before.
+pub fn counts(
+    report: &Report,
+    production: &ProductionModels,
+    persona_now: Option<&str>,
+) -> Result<(), String> {
+    let Some(m) = &report.gateway_models else {
+        return Err("the gateway's models weren't recorded".into());
+    };
+    if m.class != "production" {
+        return Err(format!(
+            "the runtime's gateway is a `{}` gateway, not the production one",
+            m.class
+        ));
+    }
+    if m.stub {
+        return Err("the gateway answered with its stub model".into());
+    }
+    if m.cloud_test {
+        return Err("a testing-only upstream was on".into());
+    }
+    // Slice H12: a hosted production config's runs count only from the `hosted` kind; a local
+    // one's only from `local`.
+    if production.hosted {
+        if m.upstreams.values().any(|u| u != "hosted") {
+            return Err(
+                "a role was served by an upstream that isn't the approved hosted model".into(),
+            );
+        }
+    } else if m.upstreams.values().any(|u| u != "local") {
+        return Err("a role was served by an upstream that isn't local".into());
+    }
+    // Slice MP6 (§4.10): a claim holds for the model that produced it. Every call of the run
+    // must have been answered by a role's primary: no fallback, no other label or hash.
+    match &report.route {
+        Some(r) => {
+            if r.fallback_used {
+                return Err("a call of the run was answered by a fallback model".into());
+            }
+            if r.pinned != "primary" {
+                return Err(format!(
+                    "the run was pinned to `{}`, not each role's primary",
+                    r.pinned
+                ));
+            }
+            if production.routed && r.unrecorded > 0 {
+                return Err(format!(
+                    "{} of its tasks didn't record which models answered them",
+                    r.unrecorded
+                ));
+            }
+            for (label, a) in &r.answered {
+                let primary = production.roles.iter().any(|(role, l)| {
+                    l == label && production.model_sha256.get(role) == a.model_sha256.as_ref()
+                });
+                if !primary {
+                    return Err(format!(
+                        "a call was answered by `{label}`, which is no role's production primary"
+                    ));
+                }
+            }
+        }
+        None if production.routed => {
+            return Err(
+                "the production gateway has routes, and the run didn't record which models \
+                 answered its calls"
+                    .into(),
+            );
+        }
+        None => {}
+    }
+    if m.roles != production.roles || m.model_sha256 != production.model_sha256 {
+        let differ: Vec<String> = production
+            .roles
+            .keys()
+            .chain(m.roles.keys())
+            .chain(m.model_sha256.keys())
+            .chain(production.model_sha256.keys())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .filter(|r| {
+                production.roles.get(*r) != m.roles.get(*r)
+                    || production.model_sha256.get(*r) != m.model_sha256.get(*r)
+            })
+            .map(|r| {
+                let then = shown_model(&m.roles, &m.model_sha256, r);
+                let then = match (
+                    production.model_sha256.contains_key(r),
+                    m.model_sha256.contains_key(r),
+                ) {
+                    (true, false) => format!("{then} (no model hash recorded)"),
+                    _ => then,
+                };
+                format!(
+                    "{r}: {then}, production {}",
+                    shown_model(&production.roles, &production.model_sha256, r)
+                )
+            })
+            .collect();
+        return Err(format!(
+            "its models aren't the production role models ({})",
+            differ.join("; ")
+        ));
+    }
+    if let Some(now) = persona_now {
+        match report.persona_hash.as_deref() {
+            Some(h) if h == now => {}
+            Some(h) => {
+                return Err(format!(
+                "it measured the persona's files as `{}`; they are now `{}` (version `{}` then)",
+                short(h),
+                short(now),
+                report.persona_version.as_deref().unwrap_or("none")
+            ))
+            }
+            None => return Err("the hash of the persona's files wasn't recorded".into()),
+        }
+    }
+    Ok(())
+}
+
+/// `sha256:0123456789ab…`, for messages.
+fn short(hash: &str) -> String {
+    let cut = hash.char_indices().nth(19).map_or(hash.len(), |(i, _)| i);
+    format!("{}…", &hash[..cut])
+}
+
+/// The reports that count ([`counts`]), and `(file, date, why not)` for the rest. With no
+/// production models (`Err`), none counts.
+pub fn split_counting(
+    reports: Vec<(String, Report)>,
+    production: &Result<ProductionModels, String>,
+    persona_now: Option<&str>,
+) -> (Vec<Report>, Vec<(String, NaiveDate, String)>) {
+    let mut kept = Vec::new();
+    let mut left = Vec::new();
+    for (file, r) in reports {
+        let verdict = match production {
+            Ok(p) => counts(&r, p, persona_now),
+            Err(e) => Err(format!("no production role models: {e}")),
+        };
+        match verdict {
+            Ok(()) => kept.push(r),
+            Err(why) => left.push((file, r.date, why)),
+        }
+    }
+    (kept, left)
+}
+
+/// The personas (marketplace bots) whose benchmark passes (D10), for `pmos lint`'s
+/// `persona-benchmark` rule: those named by at least one category under `evals_root`
+/// (`persona: <key>` in its `category.yaml`), where **every** category naming it has a pass bar
+/// and has met it two weeks in a row in `<evals_root>/reports`, counting only the reports that
+/// [`counts`] accepts: run on the production role models, and on the persona's current version
+/// in `content`. Fails closed: a category that doesn't load, has no bar, or whose reports
+/// can't be read, a persona whose version can't be read, and production models that can't be
+/// read all count as not met (`pmos-evals check` reports why), and a missing evals directory
+/// gives no persona.
+pub fn benchmarked_personas(
+    evals_root: &Path,
+    content: &Path,
+) -> std::collections::BTreeSet<String> {
+    let reports = evals_root.join("reports");
+    let production = production_models(evals_root);
+    let mut met: BTreeMap<String, bool> = BTreeMap::new();
+    let Ok(names) = crate::spec::category_names(evals_root) else {
+        return Default::default();
+    };
+    for name in names {
+        let Ok(category) = crate::spec::load_category(evals_root, &name) else {
+            // A category that doesn't load still counts against the persona it names.
+            let named = std::fs::read_to_string(
+                crate::spec::category_dir(evals_root, &name).join("category.yaml"),
+            )
+            .ok()
+            .and_then(|t| serde_norway::from_str::<serde_norway::Value>(&t).ok())
+            .and_then(|v| v.get("persona").and_then(|p| p.as_str()).map(String::from));
+            if let Some(persona) = named {
+                met.insert(persona, false);
+            }
+            continue;
+        };
+        let Some(persona) = category.persona else {
+            continue;
+        };
+        let hash = persona_hash(content, &persona).ok();
+        let ok = production.is_ok()
+            && hash.is_some()
+            && category.pass_bar.is_some_and(|bar| {
+                load_named(&reports, &name)
+                    .map(|r| {
+                        let (kept, _) = split_counting(r, &production, hash.as_deref());
+                        evaluate(&name, bar, &kept).two_weeks_met
+                    })
+                    .unwrap_or(false)
+            });
+        let entry = met.entry(persona).or_insert(true);
+        *entry = *entry && ok;
+    }
+    met.into_iter()
+        .filter(|(_, ok)| *ok)
+        .map(|(k, _)| k)
+        .collect()
 }
 
 /// Judge the reports against `pass_bar` (the category's current bar, so raising the bar

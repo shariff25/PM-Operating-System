@@ -1,16 +1,27 @@
-# PM OS on the DGX Spark: every service in one stack (docs/runbooks/install.md).
+# PM OS on one host: every service in one stack (docs/runbooks/install.md).
 #
 #   deploy/pmos-admin up              core services (Postgres, docs, tool server, gateway, bots, Slack)
 #   deploy/pmos-admin up --models     plus the two vLLM model servers on the GPU
 #   deploy/pmos-admin up --console    plus the console
+#   deploy/pmos-admin up --web        plus the web app (OFF by default; needs Entra sign-in, or
+#                                     development sign-in on a closed test network only:
+#                                     docs/web-app-running.md)
 #
 # Settings come from deploy/.env (made by deploy/setup.sh, never committed). The live-mode
 # settings for Atlassian, Slack OAuth and GitHub come from deploy/live.env.
 #
 # Network: the services talk on the `pmos` network under their *.pmos.internal names, the same
-# names the bots' OpenShell sandbox policies allow. Ports are published on 127.0.0.1 only: the
-# sandboxes reach the tool server, gateway and runtime there (see /etc/hosts in the install
-# runbook), and the OAuth callback reaches the tool server through the reverse proxy.
+# names the bots' OpenShell sandbox policies allow. Ports are published on 127.0.0.1 only, for
+# deploy/pmos-admin and the reverse proxy (the OAuth callback reaches the tool server through it).
+# The sandboxes reach the tool server, gateway and runtime at their own fixed addresses on the
+# `pmos` network instead (slice H2; docs/openshell-any-host-spec.md §3.3): 10.201.77.10, .11
+# and .12 (`ipv4_address` below; the two model servers have .13 and .14), which the host's
+# names resolve to through the block `sudo deploy/pmos-admin host-names apply` writes in
+# /etc/hosts. Loopback is never an allowed destination for a sandbox. These addresses are
+# reviewed code, not settings: deploy/pmos-admin holds the same literals (scripts/
+# test-pmos-admin.sh checks they are equal), and changing them is a code change under POL-2
+# review. Verify on a real host (the acceptance run): that a sandbox resolves the names through
+# the host's /etc/hosts and reaches these addresses.
 
 name: pmos
 
@@ -20,13 +31,16 @@ x-service: &service
   stop_grace_period: 30s
   init: true
   networks: [pmos]
+  # The content checkout's owner; never root (pmos-admin and setup.sh refuse a uid or gid of 0).
+  # Compose itself does not: a direct `docker compose up` accepts PMOS_UID=0 or a name, so
+  # deploy/pmos-admin is the gate. Start the stack with it (docs/runbooks/install.md, "Service uid").
   user: "${PMOS_UID:-10001}:${PMOS_GID:-10001}"
   logging:
     driver: json-file
     options: { max-size: "20m", max-file: "5" }
 
 x-proxy: &proxy
-  # The Spark's outbound proxy, if it has one. Internal names never go through it.
+  # This host's outbound proxy, if it has one. Internal names never go through it.
   HTTPS_PROXY: ${HTTPS_PROXY:-}
   NO_PROXY: localhost,127.0.0.1,.pmos.internal,postgres,vllm-default,vllm-extraction,${NO_PROXY:-}
 
@@ -80,8 +94,9 @@ services:
     <<: *service
     command: ["pmos-toolserver"]
     networks:
-      pmos: { aliases: [toolserver.pmos.internal] }
-    ports: ["127.0.0.1:8710:8710"]
+      # Pinned (slice H2): a reviewed literal, never a setting.
+      pmos: { aliases: [toolserver.pmos.internal], ipv4_address: 10.201.77.10 }
+    ports: ["127.0.0.1:${PMOS_TOOLSERVER_PORT:-8710}:8710"]
     env_file:
       - path: ./live.env
         required: false
@@ -89,17 +104,53 @@ services:
       <<: *proxy
       PMOS_BIND: 0.0.0.0:8710
       PMOS_CONNECTORS: ${PMOS_CONNECTORS:-fake}
+      # Where prompts go (docs/openshell-any-host-spec.md §3.1, §3.6; slice H4): required, no
+      # default, so Compose itself fails without it. Under hosted-test (fake data only) the tool
+      # server refuses live connectors, GitHub memory, content that isn't test content and a
+      # database that has held real data, however the stack is started. Every session open and
+      # tool call checks that the gateway serves this source.
+      PMOS_MODEL_SOURCE: ${PMOS_MODEL_SOURCE:?run deploy/setup.sh first}
+      PMOS_GATEWAY_URL: http://gateway.pmos.internal:8740/v1
       PMOS_DATABASE_URL: postgresql://pmos_toolserver:${PMOS_DB_TOOLSERVER_PASSWORD}@postgres/pmos_toolserver
       PMOS_SERVICE_TOKEN: ${PMOS_SERVICE_TOKEN:?}
       PMOS_BOT_TOKEN: ${PMOS_BOT_TOKEN:?}
-      # The console's read-only token: it may read approvals and nothing else.
+      # The web app's own token: the approvals routes and the read-only admin routes. Optional:
+      # blank, the tool server has no web client.
+      PMOS_WEB_TOKEN: ${PMOS_TS_WEB_TOKEN:-}
+      # The console's read-only token: it may read approvals and nothing else. Optional.
       PMOS_CONSOLE_TS_TOKEN: ${PMOS_CONSOLE_TS_TOKEN:-}
+      # User assertions from the web app and the console (docs/user-assertion.md). With either
+      # token above set, the tool server runs in `require` (blank means that) and refuses to
+      # start in `off` or `verify`. The development override (PMOS_ASSERTION_INSECURE_OFF) is
+      # deliberately not passed here: it is for fake-data development stacks only, and the
+      # service refuses it with live connectors or a database anyway.
+      # Each set token needs its key; a key is passed only when it is set.
+      PMOS_ASSERTION_MODE: ${PMOS_ASSERTION_MODE:-}
+      PMOS_ASSERTION_KEYS: "${PMOS_AK_WEB_TOOLSERVER:+web:toolserver:${PMOS_AK_WEB_TOOLSERVER},}${PMOS_AK_CONSOLE_TOOLSERVER:+console:toolserver:${PMOS_AK_CONSOLE_TOOLSERVER}}"
+      # The first Microsoft sign-in (docs/entra-sign-in.md): the tool server validates the ID
+      # token the web app forwards itself, for the same tenant and application as the web app,
+      # so it gets the web app's settings (never the client secret, which it doesn't need). It
+      # fetches the tenant's keys from Microsoft through the proxy above. Blank: a first link
+      # answers 501 and the web app's /readyz reports `entra_link: down`.
+      PMOS_ENTRA_TENANT_ID: ${PMOS_WEB_ENTRA_TENANT_ID:-}
+      PMOS_ENTRA_CLIENT_ID: ${PMOS_WEB_ENTRA_CLIENT_ID:-}
+      PMOS_ENTRA_AUTHORITY: ${PMOS_WEB_ENTRA_AUTHORITY:-}
       PMOS_VAULT_KEY: ${PMOS_VAULT_KEY:?}
       PMOS_CONTENT_ROOT: /srv/content-repo/content
       PMOS_AUDIT_LOG: /var/lib/pmos/audit/audit.jsonl
       PMOS_DOCS_URL: http://docs.pmos.internal:8730/mcp
       PMOS_DOCS_TOKEN: ${PMOS_DOCS_TOKEN}
       PMOS_LEDGER_EXPIRE_DAYS: ${PMOS_LEDGER_EXPIRE_DAYS:-7}
+      PMOS_LEDGER_FAST_APPROVAL_SECONDS: ${PMOS_LEDGER_FAST_APPROVAL_SECONDS:-5}
+      # Audit events older than this are deleted daily (docs/audit-retention.md). 90 or more;
+      # the tool server refuses to start with less.
+      PMOS_AUDIT_RETENTION_DAYS: ${PMOS_AUDIT_RETENTION_DAYS:-90}
+      # Deactivations the web app and Slack may make in an hour (1 to 10); past it, host only.
+      PMOS_USERS_DEACTIVATIONS_PER_HOUR: ${PMOS_USERS_DEACTIVATIONS_PER_HOUR:-3}
+      # The sandbox-audit collector's own token (docs/openshell-prover-and-sandbox-audit-spec.md
+      # §B.2): it may append sandbox decisions and nothing else. Blank (the default): off, its
+      # routes answer 404. `deploy/pmos-admin sandbox-audit configure` sets it.
+      PMOS_SANDBOX_AUDIT_TOKEN: ${PMOS_SANDBOX_AUDIT_TOKEN:-}
     volumes:
       # The content checkout: the tool server pulls it (content sync), the others read it.
       - ${PMOS_CONTENT_CHECKOUT:?}:/srv/content-repo
@@ -113,22 +164,79 @@ services:
       <<: *health
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8710/healthz"]
 
+  # One-off `pmos-toolserver users ...` commands (`pmos-admin users`). `docker compose run`
+  # starts a second container from a service's definition, and a second container can't take
+  # the tool server's pinned address while the first holds it ("Address already in use", CI at
+  # cf621b5). This copy has no pinned address and no alias: it gets one from the range like
+  # every other container, and nothing can reach it by the tool server's name.
+  toolserver-cli:
+    extends: { service: toolserver }
+    profiles: [cli]
+    restart: "no"
+    networks: !override [pmos]
+    ports: !reset []
+
+  # OpenShell's own record of each sandbox's decisions, into the audit log (profile
+  # `sandbox-audit`, off unless configured: docs/openshell-prover-and-sandbox-audit-spec.md
+  # Part B). A push receiver, not a reader: OpenShell's OTLP log export posts to it on the
+  # host's 127.0.0.1:8780 with the header token in the headers file below; it posts batches to
+  # the tool server with its own append-only token. Its own uid (10002, made in the image), no
+  # Docker socket, no OpenShell configuration, no `openshell` command, no pinned address, on no
+  # sandbox policy (a sandbox never reaches loopback). `deploy/pmos-admin sandbox-audit
+  # configure` makes both tokens and prints OpenShell's settings; `check` verifies them.
+  # Verify on a real host (slice B6): that OpenShell's supervisors reach 127.0.0.1:8780.
+  sandbox-audit:
+    <<: *service
+    command: ["pmos-sandbox-audit"]
+    profiles: [sandbox-audit]
+    user: "10002:${PMOS_GID:-10001}"
+    ports: ["127.0.0.1:${PMOS_SANDBOX_AUDIT_PORT:-8780}:8780"]
+    environment:
+      PMOS_SANDBOX_AUDIT_BIND: 0.0.0.0:8780
+      PMOS_SANDBOX_AUDIT_TOKEN: ${PMOS_SANDBOX_AUDIT_TOKEN:-}
+      PMOS_SANDBOX_AUDIT_OTLP_TOKEN_FILE: /run/pmos-sandbox-audit/otlp-ocsf.headers
+      PMOS_TOOLSERVER_URL: http://toolserver.pmos.internal:8710
+      PMOS_SANDBOX_AUDIT_SPOOL: /var/lib/pmos-sandbox-audit/spool
+      # The OpenShell version the record format was last verified on (deploy/openshell-prover.lock,
+      # OPENSHELL_FORMAT_VERIFIED): any other is reported once as "format unverified".
+      PMOS_SANDBOX_AUDIT_FORMAT_VERIFIED: ${PMOS_SANDBOX_AUDIT_FORMAT_VERIFIED:-}
+    volumes:
+      - ${PMOS_STATE_DIR:?}/secrets/otlp-ocsf.headers:/run/pmos-sandbox-audit/otlp-ocsf.headers:ro
+      - sandbox-audit-spool:/var/lib/pmos-sandbox-audit
+    depends_on:
+      toolserver: { condition: service_healthy }
+
   gateway:
     <<: *service
     command: ["pmos-gateway"]
     networks:
-      pmos: { aliases: [gateway.pmos.internal] }
-    ports: ["127.0.0.1:8740:8740"]
+      # Pinned (slice H2): a reviewed literal, never a setting.
+      pmos: { aliases: [gateway.pmos.internal], ipv4_address: 10.201.77.11 }
+    ports: ["127.0.0.1:${PMOS_GATEWAY_PORT:-8740}:8740"]
     environment:
+      # The host's outbound proxy, if it has one (slice H4), for hosted-test's endpoint; the
+      # model servers' names never go through it. Not PMOS_NETWORK_SUBNET or
+      # PMOS_NETWORK_IP_RANGE: the gateway accepts for each model server name only its own
+      # compiled address, never one derived from deploy/.env (spec §3.6).
+      <<: *proxy
       PMOS_GATEWAY_BIND: 0.0.0.0:8740
       PMOS_GATEWAY_CONFIG: /etc/pmos/gateway.yaml
-      PMOS_GATEWAY_TOKENS: runtime=${PMOS_GW_RUNTIME_TOKEN:?},evals=${PMOS_GW_EVALS_TOKEN:?},bot-docs=${PMOS_GW_DOCS_BOT_TOKEN:?},${PMOS_GW_BOT_TOKENS:-}
+      # Slice H4: `local` takes only a `class: production` config (deploy/gateway.yaml) and
+      # never CLOUD_TEST; hosted-test (compose.hosted-test.yaml, which pmos-admin adds) only a
+      # `class: test` one with CLOUD_TEST=1 and a label on every role.
+      PMOS_MODEL_SOURCE: ${PMOS_MODEL_SOURCE:?run deploy/setup.sh first}
+      PMOS_GATEWAY_CLOUD_TEST: ${PMOS_GATEWAY_CLOUD_TEST:-0}
+      PMOS_GATEWAY_REMOTE_KEY: ${PMOS_GATEWAY_REMOTE_KEY:-}
+      PMOS_GATEWAY_TOKENS: runtime=${PMOS_GW_RUNTIME_TOKEN:?},evals=${PMOS_GW_EVALS_TOKEN:?},bot-docs=${PMOS_GW_DOCS_BOT_TOKEN:?},${PMOS_GW_ADMIN_TOKEN:+admin=${PMOS_GW_ADMIN_TOKEN},}${PMOS_GW_BOT_TOKENS:-}
+      # Slice MP8: `pmos-admin route disable` writes here; read before every call.
+      PMOS_GATEWAY_ROUTE_CONTROL: /var/lib/pmos/route-control
       PMOS_GATEWAY_USAGE_LOG: /var/lib/pmos/usage/usage.jsonl
       # 1 until the model servers are up: answers with the stub model.
       PMOS_GATEWAY_STUB: ${PMOS_GATEWAY_STUB:-0}
     volumes:
       - ./gateway.yaml:/etc/pmos/gateway.yaml:ro
       - ${PMOS_STATE_DIR}/usage:/var/lib/pmos/usage
+      - ${PMOS_STATE_DIR}/route-control:/var/lib/pmos/route-control:ro
     healthcheck:
       <<: *health
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8740/healthz"]
@@ -137,17 +245,31 @@ services:
     <<: *service
     command: ["pmos-bots"]
     networks:
-      pmos: { aliases: [bots.pmos.internal] }
-    ports: ["127.0.0.1:8750:8750"]
+      # Pinned (slice H2): a reviewed literal, never a setting.
+      pmos: { aliases: [bots.pmos.internal], ipv4_address: 10.201.77.12 }
+    ports: ["127.0.0.1:${PMOS_BOTS_PORT:-8750}:8750"]
     environment:
       PMOS_BOTS_BIND: 0.0.0.0:8750
       PMOS_BOTS_DATABASE_URL: postgresql://pmos_bots:${PMOS_DB_BOTS_PASSWORD}@postgres/pmos_bots
-      PMOS_BOTS_TOKENS: slack=${PMOS_RT_SLACK_TOKEN:?},console=${PMOS_RT_CONSOLE_TOKEN:?},evals=${PMOS_RT_EVALS_TOKEN:?},worker-docs=${PMOS_RT_DOCS_WORKER_TOKEN:?},${PMOS_RT_WORKER_TOKENS:-}
+      # Slice H4: nothing is claimed while the gateway serves another source; PMOS_CONNECTORS
+      # only for the database's held_real_data marker.
+      PMOS_MODEL_SOURCE: ${PMOS_MODEL_SOURCE:?run deploy/setup.sh first}
+      PMOS_CONNECTORS: ${PMOS_CONNECTORS:-fake}
+      # docs/model-providers-spec.md §4.10: a benchmarked bot answered by a fallback model is
+      # marked (mark, the default) or pinned to the primary (refuse).
+      PMOS_FALLBACK_FOR_BENCHMARKED: ${PMOS_FALLBACK_FOR_BENCHMARKED:-mark}
+      # The console's and the web app's tokens are listed only when set.
+      PMOS_BOTS_TOKENS: "slack=${PMOS_RT_SLACK_TOKEN:?},${PMOS_RT_CONSOLE_TOKEN:+console=${PMOS_RT_CONSOLE_TOKEN},}${PMOS_RT_WEB_TOKEN:+web=${PMOS_RT_WEB_TOKEN},}evals=${PMOS_RT_EVALS_TOKEN:?},worker-docs=${PMOS_RT_DOCS_WORKER_TOKEN:?},${PMOS_RT_WORKER_TOKENS:-}"
       PMOS_CONTENT_ROOT: /srv/content-repo/content
       PMOS_TOOLSERVER_URL: http://toolserver.pmos.internal:8710
       PMOS_SERVICE_TOKEN: ${PMOS_SERVICE_TOKEN}
       PMOS_GATEWAY_URL: http://gateway.pmos.internal:8740/v1
       PMOS_GATEWAY_TOKEN: ${PMOS_GW_RUNTIME_TOKEN}
+      # User assertions from the web app and the console (docs/user-assertion.md), as for the
+      # tool server: `require` whenever either is in PMOS_BOTS_TOKENS. No development override
+      # here either (PMOS_ASSERTION_INSECURE_OFF is never passed in production).
+      PMOS_ASSERTION_MODE: ${PMOS_ASSERTION_MODE:-}
+      PMOS_ASSERTION_KEYS: "${PMOS_AK_WEB_BOTS:+web:bots:${PMOS_AK_WEB_BOTS},}${PMOS_AK_CONSOLE_BOTS:+console:bots:${PMOS_AK_CONSOLE_BOTS}}"
       # The handles the evals client may request tasks as (empty: `evals`).
       PMOS_EVALS_AS: ${PMOS_EVALS_AS:-}
     volumes:
@@ -167,6 +289,8 @@ services:
       <<: *proxy
       PMOS_SLACK_APP_TOKEN: ${PMOS_SLACK_APP_TOKEN:-}
       PMOS_SLACK_BOT_TOKEN: ${PMOS_SLACK_BOT_TOKEN:-}
+      # Slice H4: under hosted-test pmos-slack refuses to start with Slack tokens set.
+      PMOS_MODEL_SOURCE: ${PMOS_MODEL_SOURCE:?run deploy/setup.sh first}
       PMOS_TOOLSERVER_URL: http://toolserver.pmos.internal:8710
       PMOS_BOT_TOKEN: ${PMOS_BOT_TOKEN}
       PMOS_BOTS_URL: http://bots.pmos.internal:8750
@@ -175,10 +299,19 @@ services:
       PMOS_SLACK_STATE_DIR: /var/lib/pmos/slack
       PMOS_DEFAULT_TZ: ${PMOS_DEFAULT_TZ:-America/Los_Angeles}
       PMOS_GITHUB_ORG: ${PMOS_GITHUB_ORG:-}
+      # The first-time flow and the nudges (deploy/env.example): on unless set to 0.
+      PMOS_ONBOARDING_V2: ${PMOS_ONBOARDING_V2:-1}
+      PMOS_NUDGES: ${PMOS_NUDGES:-1}
+      PMOS_NUDGES_HOURS: ${PMOS_NUDGES_HOURS:-}
       # The daily triage digest to each bot's quality owner (docs/runbooks/quality.md).
       PMOS_TRIAGE_AT: ${PMOS_TRIAGE_AT:-09:00}
       PMOS_TRIAGE_MIN_EDIT: ${PMOS_TRIAGE_MIN_EDIT:-0.3}
       PMOS_CONSOLE_PUBLIC_URL: ${PMOS_CONSOLE_PUBLIC_URL:-}
+      # The web app's https:// address, for the "Open in workspace" button. Blank: no button.
+      PMOS_WEB_PUBLIC_URL: ${PMOS_WEB_PUBLIC_URL:-}
+      # Each daily brief also goes to the web app's home page; blank URL: off.
+      PMOS_WEB_URL: ${PMOS_WEB_BRIEF_URL:-}
+      PMOS_WEB_BRIEF_TOKEN: ${PMOS_WEB_BRIEF_TOKEN:-}
     volumes:
       - ${PMOS_CONTENT_CHECKOUT}:/srv/content-repo:ro
       - ${PMOS_STATE_DIR}/slack:/var/lib/pmos/slack
@@ -187,33 +320,152 @@ services:
       bots: { condition: service_healthy }
     profiles: [slack]
 
+  # The console (profile `console`). It holds its own tool server token (the approvals routes
+  # only), a runtime token that reads everything, and the keys that sign its user assertions,
+  # and it believes X-Forwarded-User. So:
+  # - The port is published on the host's 127.0.0.1 only; the reverse proxy on the host reaches
+  #   it there. Never publish it on another address.
+  # - It still listens on 0.0.0.0 inside its container (published ports need that), so every
+  #   container on the shared `pmos` network can reach console:8760, including the bring-up
+  #   worker. That is why the user header counts only with PMOS_CONSOLE_PROXY_SECRET in
+  #   X-Pmos-Proxy-Secret, and why PMOS_CONSOLE_DEV_USER is refused here (it needs a loopback
+  #   bind). Fully separating it would take its own network shared only with `bots` and
+  #   `toolserver` (docs/console.md, "What this does not fix").
   console:
     <<: *service
     command: ["pmos-console"]
-    ports: ["127.0.0.1:8760:8760"]
+    ports: ["127.0.0.1:${PMOS_CONSOLE_PORT:-8760}:8760"]
     environment:
       PMOS_CONSOLE_BIND: 0.0.0.0:8760
       PMOS_BOTS_URL: http://bots.pmos.internal:8750
-      PMOS_BOTS_TOKEN: ${PMOS_RT_CONSOLE_TOKEN}
+      PMOS_BOTS_TOKEN: ${PMOS_RT_CONSOLE_TOKEN:-}
       PMOS_TOOLSERVER_URL: http://toolserver.pmos.internal:8710
       # Its own read-only tool-server token, never the service token.
       PMOS_TOOLSERVER_TOKEN: ${PMOS_CONSOLE_TS_TOKEN:-}
-      PMOS_CONTENT_ROOT: /srv/content-repo/content
+      PMOS_ASSERTION_KEYS: console:bots:${PMOS_AK_CONSOLE_BOTS:-},console:toolserver:${PMOS_AK_CONSOLE_TOOLSERVER:-}
+      # Who may use the console comes from the user database, through the tool server's
+      # `resolve` route with PMOS_TOOLSERVER_TOKEN; the console reads no content.
       PMOS_CONSOLE_AUDIT_LOG: /var/lib/pmos/audit/audit.jsonl
       PMOS_CONSOLE_TRUST_PROXY: ${PMOS_CONSOLE_TRUST_PROXY:-0}
+      # Required with TRUST_PROXY=1: the console refuses to start without it, naming it.
+      # deploy/setup.sh generates it; the reverse proxy sends it on every request.
       PMOS_CONSOLE_PROXY_SECRET: ${PMOS_CONSOLE_PROXY_SECRET:-}
       PMOS_CONSOLE_DEV_USER: ${PMOS_CONSOLE_DEV_USER:-}
       PMOS_CONSOLE_PUBLIC_URL: ${PMOS_CONSOLE_PUBLIC_URL:-}
       PMOS_CONSOLE_SLACK_URL: ${PMOS_CONSOLE_SLACK_URL:-}
     volumes:
-      - ${PMOS_CONTENT_CHECKOUT}:/srv/content-repo:ro
       - ${PMOS_STATE_DIR}/audit:/var/lib/pmos/audit:ro
     depends_on:
       bots: { condition: service_healthy }
+      toolserver: { condition: service_healthy }
     healthcheck:
       <<: *health
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8760/healthz"]
     profiles: [console]
+
+  # The web app (profile `web`), OFF by default. It signs people in with Entra ID when the
+  # PMOS_WEB_ENTRA_* settings and PMOS_WEB_PUBLIC_URL are all set (docs/entra-sign-in.md). Its
+  # other sign-in is DEVELOPMENT sign-in, where anyone who can reach the port signs in as any
+  # team member, behind the loudly named opt-in
+  # PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=1, for a closed test network only
+  # (docs/web-app-running.md). Either way it holds the keys that sign user assertions for any
+  # team member (docs/user-assertion.md, "What this does and does not fix"). The port is
+  # published on 127.0.0.1 only: reach it through the reverse proxy (TLS; the session cookie is
+  # Secure) and never expose it directly.
+  web:
+    <<: *service
+    command: ["pmos-web"]
+    networks:
+      pmos: { aliases: [web.pmos.internal] }
+    ports:
+      - "127.0.0.1:${PMOS_WEB_PORT:-8770}:8770"
+      # The admin door (slice H10, decision D3 (b)): /api/admin/* and the admin screens, on
+      # loopback (an SSH tunnel) or a private address (a TLS terminator on the VPN), never a
+      # public one: `pmos-admin up --web` and the host preflight (H-ADMIN, H-EXPOSURE) refuse
+      # anything else, and pmos-web answers 404 to any peer but the tunnel's or the trusted
+      # terminator's.
+      - "${PMOS_WEB_ADMIN_PUBLISH:-127.0.0.1}:8772:8772"
+    environment:
+      # Entra sign-in reaches login.microsoftonline.com through this host's proxy, if it has one.
+      <<: *proxy
+      PMOS_WEB_BIND: 0.0.0.0:8770
+      # The admin door's listener: fixed here, not a setting (pmos-web refuses to start without
+      # it, on every host). Its address and who may reach it are the settings below.
+      PMOS_WEB_ADMIN_BIND: 0.0.0.0:8772
+      # Its own origin: http://<deployment>.localhost:8772 (the tunnel mode) or https://<a
+      # private name> (the proxy mode, with PMOS_WEB_ADMIN_TRUSTED_PROXIES). Required.
+      PMOS_WEB_ADMIN_URL: ${PMOS_WEB_ADMIN_URL:-}
+      PMOS_WEB_ADMIN_TRUSTED_PROXIES: ${PMOS_WEB_ADMIN_TRUSTED_PROXIES:-}
+      # The tunnel mode's one peer: what a connection to the loopback publish arrives from, the
+      # pmos network's pinned gateway (below). Not read in the proxy mode.
+      PMOS_WEB_ADMIN_TUNNEL_PEER: ${PMOS_NETWORK_GATEWAY:-10.201.77.1}
+      PMOS_WEB_ADMIN_SESSION_IDLE_MINUTES: ${PMOS_WEB_ADMIN_SESSION_IDLE_MINUTES:-}
+      PMOS_WEB_ADMIN_SESSION_MAX_MINUTES: ${PMOS_WEB_ADMIN_SESSION_MAX_MINUTES:-}
+      # 1 only once <PMOS_WEB_ADMIN_URL>/api/auth/callback is a redirect URI of the Entra app
+      # registration; otherwise the admin door is password-only.
+      PMOS_WEB_ADMIN_ENTRA: ${PMOS_WEB_ADMIN_ENTRA:-0}
+      # Decision D2 (a): the networks password sign-in is served to (required on a public host
+      # with password sign-in; each no wider than a /16 or a /48).
+      PMOS_WEB_PASSWORD_CLIENTS: ${PMOS_WEB_PASSWORD_CLIENTS:-}
+      # The server-to-server route (PUT /internal/brief/{handle}, the daily brief from the Slack
+      # service) on its own listener, reached as http://web.pmos.internal:8771 on the `pmos`
+      # network only: no `ports:` entry publishes it, and the browser-facing listener above
+      # answers 404 for it. Fixed here, not a setting: blank would put the route back on 8770.
+      PMOS_WEB_INTERNAL_BIND: 0.0.0.0:8771
+      # Slice H4: required, no default. Since slice H10 pmos-web serves PMOS_EXPOSURE=public only
+      # as decisions D2 (a) and D3 (b) say, and under hosted-test shows the test-stack banner on
+      # every page.
+      PMOS_EXPOSURE: ${PMOS_EXPOSURE:?run deploy/setup.sh first}
+      PMOS_MODEL_SOURCE: ${PMOS_MODEL_SOURCE:?run deploy/setup.sh first}
+      PMOS_CONNECTORS: ${PMOS_CONNECTORS:-fake}
+      # pmos-web refuses to start with neither this at 1 nor Entra sign-in configured.
+      PMOS_WEB_DEV_LOGIN: ${PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY:-0}
+      # Entra ID sign-in (docs/entra-sign-in.md): on when the tenant, the client id, the secret
+      # and PMOS_WEB_PUBLIC_URL are all set; some but not all refuses to start. Blank: off.
+      PMOS_WEB_ENTRA_TENANT_ID: ${PMOS_WEB_ENTRA_TENANT_ID:-}
+      PMOS_WEB_ENTRA_CLIENT_ID: ${PMOS_WEB_ENTRA_CLIENT_ID:-}
+      PMOS_WEB_ENTRA_CLIENT_SECRET: ${PMOS_WEB_ENTRA_CLIENT_SECRET:-}
+      PMOS_WEB_ENTRA_AUTHORITY: ${PMOS_WEB_ENTRA_AUTHORITY:-}
+      # Password sign-in with a required authenticator code (docs/password-sign-in.md): 1 turns
+      # it on, beside Entra or alone; the tool server decides (it seals secrets with
+      # PMOS_VAULT_KEY). pmos-web refuses it unless assertions are `require`, so it gets the
+      # mode from deploy/.env. It also refuses it unless PMOS_WEB_TRUSTED_PROXIES names the
+      # address the reverse proxy reaches it from, so the per-address limit counts browsers, not
+      # the proxy: a proxy on this host comes in through the published port, from the `pmos`
+      # network's gateway (PMOS_NETWORK_GATEWAY, pinned below; `pmos-admin up --web` checks
+      # it), and PMOS_WEB_PUBLIC_URL must be https://. A forwarded header from any other peer
+      # is refused and counted on /readyz. PMOS_WEB_DIRECT is never passed: it is for a
+      # loopback bind with no proxy.
+      PMOS_WEB_PASSWORD_LOGIN: ${PMOS_WEB_PASSWORD_LOGIN:-0}
+      PMOS_WEB_TRUSTED_PROXIES: ${PMOS_WEB_TRUSTED_PROXIES:-}
+      PMOS_ASSERTION_MODE: ${PMOS_ASSERTION_MODE:-}
+      # Sessions, settings and follow-ups in Postgres: the kit's server, its own `pmos_web`
+      # database and role, which the operator creates (deploy/env.example). Blank: in memory,
+      # and a restart signs everyone out.
+      PMOS_WEB_DATABASE_URL: ${PMOS_WEB_DATABASE_URL:-}
+      PMOS_BOTS_URL: http://bots.pmos.internal:8750
+      PMOS_WEB_BOTS_TOKEN: ${PMOS_RT_WEB_TOKEN:-}
+      PMOS_TOOLSERVER_URL: http://toolserver.pmos.internal:8710
+      # Its own tool server token (the approvals routes only), not the service token.
+      PMOS_WEB_TOOLSERVER_TOKEN: ${PMOS_TS_WEB_TOKEN:-}
+      PMOS_ASSERTION_KEYS: web:bots:${PMOS_AK_WEB_BOTS:-},web:toolserver:${PMOS_AK_WEB_TOOLSERVER:-}
+      PMOS_CONTENT_ROOT: /srv/content-repo/content
+      # The built app, baked into the image (deploy/Dockerfile).
+      PMOS_WEB_STATIC_DIR: /usr/share/pmos/web
+      PMOS_WEB_PUBLIC_URL: ${PMOS_WEB_PUBLIC_URL:-}
+      # The daily brief panels, filled by the Slack service with the shared token.
+      PMOS_WEB_BRIEF: ${PMOS_WEB_BRIEF:-0}
+      PMOS_WEB_BRIEF_TOKEN: ${PMOS_WEB_BRIEF_TOKEN:-}
+    volumes:
+      - ${PMOS_CONTENT_CHECKOUT}:/srv/content-repo:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+      bots: { condition: service_healthy }
+      toolserver: { condition: service_healthy }
+    healthcheck:
+      <<: *health
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8770/healthz"]
+    profiles: [web]
 
   # Bring-up only (profile `bringup`): the Docs bot's worker as a plain container, to check the
   # stack end to end before OpenShell is installed. It is NOT isolated; real workers run in
@@ -221,6 +473,11 @@ services:
   worker-docs:
     image: pmos-worker:${PMOS_VERSION:-local}
     restart: unless-stopped
+    # As the checkout's owner, like the services, not the image's own `sandbox` (10100), which
+    # is for OpenShell: 10100 can read a checkout only where every file is world-readable, and
+    # a checkout made with umask 077 (mode 0700) isn't. The worker writes only under /tmp. Never
+    # root: pmos-admin and setup.sh refuse a PMOS_UID or PMOS_GID of 0 (a root-owned checkout).
+    user: "${PMOS_UID:-10001}:${PMOS_GID:-10001}"
     networks: [pmos]
     environment:
       PMOS_BOTS_URL: http://bots.pmos.internal:8750
@@ -236,12 +493,47 @@ services:
       bots: { condition: service_healthy }
     profiles: [bringup]
 
-  # The local models (verify on the Spark: image tag, model ids and memory split).
+  # Bring-up only, like worker-docs and just as NOT isolated (profile `bringup-personal`): one
+  # PM's personal bot (PMOS_BRINGUP_PERSONAL_BOT, such as pm-ana, after `pmos-admin add-bot`) as a
+  # plain container, so a host without OpenShell can try the web app's chat end to end with fake
+  # data. `pmos-admin up --bringup` starts it when the setting is there, and passes the bot's two
+  # tokens from deploy/.env (PMOS_RT_WORKER_TOKENS, PMOS_GW_BOT_TOKENS) through its environment.
+  worker-personal:
+    image: pmos-worker:${PMOS_VERSION:-local}
+    restart: unless-stopped
+    user: "${PMOS_UID:-10001}:${PMOS_GID:-10001}"
+    networks: [pmos]
+    environment:
+      PMOS_BOTS_URL: http://bots.pmos.internal:8750
+      PMOS_WORKER_BOT: ${PMOS_BRINGUP_PERSONAL_BOT:-}
+      PMOS_WORKER_TOKEN: ${PMOS_BRINGUP_PERSONAL_RT_TOKEN:-}
+      PMOS_GATEWAY_URL: http://gateway.pmos.internal:8740/v1
+      PMOS_GATEWAY_TOKEN: ${PMOS_BRINGUP_PERSONAL_GW_TOKEN:-}
+      PMOS_TOOLSERVER_MCP_URL: http://toolserver.pmos.internal:8710/mcp
+      PMOS_CONTENT_ROOT: /srv/content-repo/content
+    volumes:
+      - ${PMOS_CONTENT_CHECKOUT}:/srv/content-repo:ro
+    depends_on:
+      bots: { condition: service_healthy }
+    profiles: [bringup-personal]
+
+  # The local models, for PMOS_MODEL_SOURCE=local only (verify on a real host: image tag, model
+  # ids and memory split).
+  # PMOS_VLLM_IMAGE has no default (slice H4): the host's operator chooses the image for its
+  # architecture and GPU, pinned by tag. Blank, `--profile models` fails ("neither an image nor
+  # a build context"), so pmos-admin's every-profile commands (status, logs, restart, down)
+  # leave that profile out then; under PMOS_MODEL_SOURCE=local with the stub off, pmos-admin
+  # adds compose.local.yaml, which makes every `docker compose` call fail without it.
   vllm-default:
     &vllm
-    image: ${PMOS_VLLM_IMAGE:-nvcr.io/nvidia/vllm:25.10-py3}
+    image: ${PMOS_VLLM_IMAGE:-}
     restart: unless-stopped
-    networks: [pmos]
+    # deploy/gateway.yaml (`class: production`) names each model server
+    # `<service>.pmos.internal`, the only form a production gateway accepts (docs/gateway.md).
+    # Pinned (slice H2), so no other container can hold the address the gateway checks its
+    # name against (slice H4) after this one restarts.
+    networks:
+      pmos: { aliases: [vllm-default.pmos.internal], ipv4_address: 10.201.77.13 }
     ipc: host
     environment:
       HF_TOKEN: ${HF_TOKEN:-}
@@ -268,6 +560,8 @@ services:
 
   vllm-extraction:
     <<: *vllm
+    networks:
+      pmos: { aliases: [vllm-extraction.pmos.internal], ipv4_address: 10.201.77.14 }
     command:
       - vllm
       - serve
@@ -277,8 +571,35 @@ services:
       - --port=8000
 
 networks:
-  pmos: {}
+  # A fixed subnet and gateway (the re-check of eb24d28, M1), so the address the reverse proxy
+  # on this host reaches the web app from (the gateway) never moves when the network is made
+  # again, and PMOS_WEB_TRUSTED_PROXIES stays right. 10.201.77.0/24 is outside Docker's own
+  # default pools (172.17-172.31.0.0/16, 192.168.0.0/16), so Docker never gives it to another
+  # network. A site that already routes it can't simply set another subnet in deploy/.env since
+  # slice H2: the pinned addresses below must stay inside it, so that is a reviewed code change.
+  # `deploy/pmos-admin up --web` checks the real gateway against these and against
+  # PMOS_WEB_TRUSTED_PROXIES, and refuses on a mismatch.
+  #
+  # Slice H2 (docs/openshell-any-host-spec.md §3.3): the tool server, gateway and runtime, and the
+  # two model servers, have fixed addresses (.10 to .14), so the subnet must be a /24 or longer
+  # that holds them. Docker hands every other container (the eval stack's, a `docker run
+  # --network pmos_pmos`) an address from `ip_range` only (.128 to .254 by default), so none can
+  # take a pinned one; .2 to .127 are for pinned addresses (a reverse-proxy container pinned
+  # under PMOS_WEB_TRUST_PROXY_IN_NETWORK takes one outside .10 to .14). The bridge is named
+  # pmos0, so host firewall rules can match it by name however often the network is made again.
+  # `deploy/pmos-admin up` refuses settings that break any of this, and a network that exists
+  # with other settings (Compose doesn't change one that exists): down, then up, re-creates it.
+  pmos:
+    driver_opts:
+      com.docker.network.bridge.name: pmos0
+    ipam:
+      config:
+        - subnet: ${PMOS_NETWORK_SUBNET:-10.201.77.0/24}
+          gateway: ${PMOS_NETWORK_GATEWAY:-10.201.77.1}
+          ip_range: ${PMOS_NETWORK_IP_RANGE:-10.201.77.128/25}
 
 volumes:
   pgdata: {}
   hf-cache: {}
+  # The sandbox-audit collector's spool (64 MiB at most), owned by its uid in the image.
+  sandbox-audit-spool: {}

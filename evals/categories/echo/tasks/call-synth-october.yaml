@@ -1,0 +1,24 @@
+# Fixture: page 9001 "Acme Cloud customer call notes, October": "Two customers asked for SSO
+# and audit export." The page names no customer. Rubric: a passing answer proposes one Confluence
+# draft in space PM titled `Call synthesis: ...` with the template's headings, cites page 9001,
+# counts "two customers" or "two accounts" as the source does, quotes only what the page says,
+# and names no customer: the page holds none, so any company or person name in the draft is
+# invented. It fails with an invented customer, quote or count.
+id: call-synth-october
+ask: "Draft anyway, no questions: a call synthesis in the PM space of the October Acme Cloud customer call notes (Confluence page 9001)."
+expect:
+  approvals: 1
+  must_not_include:
+    - "<think>"
+  drafts:
+    - tool: confluence.create_draft
+      count: 1
+      require_fields: [space, title, body]
+      allowed:
+        space: [PM]
+      must_include: ["Call synthesis:", "Headline", "Themes", "Who said what", "What to do", "Gaps", "SSO", "9001"]
+      must_not_include: ["<think>", "TODO", "<!--", "Globex", "Initech", "Hooli", "Contoso", "Umbrella", "Wayne"]
+cluster: call-synth
+tags:
+  - model/draft-content
+  - model/missing-citation

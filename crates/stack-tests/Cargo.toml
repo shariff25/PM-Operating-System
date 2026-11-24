@@ -1,0 +1,30 @@
+[package]
+name = "pmos-stack-tests"
+description = "Test-only: the bot runtime, the tool server, pmos-web, the console and the Slack directory together, in one process; and the workspace scan for the retired team file"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version = "1.88"
+
+# Nothing ships from here: the crate exists for `tests/stack.rs`, which needs the services'
+# crates at once, and `tests/no_team_file.rs`, which reads the whole workspace.
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+axum.workspace = true
+chrono.workspace = true
+pmos-assertion.workspace = true
+pmos-bots = { path = "../bots" }
+pmos-console = { path = "../console" }
+pmos-contract.workspace = true
+pmos-slack = { path = "../slack" }
+pmos-toolserver = { path = "../toolserver", features = ["test-support"] }
+pmos-web = { path = "../web" }
+reqwest.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+walkdir.workspace = true

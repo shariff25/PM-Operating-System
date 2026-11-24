@@ -70,7 +70,7 @@ pub const RULES: &[(&str, Tag, &str)] = &[
     ("policy-error", Tag::Policy, "the task failed with an error naming a policy refusal: `policy`, `denied`, `forbidden`, `not permitted` or `403`"),
     ("never-claimed", Tag::Harness, "timed out while still `queued`: no worker picked it up"),
     ("cancelled", Tag::Harness, "the task was cancelled; nothing in a benchmark cancels tasks"),
-    ("interrupted", Tag::Harness, "the task failed with an error naming the runtime or worker: `interrupted`, `restart`, `lease`, `heartbeat`, `worker`, `sandbox` or `gateway` (the model endpoint itself unreachable)"),
+    ("interrupted", Tag::Harness, "the task failed with an error naming the runtime or worker: `interrupted`, `restart`, `lease`, `heartbeat`, `worker`, `sandbox` or `gateway` (the model endpoint itself unreachable), or `model is busy` (it answered 429 or 503 after the gateway's retries), each at the start of a word"),
     ("silent-timeout", Tag::Harness, "timed out while `working` with no events: the worker never reported progress"),
     ("done-without-answer", Tag::Harness, "the task ended `done` with an empty result"),
     ("drafts-unreadable", Tag::Harness, "the task has `drafts` checks and its drafts couldn't be read"),
@@ -149,6 +149,10 @@ const HARNESS_WORDS: &[&str] = &[
     "worker",
     "sandbox",
     "gateway",
+    // The harness's own words for a model server that answered 429 or 503 after the
+    // gateway's retries (`pmReason` in harness/src/worker.ts): the endpoint, not the bot.
+    "model is busy",
+    "model is still busy",
 ];
 const MEMORY_WORDS: &[&str] = &[
     "memory",
@@ -176,8 +180,18 @@ fn tagged(id: &str, reason: impl Into<String>) -> Tagged {
     }
 }
 
+/// The first of `words` that `text` mentions at the start of a word: `restart` matches
+/// "restarts", but `lease` doesn't match "please" (the harness's "Please try again" once
+/// tagged every model-busy failure as a lost lease) and `403` doesn't match "14033".
 fn mentions<'a>(text: &str, words: &[&'a str]) -> Option<&'a str> {
-    words.iter().copied().find(|w| text.contains(w))
+    words.iter().copied().find(|w| {
+        text.match_indices(w).any(|(i, _)| {
+            !text[..i]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_alphanumeric)
+        })
+    })
 }
 
 /// The tool a trace entry names, from `tool` or `name` in its body.

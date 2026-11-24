@@ -13,7 +13,11 @@
 #   docs site instead, set PMOS_EVAL_DOCS_URL=http://docs.pmos.internal:8730/mcp in
 #   deploy/.env: the tool server then reads the main stack's docs index (read-only).
 # - **Shared models.** It shares only the main stack's gateway (the models, under the `evals`
-#   client's token), over the main stack's network.
+#   client's token), over the main stack's network. deploy/gateway.yaml caps that token at one
+#   call in flight, at `personal` priority, and ignores the X-Pmos-User its workers send, so a
+#   benchmark never holds more than one of production's slots (review finding N4). A run
+#   therefore goes one model call at a time; the runner also asks the gateway which models it
+#   serves (GET /v1/pmos/roles), which the report records (docs/evals.md, "Which runs count").
 #
 # pmos-admin starts it with fresh tokens for every run and removes it afterwards; everything is
 # in memory. The workers here are plain containers, not OpenShell sandboxes: acceptable only
@@ -30,6 +34,11 @@ x-service: &service
 x-worker: &worker
   image: pmos-worker:${PMOS_VERSION:-local}
   init: true
+  # As the content's owner (pmos-admin chowns the copy to PMOS_UID), like the services, not the
+  # image's `sandbox` (10100): the copy keeps the checkout's modes, which a umask of 077 makes
+  # unreadable to any other account. The worker writes only under /tmp. Never root: pmos-admin
+  # and setup.sh refuse a PMOS_UID or PMOS_GID of 0 (a root-owned checkout).
+  user: "${PMOS_UID:-10001}:${PMOS_GID:-10001}"
   networks: [evals, pmos]
   volumes:
     - ${PMOS_EVAL_CONTENT:?}:/srv/content:ro
@@ -43,17 +52,26 @@ services:
     environment:
       PMOS_DEV: "1"
       PMOS_CONNECTORS: fake
+      # The main stack's source, whose gateway this stack shares (slice H4): every session open
+      # and tool call checks the gateway still serves it.
+      PMOS_MODEL_SOURCE: ${PMOS_MODEL_SOURCE:?run deploy/setup.sh first}
+      PMOS_GATEWAY_URL: http://gateway.pmos.internal:8740/v1
       PMOS_BIND: 0.0.0.0:8710
       PMOS_ALLOWED_HOSTS: toolserver,localhost,127.0.0.1
       PMOS_SERVICE_TOKEN: ${PMOS_EVAL_SERVICE_TOKEN:?}
       PMOS_BOT_TOKEN: ${PMOS_EVAL_BOT_TOKEN:?}
       PMOS_CONTENT_ROOT: /srv/content
+      # The user database, in memory, seeded from the stack's seed file (evals, ben, cy and
+      # eval-admin; deploy/pmos-admin eval_stack_up), mounted beside the content, never in it:
+      # every service decides from this database (slice U7).
+      PMOS_USERS_SEED: /run/pmos-users.seed.yaml
       # Empty: the fake docs fixtures. Set PMOS_EVAL_DOCS_URL for your own docs index.
       PMOS_DOCS_URL: ${PMOS_EVAL_DOCS_URL:-}
       PMOS_DOCS_TOKEN: ${PMOS_DOCS_TOKEN:-}
       NO_PROXY: "*"
     volumes:
       - ${PMOS_EVAL_CONTENT}:/srv/content:ro
+      - ${PMOS_EVAL_USERS_SEED:?}:/run/pmos-users.seed.yaml:ro
     healthcheck: &health
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8710/healthz"]
       interval: 5s
@@ -65,8 +83,17 @@ services:
     command: ["pmos-bots"]
     environment:
       PMOS_DEV: "1"
+      PMOS_MODEL_SOURCE: ${PMOS_MODEL_SOURCE:?run deploy/setup.sh first}
+      PMOS_CONNECTORS: fake
       PMOS_BOTS_BIND: 0.0.0.0:8750
       PMOS_BOTS_TOKENS: evals=${PMOS_EVAL_RT_EVALS:?},console=${PMOS_EVAL_RT_CONSOLE:?},worker-docs=${PMOS_EVAL_RT_DOCS:?},worker-pm-evals=${PMOS_EVAL_RT_PERSONAL:?}
+      # The `console` token here is only the benchmark runner's trace reader (PMOS_EVALS_TRACE_TOKEN):
+      # no console runs, nothing names a real PM, and the stack holds fake data in memory with
+      # fresh tokens per run on its own network. So user assertions stay off, with the
+      # development override the runtime requires for that (docs/user-assertion.md, Modes).
+      # Never copy these two lines to deploy/compose.yaml.
+      PMOS_ASSERTION_MODE: "off"
+      PMOS_ASSERTION_INSECURE_OFF: "1"
       # The only handle the `evals` client may request tasks as: the benchmark member that
       # pmos-admin adds to this stack's content.
       PMOS_EVALS_AS: evals

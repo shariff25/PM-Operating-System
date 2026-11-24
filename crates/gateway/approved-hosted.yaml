@@ -1,0 +1,19 @@
+# Owner-approved hosted models (docs/openshell-any-host-spec.md §3.6). Reviewed under
+# CODEOWNERS, the owner the only code owner; compiled into pmos-gateway with include_str!.
+# Never a host name, a URL, a model id, a vendor's name or a key in this file: only names,
+# digests and the pull request number (r7, X1). At most one entry (V2).
+#
+# It ships EMPTY (slice H12): with no entry a gateway refuses PMOS_MODEL_SOURCE=hosted at start,
+# so nothing can send real data to a hosted model. The first entry is slice H13, the owner's:
+# it needs the owner's provider record (kept outside this repository), .github/owner-handle,
+# the owner-only lines in .github/CODEOWNERS and branch protection (spec §3.9, conditions 1
+# to 4). An entry's shape, for reference only:
+#
+# - name: owner-hosted              # lowercase letters, digits, inner hyphens; never a role label
+#   url_sha256: "<64 hex digits>"   # `pmos-admin hosted digest` < the URL (standard input)
+#   model_sha256: ["<64 hex digits>"]   # `pmos-admin hosted digest --model` < each model id
+#   record_sha256: "<64 hex digits>"    # `pmos-admin hosted digest --record <file>`
+#   pull: <n>                       # the pull request that adds this entry
+#   max_data_class: restricted      # optional ceiling; default restricted (all data, D1)
+#   tls_interception: refused       # or `allowed`, only with the owner's condition 5 of §3.9
+[]

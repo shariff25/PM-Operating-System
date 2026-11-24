@@ -14,6 +14,9 @@ fn line(id: &str, repeat: u32, passed: bool, cluster: Option<&str>) -> TaskRepor
         repeat,
         cluster: cluster.map(str::to_string),
         regression: false,
+        turns: Vec::new(),
+        failed_turn: None,
+        cancel: None,
         task_id: Some(format!("tsk_{id}_{repeat}")),
         status: Some("done".into()),
         passed,
@@ -49,9 +52,14 @@ fn report(date: &str, tasks: &[(&str, Option<&str>, &[bool])]) -> Report {
         requested_by: "ana".into(),
         gateway_workarounds: None,
         note: None,
+        gateway_models: None,
+        persona_version: None,
+        persona_hash: None,
         repeats,
         judges: vec![],
         judges_skipped: None,
+        isolation: None,
+        route: None,
         tasks: tasks
             .iter()
             .flat_map(|(id, c, runs)| {
@@ -348,6 +356,7 @@ fn judged(mut r: Report, task: &str, verdict: bool, blocking: bool) -> Report {
             name: "faithful".into(),
             verdict: Some(if l.id == task { verdict } else { true }),
             blocking,
+            unknown: false,
             error: None,
         }];
     }

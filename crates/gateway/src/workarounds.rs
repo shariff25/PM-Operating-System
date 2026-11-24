@@ -16,7 +16,8 @@ pub struct Workaround {
 pub const STRIP_THINK: Workaround = Workaround {
     id: "strip-think",
     what: "Moves a <think>…</think> block out of the answer into `reasoning_content`, so \
-           reasoning never reaches a PM's draft. Non-streaming replies only.",
+           reasoning never reaches a PM's draft. Works on whole answers: a streamed call to a \
+           role with it on is asked of the model server whole and replayed as a stream.",
     delete_when: "vLLM serves the model with a reasoning parser (`--reasoning-parser`), so \
                   answers arrive without <think> blocks, and the benchmark passes with \
                   PMOS_GATEWAY_WORKAROUNDS=off.",
@@ -26,6 +27,13 @@ pub const REGISTRY: &[Workaround] = &[STRIP_THINK];
 
 pub fn known(id: &str) -> bool {
     REGISTRY.iter().any(|w| w.id == id)
+}
+
+/// Whether a role's workarounds need the whole answer before they can apply (every one in the
+/// registry does). A streamed call to such a role is then asked of the model server as a whole
+/// answer and replayed to the caller as an event stream, so the workaround still applies.
+pub fn needs_whole_answer(enabled: &[String], all_on: bool) -> bool {
+    all_on && enabled.iter().any(|w| known(w))
 }
 
 /// Apply a role's workarounds to a chat completion. Returns the ids that changed something.
@@ -104,6 +112,14 @@ mod tests {
         assert!(apply(&[], true, &mut r).is_empty());
         assert!(apply(&on, false, &mut r).is_empty());
         assert_eq!(r["choices"][0]["message"]["content"], "<think>x</think>y");
+    }
+
+    #[test]
+    fn a_role_with_a_workaround_on_needs_whole_answers() {
+        let on = vec!["strip-think".to_string()];
+        assert!(needs_whole_answer(&on, true));
+        assert!(!needs_whole_answer(&on, false));
+        assert!(!needs_whole_answer(&[], true));
     }
 
     #[test]

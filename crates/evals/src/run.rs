@@ -1,6 +1,7 @@
 //! Running a category: create each task (each `repeats` times), follow it until it settles,
 //! read its drafts, grade it, ask the judges, and tag it.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,23 +9,106 @@ use chrono::{DateTime, NaiveDate, Utc};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-use crate::client::{status, Runtime, RuntimeTask, TraceEntry};
-use crate::grade::{draft_text, grade};
-use crate::judge::{Gateway, Judge, JudgeStatus, JudgeVerdict};
+use crate::client::{status, Runtime, RuntimeTask, TraceEntry, WORKER_STOPPED_EVENT};
+use crate::grade::{draft_text, grade, Check, Grade};
+use crate::isolate::Isolation;
+use crate::judge::{Gateway, Human, Judge, JudgeStatus, JudgeVerdict, Label, Reply};
 use crate::outcome::Outcome;
-use crate::report::{Report, TaskReport};
-use crate::spec::{resolve_bot, Category, EvalTask};
-use crate::tag::tag_failure;
+use crate::report::{Cancel, Report, TaskReport, TurnReport};
+use crate::spec::{resolve_bot, Category, EvalTask, Expect};
+use crate::tag::{tag_failure, Tagged};
 
 /// How to follow a task.
 #[derive(Debug, Clone)]
 pub struct Follow {
     pub poll: Duration,
     pub timeout: Duration,
+    /// After timing a task out and cancelling it, how long to wait for the runtime to say its
+    /// worker let it go ([`WORKER_STOPPED_EVENT`]) before going on: [`CANCEL_WAIT`] in a run.
+    pub cancel_wait: Duration,
 }
 
 /// Polls in a row that may fail before the task is given up on.
 const POLL_RETRIES: u32 = 3;
+
+/// How long a run waits for a cancelled task's worker to let it go: the harness worker
+/// heartbeats every 30 s and stops at the first heartbeat after the cancel, so 45 s covers one
+/// heartbeat with room to spare.
+pub const CANCEL_WAIT: Duration = Duration::from_secs(45);
+
+/// The event the runtime records for the runner's cancel ("cancelled by <who>").
+const CANCELLED_BY_RUNNER: &str = "cancelled by the benchmark runner";
+
+/// The longest the cancel call itself may take, so a runtime that doesn't answer can't hang
+/// the run.
+const CANCEL_CALL: Duration = Duration::from_secs(15);
+
+/// Cancel a task the runner timed out, then, if a worker had it (`last` wasn't `queued`), wait
+/// up to `follow.cancel_wait` for the runtime to say the worker let it go, so the next attempt
+/// on this lane starts on a free worker. Never fails and never waits past its bounds: a failed
+/// cancel or a silent worker is recorded, and the run goes on.
+async fn cancel_timed_out(rt: &Runtime, last: &RuntimeTask, follow: &Follow) -> Cancel {
+    let started = tokio::time::Instant::now();
+    let secs = |s: tokio::time::Instant| s.elapsed().as_secs_f64();
+    let error = match tokio::time::timeout(CANCEL_CALL, rt.cancel(&last.id)).await {
+        Ok(Ok(_)) => None,
+        // The task settled between the last poll and the cancel: nothing is left running.
+        Ok(Err(crate::client::ApiError::Status { status: 409, .. })) => {
+            Some("it had already finished".to_string())
+        }
+        Ok(Err(e)) => Some(e.to_string()),
+        Err(_) => Some(format!(
+            "the runtime didn't answer the cancel in {} s",
+            CANCEL_CALL.as_secs()
+        )),
+    };
+    if let Some(error) = error {
+        eprintln!("warning: task {}: couldn't cancel it: {error}", last.id);
+        return Cancel {
+            cancelled: false,
+            worker_stopped: None,
+            secs: secs(started),
+            error: Some(error),
+        };
+    }
+    if last.status == status::QUEUED {
+        return Cancel {
+            cancelled: true,
+            worker_stopped: None,
+            secs: secs(started),
+            error: None,
+        };
+    }
+    let until = started + follow.cancel_wait;
+    let stopped = loop {
+        if let Ok(events) = rt.events(&last.id).await {
+            if events
+                .iter()
+                .any(|e| e.text.as_deref() == Some(WORKER_STOPPED_EVENT))
+            {
+                break true;
+            }
+        }
+        let now = tokio::time::Instant::now();
+        if now >= until {
+            break false;
+        }
+        tokio::time::sleep(follow.poll.min(until - now)).await;
+    };
+    if !stopped {
+        eprintln!(
+            "warning: task {}: cancelled, but its worker hadn't stopped after {} s; going on",
+            last.id,
+            follow.cancel_wait.as_secs()
+        );
+    }
+    Cancel {
+        cancelled: true,
+        worker_stopped: Some(stopped),
+        secs: secs(started),
+        error: None,
+    }
+}
 
 /// Create a task (at `level`, when the category has one) and poll it until it settles or
 /// `follow.timeout` passes. Fills the events and the timings; the trace is read later, only
@@ -37,13 +121,54 @@ pub async fn follow_task(
     level: Option<&str>,
     follow: &Follow,
 ) -> Outcome {
-    let created = match rt.create_task(bot, requested_by, text, level).await {
+    let as_ = AskAs {
+        level,
+        persona: None,
+    };
+    follow_turn(rt, bot, requested_by, text, as_, None, follow).await
+}
+
+/// What a task is asked as: the category's `level` and `persona` (a marketplace bot,
+/// `docs/bot-marketplace-spec.md` §10), when it names them.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AskAs<'a> {
+    pub level: Option<&'a str>,
+    pub persona: Option<&'a str>,
+}
+
+/// [`follow_task`] for one turn of `conversation` (a thread's turns share one id).
+pub async fn follow_turn(
+    rt: &Runtime,
+    bot: &str,
+    requested_by: &str,
+    text: &str,
+    as_: AskAs<'_>,
+    conversation: Option<&str>,
+    follow: &Follow,
+) -> Outcome {
+    let created = match rt
+        .create_task_in(
+            bot,
+            requested_by,
+            text,
+            as_.level,
+            as_.persona,
+            conversation,
+        )
+        .await
+    {
         Ok(t) => t,
         Err(e) => {
-            return Outcome {
-                runtime_error: Some(e.to_string()),
-                ..Outcome::default()
+            let mut message = e.to_string();
+            if conversation.is_some() && message.contains("conversation") {
+                message.push_str(
+                    " (a thread needs the runtime to let client `evals` name a conversation; see docs/evals.md, Threads)",
+                );
             }
+            return Outcome {
+                runtime_error: Some(message),
+                ..Outcome::default()
+            };
         }
     };
     let started = tokio::time::Instant::now();
@@ -81,7 +206,22 @@ pub async fn follow_task(
             }
         }
     }
+    // Given up on: cancel it on the runtime, so its worker stops, and wait briefly for that
+    // before this lane's next attempt (`last` keeps the status seen before the timeout).
+    let cancel = if timed_out {
+        Some(cancel_timed_out(rt, &last, follow).await)
+    } else {
+        None
+    };
     let events = match rt.events(&last.id).await {
+        // The runner's own cancel left two events; tagging reads what the task did before it.
+        Ok(e) if cancel.is_some() => e
+            .into_iter()
+            .filter(|e| {
+                let t = e.text.as_deref().unwrap_or_default();
+                t != WORKER_STOPPED_EVENT && t != CANCELLED_BY_RUNNER
+            })
+            .collect(),
         Ok(e) => e,
         Err(e) => {
             eprintln!("warning: task {}: {e}; tagging without events", last.id);
@@ -112,6 +252,7 @@ pub async fn follow_task(
         drafts_error: None,
         queue_secs: claimed.map(secs),
         total_secs: (!timed_out).then(|| secs(last.updated_at)),
+        cancel,
     }
 }
 
@@ -121,6 +262,38 @@ pub struct JudgeRun {
     pub gateway: Gateway,
     /// Each judge that applies to the category, and whether it blocks.
     pub judges: Vec<(Judge, JudgeStatus)>,
+    /// Collects a labelling-pack line (label still empty) for every attempt a judge answered,
+    /// with what it saw and said (`--label-candidates`); `None`: nothing is kept.
+    pub labels: Option<LabelSink>,
+}
+
+/// Labelling-pack lines, by judge name, from one run.
+pub type LabelSink = Arc<std::sync::Mutex<Vec<(String, Label)>>>;
+
+/// What a labelling-pack line shows as the input: [`judge_input`], but with every Slack tool
+/// result left out, because labels are kept in the repository and hold no Slack text
+/// (`docs/evals.md`, LLM judges).
+pub fn judge_input_for_labels(ask: &str, trace: Option<&[TraceEntry]>) -> String {
+    let kept: Vec<TraceEntry> = trace
+        .unwrap_or_default()
+        .iter()
+        .filter(|e| {
+            let tool = e.body["tool"]
+                .as_str()
+                .or_else(|| e.body["name"].as_str())
+                .unwrap_or_default();
+            !(e.kind == "tool_result" && tool.starts_with("slack."))
+        })
+        .cloned()
+        .collect();
+    let dropped = trace.map_or(0, |t| t.len()) - kept.len();
+    let mut s = judge_input(ask, Some(&kept));
+    if dropped > 0 {
+        s.push_str(&format!(
+            "\n\n({dropped} Slack tool result(s) left out of this label: labels hold no Slack text.)"
+        ));
+    }
+    s
 }
 
 /// Options for [`run_category`].
@@ -141,6 +314,10 @@ pub struct RunOptions {
     pub judges: Option<JudgeRun>,
     /// Why judges that apply aren't asked, recorded in the report.
     pub judges_skipped: Option<String>,
+    /// A fresh tool server for every attempt, in lanes ([`crate::isolate`]). `None`: every
+    /// attempt goes to the one runtime given, and its tool server keeps what earlier attempts
+    /// left (their pending drafts too).
+    pub isolation: Option<Isolation>,
 }
 
 /// At most this much of each tool result, and of all of them, goes to a judge.
@@ -185,27 +362,90 @@ pub fn judge_output(outcome: &Outcome) -> String {
     s
 }
 
-async fn attempt(
+/// A conversation id no other attempt shares: the task, the run, the time and a counter. It
+/// fits the runtime's rule (1 to 128 of `A-Z a-z 0-9 . _ : -`; task ids are slugs of 64).
+pub fn conversation_id(task_id: &str, repeat: u32) -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("eval-{task_id}-r{repeat}-{nanos:x}-{n}")
+}
+
+/// One settled (or abandoned) request, graded, with the judges' verdicts.
+struct TurnResult {
+    outcome: Outcome,
+    grade: Grade,
+    verdicts: Vec<JudgeVerdict>,
+    trace_read: bool,
+}
+
+/// What one request is: where it goes and how it is graded.
+struct TurnRequest<'a> {
+    conversation: Option<&'a str>,
+    ask: &'a str,
+    /// `None`: the turn only has to settle.
+    expect: Option<&'a Expect>,
+    /// What the judges are shown as the request; `None`: they aren't asked.
+    judge_ask: Option<&'a str>,
+    /// Where a labelling-pack line comes from: `<task> run <n>`.
+    label_from: &'a str,
+}
+
+/// Run one request: follow it, read its drafts when `expect` checks them, grade it, read the
+/// trace for a failure, and ask the judges (when `judge_ask` says what they are shown).
+/// `expect: None` is a turn that only has to settle.
+async fn run_turn(
     rt: &Runtime,
     bot: &str,
     level: Option<&str>,
-    task: &EvalTask,
-    repeat: u32,
+    persona: Option<&str>,
+    req: TurnRequest<'_>,
     opts: &RunOptions,
-) -> TaskReport {
-    let mut outcome =
-        follow_task(rt, bot, &opts.requested_by, &task.ask, level, &opts.follow).await;
+) -> TurnResult {
+    let TurnRequest {
+        conversation,
+        ask,
+        expect,
+        judge_ask,
+        label_from,
+    } = req;
+    let mut outcome = follow_turn(
+        rt,
+        bot,
+        &opts.requested_by,
+        ask,
+        AskAs { level, persona },
+        conversation,
+        &opts.follow,
+    )
+    .await;
     let settled = outcome.runtime_error.is_none() && !outcome.timed_out;
-    let judging = opts.judges.as_ref().filter(|j| !j.judges.is_empty());
-    let wants_drafts =
-        !task.expect.drafts.is_empty() || (judging.is_some() && outcome.approvals > 0);
+    let judging = opts
+        .judges
+        .as_ref()
+        .filter(|j| judge_ask.is_some() && !j.judges.is_empty());
+    let wants_drafts = expect.is_some_and(|e| !e.drafts.is_empty())
+        || (judging.is_some() && outcome.approvals > 0);
     if let (true, true, Some(id)) = (settled, wants_drafts, outcome.task_id.clone()) {
         match rt.drafts(&id).await {
             Ok(d) => outcome.drafts = d,
             Err(e) => outcome.drafts_error = Some(e.to_string()),
         }
     }
-    let grade = grade(task, &outcome, &opts.decline_phrases);
+    let grade = match expect {
+        Some(expect) => {
+            let graded = EvalTask {
+                id: String::new(),
+                ask: ask.to_string(),
+                expect: expect.clone(),
+                ..EvalTask::default()
+            };
+            grade(&graded, &outcome, &opts.decline_phrases)
+        }
+        // A turn nobody grades fails only when it never settled.
+        None if !settled => grade(&EvalTask::default(), &outcome, &opts.decline_phrases),
+        None => Grade::default(),
+    };
     let answered = settled && !outcome.result_text().trim().is_empty();
     let mut trace_read = false;
     if !grade.passed() || (judging.is_some() && answered) {
@@ -220,57 +460,289 @@ async fn attempt(
         }
     }
     let mut verdicts = Vec::new();
-    if let (Some(j), true) = (judging, answered) {
-        let input = judge_input(&task.ask, outcome.trace.as_deref());
+    if let (Some(j), Some(judge_ask), true) = (judging, judge_ask, answered) {
+        let input = judge_input(judge_ask, outcome.trace.as_deref());
         let output = judge_output(&outcome);
         let has_sources = outcome
             .trace
             .as_deref()
             .is_some_and(|t| t.iter().any(|e| e.kind == "tool_result"));
         for (judge, status) in &j.judges {
-            let (verdict, error) = if judge.needs_sources && !has_sources {
+            let (reply, error) = if judge.needs_sources && !has_sources {
                 (
                     None,
                     Some("no tool results in the trace to judge against".to_string()),
                 )
             } else {
                 match j.gateway.ask(judge, &input, &output).await {
-                    Ok(Some(v)) => (Some(v), None),
-                    Ok(None) => (None, Some("the reply was neither yes nor no".to_string())),
+                    Ok(r @ (Reply::Yes | Reply::No)) => (Some(r), None),
+                    Ok(Reply::Unknown) => (
+                        Some(Reply::Unknown),
+                        Some("the judge said unknown: not enough to decide".to_string()),
+                    ),
+                    Ok(Reply::Unparsed) => (
+                        None,
+                        Some("the reply was neither yes, no nor unknown".to_string()),
+                    ),
                     Err(e) => (None, Some(e)),
                 }
             };
+            if let (Some(sink), Some(r)) = (&j.labels, reply) {
+                sink.lock().unwrap_or_else(|p| p.into_inner()).push((
+                    judge.name.clone(),
+                    Label {
+                        input: judge_input_for_labels(judge_ask, outcome.trace.as_deref()),
+                        output: output.clone(),
+                        label: Human::Pending,
+                        from: Some(label_from.to_string()),
+                        judge_said: Some(r.word().to_string()),
+                    },
+                ));
+            }
             verdicts.push(JudgeVerdict {
                 name: judge.name.clone(),
-                verdict,
+                verdict: reply.and_then(Reply::verdict),
                 blocking: status.blocking,
+                unknown: reply == Some(Reply::Unknown),
                 error,
             });
         }
     }
-    let tag = (!grade.passed()).then(|| tag_failure(&outcome, &grade));
+    TurnResult {
+        outcome,
+        grade,
+        verdicts,
+        trace_read,
+    }
+}
+
+async fn attempt(
+    rt: &Runtime,
+    bot: &str,
+    level: Option<&str>,
+    persona: Option<&str>,
+    task: &EvalTask,
+    repeat: u32,
+    opts: &RunOptions,
+) -> TaskReport {
+    if task.is_thread() {
+        return attempt_thread(rt, bot, level, persona, task, repeat, opts).await;
+    }
+    let from = format!("{} run {repeat}", task.id);
+    let req = TurnRequest {
+        conversation: None,
+        ask: &task.ask,
+        expect: Some(&task.expect),
+        judge_ask: Some(&task.ask),
+        label_from: &from,
+    };
+    let r = run_turn(rt, bot, level, persona, req, opts).await;
+    let tag = (!r.grade.passed()).then(|| tag_failure(&r.outcome, &r.grade));
     TaskReport {
         id: task.id.clone(),
         ask: task.ask.clone(),
         repeat,
         cluster: Some(task.cluster()),
         regression: task.regression,
-        task_id: outcome.task_id.clone(),
-        status: outcome.status.clone(),
-        passed: grade.passed(),
-        failures: grade.failures,
+        task_id: r.outcome.task_id.clone(),
+        status: r.outcome.status.clone(),
+        passed: r.grade.passed(),
+        failures: r.grade.failures,
         tag,
-        queue_secs: outcome.queue_secs,
-        total_secs: outcome.total_secs,
-        attempts: outcome.attempts,
+        queue_secs: r.outcome.queue_secs,
+        total_secs: r.outcome.total_secs,
+        attempts: r.outcome.attempts,
+        trace_read: r.trace_read,
+        judges: r.verdicts,
+        turns: Vec::new(),
+        failed_turn: None,
+        cancel: r.outcome.cancel,
+    }
+}
+
+/// What the judges see as the request of a thread's last turn: the turns before it, then it.
+fn thread_judge_ask(task: &EvalTask, upto: usize) -> String {
+    let mut s = String::new();
+    if upto > 0 {
+        s.push_str("The conversation so far (the assistant's earlier replies are not shown):\n");
+        for (i, t) in task.thread[..upto].iter().enumerate() {
+            s.push_str(&format!("{}. {}\n", i + 1, t.ask));
+        }
+        s.push_str("\nThe latest message: ");
+    }
+    s.push_str(&task.thread[upto].ask);
+    s
+}
+
+/// Run a thread: each turn is its own runtime task in one fresh conversation, started when the
+/// one before has settled. The thread passes only if every graded turn does. A turn that
+/// doesn't settle (a timeout, or the runtime failing) ends the thread there: the turns after
+/// it would be asked without their context, so they are recorded as not run.
+async fn attempt_thread(
+    rt: &Runtime,
+    bot: &str,
+    level: Option<&str>,
+    persona: Option<&str>,
+    task: &EvalTask,
+    repeat: u32,
+    opts: &RunOptions,
+) -> TaskReport {
+    let conversation = conversation_id(&task.id, repeat);
+    let last = task.thread.len() - 1;
+    let mut turns: Vec<TurnReport> = Vec::new();
+    let mut judges = Vec::new();
+    let mut first_failure: Option<(u32, Vec<crate::grade::Check>, Tagged)> = None;
+    let mut totals = (
+        None::<String>,
+        None::<String>,
+        0u32,
+        None::<f64>,
+        None::<f64>,
+    );
+    let mut trace_read = false;
+    let mut stopped = false;
+    let mut cancel = None;
+    for (i, turn) in task.thread.iter().enumerate() {
+        let n = i as u32 + 1;
+        if stopped {
+            turns.push(TurnReport {
+                turn: n,
+                ask: turn.ask.clone(),
+                graded: turn.expect.is_some(),
+                skipped: true,
+                passed: false,
+                task_id: None,
+                status: None,
+                failures: Vec::new(),
+                tag: None,
+                queue_secs: None,
+                total_secs: None,
+                cancel: None,
+            });
+            continue;
+        }
+        let judge_ask = (i == last).then(|| thread_judge_ask(task, last));
+        let from = format!("{} run {repeat}, turn {n}", task.id);
+        let req = TurnRequest {
+            conversation: Some(&conversation),
+            ask: &turn.ask,
+            expect: turn.expect.as_ref(),
+            judge_ask: judge_ask.as_deref(),
+            label_from: &from,
+        };
+        let r = run_turn(rt, bot, level, persona, req, opts).await;
+        let tag = (!r.grade.passed()).then(|| {
+            let mut t = tag_failure(&r.outcome, &r.grade);
+            t.reason = format!("turn {n} of {}: {}", task.thread.len(), t.reason);
+            t
+        });
+        if r.outcome.runtime_error.is_some() || r.outcome.timed_out {
+            stopped = true;
+        }
+        let first = tag.is_some() && first_failure.is_none();
+        if first {
+            trace_read = r.trace_read;
+            first_failure = Some((n, r.grade.failures.clone(), tag.clone().expect("a tag")));
+        }
+        // The thread's own task id, status and timings are those of its first failed turn,
+        // else of the latest turn, so a console link goes to what mattered.
+        if first_failure.is_none() || first {
+            totals = (
+                r.outcome.task_id.clone(),
+                r.outcome.status.clone(),
+                r.outcome.attempts,
+                r.outcome.queue_secs,
+                r.outcome.total_secs,
+            );
+        }
+        turns.push(TurnReport {
+            turn: n,
+            ask: turn.ask.clone(),
+            graded: turn.expect.is_some(),
+            skipped: false,
+            passed: r.grade.passed(),
+            task_id: r.outcome.task_id.clone(),
+            status: r.outcome.status.clone(),
+            failures: r.grade.failures,
+            tag,
+            queue_secs: r.outcome.queue_secs,
+            total_secs: r.outcome.total_secs,
+            cancel: r.outcome.cancel.clone(),
+        });
+        // A turn that timed out ends the thread; its cancel is the thread's.
+        if r.outcome.cancel.is_some() {
+            cancel = r.outcome.cancel;
+        }
+        judges = r.verdicts;
+    }
+    let passed = first_failure.is_none();
+    let (failed_turn, failures, tag) = match first_failure {
+        Some((n, f, t)) => (Some(n), f, Some(t)),
+        None => (None, Vec::new(), None),
+    };
+    TaskReport {
+        id: task.id.clone(),
+        ask: task.thread[0].ask.clone(),
+        repeat,
+        cluster: Some(task.cluster()),
+        regression: task.regression,
+        task_id: totals.0,
+        status: totals.1,
+        passed,
+        failures,
+        tag,
+        queue_secs: totals.3,
+        total_secs: totals.4,
+        attempts: totals.2,
         trace_read,
-        judges: verdicts,
+        judges,
+        turns,
+        failed_turn,
+        cancel,
+    }
+}
+
+/// The line for an attempt that never started because its lane couldn't get a fresh tool
+/// server: a harness failure (`harness/runtime-unreachable`), like a runtime that can't be
+/// reached, so it never counts as the bot's.
+fn not_started(task: &EvalTask, repeat: u32, error: String) -> TaskReport {
+    let outcome = Outcome {
+        runtime_error: Some(error.clone()),
+        ..Outcome::default()
+    };
+    let grade = Grade {
+        failures: vec![Check::Runtime { error }],
+    };
+    let tag = tag_failure(&outcome, &grade);
+    TaskReport {
+        id: task.id.clone(),
+        ask: task.first_ask().to_string(),
+        repeat,
+        cluster: Some(task.cluster()),
+        regression: task.regression,
+        task_id: None,
+        status: None,
+        passed: false,
+        failures: grade.failures,
+        tag: Some(tag),
+        queue_secs: None,
+        total_secs: None,
+        attempts: 0,
+        trace_read: false,
+        judges: Vec::new(),
+        turns: Vec::new(),
+        failed_turn: None,
+        cancel: None,
     }
 }
 
 /// Run every task of a category `opts.repeats` times (at most `concurrency` at once), grade
 /// and tag each attempt, and return the report. Lines are in the category's order, each
 /// task's repeats together.
+///
+/// With `opts.isolation`, each attempt instead takes a lane of its own, gets a fresh tool
+/// server there first, and runs on that lane's runtime (`rt` is not used); as many attempts
+/// run at once as there are lanes, and `concurrency` is not used.
 pub async fn run_category(
     rt: &Runtime,
     runtime_url: &str,
@@ -287,22 +759,58 @@ pub async fn run_category(
         .cloned()
         .collect();
     let limit = Arc::new(Semaphore::new(opts.concurrency.max(1)));
+    let lanes = opts.isolation.as_ref().map(|i| (i.clone(), i.pool()));
     let mut set = JoinSet::new();
     // The first run of every task goes first, so a short timeout still covers each task once.
     for repeat in 1..=repeats {
         for (i, task) in tasks.iter().cloned().enumerate() {
             let rt = rt.clone();
             let limit = limit.clone();
+            let lanes = lanes.clone();
             let bot = bot.clone();
             let level = category.level.clone();
+            let persona = category.persona.clone();
             let opts = opts.clone();
             set.spawn(async move {
-                let _permit = limit
-                    .acquire_owned()
-                    .await
-                    .expect("the semaphore is never closed");
-                let line = attempt(&rt, &bot, level.as_deref(), &task, repeat, &opts).await;
-                (i * repeats as usize + (repeat as usize - 1), line)
+                let slot = i * repeats as usize + (repeat as usize - 1);
+                let run_on = |rt: Runtime| {
+                    let (bot, level, persona, task, opts) = (&bot, &level, &persona, &task, &opts);
+                    async move {
+                        attempt(
+                            &rt,
+                            bot,
+                            level.as_deref(),
+                            persona.as_deref(),
+                            task,
+                            repeat,
+                            opts,
+                        )
+                        .await
+                    }
+                };
+                let line = match lanes {
+                    Some((isolation, pool)) => {
+                        // Held until the attempt is graded, so no other attempt shares the
+                        // lane's tool server.
+                        let lane = pool.take().await;
+                        match (isolation.fresh)(lane.n).await {
+                            Ok(()) => run_on(isolation.lanes[lane.n - 1].clone()).await,
+                            Err(e) => not_started(
+                                &task,
+                                repeat,
+                                format!("no fresh tool server for lane {}: {e}", lane.n),
+                            ),
+                        }
+                    }
+                    None => {
+                        let _permit = limit
+                            .acquire_owned()
+                            .await
+                            .expect("the semaphore is never closed");
+                        run_on(rt).await
+                    }
+                };
+                (slot, line)
             });
         }
     }
@@ -311,6 +819,10 @@ pub async fn run_category(
         let (i, line) = joined.expect("a task runner never panics");
         lines[i] = Some(line);
     }
+    let runtime_url = match &opts.isolation {
+        Some(i) => i.urls.join(", "),
+        None => runtime_url.to_string(),
+    };
     Report {
         category: category.name.clone(),
         bot,
@@ -318,17 +830,24 @@ pub async fn run_category(
         started_at,
         finished_at: Utc::now(),
         pass_bar: category.pass_bar,
-        runtime_url: runtime_url.to_string(),
+        runtime_url,
         requested_by: opts.requested_by.clone(),
         gateway_workarounds: opts.gateway_workarounds.clone(),
         note: opts.note.clone(),
+        // Filled in by the caller, which asks the gateway before and after the run.
+        gateway_models: None,
+        persona_version: None,
+        persona_hash: None,
         repeats,
+        isolation: opts.isolation.as_ref().map(Isolation::describe),
         judges: opts
             .judges
             .as_ref()
             .map(|j| j.judges.iter().map(|(_, s)| s.clone()).collect())
             .unwrap_or_default(),
         judges_skipped: opts.judges_skipped.clone(),
+        // Filled in by the caller, from every lane's runtime and the judges' gateway.
+        route: None,
         tasks: lines.into_iter().flatten().collect(),
     }
 }

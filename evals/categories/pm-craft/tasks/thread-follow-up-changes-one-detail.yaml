@@ -1,0 +1,37 @@
+# Thread. Fixture: epic PM-101 "SSO for the Acme Vault console" in project PM. Turn 1 drafts a
+# story under it. Turn 2 changes one detail (the issue type) and says to keep the rest, so the
+# new draft is a Task in PM, still under PM-101, still about SAML. It is not a new topic and
+# not a question.
+#
+# Needs the runtime to let client `evals` name a conversation and to carry history for eval
+# tasks (docs/evals.md, Threads); not `regression: true` until it does.
+id: thread-follow-up-changes-one-detail
+thread:
+  - ask: "Draft one Jira story in project PM, under the epic PM-101, for letting an admin require SAML SSO for every Acme Vault console login. Don't create anything else."
+    expect:
+      approvals: 1
+      drafts:
+        - tool: jira.create_issue
+          count: 1
+          allowed:
+            project: [PM]
+            issue_type: [Story]
+            epic: [PM-101]
+          must_include: ["SAML"]
+  - ask: "Same thing, but make it a Task, not a Story. Keep everything else as it is."
+    expect:
+      approvals: 1
+      must_not_include:
+        - "<think>"
+      drafts:
+        - tool: jira.create_issue
+          count: 1
+          require_fields: [project, issue_type, summary]
+          allowed:
+            project: [PM]
+            issue_type: [Task]
+            epic: [PM-101]
+          must_include: ["SAML"]
+cluster: thread
+tags:
+  - memory/lost-the-thread

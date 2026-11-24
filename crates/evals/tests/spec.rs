@@ -67,6 +67,46 @@ fn a_category_may_set_a_level() {
 }
 
 #[test]
+fn a_category_may_name_a_persona_on_the_personal_bot_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let task = || {
+        vec![(
+            "a-task",
+            "id: a-task\nask: \"One?\"\nexpect:\n  approvals: 0\n".to_string(),
+        )]
+    };
+    write_category(dir.path(), "cat", "personal", 0.8, &task());
+    let path = dir.path().join("categories/cat/category.yaml");
+    let base = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(load_category(dir.path(), "cat").unwrap().persona, None);
+    std::fs::write(&path, format!("{base}persona: chief\n")).unwrap();
+    assert_eq!(
+        load_category(dir.path(), "cat").unwrap().persona.as_deref(),
+        Some("chief")
+    );
+    // `nudge` is the personal bot's own generalist: no persona is sent.
+    std::fs::write(&path, format!("{base}persona: nudge\n")).unwrap();
+    assert_eq!(load_category(dir.path(), "cat").unwrap().persona, None);
+    std::fs::write(&path, format!("{base}persona: Chief!\n")).unwrap();
+    let errors = load_category(dir.path(), "cat").unwrap_err().0;
+    assert!(
+        errors.iter().any(|e| e.contains("is not a persona key")),
+        "{errors:#?}"
+    );
+    write_category(dir.path(), "team", "docs", 0.8, &task());
+    let path = dir.path().join("categories/team/category.yaml");
+    let base = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, format!("{base}persona: chief\n")).unwrap();
+    let errors = load_category(dir.path(), "team").unwrap_err().0;
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("`persona` needs `bot: personal`")),
+        "{errors:#?}"
+    );
+}
+
+#[test]
 fn every_problem_is_reported_with_its_file() {
     let dir = tempfile::tempdir().unwrap();
     write_category(dir.path(), "cat", "Docs Bot", 1.5, &[
@@ -206,14 +246,16 @@ fn docs_qa_is_a_template_on_the_fake_docs() {
     assert_eq!(c.bot, "docs");
     assert_eq!(c.repeats, 3);
     assert_eq!(
-        c.pass_bar, None,
-        "reports only until a team's own tasks are in"
+        c.pass_bar,
+        Some(0.8),
+        "a starting bar since 2026-11-16, to be tightened once a team's own tasks are in"
     );
     assert!(root.join("categories/docs-qa/README.md").is_file());
     let (declines, answerable): (Vec<_>, Vec<_>) =
         c.tasks.iter().partition(|t| t.expect.must_decline);
     assert_eq!(answerable.len(), 2);
-    assert_eq!(declines.len(), 2);
+    // Two the docs never hold, and one page that doesn't exist ("Blocked: say so").
+    assert_eq!(declines.len(), 3);
     for t in &declines {
         assert!(t.id.starts_with("decline-"), "{}", t.id);
         assert!(t.expect.must_cite.is_empty(), "{}", t.id);
@@ -318,7 +360,7 @@ fn the_seed_categories_are_ready_to_report() {
     for name in ["jira-draft", "confluence-draft", "slack-reply"] {
         let c = load_category(&root, name).unwrap();
         assert_eq!(c.bot, "personal", "{name}");
-        assert_eq!(c.pass_bar, None, "{name}");
+        assert_eq!(c.pass_bar, Some(0.8), "{name}: the starting bar");
         assert!(c.tasks.len() >= 3, "{name}: {} tasks", c.tasks.len());
         let header =
             std::fs::read_to_string(root.join("categories").join(name).join("category.yaml"))
@@ -468,7 +510,7 @@ fn judge_files_are_validated() {
 }
 
 #[test]
-fn affected_categories_follow_bot_role_and_skills() {
+fn a_role_skill_or_bot_change_runs_every_category() {
     let root = evals_root();
     let content = root.join("../content");
     let affected = |paths: &[&str]| {
@@ -478,31 +520,77 @@ fn affected_categories_follow_bot_role_and_skills() {
     let all = category_names(&root).unwrap();
     assert_eq!(affected(&["evals/categories/docs-qa/category.yaml"]), all);
     assert_eq!(affected(&["deploy/gateway.yaml"]), all);
-    assert_eq!(affected(&["content/skills/docs/SKILL.md"]), ["docs-qa"]);
+    // Any change to a role, a skill or a bot runs every category (owner, 2026-11-23): a change
+    // tuned for one bot can regress another, and skills are shared across personas. Before,
+    // the Docs bot's skill ran docs-qa alone, and pm-ana's BOT.md ran nothing.
+    for path in [
+        "content/skills/docs/SKILL.md",
+        "content/roles/docs-helper/ROLE.md",
+        "content/bots/docs/BOT.md",
+        "content/roles/pm-assistant/ROLE.md",
+        "./content/skills/prd-draft/SKILL.md",
+        "content/bots/pm-evals/BOT.md",
+        "content/bots/pm-ana/BOT.md",
+        "content/roles/chief-of-staff/ROLE.md",
+        "content/skills/funnel-diagnosis/SKILL.md",
+        // A new skill no role lists yet, and a file beside the skill folders.
+        "content/skills/asked/SKILL.md",
+        "content/skills/README.md",
+    ] {
+        assert_eq!(affected(&[path]), all, "{path}");
+    }
     assert_eq!(
-        affected(&["content/roles/docs-helper/ROLE.md"]),
-        ["docs-qa"]
+        affected(&["content/context/x.md", "content/bots/docs/BOT.md"]),
+        all
     );
-    assert_eq!(affected(&["content/bots/docs/BOT.md"]), ["docs-qa"]);
-    // Personal bots: pm-<requested_by>, made from pm-assistant and its skills.
-    let personal = [
-        "confluence-draft",
-        "jira-draft",
-        "pm-craft",
-        "principal-craft",
-        "slack-reply",
-        "staff-craft",
-    ];
-    assert_eq!(affected(&["content/roles/pm-assistant/ROLE.md"]), personal);
-    assert_eq!(affected(&["./content/skills/prd-draft/SKILL.md"]), personal);
-    assert_eq!(affected(&["content/bots/pm-evals/BOT.md"]), personal);
-    assert!(affected(&["content/bots/pm-ana/BOT.md"]).is_empty());
+    // Other paths keep their behaviour: nothing runs.
     assert!(affected(&[
         "README.md",
         "content/context/x.md",
-        "crates/evals/src/run.rs"
+        "content/templates/prd.md",
+        "content/playbooks/bar.md",
+        "content/tools.yaml",
+        "crates/evals/src/run.rs",
+        "deploy/pmos-admin",
     ])
     .is_empty());
-    // A skill directory's name must match whole: `ask` doesn't match `asked`.
-    assert!(affected(&["content/skills/asked/SKILL.md"]).is_empty());
+    // The prefix must match whole directories: `content/rolesx/` and `content/bots.md` aren't
+    // a role or a bot, and a path that only contains `content/skills/` isn't under it.
+    assert!(affected(&[
+        "content/rolesx/a.md",
+        "content/bots.md",
+        "docs/content/skills/x.md"
+    ])
+    .is_empty());
+    assert!(affected(&[]).is_empty());
+}
+
+/// Selecting every category for a content change still resolves each category's bot, role and
+/// skills, so a change that breaks them is an error, not a gate run on a broken bot.
+#[test]
+fn affected_refuses_a_category_whose_bot_does_not_resolve() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("evals");
+    let content = dir.path().join("content");
+    let tasks = root.join("categories/cat/tasks");
+    std::fs::create_dir_all(&tasks).unwrap();
+    std::fs::write(
+        root.join("categories/cat/category.yaml"),
+        "name: cat\nbot: nobody\ndescription: d\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tasks.join("t.yaml"),
+        "id: t\nask: \"q\"\nexpect:\n  approvals: 0\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(content.join("bots")).unwrap();
+    let run = |path: &str| {
+        pmos_evals::affected::affected(&root, &content, "content", "evals", &[path.to_string()])
+    };
+    let err = run("content/skills/x/SKILL.md").unwrap_err();
+    assert!(err.contains("no such bot"), "{err}");
+    // An evals change runs every category without resolving bots, as before.
+    assert_eq!(run("evals/config.yaml").unwrap(), ["cat"]);
+    assert!(run("content/context/x.md").unwrap().is_empty());
 }

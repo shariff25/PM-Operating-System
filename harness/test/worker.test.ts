@@ -7,13 +7,19 @@ import { milestoneFor } from "../src/progress.js";
 import { ClaimSchema } from "../src/runtime-client.js";
 import {
   type Logger,
+  MODEL_SOURCE_CHANGED,
+  MODEL_SOURCE_MISSING,
   type WorkerConfig,
   botSystemPrompt,
   createWorker,
+  finalAnswer,
   gatewayBaseUrl,
   pmReason,
+  taskMessages,
+  isAbortRejection,
 } from "../src/worker.js";
 import {
+  FAKE_DOCS_REF,
   type FakeMcp,
   type FakeRuntime,
   WORKER_TOKEN,
@@ -65,6 +71,7 @@ function claim(id: string, overrides: { priority?: string; text?: string } = {})
     tools: ["docs.search", "docs.read"],
     session_token: `sess-${id}`,
     lease_until: new Date(Date.now() + 120_000).toISOString(),
+    gateway: { model: "pmos/default", headers: { "X-Pmos-Model-Source": "local" } },
   };
 }
 
@@ -220,6 +227,26 @@ describe("harness worker", () => {
     expect(system).not.toContain("meeting-notes");
   });
 
+  it("shows the model each read's ref and passes source markers to the tool server as written", async () => {
+    const body = `Acme Vault needs port 4443 [[${FAKE_DOCS_REF}]].`;
+    const model = new ScriptedModel([
+      call("docs_search", { query: "vault ports" }),
+      call("confluence_create_draft", { space: "PM", title: "Ports", body }),
+      new AIMessage("A Confluence draft is waiting for your approval."),
+    ]);
+    const { runtime, mcp } = await setup({ claims: [claim("tsk_ref")], models: { tsk_ref: model } });
+    await waitFor(() => finished(runtime, "tsk_ref"));
+
+    // The read's result, as the model saw it on its next turn, carries the ref.
+    const seen = (model.prompts[1] ?? []).filter((m) => m.getType() === "tool");
+    expect(seen).toHaveLength(1);
+    expect(JSON.parse(String(seen[0]?.content)).ref).toBe(FAKE_DOCS_REF);
+    // The harness changes nothing in a write: the tool server keeps the marker for the PM's
+    // review and removes it when it writes.
+    const write = mcp.calls.find((c) => c.name === "confluence_create_draft");
+    expect(write?.args).toEqual({ space: "PM", title: "Ports", body });
+  });
+
   it("tells a team bot today's date from the worker's clock, and no level", async () => {
     const model = new ScriptedModel([new AIMessage("ok")]);
     const { runtime } = await setup({
@@ -289,8 +316,11 @@ describe("harness worker", () => {
       config: { heartbeatMs: 40 },
     });
     await waitFor(() => finished(runtime, "tsk_1"));
+    expect(runtime.forTask("tsk_1", "heartbeat").length).toBeGreaterThanOrEqual(3);
+    // The runtime sees the task finish before the worker's own call returns and clears its
+    // timer, so one beat can still be on its way. Let that settle, then nothing more may come.
+    await new Promise((r) => setTimeout(r, 120));
     const beats = runtime.forTask("tsk_1", "heartbeat").length;
-    expect(beats).toBeGreaterThanOrEqual(3);
     await new Promise((r) => setTimeout(r, 150));
     expect(runtime.forTask("tsk_1", "heartbeat").length).toBe(beats);
   });
@@ -371,8 +401,112 @@ describe("harness worker", () => {
     expect(request?.headers["x-pmos-user"]).toBe("ana");
     expect(request?.headers["x-pmos-run"]).toBe("tsk_gw");
     expect(request?.headers["x-pmos-priority"]).toBe("scheduled");
+    // X4 (slice H4): the source the task was claimed under, on every call.
+    expect(request?.headers["x-pmos-model-source"]).toBe("local");
     expect(request?.headers.authorization).toBe("Bearer gateway-token-0123456789abcdef0123456789");
     expect(request?.body.model).toBe("pmos/default");
+    // Every model call is streamed, with the token counts asked for (docs/gateway.md).
+    expect(request?.body.stream).toBe(true);
+    expect(request?.body.stream_options).toEqual({ include_usage: true });
+  });
+
+  it("streams a tool call and its follow-up turn, and finishes with the answer", async () => {
+    const gateway = await startFakeGateway("Port 4443.", undefined, [
+      { toolCall: { name: "docs_search", args: { query: "ports" } } },
+      {},
+    ]);
+    cleanups.push(gateway.close);
+    const { runtime, mcp } = await setup({
+      claims: [claim("tsk_stream_tool")],
+      config: { gatewayUrl: gateway.url },
+    });
+    const done = await waitFor(() => finished(runtime, "tsk_stream_tool"));
+    expect(done.body).toEqual({ result: "Port 4443.", approvals: [] });
+    expect(mcp.calls.map((c) => c.args)).toContainEqual({ query: "ports" });
+    expect(gateway.requests).toHaveLength(2);
+    expect(gateway.requests.every((r) => r.body.stream === true)).toBe(true);
+  });
+
+  it("fails a task whose streamed answer is cut off, never completing with the part", async () => {
+    const gateway = await startFakeGateway("Port 4443, see the docs.", undefined, [{ cut: true }]);
+    cleanups.push(gateway.close);
+    const { runtime } = await setup({
+      claims: [claim("tsk_cut")],
+      config: { gatewayUrl: gateway.url },
+    });
+    const failed = await waitFor(() => finished(runtime, "tsk_cut"));
+    expect(failed.path).toContain("/fail");
+    expect(failed.body.reason).toBe(
+      "The model gateway's answer was cut off before it finished. Please try again in a few minutes.",
+    );
+    expect(runtime.forTask("tsk_cut", "complete")).toHaveLength(0);
+    expect(gateway.requests).toHaveLength(1);
+  });
+
+  it("ends a task when the model source changes between two answers, and sends nothing more", async () => {
+    const search = { toolCall: { name: "docs_search", args: { query: "ports" } } };
+    const gateway = await startFakeGateway("unused", undefined, [
+      search,
+      { ...search, source: "hosted-test" },
+      { source: "hosted-test" },
+    ]);
+    cleanups.push(gateway.close);
+    const { runtime } = await setup({
+      claims: [claim("tsk_switch")],
+      config: { gatewayUrl: gateway.url },
+    });
+    const failed = await waitFor(() => finished(runtime, "tsk_switch"));
+    expect(failed.path).toContain("/fail");
+    expect(failed.body.reason).toBe(MODEL_SOURCE_CHANGED);
+    // The answer that said another source ended it: no call carried its tool result on.
+    expect(gateway.requests).toHaveLength(2);
+    for (const r of gateway.requests) {
+      expect(r.headers["x-pmos-model-source"]).toBe("local");
+    }
+  });
+
+  it("ends a task when the gateway refuses its source (409), never retrying it", async () => {
+    const gateway = await startFakeGateway("unused", undefined, [
+      { status: 409, source: "hosted-test" },
+    ]);
+    cleanups.push(gateway.close);
+    const { runtime } = await setup({
+      claims: [claim("tsk_409")],
+      config: { gatewayUrl: gateway.url },
+    });
+    const failed = await waitFor(() => finished(runtime, "tsk_409"));
+    expect(failed.body.reason).toBe(MODEL_SOURCE_CHANGED);
+    expect(gateway.requests).toHaveLength(1);
+  });
+
+  it("calls no model for a claim that doesn't say its model source", async () => {
+    const gateway = await startFakeGateway("unused");
+    cleanups.push(gateway.close);
+    const bare = { ...claim("tsk_nosrc"), gateway: { model: "pmos/default", headers: {} } };
+    const { runtime, mcp } = await setup({
+      claims: [bare],
+      config: { gatewayUrl: gateway.url },
+    });
+    const failed = await waitFor(() => finished(runtime, "tsk_nosrc"));
+    expect(failed.body.reason).toBe(MODEL_SOURCE_MISSING);
+    expect(gateway.requests).toHaveLength(0);
+    expect(mcp.calls).toHaveLength(0);
+  });
+
+  it("makes one gateway call per model turn when the gateway keeps answering busy", async () => {
+    // The gateway owns retries (docs/gateway.md). The worker's client must not add its own,
+    // or each model turn would be tried again on top of the gateway's own tries.
+    const gateway = await startFakeGateway("unused", { status: 503, upstreamAttempts: 3 });
+    cleanups.push(gateway.close);
+    const { runtime } = await setup({
+      claims: [claim("tsk_busy")],
+      config: { gatewayUrl: gateway.url },
+    });
+    const failed = await waitFor(() => finished(runtime, "tsk_busy"));
+    expect(failed.body.reason).toBe(
+      "The model is still busy after several tries. Please try again in a few minutes.",
+    );
+    expect(gateway.requests).toHaveLength(1);
   });
 
   it("calls the reasoning model for a role pinned to it", async () => {
@@ -470,6 +604,118 @@ describe("the bot's system prompt", () => {
   });
 });
 
+describe("a conversation's earlier turns", () => {
+  const SHORT_REPLY = "A short reply is an answer to your last question.";
+  const followUp = (history: unknown[]) =>
+    ClaimSchema.parse({ ...claim("tsk_f", { text: "customer" }), history });
+  const turns = [
+    {
+      text: "Draft a PRD for SSO",
+      result: "Who is the user of this feature?",
+      status: "done",
+      at: "2026-11-15T10:00:00Z",
+    },
+    {
+      text: "generate the content",
+      error: "The model is busy right now.",
+      status: "failed",
+      at: "2026-11-15T10:05:00Z",
+    },
+    { text: "never mind", status: "cancelled", at: "2026-11-15T10:06:00Z" },
+  ];
+
+  it("puts earlier turns first as PM and bot messages, oldest first, then the new request", () => {
+    const messages = taskMessages(followUp(turns));
+    expect(messages.map((m) => [m.getType(), m.content])).toEqual([
+      ["human", "Draft a PRD for SSO"],
+      ["ai", "Who is the user of this feature?"],
+      ["human", "generate the content"],
+      ["ai", "(This request failed: The model is busy right now.)"],
+      ["human", "never mind"],
+      ["ai", "(This request was cancelled before I answered.)"],
+      ["human", "customer"],
+    ]);
+  });
+
+  it("says in the system prompt that a short reply answers the last question", () => {
+    const text = botSystemPrompt(followUp(turns));
+    expect(text).toContain(SHORT_REPLY);
+    expect(text.indexOf("## This conversation")).toBeGreaterThan(text.indexOf("## Writes need approval"));
+  });
+
+  it("leaves a first message as it was: the request alone, and no conversation section", () => {
+    const first = ClaimSchema.parse(claim("tsk_first"));
+    expect(first.history).toEqual([]);
+    const messages = taskMessages(first);
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.getType()).toBe("human");
+    expect(messages[0]?.content).toBe("What ports does Acme Vault need?");
+    expect(botSystemPrompt(first)).not.toContain("This conversation");
+  });
+
+  it("reads the history's level from the claim, and tells the model when it is restricted", () => {
+    const RESTRICTED = "Earlier answers in this conversation drew on restricted sources.";
+    const restricted = ClaimSchema.parse({
+      ...claim("tsk_r", { text: "post that" }),
+      history: turns,
+      history_sensitivity: "restricted",
+    });
+    expect(restricted.history_sensitivity).toBe("restricted");
+    expect(botSystemPrompt(restricted)).toContain(RESTRICTED);
+    const internal = ClaimSchema.parse({
+      ...claim("tsk_i"),
+      history: turns,
+      history_sensitivity: "internal",
+    });
+    expect(botSystemPrompt(internal)).not.toContain(RESTRICTED);
+    // An older runtime sends none; a value the harness doesn't know reads as restricted.
+    expect(followUp(turns).history_sensitivity).toBeUndefined();
+    const odd = ClaimSchema.parse({ ...claim("tsk_o"), history: turns, history_sensitivity: "secret" });
+    expect(odd.history_sensitivity).toBe("restricted");
+  });
+
+  it("never lowers or reports the history's level: the tool server applies it", async () => {
+    const model = new ScriptedModel([new AIMessage("Drafted.")]);
+    const { runtime } = await setup({
+      claims: [
+        {
+          ...claim("tsk_lvl", { text: "post that" }),
+          history: turns.slice(0, 1),
+          history_sensitivity: "restricted",
+        },
+      ],
+      models: { tsk_lvl: model },
+    });
+    const done = await waitFor(() => runtime.forTask("tsk_lvl", "complete")[0]);
+    expect(JSON.stringify(done.body)).not.toContain("sensitivity");
+    expect(systemText(model.prompts[0] ?? [])).toContain("restricted sources");
+  });
+
+  it("never takes a replayed reply as the final answer", () => {
+    const messages = taskMessages(followUp(turns));
+    expect(finalAnswer(messages)).toBe("");
+    expect(finalAnswer([...messages, new AIMessage("Here is the PRD.")])).toBe("Here is the PRD.");
+  });
+
+  it("sends the turns to the model ahead of the new request", async () => {
+    const model = new ScriptedModel([new AIMessage("Here is the PRD for customers.")]);
+    const { runtime } = await setup({
+      claims: [{ ...claim("tsk_conv", { text: "customer" }), history: turns.slice(0, 1) }],
+      models: { tsk_conv: model },
+    });
+    const done = await waitFor(() => runtime.forTask("tsk_conv", "complete")[0]);
+    expect(done.body.result).toBe("Here is the PRD for customers.");
+    const prompt = model.prompts[0] ?? [];
+    expect(prompt.map((m) => m.getType())).toEqual(["system", "human", "ai", "human"]);
+    expect(prompt.slice(1).map((m) => m.content)).toEqual([
+      "Draft a PRD for SSO",
+      "Who is the user of this feature?",
+      "customer",
+    ]);
+    expect(systemText(prompt)).toContain(SHORT_REPLY);
+  });
+});
+
 describe("worker helpers", () => {
   it("reads approval ids from structured content or JSON text", () => {
     const value = { status: "pending_approval", approval_id: "apr_9" };
@@ -502,6 +748,22 @@ describe("worker helpers", () => {
 
   it("writes failure reasons for a PM", () => {
     expect(pmReason(Object.assign(new Error("busy"), { status: 503 }))).toContain("busy right now");
+    expect(
+      pmReason(
+        Object.assign(new Error("busy"), {
+          status: 429,
+          headers: new Headers({ "x-pmos-upstream-attempts": "3" }),
+        }),
+      ),
+    ).toBe("The model is still busy after several tries. Please try again in a few minutes.");
+    expect(
+      pmReason(
+        Object.assign(new Error("busy"), {
+          status: 503,
+          headers: new Headers({ "x-pmos-upstream-attempts": "1" }),
+        }),
+      ),
+    ).toBe("The model is busy right now. Please try again in a few minutes.");
     expect(pmReason(Object.assign(new Error("x"), { name: "GraphRecursionError" }))).toContain(
       "too many steps",
     );
@@ -526,5 +788,16 @@ describe("worker helpers", () => {
     expect(config.bot).toBe("docs");
     expect(config.waitMs).toBe(1000);
     expect(config.contentRoot).toBe(CONTENT);
+  });
+});
+
+describe("isAbortRejection", () => {
+  it("matches only the rejection an aborted model call leaves behind", () => {
+    expect(isAbortRejection(new Error("lost"))).toBe(true);
+    expect(isAbortRejection(new Error("stopped"))).toBe(true);
+    expect(isAbortRejection(new Error("lost connection to the gateway"))).toBe(false);
+    expect(isAbortRejection(new Error("Aborted"))).toBe(false);
+    expect(isAbortRejection("lost")).toBe(false);
+    expect(isAbortRejection(undefined)).toBe(false);
   });
 });

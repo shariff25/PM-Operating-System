@@ -21,7 +21,7 @@ use crate::{
 };
 
 /// Every rule, with what it requires. Ids are stable: CI output and docs refer to them.
-pub const RULES: [(&str, &str); 23] = [
+pub const RULES: [(&str, &str); 24] = [
     (POLICY_PARSE, "The file is a valid OpenShell policy: YAML, known fields only, right types."),
     (POLICY_VERSION, "`version` is 1."),
     (POLICY_MISSING, "Every bot has a policy and a launch spec, and every provider profile exists."),
@@ -29,6 +29,7 @@ pub const RULES: [(&str, &str); 23] = [
     (POLICY_ORPHAN, "No generated file is left for a bot that no longer exists."),
     (CONTENT_INVALID, "The content passes `pmos lint`, so policies can be generated."),
     (NET_EGRESS, "Egress only to toolserver.pmos.internal:8710, gateway.pmos.internal:8740 and bots.pmos.internal:8750: no other host, port, wildcard or IP range."),
+    (NET_ALLOWED_IPS, "Each endpoint's `allowed_ips` is exactly its own service's pinned address as a /32 (toolserver 10.201.77.10/32, gateway 10.201.77.11/32, bots 10.201.77.12/32): not missing, not another service's, not a wider range, not a second entry."),
     (NET_INSPECTION, "Every endpoint is inspected (`mcp` on /mcp for the tool server, `rest` for the gateway and runtime) and enforced; no `tls: skip`, no access preset."),
     (NET_TOOLS, "MCP: only initialize, notifications/initialized, tools/list and tools/call, and tools/call only for the role's tools, by exact name."),
     (NET_GATEWAY_ROUTES, "Gateway: only POST /v1/chat/completions."),
@@ -54,6 +55,7 @@ pub const POLICY_STALE: &str = "policy-stale";
 pub const POLICY_ORPHAN: &str = "policy-orphan";
 pub const CONTENT_INVALID: &str = "content-invalid";
 pub const NET_EGRESS: &str = "net-egress";
+pub const NET_ALLOWED_IPS: &str = "net-allowed-ips";
 pub const NET_INSPECTION: &str = "net-inspection";
 pub const NET_TOOLS: &str = "net-tools";
 pub const NET_GATEWAY_ROUTES: &str = "net-gateway-routes";
@@ -244,8 +246,8 @@ fn readable_problem(ctx: &BotContext, p: &str) -> String {
         let skill = rest.split('/').next().unwrap_or(rest);
         if !ctx.skills.iter().any(|s| s == skill) {
             return format!(
-                "`{p}` is skill `{skill}`, which role `{}` doesn't have",
-                ctx.role
+                "`{p}` is skill `{skill}`, which {} doesn't have",
+                skill_owners(ctx)
             );
         }
     }
@@ -262,6 +264,18 @@ fn readable_problem(ctx: &BotContext, p: &str) -> String {
         return format!("`{p}` is broader than the paths this bot may read");
     }
     format!("`{p}` is not a path this sandbox may read (only OpenShell's system paths, the role's skills and the bot's master context)")
+}
+
+/// Where a bot's skills come from, in words: its role, and for a personal bot of the personal
+/// role also the catalog's personas (`docs/bot-marketplace-spec.md` §4).
+fn skill_owners(ctx: &BotContext) -> String {
+    if ctx.scope == Some(pmos_contract::bots::BotScope::Personal)
+        && ctx.role == pmos_contract::onboarding::PERSONAL_ROLE
+    {
+        format!("role `{}` or any persona in the catalog", ctx.role)
+    } else {
+        format!("role `{}`", ctx.role)
+    }
 }
 
 /// Under the content mount, and not the workspace.
@@ -347,6 +361,7 @@ fn check_network(ctx: &BotContext, policy: &Policy, out: &mut Out) {
             let Some(service) = destination(key, ep, out) else {
                 continue;
             };
+            check_allowed_ips(key, service, ep, out);
             check_inspection(key, service, ep, out);
             check_binding(ctx, key, service, ep, out);
             match service {
@@ -415,6 +430,60 @@ fn destination(key: &str, ep: &Endpoint, out: &mut Out) -> Option<Service> {
         ),
     );
     None
+}
+
+/// `allowed_ips` exactly the service's own `/32` (decision O6): a name that resolves anywhere
+/// but its own service is then refused by OpenShell, not sent on. Compared as text, so a bare
+/// address, another spelling of the same network or any second entry fails too: the generator
+/// writes exactly [`Service::allowed_ips`].
+fn check_allowed_ips(key: &str, service: Service, ep: &Endpoint, out: &mut Out) {
+    let want = service.allowed_ips();
+    if ep.allowed_ips == want {
+        return;
+    }
+    let dest = format!("{}:{}", service.host(), service.port());
+    let want_one = &want[0];
+    let problem = if ep.allowed_ips.is_empty() {
+        "has no allowed_ips, so it would be sent wherever the name resolves".to_string()
+    } else {
+        let mut parts = Vec::new();
+        if ep.allowed_ips.len() > 1 {
+            parts.push(format!(
+                "lists {} addresses ({}); exactly one is allowed",
+                ep.allowed_ips.len(),
+                ep.allowed_ips.join(", ")
+            ));
+        }
+        for ip in ep.allowed_ips.iter().filter(|ip| *ip != want_one) {
+            let other = Service::ALL
+                .into_iter()
+                .find(|s| s.allowed_ips().contains(ip) || s.addr().to_string() == *ip);
+            parts.push(match other {
+                Some(s) if s != service => format!(
+                    "allows `{ip}`, the {} address ({})",
+                    service_label(s),
+                    s.host()
+                ),
+                Some(_) => format!("allows `{ip}`; write the address exactly as `{want_one}`"),
+                None => format!("allows `{ip}`, which is not its own address"),
+            });
+        }
+        parts.join("; ")
+    };
+    out.add(
+        NET_ALLOWED_IPS,
+        format!(
+            "rule `{key}`: {dest} {problem}; allowed_ips must be exactly [{want_one}], its own pinned address (a code change under POL-2 moves it)"
+        ),
+    );
+}
+
+fn service_label(s: Service) -> &'static str {
+    match s {
+        Service::ToolServer => "tool server's",
+        Service::Gateway => "gateway's",
+        Service::Runtime => "bot runtime's",
+    }
 }
 
 fn check_inspection(key: &str, service: Service, ep: &Endpoint, out: &mut Out) {
@@ -732,8 +801,9 @@ pub fn check_spec(
             None => out.add(
                 FS_UPLOADS,
                 format!(
-                    "uploads `{}`, which is not a skill of role `{}`, the bot's master context or the tool registry",
-                    u.from, ctx.role
+                    "uploads `{}`, which is not a skill of {}, the bot's master context or the tool registry",
+                    u.from,
+                    skill_owners(ctx)
                 ),
             ),
         }
@@ -1108,6 +1178,122 @@ mod tests {
         only(
             &with(|p| ts(p).host = Some("docs.pmos.internal".into())),
             NET_EGRESS,
+        );
+    }
+
+    // --- net-allowed-ips (decision O6) ---
+
+    #[test]
+    fn net_allowed_ips_passes_each_service_pinned_to_its_own_address() {
+        assert_eq!(with(|_| {}), vec![]);
+        // Written out, as in every committed policy.
+        let text = docs().render_policy();
+        for want in [
+            "      - allowed_ips:\n          - \"10.201.77.10/32\"\n",
+            "      - allowed_ips:\n          - \"10.201.77.11/32\"\n",
+            "      - allowed_ips:\n          - \"10.201.77.12/32\"\n",
+        ] {
+            assert_eq!(text.matches(want).count(), 1, "{want:?} in\n{text}");
+        }
+    }
+
+    #[test]
+    fn net_allowed_ips_refuses_a_missing_list() {
+        for edit in [ts, gw, rt] {
+            let v = with(|p| edit(p).allowed_ips.clear());
+            only(&v, NET_ALLOWED_IPS);
+            assert_eq!(v.len(), 1);
+            assert!(
+                v[0].message.contains("has no allowed_ips"),
+                "{}",
+                v[0].message
+            );
+        }
+        // The same as a hand edit of the text: the lines taken out.
+        let text = docs().render_policy().replace(
+            "      - allowed_ips:\n          - \"10.201.77.11/32\"\n        ",
+            "      - ",
+        );
+        let v = check_policy(&docs(), PATH, &text);
+        only(&v, NET_ALLOWED_IPS);
+        assert!(
+            v[0].message.contains("gateway.pmos.internal:8740"),
+            "{}",
+            v[0].message
+        );
+    }
+
+    #[test]
+    fn net_allowed_ips_refuses_another_services_address() {
+        let v = with(|p| ts(p).allowed_ips = vec!["10.201.77.11/32".into()]);
+        only(&v, NET_ALLOWED_IPS);
+        assert!(
+            v[0].message
+                .contains("`10.201.77.11/32`, the gateway's address"),
+            "{}",
+            v[0].message
+        );
+        assert!(v[0].message.contains("exactly [10.201.77.10/32]"));
+        // Two names swapped.
+        let v = with(|p| {
+            gw(p).allowed_ips = vec!["10.201.77.12/32".into()];
+            rt(p).allowed_ips = vec!["10.201.77.11/32".into()];
+        });
+        only(&v, NET_ALLOWED_IPS);
+        assert_eq!(v.len(), 2);
+        // An address elsewhere entirely.
+        only(
+            &with(|p| rt(p).allowed_ips = vec!["10.201.78.12/32".into()]),
+            NET_ALLOWED_IPS,
+        );
+        only(
+            &with(|p| rt(p).allowed_ips = vec!["169.254.169.254/32".into()]),
+            NET_ALLOWED_IPS,
+        );
+    }
+
+    #[test]
+    fn net_allowed_ips_refuses_a_wider_range() {
+        for wide in [
+            "10.201.77.0/24",
+            "10.201.77.10/31",
+            "10.0.0.0/8",
+            "0.0.0.0/0",
+        ] {
+            let v = with(|p| gw(p).allowed_ips = vec![wide.into()]);
+            only(&v, NET_ALLOWED_IPS);
+            assert!(
+                v[0].message.contains("not its own address"),
+                "{}",
+                v[0].message
+            );
+        }
+    }
+
+    #[test]
+    fn net_allowed_ips_refuses_a_second_entry() {
+        for extra in ["10.201.77.13/32", "10.201.77.10/32", "10.201.77.11/32"] {
+            let v = with(|p| ts(p).allowed_ips.push(extra.into()));
+            only(&v, NET_ALLOWED_IPS);
+            assert_eq!(v.len(), 1);
+            assert!(v[0].message.contains("exactly one"), "{}", v[0].message);
+        }
+    }
+
+    #[test]
+    fn net_allowed_ips_refuses_another_spelling_of_the_address() {
+        // The spec writes `/32`; whether OpenShell takes a bare address is to verify on a real
+        // host, so only the generated spelling passes.
+        for spelling in ["10.201.77.12", "10.201.77.12/32 ", "010.201.077.012/32"] {
+            let v = with(|p| rt(p).allowed_ips = vec![spelling.into()]);
+            only(&v, NET_ALLOWED_IPS);
+        }
+        let v = with(|p| rt(p).allowed_ips = vec!["10.201.77.12".into()]);
+        assert!(
+            v[0].message
+                .contains("write the address exactly as `10.201.77.12/32`"),
+            "{}",
+            v[0].message
         );
     }
 

@@ -1,15 +1,24 @@
 # Testing PM OS with Claude and a test Slack workspace
 
-**Testing only (decided 2026-11-14).** Before the Spark's local models are up, PM OS can be
+**Since slice H4 (2026-11-23): no Slack bot on this stack.** `scripts/claude-test-stack.sh` runs
+every service as `PMOS_MODEL_SOURCE=hosted-test` (fake data only,
+`docs/openshell-any-host-spec.md` §3.6), and in that mode `pmos-slack` refuses to start with
+Slack tokens: a test workspace can't be told apart from a real one. The script ignores
+`PMOS_SLACK_APP_TOKEN` and `PMOS_SLACK_BOT_TOKEN` (it says so) and skips the Slack preflight; try
+the bots in the web app (`PMOS_TEST_WEB=1`, which shows a "test stack: fake data only" banner on
+every page) or through the benchmarks (`PMOS_TEST_EVALS=1`). The Slack rows below describe the
+stack as it was before H4.
+
+**Testing only (decided 2026-11-14).** Before local models are up, PM OS can be
 tried end to end with a Claude model behind the gateway, in a Slack workspace made for testing.
 Prompts to Claude leave the machine. So this setup uses only:
 - a test Slack workspace;
 - fake Jira, Confluence and Slack fixtures;
 - your company's public docs site (`PMOS_DOCS_BASE_URL`), if you set one.
 
-Never use it with real PM tokens or company data. The production rule (local open-weight
-models only) is unchanged: the gateway refuses the Claude upstream unless
-`PMOS_GATEWAY_CLOUD_TEST=1` is set.
+Never use it with real PM tokens or company data. Production takes local models or the one
+owner-approved hosted model (not built yet); a test upstream still needs
+`PMOS_GATEWAY_CLOUD_TEST=1` and fake data: the gateway refuses the Claude upstream without it.
 
 The same stack can use another provider's model instead of Claude: see
 [Another provider](#another-provider).
@@ -24,10 +33,10 @@ The same stack can use another provider's model instead of Claude: see
 | `every weekday at 9am, summarize the launch issues` | A routine is parsed and confirmed |
 | `setup` | The onboarding checklist. Its Connect links can't complete here, because the OAuth callback needs a public URL. |
 | `/docs rotate a key` | The `/docs` shortcut |
-| `requests`, `remove <handle>` | Platform-owner commands. You are an admin in the test `team.yaml`. |
+| `requests`, `remove <handle>` | Platform-owner commands. You are an admin in the test stack's user database (its seed). |
 
 **Not in this test:** real Jira, Confluence or Slack reads, account linking, GitHub memory and
-the approval commit. Those need the Spark setup (`docs/toolserver.md`).
+the approval commit. Those need a real host's setup (`docs/toolserver.md`).
 
 ## 1. Create the test Slack workspace and app
 
@@ -71,14 +80,47 @@ scripts/claude-test-stack.sh
 
 **What the script does:**
 - builds everything;
-- copies `content/` to `state/claude-test/content` and adds you there as `pm` and `admin`, with
-  your bot `pm-<handle>` (`pmos member add`);
+- copies `content/` to `state/claude-test/content` and adds
+  your bot `pm-<handle>` there (`pmos bot add-personal`), and you as `pm, admin` in the user
+  database's seed (`$STATE/users.seed.yaml`, beside the content, never in it);
 - starts the services with fresh tokens between them;
+- deletes the Slack service's `notifications.cursor` from the last run, since the in-memory
+  runtime restarts its notification ids at 1 and a stale cursor would make the bot skip replies;
 - prints what to try.
 
 **Logs** are in `state/claude-test/logs`. The gateway's usage log
 (`state/claude-test/usage.jsonl`) records each Claude call: who made it, the role and the
 tokens, never the text. **Ctrl-C** stops everything.
+
+## The web app (optional)
+
+To try the web app (`web/` and its backend `pmos-web`) against this stack, run
+`PMOS_TEST_WEB=1 scripts/claude-test-stack.sh`. It builds the app and the backend, starts
+`pmos-web` on `127.0.0.1:8770` with development sign-in (this machine only) and prints the
+address. Without the variable nothing changes. See [Running the web app](web-app-running.md),
+including why it isn't ready for production.
+
+## Benchmarks (optional)
+
+`PMOS_TEST_EVALS=1 scripts/claude-test-stack.sh` also sets the stack up for `pmos-evals`: the
+benchmark member `evals` with a personal bot `pm-evals` and every offered persona on its team,
+the runner's and judges' tokens, the fake docs fixtures, and `PMOS_TEST_EVALS_LANES` isolated
+lanes (default 1) that give every attempt a fresh tool server. It can't be combined with
+`PMOS_TEST_WEB=1`. See "On the test stack" in [Benchmarks](evals.md). Each report records the
+models the gateway served (model ids and `remote-test` or `claude-test`, never the provider's
+host), and a test-stack report never counts towards a bar.
+
+The script starts every service from an empty environment (its services run with
+`PMOS_DEV=1`): each gets only the settings the script gives it and an explicit allow-list of
+what your shell exports, listed in the script's header (`PATH`, `HOME`, `TMPDIR`, the locale,
+the proxy and CA variables, `RUST_LOG`; `NODE_OPTIONS` for the harness workers only, the one
+Node service, so a proxy's CA trusted through `NODE_OPTIONS=--use-openssl-ca` still reaches
+them, and no Rust service gets it; the docs site settings for `pmos-docs`; the model keys,
+`PMOS_GATEWAY_WORKAROUNDS` and `PMOS_GATEWAY_RETRY_*` for the gateway; the Slack tokens by
+name). So a database URL, vault key, address or connector setting in your shell reaches none of
+them. Every input documented above still works. It refuses to start if one of its ports on
+127.0.0.1 is already taken (another stack, say), and stops with an error if a service it
+started exits.
 
 ## The model
 
@@ -109,6 +151,8 @@ company data.
 | `PMOS_TEST_MODEL` | The model name for the `default`, `reasoning` and `extraction` roles. It must support tool calling. |
 | `PMOS_GATEWAY_REMOTE_KEY` | The provider's API key, sent as `Authorization: Bearer`. It is never logged. |
 | `PMOS_TEST_MODEL_FAST` | Optional: a different model for `extraction` (routine parsing) |
+| `PMOS_TEST_MODEL_LABEL` | Optional, default `hosted-model-a`: the neutral name the gateway reports for `PMOS_TEST_MODEL` (letters, digits, `.`, `_`, `-`). Eval reports, the roles answer and the gateway's logs carry only this. |
+| `PMOS_TEST_MODEL_FAST_LABEL` | Optional, default `hosted-model-b`: the same for a `PMOS_TEST_MODEL_FAST` that differs from `PMOS_TEST_MODEL` |
 
 Then run the same script:
 
@@ -117,8 +161,13 @@ scripts/claude-test-stack.sh
 ```
 
 With `PMOS_TEST_MODEL_URL` set, the script writes `state/claude-test/gateway.yaml` with one
-upstream, `openai+<url>`, and every role on `PMOS_TEST_MODEL`, and starts the gateway with it.
-The usage log (`state/claude-test/usage.jsonl`) names the provider's host on every call.
+upstream, `openai+<url>`, and every role on `PMOS_TEST_MODEL` with `label:` set to
+`PMOS_TEST_MODEL_LABEL`, and starts the gateway with it. The gateway then reports and logs the
+label, never the model id or the provider's host (`docs/gateway.md`, "Hiding the model behind
+a label"): an eval run's report records only the label, the script's own messages name only the
+label, and the usage log (`state/claude-test/usage.jsonl`) shows `remote-test` as the upstream.
+The model id and URL are still in `state/claude-test/gateway.yaml` and your environment, both
+outside the repo.
 
 **Worked example: Gemini.** Create an API key in Google AI Studio, then:
 

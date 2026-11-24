@@ -120,6 +120,7 @@ fn opts(timeout_ms: u64) -> RunOptions {
         follow: Follow {
             poll: Duration::from_millis(10),
             timeout: Duration::from_millis(timeout_ms),
+            cancel_wait: Duration::from_secs(1),
         },
         concurrency: 8,
         date: NaiveDate::from_ymd_opt(2026, 11, 9).unwrap(),
@@ -130,6 +131,7 @@ fn opts(timeout_ms: u64) -> RunOptions {
         decline_phrases: vec!["don't answer".into()],
         judges: None,
         judges_skipped: None,
+        isolation: None,
     }
 }
 
@@ -285,13 +287,17 @@ async fn load_test_reports_percentiles_against_targets() {
     let follow = Follow {
         poll: Duration::from_millis(10),
         timeout: Duration::from_secs(5),
+        cancel_wait: Duration::from_secs(1),
     };
     let result = run_load(
         &rt,
         "docs",
         "ana",
         &["ask".to_string()],
-        Some("staff"),
+        pmos_evals::run::AskAs {
+            level: Some("staff"),
+            persona: None,
+        },
         5,
         &follow,
     )
@@ -351,13 +357,14 @@ async fn load_test_counts_unfinished_tasks() {
     let follow = Follow {
         poll: Duration::from_millis(10),
         timeout: Duration::from_millis(200),
+        cancel_wait: Duration::from_secs(1),
     };
     let result = run_load(
         &rt,
         "docs",
         "ana",
         &["stuck".to_string(), "fine".to_string()],
-        None,
+        pmos_evals::run::AskAs::default(),
         4,
         &follow,
     )
@@ -390,7 +397,16 @@ async fn cli_run_history_and_check() {
             ..Script::default()
         },
     );
+    // The runtime reports which models its own gateway serves (a run counts only with them,
+    // N5, from a production gateway, R3).
+    *mock.gateway.lock().unwrap() = Some(common::prod_gateway());
     let url = spawn(mock.clone()).await;
+    // A gateway for the runner's judges; the category has none, so nothing is asked of it.
+    let gw_url = common::spawn_gateway(Arc::new(common::Gateway {
+        reply: Box::new(|_: &str| "yes".into()),
+        calls: std::sync::Mutex::new(Vec::new()),
+    }))
+    .await;
     let dir = tempfile::tempdir().unwrap();
     let (id, yaml) = task("t-pass", "q-pass", "  approvals: 0\n");
     write_category(dir.path(), "cat", "docs", 1.0, &[(id.as_str(), yaml)]);
@@ -400,6 +416,7 @@ async fn cli_run_history_and_check() {
     let bin = env!("CARGO_BIN_EXE_pmos-evals");
     let run = |args: Vec<String>| {
         let root = root.clone();
+        let gw_url = gw_url.clone();
         tokio::task::spawn_blocking(move || {
             std::process::Command::new(bin)
                 .arg("--root")
@@ -408,7 +425,11 @@ async fn cli_run_history_and_check() {
                 .env_remove("PMOS_EVALS_TOKEN")
                 .env_remove("PMOS_BOTS_URL")
                 .env_remove("PMOS_EVALS_AS")
+                .env_remove("PMOS_EVALS_LANES")
+                .env_remove("PMOS_EVALS_FRESH_CMD")
                 .env("PMOS_GATEWAY_WORKAROUNDS", "off")
+                .env("PMOS_GATEWAY_URL", &gw_url)
+                .env("PMOS_EVALS_GATEWAY_TOKEN", common::GATEWAY_TOKEN)
                 .output()
                 .unwrap()
         })
@@ -563,5 +584,69 @@ async fn a_category_level_goes_on_every_task_and_check_reports_it() {
     assert!(
         stdout.contains("staff-craft: 2 tasks for bot `personal`, bar 100%, level staff"),
         "{stdout}"
+    );
+}
+
+/// A category that names a persona (`docs/bot-marketplace-spec.md` §10): every task the
+/// runner creates asks it, and `check` accepts an offered persona of the content and refuses
+/// an unknown one.
+#[tokio::test]
+async fn a_category_persona_goes_on_every_task_and_check_validates_it() {
+    let mock = Arc::new(Mock::default());
+    mock.script(
+        "q-one",
+        Script {
+            result: Some("Done.".into()),
+            ..Script::default()
+        },
+    );
+    let url = spawn(mock.clone()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let (a, ay) = task("t-one", "q-one", "  approvals: 0\n");
+    write_category(dir.path(), "chiefly", "personal", 1.0, &[(a.as_str(), ay)]);
+    let path = dir.path().join("categories/chiefly/category.yaml");
+    let yaml = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, format!("{yaml}persona: chief\n")).unwrap();
+    common::write_taxonomy(dir.path());
+    let category = load_category(dir.path(), "chiefly").unwrap();
+    assert_eq!(category.persona.as_deref(), Some("chief"));
+
+    let rt = Runtime::new(&url, TOKEN, None);
+    run_category(&rt, &url, &category, &opts(1500)).await;
+    let bodies = mock.created_bodies();
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(bodies[0]["persona"], "chief", "{bodies:?}");
+    assert_eq!(bodies[0]["bot"], "pm-ana");
+
+    let content = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../content");
+    let check = |root: std::path::PathBuf| {
+        let content = content.clone();
+        tokio::task::spawn_blocking(move || {
+            std::process::Command::new(env!("CARGO_BIN_EXE_pmos-evals"))
+                .arg("--root")
+                .arg(&root)
+                .arg("check")
+                .arg("--content")
+                .arg(&content)
+                .output()
+                .unwrap()
+        })
+    };
+    let out = check(dir.path().to_path_buf()).await.unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(stdout.contains("as persona `chief`"), "{stdout}");
+
+    std::fs::write(&path, format!("{yaml}persona: quill\n")).unwrap();
+    let out = check(dir.path().to_path_buf()).await.unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("`persona` `quill` is not a persona"),
+        "{stderr}"
     );
 }

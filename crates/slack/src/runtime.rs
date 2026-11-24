@@ -11,6 +11,10 @@ use serde_json::{json, Value};
 
 const USER_HEADER: &str = "x-pmos-user";
 
+/// The notification feed's codes for a saved cursor it can't continue from: ahead of the
+/// feed (the runtime's database was reset or restored), or unknown to it.
+pub const CURSOR_CODES: [&str; 2] = ["cursor_ahead", "cursor_unknown"];
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum RuntimeError {
     #[error("PM OS bots are unavailable right now")]
@@ -21,7 +25,21 @@ pub enum RuntimeError {
     /// `422 {question}` from routine parsing: the request was unclear.
     #[error("{0}")]
     Question(String),
+    /// `400 {code}` from `POST /v1/tasks` about the ask's `persona`: one of
+    /// [`PERSONA_CODES`]. Only [`Runtime::create_task_as`] answers it.
+    #[error("that bot can't take this ({0})")]
+    Persona(String),
 }
+
+/// The `400` codes `POST /v1/tasks` gives an ask's `persona` (`docs/bots-runtime.md`,
+/// "Personas").
+pub const PERSONA_CODES: [&str; 4] = [
+    "bad_request",
+    "unknown_persona",
+    "persona_needs_personal_bot",
+    // The runtime refused it at claim moments ago: not on the PM's team (gate-fix-4).
+    "persona_not_on_team",
+];
 
 /// One entry of `GET /v1/bots`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -171,17 +189,92 @@ impl Runtime {
         channel: &str,
         thread_ts: &str,
     ) -> Result<Value, RuntimeError> {
-        self.send(
-            self.request(Method::POST, "/v1/tasks", Some(user))
-                .json(&json!({
-                    "bot": bot,
-                    "requested_by": user,
-                    "text": text,
-                    "source": "slack",
-                    "slack": {"channel": channel, "thread_ts": thread_ts},
-                })),
-        )
-        .await
+        self.create_task_as(user, bot, text, channel, thread_ts, None)
+            .await
+    }
+
+    /// [`Runtime::create_task`] naming a persona (`docs/bots-runtime.md`, "Personas"): `None`
+    /// sends no `persona`, so a reply in a thread inherits the thread's; `Some("nudge")`
+    /// switches the thread to Nudge. A `400` with one of [`PERSONA_CODES`] is
+    /// [`RuntimeError::Persona`]. Whether the persona is on the PM's team is decided at claim
+    /// by the tool server: a task for one that isn't is created, and fails with its sentence.
+    pub async fn create_task_as(
+        &self,
+        user: &str,
+        bot: &str,
+        text: &str,
+        channel: &str,
+        thread_ts: &str,
+        persona: Option<&str>,
+    ) -> Result<Value, RuntimeError> {
+        let mut body = json!({
+            "bot": bot,
+            "requested_by": user,
+            "text": text,
+            "source": "slack",
+            "slack": {"channel": channel, "thread_ts": thread_ts},
+        });
+        if let Some(persona) = persona {
+            body["persona"] = json!(persona);
+        }
+        let res = self
+            .request(Method::POST, "/v1/tasks", Some(user))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::warn!(error = %e, "bots runtime unreachable");
+                RuntimeError::Unavailable
+            })?;
+        let status = res.status();
+        let json: Value = res.json().await.unwrap_or(Value::Null);
+        if status.is_success() {
+            return Ok(json);
+        }
+        if status.is_server_error() {
+            tracing::warn!(%status, "bots runtime error");
+            return Err(RuntimeError::Unavailable);
+        }
+        let code = json["code"].as_str().unwrap_or_default();
+        if persona.is_some() && status.as_u16() == 400 && PERSONA_CODES.contains(&code) {
+            return Err(RuntimeError::Persona(code.to_string()));
+        }
+        Err(RuntimeError::Refused(
+            json["error"]
+                .as_str()
+                .map(String::from)
+                .unwrap_or_else(|| format!("refused ({status})")),
+        ))
+    }
+
+    /// `GET /v1/personas`: the offered marketplace bots, Nudge first. A runtime without the
+    /// route (`404`, from before personas) or one that refuses it gives an empty catalog, so
+    /// no prefix matches and every ask goes as before; unreachable or failing is
+    /// [`RuntimeError::Unavailable`].
+    pub async fn personas(&self) -> Result<Vec<crate::personas::Persona>, RuntimeError> {
+        match self
+            .send(self.request(Method::GET, "/v1/personas", None))
+            .await
+        {
+            Ok(json) => Ok(crate::personas::parse(&json)),
+            Err(RuntimeError::Unavailable) => Err(RuntimeError::Unavailable),
+            Err(e) => {
+                tracing::info!(error = %e, "no persona catalog from the runtime; none used");
+                Ok(Vec::new())
+            }
+        }
+    }
+
+    /// `GET /v1/model-source` (slice H12): the App Home's first line, where prompts go, by
+    /// label only. `None` when the runtime can't say (then the line says so).
+    pub async fn model_line(&self) -> String {
+        match self
+            .send(self.request(Method::GET, "/v1/model-source", None))
+            .await
+        {
+            Ok(v) => model_line(&v),
+            Err(_) => model_line(&serde_json::Value::Null),
+        }
     }
 
     /// `GET /v1/notifications`: long-polls up to `wait`.
@@ -195,12 +288,39 @@ impl Runtime {
         if let Some(after) = after {
             query.push(("after", after));
         }
-        self.send(
-            self.request(Method::GET, "/v1/notifications", None)
-                .query(&query)
-                .timeout(wait + Duration::from_secs(10)),
-        )
-        .await
+        let res = self
+            .request(Method::GET, "/v1/notifications", None)
+            .query(&query)
+            .timeout(wait + Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::warn!(error = %e, "bots runtime unreachable");
+                RuntimeError::Unavailable
+            })?;
+        let status = res.status();
+        let json: Value = res.json().await.unwrap_or(Value::Null);
+        // The runtime saying the saved cursor is ahead of it, or one it doesn't know (a reset
+        // database): passed on as a batch with that `code`, for the notifier to start again
+        // from now (`notify.rs`, `cursor_reset`).
+        if status.is_client_error() && CURSOR_CODES.contains(&json["code"].as_str().unwrap_or("")) {
+            let mut batch = json;
+            batch["items"] = json!([]);
+            return Ok(batch);
+        }
+        if status.is_success() {
+            return Ok(json);
+        }
+        if status.is_server_error() {
+            tracing::warn!(%status, "bots runtime error");
+            return Err(RuntimeError::Unavailable);
+        }
+        Err(RuntimeError::Refused(
+            json["error"]
+                .as_str()
+                .map(String::from)
+                .unwrap_or_else(|| format!("refused ({status})")),
+        ))
     }
 
     /// `POST /v1/routines/parse`: `{draft, summary}`, or [`RuntimeError::Question`].
@@ -252,6 +372,25 @@ impl Runtime {
         self.send(
             self.request(Method::PATCH, &format!("/v1/routines/{id}"), Some(owner))
                 .json(&json!({ "enabled": enabled })),
+        )
+        .await
+    }
+
+    /// `PATCH /v1/routines/{id} {schedule, enabled: true}`: the same routine on at a new time,
+    /// so whatever else it has (the bot it runs as, above all) stays (slice R2: a daily brief
+    /// Chief writes).
+    pub async fn set_routine_schedule(
+        &self,
+        owner: &str,
+        id: &str,
+        schedule: &Value,
+    ) -> Result<Value, RuntimeError> {
+        if !safe_id(id) {
+            return Err(RuntimeError::Refused("not a routine id".into()));
+        }
+        self.send(
+            self.request(Method::PATCH, &format!("/v1/routines/{id}"), Some(owner))
+                .json(&json!({ "schedule": schedule, "enabled": true })),
         )
         .await
     }
@@ -337,5 +476,57 @@ mod tests {
         assert_eq!(list_of(json!({"bots": [2]}), "bots"), vec![json!(2)]);
         assert_eq!(list_of(json!({"items": [3]}), "routines"), vec![json!(3)]);
         assert!(list_of(json!(null), "bots").is_empty());
+    }
+}
+
+/// The App Home's model line (slice H12, spec §3.6 "The indicator"), from `GET
+/// /v1/model-source`: the entry name for `hosted`, never a host; the switch notice while one
+/// waits. Anything this build doesn't know reads as unknown.
+pub fn model_line(v: &serde_json::Value) -> String {
+    let fake = v["fake_data"].as_bool().unwrap_or(false);
+    let base = match (v["source"].as_str(), v["name"].as_str()) {
+        _ if fake => "Model: test endpoint (fake data only)".to_string(),
+        (Some("hosted"), Some(name))
+            if pmos_contract::model_source::hosted_name(&format!("hosted:{name}")).is_some() =>
+        {
+            format!("Model: hosted ({name})")
+        }
+        (Some("local"), _) => "Model: local".to_string(),
+        (Some("hosted-test"), _) => "Model: test endpoint (fake data only)".to_string(),
+        (Some("stub"), _) => "Model: stub (no model)".to_string(),
+        _ => "Model: unknown".to_string(),
+    };
+    if v["switch_pending"].as_bool().unwrap_or(false) {
+        format!("{base}. An administrator must confirm the model source switch")
+    } else {
+        base
+    }
+}
+
+#[cfg(test)]
+mod model_line_tests {
+    use super::model_line;
+    use serde_json::json;
+
+    #[test]
+    fn the_model_line_names_labels_only() {
+        assert_eq!(
+            model_line(&json!({"source": "hosted", "name": "owner-hosted"})),
+            "Model: hosted (owner-hosted)"
+        );
+        assert_eq!(model_line(&json!({"source": "local"})), "Model: local");
+        assert_eq!(
+            model_line(&json!({"source": "hosted", "name": "stack-test", "fake_data": true})),
+            "Model: test endpoint (fake data only)"
+        );
+        assert_eq!(
+            model_line(&json!({"source": "hosted", "name": "models.example.test"})),
+            "Model: unknown"
+        );
+        assert_eq!(model_line(&serde_json::Value::Null), "Model: unknown");
+        assert!(
+            model_line(&json!({"source": "hosted", "name": "a", "switch_pending": true}))
+                .ends_with("An administrator must confirm the model source switch")
+        );
     }
 }

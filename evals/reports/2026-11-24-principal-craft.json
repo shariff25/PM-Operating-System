@@ -1,0 +1,814 @@
+{
+  "category": "principal-craft",
+  "bot": "pm-evals",
+  "date": "2026-11-24",
+  "started_at": "2026-11-24T03:18:06.216422910Z",
+  "finished_at": "2026-11-24T04:07:14.470039077Z",
+  "pass_bar": 0.8,
+  "runtime_url": "http://127.0.0.1:8850, http://127.0.0.1:8950, http://127.0.0.1:9050, http://127.0.0.1:9150",
+  "requested_by": "evals",
+  "gateway_workarounds": null,
+  "note": "E4: full run on the test stack, streamed calls, hosted-model-a, fake fixtures",
+  "gateway_models": {
+    "roles": {
+      "default": "hosted-model-a",
+      "extraction": "hosted-model-a",
+      "reasoning": "hosted-model-a"
+    },
+    "upstreams": {
+      "default": "remote-test",
+      "extraction": "remote-test",
+      "reasoning": "remote-test"
+    },
+    "stub": false,
+    "cloud_test": true,
+    "workarounds": true,
+    "class": "test",
+    "model_sha256": {
+      "default": "e8f0d28d3c21c3b359dbe88694b49554ec3782fc18161acaf633383c27316cb9",
+      "extraction": "e8f0d28d3c21c3b359dbe88694b49554ec3782fc18161acaf633383c27316cb9",
+      "reasoning": "e8f0d28d3c21c3b359dbe88694b49554ec3782fc18161acaf633383c27316cb9"
+    }
+  },
+  "repeats": 3,
+  "isolation": "a fresh tool server for every attempt (`fresh-toolserver` before each), 4 lanes",
+  "judges": [
+    {
+      "name": "business-effect-as-range",
+      "blocking": false,
+      "reason": "advisory: not calibrated"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "decision-doc-what-must-be-true",
+      "ask": "Draft anyway, no questions: a decision doc in the PM space on whether the company should bet on enterprise identity (audit log export or SCIM user provisioning, Jira story PM-102) for Acme Vault, given the October Acme Cloud call notes (Confluence page 9001).",
+      "repeat": 1,
+      "cluster": "decision-doc",
+      "task_id": "tsk_92be97825f1541fdadb097bf9649fa1c",
+      "status": "failed",
+      "passed": false,
+      "failures": [
+        {
+          "check": "status",
+          "expected": "`needs_approval`",
+          "got": "failed"
+        },
+        {
+          "check": "approvals",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "draft_count",
+          "tool": "confluence.create_draft",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "no_answer"
+        }
+      ],
+      "tag": {
+        "tag": "harness",
+        "rule": "interrupted",
+        "reason": "error mentions `gateway`: the model gateway's answer was cut off before it finished. please try again in a few minutes.",
+        "sub": "harness/interrupted"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 136.973,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "decision-doc-what-must-be-true",
+      "ask": "Draft anyway, no questions: a decision doc in the PM space on whether the company should bet on enterprise identity (audit log export or SCIM user provisioning, Jira story PM-102) for Acme Vault, given the October Acme Cloud call notes (Confluence page 9001).",
+      "repeat": 2,
+      "cluster": "decision-doc",
+      "task_id": "tsk_c91bc31d63f2499ba0007496f292ead9",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 585.505,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "business-effect-as-range",
+          "verdict": false,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "decision-doc-what-must-be-true",
+      "ask": "Draft anyway, no questions: a decision doc in the PM space on whether the company should bet on enterprise identity (audit log export or SCIM user provisioning, Jira story PM-102) for Acme Vault, given the October Acme Cloud call notes (Confluence page 9001).",
+      "repeat": 3,
+      "cluster": "decision-doc",
+      "task_id": "tsk_45bfb1379f3f4fb49403db8162c4ce86",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 458.751,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "business-effect-as-range",
+          "verdict": false,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "investment-case-payback-from-tool",
+      "ask": "Draft anyway, no questions: an investment case in the PM space for a key export service for Acme Vault. Use these inputs and no others: upfront cost 100, year 1 revenue 60 and cost 10, year 2 revenue 80 and cost 10, discount rate 10%.",
+      "repeat": 1,
+      "cluster": "investment-case",
+      "task_id": "tsk_7952c9126bb241a884132966d46b504a",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 282.187,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "business-effect-as-range",
+          "verdict": false,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "investment-case-payback-from-tool",
+      "ask": "Draft anyway, no questions: an investment case in the PM space for a key export service for Acme Vault. Use these inputs and no others: upfront cost 100, year 1 revenue 60 and cost 10, year 2 revenue 80 and cost 10, discount rate 10%.",
+      "repeat": 2,
+      "cluster": "investment-case",
+      "task_id": "tsk_c0c61551fe7a482ab509f7f8290956d1",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 286.809,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "business-effect-as-range",
+          "verdict": false,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "investment-case-payback-from-tool",
+      "ask": "Draft anyway, no questions: an investment case in the PM space for a key export service for Acme Vault. Use these inputs and no others: upfront cost 100, year 1 revenue 60 and cost 10, year 2 revenue 80 and cost 10, discount rate 10%.",
+      "repeat": 3,
+      "cluster": "investment-case",
+      "task_id": "tsk_3a61c79218144356b62a293c48c47ef5",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 498.565,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "business-effect-as-range",
+          "verdict": false,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "strategy-doc-what-must-be-true",
+      "ask": "Draft anyway, no questions: a strategy doc in the PM space for where Acme Vault goes in enterprise identity over the next three years (SAML SSO and SCIM), from Jira epic PM-101, story PM-102 and the October Acme Cloud call notes (Confluence page 9001).",
+      "repeat": 1,
+      "cluster": "strategy-doc",
+      "task_id": "tsk_5bf50e07c14846b38b73fa67a733beac",
+      "status": "failed",
+      "passed": false,
+      "failures": [
+        {
+          "check": "status",
+          "expected": "`needs_approval`",
+          "got": "failed"
+        },
+        {
+          "check": "approvals",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "draft_count",
+          "tool": "confluence.create_draft",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "no_answer"
+        }
+      ],
+      "tag": {
+        "tag": "harness",
+        "rule": "interrupted",
+        "reason": "error mentions `gateway`: the model gateway's answer was cut off before it finished. please try again in a few minutes.",
+        "sub": "harness/interrupted"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 293.06,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "strategy-doc-what-must-be-true",
+      "ask": "Draft anyway, no questions: a strategy doc in the PM space for where Acme Vault goes in enterprise identity over the next three years (SAML SSO and SCIM), from Jira epic PM-101, story PM-102 and the October Acme Cloud call notes (Confluence page 9001).",
+      "repeat": 2,
+      "cluster": "strategy-doc",
+      "task_id": "tsk_3fd7ba4473ae40b3b43913b2011ce407",
+      "status": "working",
+      "passed": false,
+      "failures": [
+        {
+          "check": "timed_out",
+          "status": "working"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "timed out while `working`",
+        "sub": "model/timed-out"
+      },
+      "queue_secs": 0.0,
+      "total_secs": null,
+      "attempts": 1,
+      "trace_read": true,
+      "cancel": {
+        "cancelled": true,
+        "worker_stopped": true,
+        "secs": 30.063116741
+      }
+    },
+    {
+      "id": "strategy-doc-what-must-be-true",
+      "ask": "Draft anyway, no questions: a strategy doc in the PM space for where Acme Vault goes in enterprise identity over the next three years (SAML SSO and SCIM), from Jira epic PM-101, story PM-102 and the October Acme Cloud call notes (Confluence page 9001).",
+      "repeat": 3,
+      "cluster": "strategy-doc",
+      "task_id": "tsk_190a81c2254349b3a7f1568f9734c672",
+      "status": "working",
+      "passed": false,
+      "failures": [
+        {
+          "check": "timed_out",
+          "status": "working"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "timed out while `working`",
+        "sub": "model/timed-out"
+      },
+      "queue_secs": 0.0,
+      "total_secs": null,
+      "attempts": 1,
+      "trace_read": true,
+      "cancel": {
+        "cancelled": true,
+        "worker_stopped": true,
+        "secs": 30.055380309
+      }
+    },
+    {
+      "id": "structure-exec-brief",
+      "ask": "Draft anyway, no questions: an exec brief in the PM space asking the executive team to fund SAML SSO for the Acme Vault console (Jira epic PM-101), given the October Acme Cloud call notes (Confluence page 9001).",
+      "repeat": 1,
+      "cluster": "exec-brief",
+      "task_id": "tsk_251ec795c6cd4be78d032c726aee41e1",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 319.081,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "business-effect-as-range",
+          "verdict": false,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-exec-brief",
+      "ask": "Draft anyway, no questions: an exec brief in the PM space asking the executive team to fund SAML SSO for the Acme Vault console (Jira epic PM-101), given the October Acme Cloud call notes (Confluence page 9001).",
+      "repeat": 2,
+      "cluster": "exec-brief",
+      "task_id": "tsk_dbec403b80d64b49a97fa065efbe7250",
+      "status": "failed",
+      "passed": false,
+      "failures": [
+        {
+          "check": "status",
+          "expected": "`needs_approval`",
+          "got": "failed"
+        },
+        {
+          "check": "approvals",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "draft_count",
+          "tool": "confluence.create_draft",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "no_answer"
+        }
+      ],
+      "tag": {
+        "tag": "harness",
+        "rule": "interrupted",
+        "reason": "error mentions `gateway`: the model gateway's answer was cut off before it finished. please try again in a few minutes.",
+        "sub": "harness/interrupted"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 356.921,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "structure-exec-brief",
+      "ask": "Draft anyway, no questions: an exec brief in the PM space asking the executive team to fund SAML SSO for the Acme Vault console (Jira epic PM-101), given the October Acme Cloud call notes (Confluence page 9001).",
+      "repeat": 3,
+      "cluster": "exec-brief",
+      "task_id": "tsk_9bb5af0153d14f4a97a24abc00ea8221",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 339.423,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "business-effect-as-range",
+          "verdict": false,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-investment-case",
+      "ask": "Draft anyway, no questions: an investment case in the PM space for building SAML SSO and SCIM for the Acme Vault console (Jira epic PM-101 and story PM-102). Mark any input you cannot source as unverified.",
+      "repeat": 1,
+      "cluster": "investment-case",
+      "task_id": "tsk_04acae47a1d24f2fa300970c433296b3",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 570.838,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "business-effect-as-range",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-investment-case",
+      "ask": "Draft anyway, no questions: an investment case in the PM space for building SAML SSO and SCIM for the Acme Vault console (Jira epic PM-101 and story PM-102). Mark any input you cannot source as unverified.",
+      "repeat": 2,
+      "cluster": "investment-case",
+      "task_id": "tsk_935ba1b4c3c94fcfba784817f5761c79",
+      "status": "working",
+      "passed": false,
+      "failures": [
+        {
+          "check": "timed_out",
+          "status": "working"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "timed out while `working`",
+        "sub": "model/timed-out"
+      },
+      "queue_secs": 0.0,
+      "total_secs": null,
+      "attempts": 1,
+      "trace_read": true,
+      "cancel": {
+        "cancelled": true,
+        "worker_stopped": true,
+        "secs": 30.0561878
+      }
+    },
+    {
+      "id": "structure-investment-case",
+      "ask": "Draft anyway, no questions: an investment case in the PM space for building SAML SSO and SCIM for the Acme Vault console (Jira epic PM-101 and story PM-102). Mark any input you cannot source as unverified.",
+      "repeat": 3,
+      "cluster": "investment-case",
+      "task_id": "tsk_e4c70e1435be47fe858647f0cb56f85d",
+      "status": "working",
+      "passed": false,
+      "failures": [
+        {
+          "check": "timed_out",
+          "status": "working"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "timed out while `working`",
+        "sub": "model/timed-out"
+      },
+      "queue_secs": 0.0,
+      "total_secs": null,
+      "attempts": 1,
+      "trace_read": true,
+      "cancel": {
+        "cancelled": true,
+        "worker_stopped": true,
+        "secs": 30.049971626
+      }
+    },
+    {
+      "id": "structure-platform-strategy",
+      "ask": "Draft anyway, no questions: a platform strategy in the PM space for identity in Acme Vault and Acme Cloud: should we build, buy or partner for SSO and SCIM (Jira epic PM-101, story PM-102)?",
+      "repeat": 1,
+      "cluster": "platform-strategy",
+      "task_id": "tsk_18f34604ee974badb8321005f7afe029",
+      "status": "working",
+      "passed": false,
+      "failures": [
+        {
+          "check": "timed_out",
+          "status": "working"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "timed out while `working`",
+        "sub": "model/timed-out"
+      },
+      "queue_secs": 0.0,
+      "total_secs": null,
+      "attempts": 1,
+      "trace_read": true,
+      "cancel": {
+        "cancelled": true,
+        "worker_stopped": true,
+        "secs": 30.147123641
+      }
+    },
+    {
+      "id": "structure-platform-strategy",
+      "ask": "Draft anyway, no questions: a platform strategy in the PM space for identity in Acme Vault and Acme Cloud: should we build, buy or partner for SSO and SCIM (Jira epic PM-101, story PM-102)?",
+      "repeat": 2,
+      "cluster": "platform-strategy",
+      "task_id": "tsk_ba2739504dfc4a858f451da3397bd73f",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 463.065,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "business-effect-as-range",
+          "verdict": false,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-platform-strategy",
+      "ask": "Draft anyway, no questions: a platform strategy in the PM space for identity in Acme Vault and Acme Cloud: should we build, buy or partner for SSO and SCIM (Jira epic PM-101, story PM-102)?",
+      "repeat": 3,
+      "cluster": "platform-strategy",
+      "task_id": "tsk_d1ac568dfd8448caab39f9c04088e4ec",
+      "status": "working",
+      "passed": false,
+      "failures": [
+        {
+          "check": "timed_out",
+          "status": "working"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "timed out while `working`",
+        "sub": "model/timed-out"
+      },
+      "queue_secs": 0.0,
+      "total_secs": null,
+      "attempts": 1,
+      "trace_read": true,
+      "cancel": {
+        "cancelled": true,
+        "worker_stopped": true,
+        "secs": 30.066542672
+      }
+    },
+    {
+      "id": "structure-pricing-proposal",
+      "ask": "Draft anyway, no questions: a pricing proposal in the PM space for packaging SAML SSO and SCIM in Acme Vault, given the October Acme Cloud call notes (Confluence page 9001). Our competitor is Initech; do not quote its prices.",
+      "repeat": 1,
+      "cluster": "pricing-proposal",
+      "task_id": "tsk_4827e76375874c4caef7efbd646a5bbe",
+      "status": "failed",
+      "passed": false,
+      "failures": [
+        {
+          "check": "status",
+          "expected": "`needs_approval`",
+          "got": "failed"
+        },
+        {
+          "check": "approvals",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "draft_count",
+          "tool": "confluence.create_draft",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "no_answer"
+        }
+      ],
+      "tag": {
+        "tag": "harness",
+        "rule": "interrupted",
+        "reason": "error mentions `gateway`: the model gateway's answer was cut off before it finished. please try again in a few minutes.",
+        "sub": "harness/interrupted"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 422.166,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "structure-pricing-proposal",
+      "ask": "Draft anyway, no questions: a pricing proposal in the PM space for packaging SAML SSO and SCIM in Acme Vault, given the October Acme Cloud call notes (Confluence page 9001). Our competitor is Initech; do not quote its prices.",
+      "repeat": 2,
+      "cluster": "pricing-proposal",
+      "task_id": "tsk_23578c4755b940cbb80eae6945dbbba5",
+      "status": "failed",
+      "passed": false,
+      "failures": [
+        {
+          "check": "status",
+          "expected": "`needs_approval`",
+          "got": "failed"
+        },
+        {
+          "check": "approvals",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "draft_count",
+          "tool": "confluence.create_draft",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "no_answer"
+        }
+      ],
+      "tag": {
+        "tag": "harness",
+        "rule": "interrupted",
+        "reason": "error mentions `gateway`: the model gateway's answer was cut off before it finished. please try again in a few minutes.",
+        "sub": "harness/interrupted"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 88.717,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "structure-pricing-proposal",
+      "ask": "Draft anyway, no questions: a pricing proposal in the PM space for packaging SAML SSO and SCIM in Acme Vault, given the October Acme Cloud call notes (Confluence page 9001). Our competitor is Initech; do not quote its prices.",
+      "repeat": 3,
+      "cluster": "pricing-proposal",
+      "task_id": "tsk_10d2a85d70fb4bf2a9f8fa43ce8f9cac",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 405.442,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "business-effect-as-range",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-vision-doc",
+      "ask": "Draft anyway, no questions: a vision doc in the PM space for Acme Vault in 2029, from the October Acme Cloud call notes (Confluence page 9001) and Jira epic PM-101.",
+      "repeat": 1,
+      "cluster": "vision-doc",
+      "task_id": "tsk_9444f6c3c1714fe89157beb587369bb9",
+      "status": "failed",
+      "passed": false,
+      "failures": [
+        {
+          "check": "status",
+          "expected": "`needs_approval`",
+          "got": "failed"
+        },
+        {
+          "check": "approvals",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "draft_count",
+          "tool": "confluence.create_draft",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "no_answer"
+        }
+      ],
+      "tag": {
+        "tag": "harness",
+        "rule": "interrupted",
+        "reason": "error mentions `gateway`: the model gateway's answer was cut off before it finished. please try again in a few minutes.",
+        "sub": "harness/interrupted"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 315.866,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "structure-vision-doc",
+      "ask": "Draft anyway, no questions: a vision doc in the PM space for Acme Vault in 2029, from the October Acme Cloud call notes (Confluence page 9001) and Jira epic PM-101.",
+      "repeat": 2,
+      "cluster": "vision-doc",
+      "task_id": "tsk_0f858a6f4ed741e5bf67020decc8708c",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 382.726,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "business-effect-as-range",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-vision-doc",
+      "ask": "Draft anyway, no questions: a vision doc in the PM space for Acme Vault in 2029, from the October Acme Cloud call notes (Confluence page 9001) and Jira epic PM-101.",
+      "repeat": 3,
+      "cluster": "vision-doc",
+      "task_id": "tsk_ad79c8db61d24e9db703f7c47fbec26d",
+      "status": "working",
+      "passed": false,
+      "failures": [
+        {
+          "check": "timed_out",
+          "status": "working"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "timed out while `working`",
+        "sub": "model/timed-out"
+      },
+      "queue_secs": 0.0,
+      "total_secs": null,
+      "attempts": 1,
+      "trace_read": true,
+      "cancel": {
+        "cancelled": true,
+        "worker_stopped": true,
+        "secs": 30.064135919
+      }
+    }
+  ],
+  "summary": {
+    "attempts": 24,
+    "passed": 11,
+    "pass_rate": 0.4583333333333333,
+    "tasks": 8,
+    "tasks_all_attempts_passed": 1,
+    "all_attempts_pass_rate": 0.125,
+    "infra_losses": 6,
+    "pass_rate_excluding_infra": 0.6111111111111112,
+    "pass_bar": 0.8,
+    "met_bar": false,
+    "by_task": [
+      {
+        "id": "decision-doc-what-must-be-true",
+        "passes": 2,
+        "attempts": 3,
+        "pass_rate": 0.6666666666666666,
+        "all_attempts_passed": false,
+        "infra_losses": 1
+      },
+      {
+        "id": "investment-case-payback-from-tool",
+        "passes": 3,
+        "attempts": 3,
+        "pass_rate": 1.0,
+        "all_attempts_passed": true,
+        "infra_losses": 0
+      },
+      {
+        "id": "strategy-doc-what-must-be-true",
+        "passes": 0,
+        "attempts": 3,
+        "pass_rate": 0.0,
+        "all_attempts_passed": false,
+        "infra_losses": 1
+      },
+      {
+        "id": "structure-exec-brief",
+        "passes": 2,
+        "attempts": 3,
+        "pass_rate": 0.6666666666666666,
+        "all_attempts_passed": false,
+        "infra_losses": 1
+      },
+      {
+        "id": "structure-investment-case",
+        "passes": 1,
+        "attempts": 3,
+        "pass_rate": 0.3333333333333333,
+        "all_attempts_passed": false,
+        "infra_losses": 0
+      },
+      {
+        "id": "structure-platform-strategy",
+        "passes": 1,
+        "attempts": 3,
+        "pass_rate": 0.3333333333333333,
+        "all_attempts_passed": false,
+        "infra_losses": 0
+      },
+      {
+        "id": "structure-pricing-proposal",
+        "passes": 1,
+        "attempts": 3,
+        "pass_rate": 0.3333333333333333,
+        "all_attempts_passed": false,
+        "infra_losses": 2
+      },
+      {
+        "id": "structure-vision-doc",
+        "passes": 1,
+        "attempts": 3,
+        "pass_rate": 0.3333333333333333,
+        "all_attempts_passed": false,
+        "infra_losses": 1
+      }
+    ]
+  }
+}

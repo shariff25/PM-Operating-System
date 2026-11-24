@@ -1,12 +1,17 @@
 //! Which categories a change affects, for the eval gate in CI (`pmos-evals affected`).
 //!
 //! - A change under `evals/`, or to `deploy/gateway.yaml`, affects every category.
-//! - Otherwise a category is affected when the change touches its bot's `BOT.md` directory
-//!   (`content/bots/<bot>/`), its role's directory (`content/roles/<role>/`), or the directory
-//!   of any skill the role runs (`content/skills/<skill>/`).
+//! - So does any change under the content's `roles/`, `skills/` or `bots/` (owner, 2026-11-23):
+//!   a change tuned for one bot can regress another's behaviour, skills are shared across
+//!   personas, and role files are shared by every bot made from them. Before, only the
+//!   categories whose bot, role or role's skills the change touched ran.
+//! - Any other change (`content/context/`, `content/templates/`, the code) affects none.
 //!
-//! For `bot: personal` the bot is `pm-<requested_by>`. If that bot has no `BOT.md` in the
-//! content root, its role is `pm-assistant`, the role every personal bot is made from.
+//! When a content change selects every category, each category's bot, role and skills must
+//! still resolve ([`dependencies`]), so a change that breaks a bot's `BOT.md` or a role's
+//! `ROLE.md` is an error rather than a gate run on a broken bot. For `bot: personal` the bot is
+//! `pm-<requested_by>`. If that bot has no `BOT.md` in the content root, its role is
+//! `pm-assistant`, the role every personal bot is made from.
 
 use std::path::Path;
 
@@ -16,7 +21,7 @@ use serde::Deserialize;
 use crate::spec::{category_names, load_category, resolve_bot, PERSONAL_BOT};
 
 /// The role every personal bot is made from (`pmos_contract::onboarding::render_personal_bot`).
-pub const PERSONAL_ROLE: &str = "pm-assistant";
+pub const PERSONAL_ROLE: &str = pmos_contract::onboarding::PERSONAL_ROLE;
 
 #[derive(Deserialize)]
 struct BotFront {
@@ -91,16 +96,21 @@ pub fn affected(
     {
         return Ok(names);
     }
-    let mut out = Vec::new();
-    for name in names {
-        let category = load_category(root, &name).map_err(|e| e.to_string())?;
-        let deps = dependencies(content, content_prefix, &category.bot, requested_by)?;
-        if changed
-            .iter()
-            .any(|p| deps.iter().any(|d| p.starts_with(d.as_str())))
-        {
-            out.push(name);
-        }
+    let p = content_prefix.trim_end_matches('/');
+    let bot_content = [
+        format!("{p}/roles/"),
+        format!("{p}/skills/"),
+        format!("{p}/bots/"),
+    ];
+    if !changed
+        .iter()
+        .any(|c| bot_content.iter().any(|d| c.starts_with(d.as_str())))
+    {
+        return Ok(Vec::new());
     }
-    Ok(out)
+    for name in &names {
+        let category = load_category(root, name).map_err(|e| e.to_string())?;
+        dependencies(content, content_prefix, &category.bot, requested_by)?;
+    }
+    Ok(names)
 }

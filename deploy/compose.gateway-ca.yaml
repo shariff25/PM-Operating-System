@@ -1,0 +1,11 @@
+# TESTING ONLY, with PMOS_MODEL_SOURCE=hosted-test: a host whose outbound proxy re-signs TLS
+# gives the gateway the proxy's CA bundle at run time (PMOS_GATEWAY_CA_FILE in deploy/.env; the
+# whole bundle, as the gateway then trusts only what is in it). deploy/pmos-admin adds this file
+# only with hosted-test and the setting, and refuses the setting with any other model source
+# (docs/openshell-any-host-spec.md §3.6, "Egress": no run-time CA for the production sources).
+services:
+  gateway:
+    environment:
+      SSL_CERT_FILE: /etc/pmos/ca-bundle.crt
+    volumes:
+      - ${PMOS_GATEWAY_CA_FILE:?}:/etc/pmos/ca-bundle.crt:ro

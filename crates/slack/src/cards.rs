@@ -6,6 +6,7 @@
 use serde_json::{json, Value};
 
 use crate::blocks::{escape, link, truncate};
+use crate::runtime::safe_id;
 
 /// Fields an approval card's **Edit** modal offers, when the item's arguments have them:
 /// what a draft says, never where it goes.
@@ -44,6 +45,9 @@ const INPUT_MAX: usize = 3000;
 /// Action ids the bot puts on buttons, and the modal's callback id.
 pub mod action {
     pub const APPROVE: &str = "apr_approve";
+    /// **Open in workspace**: a URL button to the web app's draft page. Slack sends no handler
+    /// for it, and a click is acknowledged with nothing.
+    pub const OPEN_WEB: &str = "apr_open_web";
     pub const EDIT: &str = "apr_edit";
     pub const REJECT: &str = "apr_reject";
     /// A reason button is this prefix and the reason's code: `apr_reason_tone`.
@@ -221,11 +225,13 @@ pub fn sections(text: &str) -> Vec<Value> {
     blocks
 }
 
-/// A bot's answer or message, from markdown.
+/// A bot's answer or message, from markdown. Source markers (`[[src-…]]`, for drafts in the
+/// web app) are removed.
 pub fn answer(markdown: &str) -> (String, Value) {
+    let markdown = pmos_contract::cite::strip(markdown);
     (
-        fallback(markdown),
-        Value::Array(sections(&mrkdwn(markdown))),
+        fallback(&markdown),
+        Value::Array(sections(&mrkdwn(&markdown))),
     )
 }
 
@@ -286,8 +292,11 @@ pub fn tool_label(tool: &str) -> String {
     }
 }
 
-/// The arguments of a write, one line per field: the editable ones first.
+/// The arguments of a write, one line per field: the editable ones first. Text is shown as
+/// it will be written: without source markers (`[[src-…]]`), which the tool server removes
+/// when it writes.
 pub fn args_summary(args: &Value) -> String {
+    let args = &pmos_contract::cite::strip_json(args);
     let Some(obj) = args.as_object() else {
         return escape(&truncate(&args.to_string(), 500));
     };
@@ -328,7 +337,83 @@ pub fn args_summary(args: &Value) -> String {
     truncate(&lines.join("\n"), SECTION_MAX - 200)
 }
 
+/// The most reviewers a card names; past it, "and N more".
+const MAX_RECOMMENDERS: usize = 3;
+
+/// One context line when a reviewer has recommended on the draft (the tool server's
+/// `recommendations`, `docs/user-database-spec.md` §8): "Ana recommends approving", "Bo
+/// suggests changes", each marked "(on an earlier version)" when the draft changed since.
+/// The note is never on a card (the web app shows it). A display name is untrusted text,
+/// rendered inert with [`crate::blocks::name`]; an unknown verdict is left out. Recommending
+/// itself happens in the web app: there is no button for it here.
+pub fn recommendation_line(item: &Value) -> Option<String> {
+    let parts: Vec<String> = item["recommendations"]
+        .as_array()?
+        .iter()
+        .filter_map(|r| {
+            let what = match r["verdict"].as_str()? {
+                "approve" => "recommends approving",
+                "changes" => "suggests changes",
+                _ => return None,
+            };
+            let named = |k: &str| r[k].as_str().filter(|n| !n.trim().is_empty());
+            let who = named("reviewer_name").or_else(|| named("reviewer"))?;
+            let mut line = format!("{} {what}", crate::blocks::name(who, 60));
+            if r["stale"] == true {
+                line.push_str(" (on an earlier version)");
+            }
+            Some(line)
+        })
+        .collect();
+    if parts.is_empty() {
+        return None;
+    }
+    let mut shown = parts[..parts.len().min(MAX_RECOMMENDERS)].join(" · ");
+    if parts.len() > MAX_RECOMMENDERS {
+        shown.push_str(&format!(" · and {} more", parts.len() - MAX_RECOMMENDERS));
+    }
+    Some(format!(":speech_balloon: {shown}"))
+}
+
 fn approval_head(item: &Value) -> Vec<Value> {
+    let mut head = approval_head_only(item);
+    head.extend(recommendation_line(item).map(|l| context(&l)));
+    head.extend(held_line(item).map(context));
+    head
+}
+
+/// "Drafted by Chief", when a marketplace bot drafted the item: the name the Slack bot put on
+/// it from the tool server's item (`personas::annotate`), already safe `mrkdwn`, followed by
+/// "· Preview: not yet benchmarked" on **every** card of a Preview bot (gate-fix-4, M1).
+/// `None` for Nudge.
+pub fn drafted_by(item: &Value) -> Option<String> {
+    let name = item[crate::personas::DRAFTED_BY_FIELD]
+        .as_str()
+        .filter(|n| !n.trim().is_empty())?;
+    Some(if item[crate::personas::DRAFTED_PREVIEW_FIELD] == true {
+        format!("Drafted by {name} · {}", crate::personas::PREVIEW_LABEL)
+    } else {
+        format!("Drafted by {name}")
+    })
+}
+
+/// A pending draft whose bot was withdrawn from the catalog is **held**
+/// (`docs/bot-marketplace-spec.md` §6, "Removal"): it can be rejected, not approved or edited,
+/// until the bot is offered again or an Admin releases it.
+pub fn is_held(item: &Value) -> bool {
+    item["held"] == true && item["status"] == "pending"
+}
+
+/// The line a held draft's card carries.
+pub const HELD_LINE: &str = ":lock: Held: the bot that drafted this isn't offered in PM OS \
+     any more, so it can't be approved or edited until an Admin releases it. You can still \
+     reject it.";
+
+fn held_line(item: &Value) -> Option<&'static str> {
+    is_held(item).then_some(HELD_LINE)
+}
+
+fn approval_head_only(item: &Value) -> Vec<Value> {
     if is_reply(item) {
         return reply_head(item);
     }
@@ -339,38 +424,143 @@ fn approval_head(item: &Value) -> Vec<Value> {
             escape(&tool_label(tool)),
             args_summary(&item["args"])
         )),
-        context(&format!(
-            "`{}` · for {} · nothing is sent until you approve",
-            escape(tool),
-            escape(&person(item["user"].as_str().unwrap_or("you")))
-        )),
+        context(&{
+            let mut line = format!(
+                "`{}` · for {}",
+                escape(tool),
+                escape(&person(item["user"].as_str().unwrap_or("you")))
+            );
+            if let Some(drafted) = drafted_by(item) {
+                line.push_str(" · ");
+                line.push_str(&drafted);
+            }
+            if let Some(edited) = edited_note(item) {
+                line.push_str(" · ");
+                line.push_str(&edited);
+            }
+            line.push_str(" · nothing is sent until you approve");
+            line
+        }),
     ]
 }
 
-fn approval_buttons(item: &Value) -> Value {
+/// The Confluence and Jira drafts get **Open in workspace** when the web app's address is
+/// set (`PMOS_WEB_PUBLIC_URL`, an `https://` origin with no trailing `/`): the web app's own
+/// route for the draft, `{web}/#/d/{id}` (`web/src/url.ts`). Slack replies and messages do
+/// not, and neither does a card when the address is unset or the id is not safe to put in a
+/// URL. (Cards posted before this used `{web}/drafts/{id}`, which pmos-web now redirects.)
+fn open_web_button(item: &Value, web: Option<&str>) -> Option<Value> {
+    let web = web?;
+    let tool = item["tool"].as_str().unwrap_or_default();
     let id = item["id"].as_str().unwrap_or_default();
-    let mut elements = if is_reply(item) {
+    if !(tool.starts_with("confluence.") || tool.starts_with("jira.")) || !safe_id(id) {
+        return None;
+    }
+    Some(json!({
+        "type": "button",
+        "text": {"type": "plain_text", "text": "Open in workspace"},
+        "url": format!("{web}/#/d/{id}"),
+        "action_id": action::OPEN_WEB,
+    }))
+}
+
+fn approval_buttons(item: &Value, web: Option<&str>) -> Value {
+    let id = item["id"].as_str().unwrap_or_default();
+    let held = is_held(item);
+    let mut elements = if held {
+        Vec::new()
+    } else if is_reply(item) {
         vec![button("Post as you", action::APPROVE, id, Some("primary"))]
     } else {
         vec![button("Approve", action::APPROVE, id, Some("primary"))]
     };
-    if !editable_fields(item).is_empty() {
+    if !held && !editable_fields(item).is_empty() {
         elements.push(button("Edit", action::EDIT, id, None));
     }
-    if is_reply(item) {
+    if !held && is_reply(item) {
         elements.push(button("Snooze", action::SNOOZE, id, None));
     }
     elements.push(button("Reject", action::REJECT, id, Some("danger")));
-    json!({"type": "actions", "block_id": format!("approval:{id}"), "elements": elements})
+    elements.extend(open_web_button(item, web));
+    let block_id = match shown_hash(item) {
+        Some(hash) => format!("approval:{id}:{hash}"),
+        None => format!("approval:{id}"),
+    };
+    json!({"type": "actions", "block_id": block_id, "elements": elements})
+}
+
+/// How many hex characters of the item's `args_hash` a card's buttons carry.
+pub const SHOWN_HASH_LEN: usize = 16;
+
+/// The start of `item`'s `args_hash` (the text the card shows), if the item has one.
+pub fn shown_hash(item: &Value) -> Option<&str> {
+    item["args_hash"]
+        .as_str()
+        .filter(|h| h.len() >= SHOWN_HASH_LEN && h.chars().all(|c| c.is_ascii_hexdigit()))
+        .map(|h| &h[..SHOWN_HASH_LEN])
+}
+
+/// The `args_hash` start an approval card's buttons were posted with (`approval:<id>:<hash>`),
+/// from the clicked block's id; `None` for a card from before cards carried it.
+pub fn clicked_hash(block_id: &str) -> Option<&str> {
+    let rest = block_id.strip_prefix("approval:")?;
+    let (_, hash) = rest.split_once(':')?;
+    (hash.len() == SHOWN_HASH_LEN && hash.chars().all(|c| c.is_ascii_hexdigit())).then_some(hash)
+}
+
+/// Was the card clicked showing other text than the item has now? It was posted before the
+/// PM saved an edit (in the web app): the card's buttons carry the start of the arguments'
+/// hash they were posted with, and it differs from the item's.
+pub fn card_is_stale(block_id: Option<&str>, item: &Value) -> bool {
+    match (block_id.and_then(clicked_hash), shown_hash(item)) {
+        (Some(clicked), Some(now)) => clicked != now,
+        _ => false,
+    }
+}
+
+/// The card again, with what the item holds now and a line saying why nothing was decided:
+/// the text changed since the card was posted (an edit saved in the web app).
+pub fn approval_changed(item: &Value, web: Option<&str>) -> (String, Value) {
+    let (text, blocks) = approval_card(item, web);
+    let mut blocks = blocks.as_array().cloned().unwrap_or_default();
+    blocks.push(context(
+        ":pencil2: This draft was edited after this card was posted, so nothing was approved. \
+         Here is the text as it is now: read it, then approve.",
+    ));
+    (text, Value::Array(blocks))
+}
+
+/// The card again, for a card that doesn't say what text it showed (posted before cards
+/// carried the args hash, or a confirmation card without it): nothing was approved, and the
+/// text as it is now is shown to approve.
+pub fn approval_reshown(item: &Value, web: Option<&str>) -> (String, Value) {
+    let (text, blocks) = approval_card(item, web);
+    let mut blocks = blocks.as_array().cloned().unwrap_or_default();
+    blocks.push(context(
+        ":arrows_counterclockwise: This card is from an older version of PM OS, so nothing was \
+         approved. Here is the text as it is now: read it, then approve.",
+    ));
+    (text, Value::Array(blocks))
+}
+
+/// "edited by Ana", when a person changed the bot's text (a saved edit or an edit), for the
+/// card's context line.
+fn edited_note(item: &Value) -> Option<String> {
+    (item["edited"] == true).then(|| {
+        format!(
+            "edited by {}",
+            escape(&person(item["user"].as_str().unwrap_or("you")))
+        )
+    })
 }
 
 /// A pending approval card: the tool, its arguments, and **Approve**, **Edit**, **Reject**.
 /// A reply draft gets the reply card instead: **Post as you**, **Edit**, **Snooze** and
 /// **Reject**.
-pub fn approval_card(item: &Value) -> (String, Value) {
+pub fn approval_card(item: &Value, web: Option<&str>) -> (String, Value) {
     let tool = item["tool"].as_str().unwrap_or("a write");
     let mut blocks = approval_head(item);
-    blocks.push(approval_buttons(item));
+    blocks.push(approval_buttons(item, web));
     let text = if is_reply(item) {
         format!("{}: approval needed", reply_title(item))
     } else {
@@ -381,13 +571,14 @@ pub fn approval_card(item: &Value) -> (String, Value) {
 
 /// The card after **Reject**: why, as six one-tap reasons, and **Back** to the card's own
 /// buttons. Nothing is decided until a reason is chosen.
-pub fn approval_reasons(item: &Value) -> (String, Value) {
+pub fn approval_reasons(item: &Value, web: Option<&str>) -> (String, Value) {
     let id = item["id"].as_str().unwrap_or_default();
     let mut elements: Vec<Value> = REASONS
         .iter()
         .map(|(code, label)| button(label, &format!("{}{code}", action::REASON_PREFIX), id, None))
         .collect();
     elements.push(button("Back", action::BACK, id, None));
+    elements.extend(open_web_button(item, web));
     let mut blocks = approval_head(item);
     blocks.push(section("*Why reject it?* Nothing is sent either way."));
     blocks
@@ -403,8 +594,8 @@ pub fn approval_closed(item: &Value, line: &str) -> (String, Value) {
 }
 
 /// The card with its buttons back and an error under them, to try again.
-pub fn approval_retry(item: &Value, error: &str) -> (String, Value) {
-    let (text, blocks) = approval_card(item);
+pub fn approval_retry(item: &Value, error: &str, web: Option<&str>) -> (String, Value) {
+    let (text, blocks) = approval_card(item, web);
     let mut blocks = blocks.as_array().cloned().unwrap_or_default();
     blocks.push(context(&format!(":warning: {}", escape(error))));
     (text, Value::Array(blocks))
@@ -459,13 +650,17 @@ pub fn decision_line(item: &Value, decided_by: &str, edited: bool) -> String {
     }
 }
 
-/// The editable string fields this item has, with their values. Never a target
-/// ([`TARGETS`]).
+/// The editable string fields this item has, with their values, without source markers: the
+/// PM edits the text as it will be written. Never a target ([`TARGETS`]).
 pub fn editable_fields(item: &Value) -> Vec<(&'static str, String)> {
     EDITABLE
         .iter()
         .filter(|f| !TARGETS.contains(f))
-        .filter_map(|f| item["args"][*f].as_str().map(|v| (*f, v.to_string())))
+        .filter_map(|f| {
+            item["args"][*f]
+                .as_str()
+                .map(|v| (*f, pmos_contract::cite::strip(v)))
+        })
         .collect()
 }
 
@@ -692,9 +887,9 @@ fn reply_head(item: &Value) -> Vec<Value> {
         title.push_str(&link(&url, "open the thread"));
     }
     let mut blocks = vec![section(&title)];
-    let text = args["text"].as_str().unwrap_or_default();
+    let text = pmos_contract::cite::strip(args["text"].as_str().unwrap_or_default());
     if item["status"] != "expired" && !text.trim().is_empty() && text != "[expired]" {
-        let quoted: Vec<String> = reply_text(&truncate(text, 2500))
+        let quoted: Vec<String> = reply_text(&truncate(&text, 2500))
             .lines()
             .map(|l| format!("> {l}"))
             .collect();
@@ -707,6 +902,8 @@ fn reply_head(item: &Value) -> Vec<Value> {
         ),
         "posts as you, marked “Drafted with PM OS”".to_string(),
     ];
+    meta.extend(drafted_by(item));
+    meta.extend(edited_note(item));
     if let Some(s) = item["sources_sensitivity"]
         .as_str()
         .filter(|s| matches!(*s, "public" | "internal" | "restricted"))
@@ -736,8 +933,9 @@ pub fn reply_note(item: &Value, line: &str) -> (String, Value) {
 /// The `audience_blocked` answer: why, in plain words, with only **Reject**. Editing can't
 /// unblock it: the draft was built from restricted sources whatever its text now says, so
 /// the PM answers in the thread themselves if it still needs an answer.
-/// `outsiders` is how many members aren't in `team.yaml`; with none, the channel is
-/// externally shared.
+/// `outsiders` is how many channel members aren't PM OS insiders (the tool server's count:
+/// active users holding `pm`, `reviewer` or `admin`); with none, the channel is externally
+/// shared.
 pub fn reply_blocked(item: &Value, outsiders: Option<u64>) -> (String, Value) {
     let id = item["id"].as_str().unwrap_or_default();
     let place = reply_place(item);
@@ -788,10 +986,22 @@ pub fn reply_confirm_external(item: &Value, edited: bool) -> (String, Value) {
     shown["audience"]["external"] = json!(true);
     let mut blocks = approval_head(&shown);
     blocks.push(section(&line));
-    blocks.push(
-        json!({"type": "actions", "block_id": format!("external:{id}"), "elements": elements}),
-    );
+    // Like an approval card's, the buttons carry the start of the args hash of the text shown
+    // (not after an edit, whose own text is what posts): the confirmation approves exactly it.
+    let block_id = match shown_hash(item).filter(|_| !edited) {
+        Some(hash) => format!("external:{id}:{hash}"),
+        None => format!("external:{id}"),
+    };
+    blocks.push(json!({"type": "actions", "block_id": block_id, "elements": elements}));
     (truncate(&line, 300), Value::Array(blocks))
+}
+
+/// The args hash start a **Post to external channel** card was posted with
+/// (`external:<id>:<hash>`); `None` for one from before it carried it, or after an edit.
+pub fn confirmed_hash(block_id: &str) -> Option<&str> {
+    let rest = block_id.strip_prefix("external:")?;
+    let (_, hash) = rest.split_once(':')?;
+    (hash.len() == SHOWN_HASH_LEN && hash.chars().all(|c| c.is_ascii_hexdigit())).then_some(hash)
 }
 
 /// **Snooze**'s choices in place, each `(code, label)`, and **Back**. With none left before
@@ -902,6 +1112,74 @@ pub fn routine_list(routines: &[Value], display: impl Fn(&str) -> String) -> (St
     )
 }
 
+// ---- The first-time flow (`PMOS_ONBOARDING_V2=1`, `onboard_copy.rs`) ----
+
+/// A starter button's action id is this prefix and the starter's id.
+pub const ONBOARD_START_PREFIX: &str = "pmos_onboard_start_";
+/// The welcome's one button: a link, so Slack sends no handler for a click.
+pub const ONBOARD_CONNECT: &str = "pmos_onboard_connect";
+
+/// The welcome: two short lines and one **Connect Jira and Confluence** button. Without a
+/// link, the lines and a plain sentence say what to do instead.
+pub fn onboard_hello(first_name: &str, url: Option<&str>) -> (String, Value) {
+    // A display name from Slack: rendered inert (no mention, link or formatting).
+    let first = crate::blocks::name(first_name, 60);
+    let greeting = if first.is_empty() {
+        crate::onboard_copy::HELLO_NO_NAME.to_string()
+    } else {
+        crate::onboard_copy::HELLO.replace("{name}", &first)
+    };
+    match url.filter(|u| u.starts_with("https://") || u.starts_with("http://")) {
+        Some(url) => (
+            truncate(&greeting, 300),
+            json!([
+                section(&greeting),
+                {"type": "actions", "block_id": "onboard_hello", "elements": [{
+                    "type": "button", "style": "primary",
+                    "text": {"type": "plain_text", "text": crate::onboard_copy::CONNECT_BUTTON},
+                    "action_id": ONBOARD_CONNECT, "url": url,
+                }]},
+            ]),
+        ),
+        None => {
+            let text = format!("{greeting}\n{}", crate::onboard_copy::NO_LINK);
+            (truncate(&text, 300), json!([section(&text)]))
+        }
+    }
+}
+
+/// The offer after the account is linked: three buttons, each starting a task.
+pub fn onboard_offer() -> (String, Value) {
+    let elements: Vec<Value> = crate::onboard_copy::STARTERS
+        .iter()
+        .map(|s| {
+            button(
+                s.label,
+                &format!("{ONBOARD_START_PREFIX}{}", s.id),
+                s.id,
+                None,
+            )
+        })
+        .collect();
+    (
+        crate::onboard_copy::OFFER.to_string(),
+        json!([
+            section(crate::onboard_copy::OFFER),
+            {"type": "actions", "block_id": "onboard_offer", "elements": elements},
+        ]),
+    )
+}
+
+/// The offer after a starter was tapped: no buttons left.
+pub fn onboard_started(label: &str) -> (String, Value) {
+    note(&crate::onboard_copy::STARTED.replace("{label}", &escape(label)))
+}
+
+/// The one closing line.
+pub fn onboard_closing() -> (String, Value) {
+    note(crate::onboard_copy::CLOSING)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -932,13 +1210,65 @@ mod tests {
     }
 
     #[test]
+    fn a_reviewers_recommendation_is_one_inert_line_without_the_note() {
+        let mut item = json!({
+            "id": "apr_1", "user": "ana", "tool": "jira.create_issue",
+            "args": {"project": "PM", "summary": "Fake"}, "status": "pending",
+        });
+        let (_, blocks) = approval_card(&item, None);
+        assert!(!blocks.to_string().contains("recommends"));
+        item["recommendations"] = json!([
+            {"reviewer": "rev", "reviewer_name": "Rev <!channel> *Bold* @here", "verdict": "approve", "stale": false,
+             "note": "Fake note that a card never shows"},
+            {"reviewer": "bo", "reviewer_name": "", "verdict": "changes", "stale": true},
+            {"reviewer": "cy", "reviewer_name": "Cy", "verdict": "reject", "stale": false},
+        ]);
+        let line = recommendation_line(&item).unwrap();
+        assert!(line.contains("recommends approving"), "{line}");
+        assert!(
+            line.contains("bo suggests changes (on an earlier version)"),
+            "{line}"
+        );
+        assert!(
+            !line.contains("<!channel>") && !line.contains("*Bold*") && !line.contains("@here"),
+            "{line}"
+        );
+        assert!(line.contains("&lt;!channel&gt;"), "{line}");
+        assert!(
+            !line.contains("Cy"),
+            "an unknown verdict is left out: {line}"
+        );
+        for card in [
+            approval_card(&item, None).1,
+            approval_closed(&item, "Approved").1,
+            approval_reasons(&item, None).1,
+        ] {
+            let s = card.to_string();
+            assert_eq!(s.matches("recommends approving").count(), 1, "{s}");
+            assert!(!s.contains("Fake note"), "{s}");
+        }
+        let mut reply = item.clone();
+        reply["tool"] = json!("slack.post_reply");
+        reply["args"] = json!({"channel": "C0PMTEAM", "thread_ts": "1.0", "text": "Fake"});
+        assert!(approval_card(&reply, None)
+            .1
+            .to_string()
+            .contains("suggests changes"));
+        let many: Vec<Value> = (0..5)
+            .map(|i| json!({"reviewer": format!("r{i}"), "verdict": "approve", "stale": false}))
+            .collect();
+        item["recommendations"] = json!(many);
+        assert!(recommendation_line(&item).unwrap().ends_with("and 2 more"));
+    }
+
+    #[test]
     fn approval_cards() {
         let item = json!({
             "id": "apr_1", "user": "ana", "tool": "confluence.create_draft",
             "args": {"space": "PM", "title": "Launch <plan>", "body": "line 1\nline 2"},
             "status": "pending",
         });
-        let (_, blocks) = approval_card(&item);
+        let (_, blocks) = approval_card(&item, None);
         let s = blocks.to_string();
         assert!(s.contains("Create a Confluence draft"));
         assert!(s.contains("*Title:* Launch &lt;plan&gt;"), "{s}");
@@ -1040,7 +1370,7 @@ mod tests {
     #[test]
     fn reply_cards() {
         let item = reply_item();
-        let (text, blocks) = approval_card(&item);
+        let (text, blocks) = approval_card(&item, None);
         assert_eq!(text, "Reply drafted for <#C0LAUNCH>: approval needed");
         let s = blocks.to_string();
         assert!(s.contains("*Reply drafted for <#C0LAUNCH>* · <https://slack.com/archives/C0LAUNCH/p1731500000000100|open the thread>"), "{s}");
@@ -1114,6 +1444,45 @@ mod tests {
         assert_eq!(modal["submit"]["text"], "Post as you");
     }
 
+    /// Source markers are for the web app's draft view: a card shows, and its Edit modal
+    /// offers, the text as it will be written, without them.
+    #[test]
+    fn cards_show_drafts_without_source_markers() {
+        let page = json!({
+            "id": "apr_1", "user": "ana", "tool": "confluence.create_draft",
+            "args": {"space": "PM", "title": "Plan [[src-3f9a1c]]",
+                     "body": "Grace is 7 days [[src-3f9a1c]][[src-0b77d2]].\nUse `[[src-3f9a1c]]`."},
+            "status": "pending"
+        });
+        let mut reply = reply_item();
+        reply["args"]["text"] = json!("Yes, SSO ships in 4.2 [[src-3f9a1c]]. Ask <@U0BOB> [[s2]].");
+        for item in [&page, &reply] {
+            let (_, blocks) = approval_card(item, None);
+            let shown = blocks.to_string();
+            assert!(!shown.contains("[[src-3f9a1c]]."), "{shown}");
+            assert!(!shown.contains("[[src-0b77d2]]") && !shown.contains("[[s2]]"));
+            let modal = edit_modal(item, "C1", "1.2").unwrap().to_string();
+            assert!(!modal.contains("[[src-0b77d2]]") && !modal.contains("[[s2]]"));
+        }
+        let (_, blocks) = approval_card(&page, None);
+        let shown = blocks.to_string();
+        assert!(shown.contains("Grace is 7 days."), "{shown}");
+        assert!(shown.contains("Plan"));
+        // Code keeps what it says.
+        assert!(shown.contains("`[[src-3f9a1c]]`"), "{shown}");
+        let (_, blocks) = approval_card(&reply, None);
+        assert!(blocks
+            .to_string()
+            .contains("Yes, SSO ships in 4.2. Ask <@U0BOB>."));
+        assert_eq!(
+            editable_fields(&reply),
+            vec![("text", "Yes, SSO ships in 4.2. Ask <@U0BOB>.".to_string())]
+        );
+        let (text, blocks) = answer("Done [[src-3f9a1c]].");
+        assert_eq!(text, "Done.");
+        assert!(!blocks.to_string().contains("src-"));
+    }
+
     #[test]
     fn reply_text_keeps_only_safe_markup() {
         assert_eq!(reply_text("a < b"), "a &lt; b");
@@ -1129,12 +1498,111 @@ mod tests {
     }
 
     #[test]
+    fn open_in_workspace_button_for_confluence_and_jira_drafts() {
+        const WEB: &str = "https://pm.example.com";
+        let confluence = json!({
+            "id": "apr_1", "user": "ana", "tool": "confluence.create_draft",
+            "args": {"space": "PM", "title": "Plan", "body": "x"}, "status": "pending",
+        });
+        let jira = json!({
+            "id": "apr_2", "user": "ana", "tool": "jira.create_issue",
+            "args": {"project": "PM", "summary": "s"}, "status": "pending",
+        });
+        let slack = json!({
+            "id": "apr_r1", "user": "ana", "tool": "slack.post_reply", "status": "pending",
+            "args": {"channel": "C0LAUNCH", "text": "hi"}, "bot": "pm-ana",
+        });
+        let button_of = |item: &Value, web: Option<&str>| -> Option<Value> {
+            let (_, blocks) = approval_card(item, web);
+            blocks
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|b| b["elements"].as_array().cloned().unwrap_or_default())
+                .find(|e| e["action_id"] == action::OPEN_WEB)
+        };
+        for (item, id) in [(&confluence, "apr_1"), (&jira, "apr_2")] {
+            let b = button_of(item, Some(WEB)).expect("button when configured");
+            assert_eq!(b["text"]["text"], "Open in workspace");
+            assert_eq!(b["url"], format!("{WEB}/#/d/{id}"));
+            assert!(
+                button_of(item, None).is_none(),
+                "absent when not configured"
+            );
+        }
+        assert!(
+            button_of(&slack, Some(WEB)).is_none(),
+            "no button for Slack drafts"
+        );
+        let (_, reasons) = approval_reasons(&confluence, Some(WEB));
+        assert!(reasons
+            .to_string()
+            .contains("https://pm.example.com/#/d/apr_1"));
+        let unsafe_id = json!({
+            "id": "../apr", "tool": "jira.create_issue", "args": {"summary": "s"},
+            "status": "pending",
+        });
+        assert!(
+            button_of(&unsafe_id, Some(WEB)).is_none(),
+            "unsafe id is never linked"
+        );
+    }
+
+    #[test]
+    fn a_card_shows_a_saved_edit_and_knows_when_it_is_stale() {
+        let hash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let mut item = json!({
+            "id": "apr_1", "user": "ana", "tool": "confluence.create_draft",
+            "args": {"space": "PM", "title": "Plan", "body": "Edited in the web app."},
+            "args_hash": hash, "status": "pending", "edited": true,
+        });
+        // The card shows the saved edit, says it was edited, and carries the text's hash.
+        let (_, blocks) = approval_card(&item, None);
+        let s = blocks.to_string();
+        assert!(s.contains("Edited in the web app."));
+        assert!(s.contains("edited by Ana"));
+        let actions = blocks
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["type"] == "actions")
+            .unwrap();
+        let block_id = actions["block_id"].as_str().unwrap();
+        assert_eq!(block_id, "approval:apr_1:0123456789abcdef");
+        assert_eq!(clicked_hash(block_id), Some("0123456789abcdef"));
+        assert!(!card_is_stale(Some(block_id), &item));
+        // The PM saves another edit in the web app: that card is stale now.
+        item["args_hash"] = json!("f".repeat(64));
+        assert!(card_is_stale(Some(block_id), &item));
+        let (_, again) = approval_changed(&item, None);
+        assert!(again
+            .to_string()
+            .contains("edited after this card was posted"));
+        // Cards posted before they carried a hash, and items without one, aren't stale.
+        assert!(!card_is_stale(Some("approval:apr_1"), &item));
+        assert!(!card_is_stale(None, &item));
+        item.as_object_mut().unwrap().remove("args_hash");
+        assert!(!card_is_stale(Some(block_id), &item));
+        // A reply card says so too; an unedited one doesn't.
+        let mut reply = json!({
+            "id": "apr_r", "user": "ana", "tool": "slack.post_reply", "status": "pending",
+            "args": {"channel": "C0LAUNCH", "thread_ts": "1731600000.000100", "text": "Yes."},
+            "edited": true,
+        });
+        let (_, blocks) = approval_card(&reply, None);
+        assert!(blocks.to_string().contains("edited by Ana"));
+        reply["edited"] = json!(false);
+        let (_, blocks) = approval_card(&reply, None);
+        assert!(!blocks.to_string().contains("edited by"));
+    }
+
+    #[test]
     fn reject_reasons() {
         let item = json!({
             "id": "apr_1", "user": "ana", "tool": "jira.create_issue",
             "args": {"summary": "Fix <login>"}, "status": "pending",
         });
-        let (_, blocks) = approval_reasons(&item);
+        let (_, blocks) = approval_reasons(&item, None);
         let actions = blocks.as_array().unwrap().last().unwrap();
         let ids: Vec<&str> = actions["elements"]
             .as_array()

@@ -1,0 +1,23 @@
+# TESTING ONLY: the gateway on a hosted OpenAI-compatible model nobody approved
+# (PMOS_MODEL_SOURCE=hosted-test; docs/openshell-any-host-spec.md §3.6, "hosted-test, and
+# fake-data mode"). Prompts leave this host, so the stack takes fake data only.
+#
+# deploy/pmos-admin adds this file to every `docker compose` call when deploy/.env says
+# PMOS_MODEL_SOURCE=hosted-test, and writes the gateway's config, a `class: test` one with every
+# role on PMOS_HOSTED_TEST_MODEL behind its label, to $PMOS_STATE_DIR/gateway.hosted-test.yaml
+# (outside the repo: it names the provider's URL and model id). PMOS_MODEL_SOURCE itself reaches
+# every service from deploy/compose.yaml, and each refuses what fake-data mode refuses however
+# the stack is started (slice H4).
+services:
+  gateway:
+    environment:
+      # The host's outbound proxy, if it has one, as for the other services (x-proxy).
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: localhost,127.0.0.1,.pmos.internal,postgres,vllm-default,vllm-extraction,${NO_PROXY:-}
+      PMOS_GATEWAY_CLOUD_TEST: "1"
+      # One upstream: its key here (pmos-admin requires it). Routes (PMOS_HOSTED_TEST_ROUTES=1):
+      # blank, and each upstream's key is a Compose secret pmos-admin adds
+      # ($PMOS_STATE_DIR/compose.upstream-keys.yaml, gateway only; docs/model-providers-spec.md).
+      PMOS_GATEWAY_REMOTE_KEY: ${PMOS_GATEWAY_REMOTE_KEY:-}
+    volumes:
+      - ${PMOS_STATE_DIR:?}/gateway.hosted-test.yaml:/etc/pmos/gateway.yaml:ro

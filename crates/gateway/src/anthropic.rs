@@ -1,4 +1,4 @@
-//! **Testing only:** a Claude model behind the gateway, for trying PM OS before the Spark's
+//! **Testing only:** a Claude model behind the gateway, for trying PM OS before the
 //! local models are up (decided 2026-11-14).
 //!
 //! It is off unless `PMOS_GATEWAY_CLOUD_TEST=1` and a role's upstream is written
@@ -245,6 +245,7 @@ pub fn error_body(res: &Value, status: u16) -> Value {
 
 /// A finished `chat.completion` as an OpenAI server-sent-event stream, for callers that asked
 /// for `stream: true`: the whole answer in one delta, then the finish reason and `[DONE]`.
+/// Also used for a streamed call to a role whose workarounds need the whole answer (`app.rs`).
 pub fn as_stream(answer: &Value) -> String {
     let base = |delta: Value, finish: Value| {
         json!({
@@ -257,6 +258,10 @@ pub fn as_stream(answer: &Value) -> String {
     };
     let msg = &answer["choices"][0]["message"];
     let mut delta = json!({"role": "assistant", "content": msg["content"]});
+    // A workaround's output on a whole answer (`strip-think`'s reasoning) goes with it.
+    if let Some(r) = msg["reasoning_content"].as_str() {
+        delta["reasoning_content"] = json!(r);
+    }
     if let Some(calls) = msg["tool_calls"].as_array() {
         let indexed: Vec<Value> = calls
             .iter()
