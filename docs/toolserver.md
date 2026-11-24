@@ -433,6 +433,43 @@ why a newer event can't be deleted by anyone, is in `docs/audit-retention.md`. I
   token against the exact set allowed, so a new route can't silently widen a client.
 - **Session token:** each sandbox gets only its own.
 
+### OpenShell: policy proofs and sandbox decisions
+
+Built before review (owner's instruction of 2026-11-24); `docs/openshell-prover-and-sandbox-
+audit-spec.md`. The tool server runs no prover and reads nothing from OpenShell: proofs come
+from a host command, decisions from the `pmos-sandbox-audit` collector (`crates/sandbox-audit`).
+Code: `src/openshell/` (store, Postgres, `sandbox.rs`), `src/app/sandbox_audit.rs`.
+
+| Route | Who | What |
+| --- | --- | --- |
+| `POST /internal/sandbox-audit/batch` `{collector_run, events: [{seq, kind, at, …}]}` | `PMOS_SANDBOX_AUDIT_TOKEN` only (every other token `403`, none `401`; without the setting `404`) | At most 500 events and 256 KiB; unknown fields, a query string or fragment in `http_path`, non-printable or over-long strings, a reason outside the fixed set, an event from the future or `seq` not increasing are `400` and nothing is stored. Answers `{stored, duplicates, replayed, gaps}` |
+| `POST /internal/sandbox-audit/heartbeat` `{collector_run, acked_seq}` | the same | The run is alive; an `acked_seq` past what was stored is a gap |
+| `GET /internal/admin/policy/proofs?user=` | service or web token; viewer with `view-policies` | `{proofs: [newest per bot], policy_loads: {bot: at}, not_proved, domains}`. Refusals recorded as `admin.policy_proofs` |
+| `GET /internal/admin/sandbox?user=&bot=` | service or web token; `view-audit-log` or `view-policies` | `{configured, collector, denials: {bot: [≤20 rows]}, policy_loads, view}`; an Auditor's rows carry no host, address, path or process. Refusals recorded as `admin.sandbox` |
+
+- **The collector's token** (`PMOS_SANDBOX_AUDIT_TOKEN`, at least 32 characters, distinct from
+  every other client's) is no client of any other route: `client_for` doesn't know it, so it is
+  `401` everywhere else (`tests/sandbox_audit.rs` has the matrix). It can append sandbox rows
+  through these checks and can't read, edit or delete audit events.
+- **Rows** are `audit_events` with client `sandbox_audit` and the sandbox columns of migration
+  0031; only that client may write a `sandbox.*` row (a check constraint). A deny or finding
+  delivered twice (same `os_event_uid`) is stored once.
+- **Attribution:** the bot from the sandbox name `pmos-<bot>` when the roster has it (else
+  `unknown sandbox`); a personal bot's PM is its owner; a team bot's PM and task only when
+  exactly one of its sessions was open at the event's time (else the actor `pmos-sandbox-audit`
+  and `no task` or `ambiguous`). The sandbox id `pmos-admin sandbox` recorded is not compared yet
+  (verify on a real host).
+- **Gaps:** each run's `seq` must run on: a hole is `sandbox.collector_gap` (`seq a to b missing
+  n`), a replay is skipped, a new run records `sandbox.collector_down` from the previous run's
+  last word, and the watchdog (every minute, while the token is set) opens a `collector_down`
+  (`silent since <t>`) after 5 silent minutes, closed with both ends when it is heard from.
+- **Tripwire:** `openshell::denials_since(bot, t)` and `openshell::sandbox_gaps_since(t)` for
+  the phase 2 halt (IL2-16).
+- **Proofs:** `pmos-toolserver policy-proof record` (needs `PMOS_HOST_USER` and
+  `PMOS_DATABASE_URL`) reads a `pmos policy prove --format json` report on standard input,
+  checks every field and records one `policy_proofs` row and one `policy.prove` audit event
+  (client `host`) per bot in one transaction.
+
 ### Approvals auth: user assertions
 
 With the web or console token, the person a call names (`user=`, `decided_by`) is believed

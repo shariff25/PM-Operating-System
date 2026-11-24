@@ -240,6 +240,32 @@ Each admin who proposes links GitHub (`setup` in a Slack DM, the App Home's **Ac
 needs write access to the content repository. Branch protection (above) stops that access from
 reaching the default branch without someone else's review.
 
+## OpenShell's prover and the sandbox's denials
+
+Built before review (owner's instruction of 2026-11-24); design and status in
+`docs/openshell-prover-and-sandbox-audit-spec.md`. Nothing here has run against a real OpenShell.
+
+- **Prover row**, on every bot card: the newest proof `deploy/pmos-admin policy prove` recorded
+  on the host for that bot's running sandbox (`GET /internal/admin/policy/proofs`, admins and
+  auditors). It reads **Proved (5 of 5 domains)** only for a proof whose status is `proved` and
+  which is current: its `candidate_sha256` is the checked-in policy's (the SHA-256 of its
+  canonical form) and it is not older than the sandbox's last `sandbox.policy_loaded`. Anything
+  else says what it is: **Stale**, **Exceeds boundary: …**, **Not checked: unsupported (…)**,
+  **Not checked: inconclusive**, **Prover error**, **Prover not available on the host**,
+  **Prover version too old (or different)**, or that no proof is recorded, or that the tool
+  server didn't answer. None of them is a pass. A proof is of the **network view** (the
+  tool-server endpoint's MCP rules removed, which only widens), and every card lists what a
+  proof never covers (readable paths, the MCP tool allowlist, credentials, uploads, name
+  resolution, what a running sandbox enforces).
+- **Not run here:** `pmos-web` runs no prover; the propose and proposals parts say "The prover
+  runs on the pull request (CI check `policy-prover`). Not run here." Reading that check into
+  the proposals list (slice A6) needs the GitHub App's **Checks: read** and is not built.
+- **Sandbox denials**, on every bot card: its latest five denials, findings and deny summaries
+  OpenShell recorded in the last 7 days (rule, destination, time), from
+  `GET /internal/admin/sandbox`. An Admin sees the host, port, method and path; an Auditor the
+  destination class (`pmos service`, `private`, `public`, `always blocked`, `unknown`) and port.
+  The card says when the collector is off, silent (no record is not proof of none), or unknown.
+
 ## What it is not
 
 - **Not a writer.** It never edits a file on the server, applies a policy to OpenShell
