@@ -3,7 +3,7 @@ import { ApiError } from '../api';
 import type { Draft, Task } from '../api';
 import { messageOf, useApp } from '../app-context';
 import { identify } from '../bots';
-import { BotFace, PreviewTag } from '../components/BotParts';
+import { BotFace, FallbackNote, PreviewTag } from '../components/BotParts';
 import { Avatar, Empty, ErrorNote, Markdown, Skeleton, StrippedNote, SystemTag, kindSystem } from '../components/bits';
 import { Icon, Mark, kindIcon } from '../components/icons';
 import { PageBar } from '../components/Shell';
@@ -33,7 +33,7 @@ function TaskReference({ id }: { id: string }) {
 }
 
 /** A draft the request produced, as a card with its title, kind and an Open draft button. */
-function DraftCard({ id }: { id: string }) {
+function DraftCard({ id, fallback }: { id: string; fallback?: boolean }) {
   const { api, navigate } = useApp();
   const [draft, setDraft] = useState<Draft | null>(null);
   useEffect(() => {
@@ -53,6 +53,7 @@ function DraftCard({ id }: { id: string }) {
         </span>
         <a className="draft-card-title" href={draftHref(id)}>{draft?.title ?? copy.activity.draftCard}</a>
         {draft && <span className="draft-card-meta">{draft.target.label}</span>}
+        {fallback && <FallbackNote />}
       </span>
       <button type="button" className="btn btn-primary" onClick={() => navigate(`/d/${encodeURIComponent(id)}`)}>
         {copy.activity.openDraft}
@@ -220,6 +221,7 @@ export function Thread({ id }: { id: string }) {
                 <h2 className="sr-only">{copy.task.resultHeading}</h2>
                 <Markdown rendered={rendered} className="prose" />
                 <StrippedNote parts={rendered.stripped} what={copy.stripped.answer} />
+                {task.fallback_used && <FallbackNote />}
               </div>
             )}
 
@@ -255,7 +257,7 @@ export function Thread({ id }: { id: string }) {
               </Empty>
             )}
 
-            {task.draft_ids.map((d) => <DraftCard key={d} id={d} />)}
+            {task.draft_ids.map((d) => <DraftCard key={d} id={d} fallback={task.fallback_used} />)}
           </div>
         </article>
       </section>

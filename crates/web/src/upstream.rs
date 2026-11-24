@@ -123,6 +123,10 @@ pub struct Task {
     /// slice R1). A runtime from before personas doesn't send it: every task is then Nudge's.
     #[serde(default)]
     pub persona: Option<String>,
+    /// A call of the task was answered by a fallback model (`docs/model-providers-spec.md`
+    /// §4.10, slice MP7): the app marks the reply. A runtime from before routes doesn't send it.
+    #[serde(default)]
+    pub fallback_used: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

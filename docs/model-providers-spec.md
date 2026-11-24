@@ -1,6 +1,30 @@
 # Model providers: switching and automatic fallback in `pmos-gateway`
 
-Status: **design spec; not built.** Written on 2026-11-24 after the owner's go-ahead ("build to
+> **Status note (2026-11-24): slices MP1 to MP8 are built, built before review (owner's
+> instruction of 2026-11-24)**, on branch `build/model-providers`, one commit per slice, under
+> `hosted-test` with fake data, the stub and mock upstreams only; `local` keeps its two pinned
+> model servers (a route may hold only those); `hosted` is still refused as not built. MP9 and
+> MP10 are not built (they wait on H12 and the owner's Q1). What `docs/gateway.md`, "Routes",
+> describes is what was built. Defaults taken for the owner's questions: Q1 no second hosted
+> entry (the cap is unchanged); Q2 `PMOS_FALLBACK_FOR_BENCHMARKED=mark` (setting: `refuse`); Q3
+> no route mixes sources (refused at start-up); Q4 tokens per label only (`pmos-admin usage
+> --by-label`, no spend limits); Q5 plain SHA-256 (`model_sha256`, `upstream_sha256`), unkeyed;
+> Q6 key files in the gateway container. Where this spec was silent the more refusing reading
+> was built: a one-hop role keeps every behaviour it had (no circuit; its own retry policy); an
+> upstream key file readable by group or others is unusable; a stream past 64 KiB with no first
+> content fails over; a key file that can't be used skips its hop on each call rather than
+> opening a circuit (so a fixed key acts at once); `GET /v1/pmos/routes` is for the `admin`
+> client only; a fallback's missing `context-tokens` counts as smaller than the primary's;
+> failures are counted against the model's circuit except connection, timeout, key and redirect
+> failures (the upstream's); a pin does not get past an open circuit or a disabled model.
+> **Not verified:** any run on the test stack or with real test upstreams (no Docker was used),
+> whether real providers accept each other's tool-call ids in history, that the gateway
+> container's user can read a mounted key file, and the `docker inspect` check of MP-13. Not
+> built: the mark on the web Drafts page and in the draft record (the tool server's), a run
+> pinned to a fallback hop in the eval runner (the gateway's `pin` is built), and the
+> `stopped-<name>` files (MP10).
+
+Status: **design spec; built before review (MP1 to MP8, above).** Written on 2026-11-24 after the owner's go-ahead ("build to
 the PRD"). It goes to the independent security reviewer before any code (CLAUDE.md, "How to
 work"). Code cited is `claude/web-app` at `0e1316b`; line numbers may move, and the slice that
 edits a file re-checks them. Nothing here changes `docs/openshell-any-host-spec.md` (r7); where

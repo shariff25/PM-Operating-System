@@ -22,6 +22,21 @@ use serde_json::Value;
 
 /// Shown once per thread under a Preview persona's first message there.
 pub const PREVIEW_LABEL: &str = "Preview: not yet benchmarked";
+/// Shown under a reply, and on each draft card, of a task a fallback model answered (in part)
+/// (`docs/model-providers-spec.md` §4.10, slice MP7): the benchmark of the bot's model doesn't
+/// cover it. On every such message, never only the first.
+pub const FALLBACK_LABEL: &str = "Answered by a fallback model: not benchmarked for this bot";
+
+/// A message with [`FALLBACK_LABEL`] added as its last context line, when the feed item says
+/// a fallback model answered the task.
+pub fn mark_fallback((text, blocks): (String, Value), item: &Value) -> (String, Value) {
+    if item["fallback_used"] != true {
+        return (text, blocks);
+    }
+    let mut blocks = blocks.as_array().cloned().unwrap_or_default();
+    blocks.push(context(FALLBACK_LABEL));
+    (format!("{text} ({FALLBACK_LABEL})"), Value::Array(blocks))
+}
 /// A persona key the catalog doesn't (or no longer) list: never guessed from the key.
 pub const NO_LONGER_OFFERED: &str = "A bot no longer offered";
 /// A persona the Slack bot can't name because neither the tool server's item nor any catalog

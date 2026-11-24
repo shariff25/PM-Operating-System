@@ -1049,6 +1049,8 @@ export const copy = {
     byLabel: (name: string) => `By ${name}`,
     preview: 'Preview',
     previewNote: 'Not yet benchmarked',
+    /** On a reply, and each of its draft cards, that a fallback model answered (in part). */
+    fallbackNote: 'Answered by a fallback model: not benchmarked for this bot',
     needs: (label: string) => `Needs ${label}`,
     alwaysOn: 'Always on',
     alwaysOnTeam: 'Always on your team',

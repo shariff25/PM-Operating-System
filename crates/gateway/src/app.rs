@@ -49,7 +49,9 @@ use serde_json::{json, Value};
 use pmos_contract::model_source::{self as source, ModelSource};
 
 use crate::anthropic;
-use crate::config::{Client, ClientPolicy, GatewayClass, Models, Role, UpstreamKind};
+use crate::config::{Client, ClientPolicy, GatewayClass, Hop, Models, Role, UpstreamKind};
+use crate::health::{Health, Key as HealthKey};
+use crate::keys::{KeyStore, Unusable};
 use crate::remote::{StreamScanner, ToolCallExtras};
 use crate::retry::RetryPolicy;
 use crate::scheduler::{Busy, Owner, Permit, Priority, Scheduler};
@@ -137,6 +139,16 @@ struct Inner {
     remote_key: String,
     /// Remote test upstreams only: tool-call `extra_content` to give back (`remote.rs`).
     extras: Arc<ToolCallExtras>,
+    /// The upstreams' `key-file:` keys (slice MP2).
+    keys: Arc<KeyStore>,
+    /// Routed roles' circuits, per model and per upstream (slice MP4).
+    health: Arc<Health>,
+    /// [`RouterOptions::route_control`].
+    route_control: Option<std::path::PathBuf>,
+    /// `upstreams.<u>.max-in-flight`, by upstream key (§4.7).
+    upstream_caps: std::collections::HashMap<String, Arc<tokio::sync::Semaphore>>,
+    /// The hop that last answered each (role, run), and when (§4.3, step 3).
+    sticky: std::sync::Mutex<std::collections::HashMap<(String, String), (usize, Instant)>>,
     /// [`Timeouts::ready_cache`].
     ready_cache: Duration,
     /// `GET /readyz`'s last probe. Held across a probe, so callers that arrive while one
@@ -170,7 +182,22 @@ impl Endpoint {
     }
 }
 
-pub fn router(mut cfg: GatewayConfig) -> Router {
+/// What the router takes beside [`GatewayConfig`], each with a default that changes nothing.
+#[derive(Debug, Default, Clone)]
+pub struct RouterOptions {
+    /// The upstreams' keys (`keys.rs`); `main` keeps a handle to reload them on `SIGHUP`.
+    pub keys: Arc<KeyStore>,
+    /// `$PMOS_STATE_DIR/route-control` (§4.11, slice MP8): `disabled-<label>` there takes that
+    /// model out of every route, looked at before every call. `None`: no model is disabled.
+    pub route_control: Option<std::path::PathBuf>,
+}
+
+pub fn router(cfg: GatewayConfig) -> Router {
+    router_with(cfg, RouterOptions::default())
+}
+
+/// [`router`], with the options of [`RouterOptions`].
+pub fn router_with(mut cfg: GatewayConfig, opts: RouterOptions) -> Router {
     // With the stub model on, the gateway is a `test` one whatever its config says, so a stub
     // run never reports `production` (`Config::served_class`).
     if cfg.stub {
@@ -225,6 +252,35 @@ pub fn router(mut cfg: GatewayConfig) -> Router {
             }
         });
     }
+    // What each circuit's log line names: a model's label; an upstream's models' labels
+    // (its own key is config-local and never logged).
+    let mut names: std::collections::HashMap<HealthKey, String> = Default::default();
+    for hop in cfg
+        .models
+        .roles
+        .values()
+        .filter(|r| r.routed())
+        .flat_map(Role::hops)
+    {
+        let label = hop.reported_model().to_string();
+        names.insert(HealthKey::Model(label.clone()), label.clone());
+        let up = names
+            .entry(HealthKey::Upstream(hop.upstream_id.clone()))
+            .or_default();
+        if !up.split(',').any(|l| l == label) {
+            if !up.is_empty() {
+                up.push(',');
+            }
+            up.push_str(&label);
+        }
+    }
+    let health = Health::new(cfg.models.routing.circuit, names);
+    let upstream_caps = cfg
+        .models
+        .upstream_caps
+        .iter()
+        .map(|(id, cap)| (id.clone(), Arc::new(tokio::sync::Semaphore::new(*cap))))
+        .collect();
     let state = AppState(Arc::new(Inner {
         models: cfg.models,
         clients: cfg.clients,
@@ -238,6 +294,11 @@ pub fn router(mut cfg: GatewayConfig) -> Router {
         remote_key: cfg.remote_key,
         retry: cfg.retry,
         extras: Arc::default(),
+        keys: opts.keys,
+        health,
+        route_control: opts.route_control,
+        upstream_caps,
+        sticky: Default::default(),
         ready_cache,
         probe: tokio::sync::Mutex::new(None),
         source: served,
@@ -249,6 +310,7 @@ pub fn router(mut cfg: GatewayConfig) -> Router {
         .route("/embeddings", post(embeddings))
         .route("/pmos/workarounds", get(list_workarounds))
         .route("/pmos/roles", get(list_roles))
+        .route("/pmos/routes", get(list_routes))
         .layer(middleware::from_fn_with_state(state.clone(), authenticate))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES));
     // Every answer, errors, refusals and streams included, says the source it was served from
@@ -346,7 +408,7 @@ async fn list_workarounds(State(state): State<AppState>) -> Response {
                 .models
                 .roles
                 .values()
-                .filter(|r| r.workarounds.iter().any(|id| id == w.id))
+                .filter(|r| r.uses_workaround(w.id))
                 .map(Role::alias)
                 .collect();
             json!({"id": w.id, "what": w.what, "delete_when": w.delete_when, "roles": roles})
@@ -376,6 +438,18 @@ async fn list_roles(State(state): State<AppState>) -> Response {
             // model swapped behind an unchanged label (`crates/evals`, "Which runs count").
             if let Some(h) = r.model_sha256() {
                 v["model_sha256"] = json!(h);
+            }
+            // A routed role's whole route, by label (§4.12); its `model` above is the primary.
+            if r.routed() {
+                v["route"] = r
+                    .hops()
+                    .iter()
+                    .map(|h| {
+                        json!({"label": h.reported_model(), "model_sha256": h.model_sha256(),
+                               "kind": h.upstream_kind_label(),
+                               "features": h.features.iter().flatten().map(|f| f.as_str()).collect::<Vec<_>>()})
+                    })
+                    .collect();
             }
             v
         })
@@ -427,19 +501,38 @@ async fn readyz(State(state): State<AppState>) -> Response {
         .values()
         .any(|r| r.kind.is_cloud_test());
     let up_by_base = probe_upstreams(&state.0).await;
-    let ok = up_by_base.values().all(|up| *up);
-    // By role, with labels only (no address, host, URL or key).
+    // By role, with labels only (no address, host, URL or key). A routed role (§4.12) is `ok`
+    // while any of its hops is usable (its upstream answers, no circuit of it is open, it isn't
+    // disabled), and says how many hops it has and how many are usable: counts, never labels,
+    // since this route needs no token.
+    let mut ok = true;
     let checks: serde_json::Map<String, Value> = state
         .0
         .models
         .roles
         .values()
         .map(|r| {
-            let up = up_by_base.get(&r.upstream).copied().unwrap_or(false);
+            if !r.routed() {
+                let up = up_by_base.get(&r.upstream).copied().unwrap_or(false)
+                    && !disabled(&state.0, &r.hops()[0]);
+                ok &= up;
+                return (
+                    r.name.clone(),
+                    json!({"upstream": r.upstream_kind_label(),
+                           "status": if up { "ok" } else { "down" }}),
+                );
+            }
+            let hops = r.hops();
+            let usable = hops
+                .iter()
+                .filter(|h| hop_usable(&state.0, h, &up_by_base))
+                .count();
+            ok &= usable > 0;
             (
                 r.name.clone(),
                 json!({"upstream": r.upstream_kind_label(),
-                       "status": if up { "ok" } else { "down" }}),
+                       "status": if usable > 0 { "ok" } else { "down" },
+                       "hops": hops.len(), "hops_usable": usable}),
             )
         })
         .collect();
@@ -457,6 +550,112 @@ async fn readyz(State(state): State<AppState>) -> Response {
         ),
     )
         .into_response()
+}
+
+/// Whether a routed hop can be used now: its upstream answered the last probe, neither its
+/// model's nor its upstream's circuit is open, and it isn't disabled (§4.12).
+fn hop_usable(
+    inner: &Inner,
+    h: &Hop,
+    up_by_base: &std::collections::HashMap<String, bool>,
+) -> bool {
+    use crate::health::State;
+    up_by_base.get(&h.upstream).copied().unwrap_or(false)
+        && !disabled(inner, h)
+        && [
+            HealthKey::Model(h.reported_model().to_string()),
+            HealthKey::Upstream(h.upstream_id.clone()),
+        ]
+        .iter()
+        .all(|k| !matches!(inner.health.state(k), State::Open { .. }))
+}
+
+/// Whether `route disable` has taken a model out of every route (§4.11, slice MP8): a file
+/// `disabled-<label>` in the route-control directory, looked at (a `stat`, uncached) on every
+/// call. A hop without a label (an unlabelled one-hop role) is never disabled this way.
+fn disabled(inner: &Inner, h: &Hop) -> bool {
+    match (&inner.route_control, &h.label) {
+        (Some(dir), Some(label)) => dir.join(format!("disabled-{label}")).exists(),
+        _ => false,
+    }
+}
+
+/// `GET /v1/pmos/routes` (§4.12): the `admin` client only. Per role and hop: its label, its
+/// circuits' state (`closed`, `open` with the seconds left, `half-open`), whether it is
+/// disabled or stopped, and the last readiness probe of its upstream (`ok`, `down`, or
+/// `unknown` before any). Never an address, an upstream's key or a model id.
+async fn list_routes(
+    State(state): State<AppState>,
+    Extension(client): Extension<ClientName>,
+) -> Response {
+    use crate::health::State as C;
+    if client.0 != crate::config::ADMIN_CLIENT {
+        return error(
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            "only the admin client may read the routes",
+        );
+    }
+    let inner = &state.0;
+    let probed = inner.probe.lock().await.as_ref().map(|(_, m)| m.clone());
+    let now = Instant::now();
+    let roles: Vec<Value> = inner
+        .models
+        .roles
+        .values()
+        .map(|r| {
+            let hops: Vec<Value> = r
+                .hops()
+                .iter()
+                .enumerate()
+                .map(|(i, h)| {
+                    let states = [
+                        inner
+                            .health
+                            .state(&HealthKey::Model(h.reported_model().to_string())),
+                        inner
+                            .health
+                            .state(&HealthKey::Upstream(h.upstream_id.clone())),
+                    ];
+                    let open = states
+                        .iter()
+                        .filter_map(|s| match s {
+                            C::Open { until } => Some(*until),
+                            _ => None,
+                        })
+                        .max();
+                    let circuit = match open {
+                        Some(_) => "open",
+                        None if states.contains(&C::HalfOpen) => "half-open",
+                        None => "closed",
+                    };
+                    let probe = match probed.as_ref().and_then(|m| m.get(&h.upstream)) {
+                        Some(true) => "ok",
+                        Some(false) => "down",
+                        None => "unknown",
+                    };
+                    let mut v = json!({
+                        "hop": i + 1,
+                        "label": h.reported_model(),
+                        "kind": h.upstream_kind_label(),
+                        "circuit": if r.routed() { circuit } else { "none" },
+                        "disabled": disabled(inner, h),
+                        "stopped": false,
+                        "probe": probe,
+                    });
+                    if let Some(u) = open {
+                        v["open_secs"] = json!(u.saturating_duration_since(now).as_secs());
+                    }
+                    if let Some(sha) = h.model_sha256() {
+                        v["model_sha256"] = json!(sha);
+                    }
+                    v
+                })
+                .collect();
+            json!({"role": r.name, "routed": r.routed(), "hops": hops})
+        })
+        .collect();
+    Json(json!({"model_source": inner.source, "roles": roles})).into_response()
 }
 
 /// Whether each upstream base answers `GET <base>/models`: the cached probe while it is
@@ -487,7 +686,8 @@ fn upstream_bases(inner: &Inner) -> Vec<String> {
         .models
         .roles
         .values()
-        .map(|r| r.upstream.clone())
+        .flat_map(Role::hops)
+        .map(|h| h.upstream)
         .collect();
     upstreams.sort();
     upstreams.dedup();
@@ -504,18 +704,24 @@ async fn probe_now(inner: &Inner) -> std::collections::HashMap<String, bool> {
     }
     let mut up_by_base = std::collections::HashMap::new();
     for base in upstream_bases(inner) {
-        let remote = inner
+        let hop = inner
             .models
             .roles
             .values()
-            .any(|r| r.upstream == base && r.kind == UpstreamKind::RemoteOpenAi);
-        let probe = if remote {
-            inner
+            .flat_map(Role::hops)
+            .find(|h| h.upstream == base && h.kind == UpstreamKind::RemoteOpenAi);
+        let remote = hop.is_some();
+        let probe = match hop.map(|h| upstream_key(inner, &h)) {
+            // Its key file can't be used: nothing is sent, and it reads as down.
+            Some(Err(_)) => {
+                up_by_base.insert(base, false);
+                continue;
+            }
+            Some(Ok(key)) => inner
                 .http
                 .get(format!("{base}/models"))
-                .bearer_auth(&inner.remote_key)
-        } else {
-            inner.http.get(format!("{base}/models"))
+                .bearer_auth(key.unwrap_or_default()),
+            None => inner.http.get(format!("{base}/models")),
         };
         let up = tokio::time::timeout(
             Duration::from_secs(if remote { 5 } else { 2 }),
@@ -626,6 +832,50 @@ fn declared(headers: &HeaderMap) -> Result<Declared, String> {
     })
 }
 
+/// Why a call's route headers were refused (§4.10).
+enum RouteRefused {
+    /// `X-Pmos-Fallback` that isn't `on` or `off` (`400`).
+    Malformed(String),
+    /// `X-Pmos-Route-Model` from a client that isn't `pin`, or naming no model of the role's
+    /// route (`403`).
+    NotPinnable,
+}
+
+/// The one hop (index into the role's route) a call may use, or `None` for the whole route:
+/// `pin` with `X-Pmos-Route-Model` names it; `primary-only`, or `X-Pmos-Fallback: off` from
+/// any client, keeps hop 1. A one-hop role has only hop 1 anyway, but a pin still has to name
+/// its label.
+fn route_choice(
+    headers: &HeaderMap,
+    policy: &ClientPolicy,
+    role: &Role,
+) -> Result<Option<usize>, RouteRefused> {
+    use crate::config::RouteRule;
+    let fallback_off = match headers.get("x-pmos-fallback").map(|v| v.to_str()) {
+        None => false,
+        Some(Ok("off")) => true,
+        Some(Ok("on")) => false,
+        Some(_) => {
+            return Err(RouteRefused::Malformed(
+                "X-Pmos-Fallback must be `off` (or `on`)".into(),
+            ))
+        }
+    };
+    if let Some(v) = headers.get("x-pmos-route-model") {
+        if policy.route != RouteRule::Pin {
+            return Err(RouteRefused::NotPinnable);
+        }
+        let label = v.to_str().map_err(|_| RouteRefused::NotPinnable)?;
+        return role
+            .hops()
+            .iter()
+            .position(|h| h.label.as_deref() == Some(label))
+            .map(Some)
+            .ok_or(RouteRefused::NotPinnable);
+    }
+    Ok((fallback_off || policy.route == RouteRule::PrimaryOnly).then_some(0))
+}
+
 /// Why no slot was had.
 #[derive(Clone, Copy)]
 enum NoSlot {
@@ -730,6 +980,11 @@ struct StreamEnd {
     event: UsageEvent,
     started: Instant,
     _permit: Permit,
+    /// A routed hop's model circuit: a stream cut off after its commit point counts against
+    /// it (§4.4, the last rows). `None` for a one-hop role.
+    circuit: Option<(Arc<Health>, HealthKey)>,
+    /// The upstream's own cap (`upstreams.<u>.max-in-flight`, §4.7), held as long as the slot.
+    _upstream: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl Drop for StreamEnd {
@@ -820,6 +1075,9 @@ fn bounded_stream(
         let cut = |f: &mut Flow, status: u16, why: String| {
             f.done = true;
             f.end.event.status = status;
+            if let Some((h, k)) = &f.end.circuit {
+                h.failure(k, crate::fallback::Hit::Count, "stream_cut");
+            }
             tracing::warn!(role = %f.end.event.role, status, reason = %why, "streamed answer cut off");
             Err(std::io::Error::other(why))
         };
@@ -866,6 +1124,14 @@ async fn forward(
 ) -> Response {
     let inner = &state.0;
     let started = Instant::now();
+    // The admin client is read-only (§4.12): it never makes a model call.
+    if client == crate::config::ADMIN_CLIENT {
+        return error(
+            StatusCode::FORBIDDEN,
+            "permission_error",
+            "the admin client is read-only and makes no model calls",
+        );
+    }
     let mut req: Value = match serde_json::from_slice(&body) {
         Ok(v @ Value::Object(_)) => v,
         _ => {
@@ -929,6 +1195,11 @@ async fn forward(
         refused_users: Vec::new(),
         refused_users_more: None,
         user_key: None,
+        hop: None,
+        fallback: false,
+        reason: None,
+        skipped: Vec::new(),
+        upstream_sha256: None,
     };
     let who = match caller(&headers, &client, &policy) {
         Ok(c) => c,
@@ -960,6 +1231,31 @@ async fn forward(
                 StatusCode::FORBIDDEN,
                 "permission_error",
                 "this client may not make calls for that person (X-Pmos-User)",
+            );
+        }
+    };
+    // §4.10 (slice MP6): which hops this client may use. Only a `pin` client may name one in
+    // `X-Pmos-Route-Model`; any client may narrow itself to the primary with
+    // `X-Pmos-Fallback: off`; no client can ask for more than its setting allows. Checked
+    // before the call is queued, so a refusal sends nothing anywhere.
+    let only = match route_choice(&headers, &policy, &role) {
+        Ok(o) => o,
+        Err(RouteRefused::Malformed(m)) => {
+            return error(StatusCode::BAD_REQUEST, "invalid_request_error", m)
+        }
+        Err(RouteRefused::NotPinnable) => {
+            inner.usage.record_refusal(refused_line(
+                403,
+                who.user.clone(),
+                who.run.clone(),
+                who.priority,
+                "names a model of the route this client may not pin",
+            ));
+            return error(
+                StatusCode::FORBIDDEN,
+                "permission_error",
+                "this client may not choose the model (X-Pmos-Route-Model), or the role's route \
+                 has no such model",
             );
         }
     };
@@ -1018,12 +1314,21 @@ async fn forward(
         refused_users: Vec::new(),
         refused_users_more: None,
         user_key: None,
+        hop: Some(1),
+        fallback: false,
+        reason: None,
+        skipped: Vec::new(),
+        upstream_sha256: None,
     };
     let model_header = HeaderValue::from_str(role.reported_model()).ok();
+    let primary_sha = role.model_sha256();
     let finish = |mut res: Response| {
         if let Some(v) = model_header.clone() {
             res.headers_mut().insert("x-pmos-model", v);
         }
+        // §4.9: every answer says which model of the route answered. A one-hop role's (and a
+        // stub's) is always its primary.
+        route_headers(&mut res, primary_sha.as_deref(), 1, false);
         res
     };
 
@@ -1044,6 +1349,39 @@ async fn forward(
                 Json(stub::embeddings(&req, role.reported_model())).into_response()
             }
         });
+    }
+
+    if role.routed() {
+        return forward_routed(
+            inner,
+            Routed {
+                role,
+                endpoint,
+                req,
+                stream,
+                event,
+                permit,
+                owner,
+                priority: who.priority,
+                started,
+                only,
+            },
+        )
+        .await;
+    }
+
+    // §4.11 (slice MP8): a one-hop role whose model is disabled has no model left.
+    if disabled(inner, &role.hops()[0]) {
+        event.status = 503;
+        event.attempts = 0;
+        event.skipped = vec![crate::usage::Skipped {
+            label: role.reported_model().to_string(),
+            why: "disabled",
+        }];
+        event.latency_ms = started.elapsed().as_millis() as u64;
+        inner.usage.record(event);
+        drop(permit);
+        return finish(no_model_available(1));
     }
 
     if role.kind == UpstreamKind::ClaudeTest {
@@ -1069,6 +1407,25 @@ async fn forward(
     let upstream_stream = stream && !whole_for_stream;
     let url = format!("{}/{}", role.upstream, endpoint.path());
     let remote = role.kind == UpstreamKind::RemoteOpenAi;
+    // The upstream's own key (slice MP2): its `key-file:`, else `PMOS_GATEWAY_REMOTE_KEY`. A
+    // key file that can't be used sends nothing.
+    let key = match upstream_key(inner, &role.hops()[0]) {
+        Ok(k) => k.unwrap_or_default(),
+        Err(why) => {
+            tracing::warn!(
+                role = %role.alias(), upstream = role.upstream_kind_label(), reason = why.as_str(),
+                "the upstream's key file can't be used; nothing was sent"
+            );
+            event.status = 502;
+            event.latency_ms = started.elapsed().as_millis() as u64;
+            inner.usage.record(event);
+            return finish(error(
+                StatusCode::BAD_GATEWAY,
+                "upstream_error",
+                format!("the `{}` model server is unavailable", role.name),
+            ));
+        }
+    };
     if remote {
         let restored = inner.extras.restore(&role.upstream, &mut req);
         if restored > 0 {
@@ -1081,6 +1438,16 @@ async fn forward(
     // slot is given back while waiting so retries don't hold up the queue; the same priority
     // takes it again afterwards. A streamed answer is only ever retried here, before any byte
     // of it has gone to the caller.
+    // §4.7: the upstream's own cap, if it has one, waited for like a slot.
+    let upstream_permit = match upstream_slot(inner, &role.upstream_id).await {
+        Ok(u) => u,
+        Err(why) => {
+            event.status = why.status().as_u16();
+            event.latency_ms = started.elapsed().as_millis() as u64;
+            inner.usage.record(event);
+            return busy(why);
+        }
+    };
     let mut permit = Some(permit);
     let first_attempt = Instant::now();
     let mut attempt = 0u32;
@@ -1095,11 +1462,7 @@ async fn forward(
         };
         let post = client.post(&url);
         // The client's own gateway token never goes upstream; the remote key does.
-        let post = if remote {
-            post.bearer_auth(&inner.remote_key)
-        } else {
-            post
-        };
+        let post = if remote { post.bearer_auth(&key) } else { post };
         let this = match post.json(&req).send().await {
             Ok(r) if !crate::retry::is_retryable_status(r.status().as_u16()) => Attempt::Live(r),
             Ok(r) => {
@@ -1222,6 +1585,8 @@ async fn forward(
             event,
             started,
             _permit: permit,
+            circuit: None,
+            _upstream: upstream_permit,
         };
         // Remote test upstreams: remember tool-call extra_content as it passes (`remote.rs`).
         let scanner = remote.then(|| StreamScanner::new(inner.extras.clone(), &role.upstream));
@@ -1327,6 +1692,616 @@ async fn forward(
     finish(Json(answer).into_response())
 }
 
+/// The headers every answer carries about the model that answered (§4.9): its
+/// `model_sha256` (labelled models only), its 1-based place in the role's route, and whether
+/// it is a fallback. `x-pmos-model` is set beside them.
+fn route_headers(res: &mut Response, sha: Option<&str>, hop: u32, fallback: bool) {
+    let h = res.headers_mut();
+    if let Some(v) = sha.and_then(|s| HeaderValue::from_str(s).ok()) {
+        h.insert("x-pmos-model-sha256", v);
+    }
+    h.insert("x-pmos-route-hop", HeaderValue::from(hop));
+    h.insert(
+        "x-pmos-fallback",
+        HeaderValue::from_static(if fallback { "1" } else { "0" }),
+    );
+}
+
+/// A routed role's call, admitted: its slot is held (one slot covers every hop, §4.3).
+struct Routed {
+    role: Role,
+    endpoint: Endpoint,
+    req: Value,
+    stream: bool,
+    event: UsageEvent,
+    permit: Permit,
+    owner: Owner,
+    priority: Priority,
+    started: Instant,
+    /// The one hop (index into the route) this call may use, when the client may not fall
+    /// back (§4.10): `Some(0)` for primary-only, the pinned one for `pin`.
+    only: Option<usize>,
+}
+
+/// What one attempt at one hop came to.
+enum HopOutcome {
+    /// The commit point was reached (§4.5): this hop answers, for good.
+    Committed(Committed),
+    /// An answer that is the caller's own (a client `4xx`), never routed around (§4.4).
+    Final {
+        status: u16,
+        headers: HeaderMap,
+        body: Bytes,
+    },
+    /// A failure on the upstream's side: the same hop again, or the next.
+    Failed(crate::fallback::Failure),
+}
+
+enum Committed {
+    /// A whole, valid answer (not streamed, or asked whole for a hop's workaround, or the
+    /// Claude test upstream's translated answer).
+    Whole(Value),
+    /// A stream past its first content: the events held until then, and the rest.
+    Stream { held: Bytes, rest: Upstream },
+}
+
+/// §4.3 and §4.4: the hops of a routed role, in order, until one commits, the list ends, or
+/// `routing.budget-secs` would be passed. Each hop gets up to `routing.same-hop-attempts`; a
+/// failure on the upstream's side moves to the next hop, a client's own error and a refusal are
+/// answers. Nothing left: `503 no_model_available`, naming no hop and no upstream's error. The
+/// caller never sees an upstream's own error text: every hop of a route is labelled, so every
+/// error body is the neutral one (V3). Each attempt gets its usage line (§4.9).
+async fn forward_routed(inner: &Inner, call: Routed) -> Response {
+    let Routed {
+        role,
+        endpoint,
+        req,
+        stream,
+        mut event,
+        permit,
+        owner,
+        priority,
+        started,
+        only,
+    } = call;
+    let routing = inner.models.routing;
+    let hops = role.hops();
+    let mut skipped: Vec<crate::usage::Skipped> = Vec::new();
+    let candidates: Vec<usize> = match only {
+        Some(i) => vec![i],
+        None => (0..hops.len()).collect(),
+    };
+    let mut plan = Vec::new();
+    for i in candidates {
+        let hop = &hops[i];
+        let label = hop.reported_model().to_string();
+        // §4.11 (slice MP8): `route disable` takes a model out of every route at once.
+        if disabled(inner, hop) {
+            skipped.push(crate::usage::Skipped {
+                label,
+                why: "disabled",
+            });
+            continue;
+        }
+        if !crate::fallback::serves(
+            hop,
+            endpoint == Endpoint::Embeddings,
+            &req,
+            stream,
+            inner.workarounds_on,
+        ) {
+            skipped.push(crate::usage::Skipped {
+                label,
+                why: "feature",
+            });
+            continue;
+        }
+        plan.push(i);
+    }
+    // §4.3 step 3: a hop that answered this run in the last 15 minutes goes first, so one
+    // task doesn't alternate between models after one fallback.
+    if let (true, None, Some(run)) = (routing.sticky_per_run, only, &event.run) {
+        if let Some(i) = sticky_hop(inner, &role.name, run) {
+            if let Some(pos) = plan.iter().position(|p| *p == i) {
+                let h = plan.remove(pos);
+                plan.insert(0, h);
+            }
+        }
+    }
+    let deadline = Instant::now() + routing.budget();
+    let mut soonest: Option<Instant> = None;
+    let mut permit = Some(permit);
+    let mut attempts = 0u32;
+    let mut first = true;
+    'hops: for &i in &plan {
+        let hop = &hops[i];
+        let key = match upstream_key(inner, hop) {
+            Ok(k) => k,
+            Err(why) => {
+                tracing::warn!(
+                    role = %role.alias(), model = %hop.reported_model(), reason = why.as_str(),
+                    "the upstream's key file can't be used; this model is skipped"
+                );
+                skipped.push(crate::usage::Skipped {
+                    label: hop.reported_model().to_string(),
+                    why: "key",
+                });
+                continue;
+            }
+        };
+        let circuits = [
+            HealthKey::Model(hop.reported_model().to_string()),
+            HealthKey::Upstream(hop.upstream_id.clone()),
+        ];
+        let mut same = 0u32;
+        loop {
+            if !first && Instant::now() >= deadline {
+                break 'hops;
+            }
+            // §4.6: an open circuit skips the hop; a half-open one lets one call through.
+            let trial = match inner.health.admit(&circuits) {
+                Ok(t) => t,
+                Err(until) => {
+                    if same == 0 {
+                        skipped.push(crate::usage::Skipped {
+                            label: hop.reported_model().to_string(),
+                            why: "circuit",
+                        });
+                    }
+                    soonest = Some(soonest.map_or(until, |s: Instant| s.min(until)));
+                    continue 'hops;
+                }
+            };
+            first = false;
+            same += 1;
+            attempts += 1;
+            // §4.7: an upstream at its own cap is waited for, within queue-wait-secs, like a
+            // slot; busy is never a reason to switch model.
+            let upstream = match upstream_slot(inner, &hop.upstream_id).await {
+                Ok(u) => u,
+                Err(why) => {
+                    drop(trial);
+                    event.status = why.status().as_u16();
+                    event.attempts = attempts - 1;
+                    event.latency_ms = started.elapsed().as_millis() as u64;
+                    inner.usage.record(event);
+                    return busy(why);
+                }
+            };
+            let outcome =
+                attempt_hop(inner, &role, hop, endpoint, &req, stream, key.as_deref()).await;
+            let mut line = hop_line(inner, &event, hop, i);
+            line.attempt = attempts;
+            line.attempts = attempts;
+            match outcome {
+                HopOutcome::Committed(c) => {
+                    inner.health.success(&circuits);
+                    drop(trial);
+                    line.skipped = skipped;
+                    let permit = permit.take().expect("a committed hop holds its slot");
+                    if let (true, Some(run)) = (routing.sticky_per_run, &event.run) {
+                        remember_hop(inner, &role.name, run, i);
+                    }
+                    return committed(
+                        inner, hop, i, endpoint, stream, c, line, permit, upstream, started,
+                        attempts,
+                    );
+                }
+                HopOutcome::Final {
+                    status,
+                    headers,
+                    body,
+                } => {
+                    // The caller's own error counts against no circuit (§4.4).
+                    drop(trial);
+                    line.status = status;
+                    line.skipped = skipped;
+                    line.latency_ms = started.elapsed().as_millis() as u64;
+                    inner.usage.record(line);
+                    drop(permit.take());
+                    let mut res = (
+                        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                        Json(neutral_error(status, &body)),
+                    )
+                        .into_response();
+                    if let Some(v) = headers.get(header::RETRY_AFTER) {
+                        res.headers_mut().insert(header::RETRY_AFTER, v.clone());
+                    }
+                    return hop_response(res, hop, i, attempts);
+                }
+                HopOutcome::Failed(failure) => {
+                    let k = match failure.scope {
+                        crate::fallback::Scope::Model => &circuits[0],
+                        crate::fallback::Scope::Upstream => &circuits[1],
+                    };
+                    inner.health.failure(k, failure.hit, failure.reason);
+                    drop(trial);
+                    tracing::warn!(
+                        role = %role.alias(), model = %hop.reported_model(),
+                        upstream = hop.upstream_kind_label(), reason = failure.reason, attempt = attempts,
+                        "a model of the route failed"
+                    );
+                    line.status = 502;
+                    line.retrying = true;
+                    line.reason = Some(failure.reason);
+                    line.latency_ms = started.elapsed().as_millis() as u64;
+                    inner.usage.record(line);
+                    let wait = match failure.same {
+                        crate::fallback::Same::No => None,
+                        crate::fallback::Same::After(d) => Some(d),
+                        crate::fallback::Same::Backoff => Some(inner.retry.backoff(same)),
+                    };
+                    let Some(wait) = wait.filter(|w| {
+                        same < routing.same_hop_attempts && Instant::now() + *w < deadline
+                    }) else {
+                        continue 'hops;
+                    };
+                    // The slot is given back while waiting, as a one-hop role's retry does.
+                    drop(permit.take());
+                    tokio::time::sleep(wait).await;
+                    let waited = Instant::now();
+                    match slot(inner, &owner, priority).await {
+                        Ok(p) => permit = Some(p),
+                        Err(why) => {
+                            event.status = why.status().as_u16();
+                            event.attempts = attempts;
+                            event.latency_ms = started.elapsed().as_millis() as u64;
+                            inner.usage.record(event);
+                            return busy(why);
+                        }
+                    }
+                    event.queue_ms += waited.elapsed().as_millis() as u64;
+                }
+            }
+        }
+    }
+    drop(permit);
+    // Nothing left (§4.3, step 5): no hop, no upstream's error, named.
+    event.status = 503;
+    event.attempt = attempts;
+    event.attempts = attempts;
+    event.skipped = skipped;
+    event.latency_ms = started.elapsed().as_millis() as u64;
+    inner.usage.record(event);
+    // Retry-After: the soonest end of a cool-down that skipped a hop, at least a second.
+    let secs = soonest.map_or(1, |u| {
+        u.saturating_duration_since(Instant::now())
+            .as_secs_f64()
+            .ceil() as u64
+    });
+    no_model_available(secs)
+}
+
+/// How long a run keeps to the hop that answered it (§4.3, step 3).
+const STICKY_FOR: Duration = Duration::from_secs(15 * 60);
+/// The most runs remembered; past it, the oldest are forgotten.
+const STICKY_KEEP: usize = 10_000;
+
+fn sticky_hop(inner: &Inner, role: &str, run: &str) -> Option<usize> {
+    let map = inner.sticky.lock().expect("sticky lock");
+    map.get(&(role.to_string(), run.to_string()))
+        .filter(|(_, at)| at.elapsed() < STICKY_FOR)
+        .map(|(i, _)| *i)
+}
+
+fn remember_hop(inner: &Inner, role: &str, run: &str, i: usize) {
+    let mut map = inner.sticky.lock().expect("sticky lock");
+    if map.len() >= STICKY_KEEP {
+        map.retain(|_, (_, at)| at.elapsed() < STICKY_FOR);
+        if map.len() >= STICKY_KEEP {
+            map.clear();
+        }
+    }
+    map.insert((role.to_string(), run.to_string()), (i, Instant::now()));
+}
+
+/// A place under an upstream's own cap (§4.7), waited for within `limits.queue-wait-secs`.
+/// `Ok(None)`: the upstream has no cap of its own (`limits.max-in-flight` bounds it).
+async fn upstream_slot(
+    inner: &Inner,
+    upstream_id: &str,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, NoSlot> {
+    let Some(sem) = inner.upstream_caps.get(upstream_id) else {
+        return Ok(None);
+    };
+    let wait = Duration::from_secs(inner.models.limits.queue_wait_secs);
+    match tokio::time::timeout(wait, sem.clone().acquire_owned()).await {
+        Ok(Ok(p)) => Ok(Some(p)),
+        _ => Err(NoSlot::TimedOut),
+    }
+}
+
+/// `503 no_model_available` (§4.3, step 5), with `Retry-After` (at least a second).
+fn no_model_available(retry_after_secs: u64) -> Response {
+    let mut res = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"error": {
+            "type": "no_model_available",
+            "status": 503,
+            "message": "no model of this role is available now; try again shortly",
+        }})),
+    )
+        .into_response();
+    res.headers_mut().insert(
+        header::RETRY_AFTER,
+        HeaderValue::from(retry_after_secs.max(1)),
+    );
+    res
+}
+
+/// The usage line for an attempt at `hop` (index `i` of the route): the call's line with the
+/// hop's label, hash, kind, place and fallback flag (§4.9).
+fn hop_line(inner: &Inner, event: &UsageEvent, hop: &Hop, i: usize) -> UsageEvent {
+    let mut line = event.clone();
+    line.model = hop.reported_model().to_string();
+    line.model_sha256 = hop.model_sha256();
+    line.upstream = hop.logged_upstream_host();
+    line.hop = Some(i as u32 + 1);
+    line.fallback = i > 0;
+    line.upstream_sha256 = inner.hosted_test.then(|| hop.upstream_sha256());
+    line.status = 200;
+    line.retrying = false;
+    line.reason = None;
+    line
+}
+
+/// An answer from `hop` (index `i`), with the headers that say which model answered (§4.9).
+fn hop_response(mut res: Response, hop: &Hop, i: usize, attempts: u32) -> Response {
+    if let Ok(v) = HeaderValue::from_str(hop.reported_model()) {
+        res.headers_mut().insert("x-pmos-model", v);
+    }
+    route_headers(&mut res, hop.model_sha256().as_deref(), i as u32 + 1, i > 0);
+    res.headers_mut()
+        .insert("x-pmos-upstream-attempts", HeaderValue::from(attempts));
+    res
+}
+
+/// The answer once `hop` has committed: a whole answer with the hop's workarounds and label
+/// applied, or its stream (held events first) under the gateway's usual limits.
+#[allow(clippy::too_many_arguments)]
+fn committed(
+    inner: &Inner,
+    hop: &Hop,
+    i: usize,
+    endpoint: Endpoint,
+    stream: bool,
+    c: Committed,
+    mut event: UsageEvent,
+    permit: Permit,
+    upstream: Option<tokio::sync::OwnedSemaphorePermit>,
+    started: Instant,
+    attempts: u32,
+) -> Response {
+    let label = hop.reported_model().to_string();
+    let remote = hop.kind == UpstreamKind::RemoteOpenAi;
+    match c {
+        Committed::Stream { held, rest } => {
+            let end = StreamEnd {
+                usage: inner.usage.clone(),
+                event,
+                started,
+                _permit: permit,
+                circuit: Some((
+                    inner.health.clone(),
+                    HealthKey::Model(hop.reported_model().to_string()),
+                )),
+                _upstream: upstream,
+            };
+            let scanner = remote.then(|| StreamScanner::new(inner.extras.clone(), &hop.upstream));
+            let limits = inner.models.limits;
+            let upstream: Upstream =
+                Box::pin(futures_util::stream::once(async move { Ok(held) }).chain(rest));
+            let body = bounded_stream(
+                upstream,
+                end,
+                scanner,
+                tokio::time::Instant::now() + Duration::from_secs(limits.stream_max_secs),
+                limits.max_answer_bytes,
+            );
+            let res = (
+                [
+                    (header::CONTENT_TYPE, "text/event-stream"),
+                    (header::CACHE_CONTROL, "no-cache"),
+                ],
+                Body::from_stream(relabel_stream(body, label)),
+            )
+                .into_response();
+            hop_response(res, hop, i, attempts)
+        }
+        Committed::Whole(mut answer) => {
+            if remote && endpoint == Endpoint::Chat {
+                inner.extras.remember_answer(&hop.upstream, &answer);
+            }
+            if endpoint == Endpoint::Chat && hop.kind != UpstreamKind::ClaudeTest {
+                event.workarounds =
+                    workarounds::apply(&hop.workarounds, inner.workarounds_on, &mut answer);
+            }
+            relabel(&mut answer, &label);
+            event.prompt_tokens = answer["usage"]["prompt_tokens"].as_u64();
+            event.completion_tokens = answer["usage"]["completion_tokens"].as_u64();
+            event.latency_ms = started.elapsed().as_millis() as u64;
+            inner.usage.record(event);
+            drop(permit);
+            drop(upstream);
+            let res = if stream {
+                (
+                    [
+                        (header::CONTENT_TYPE, "text/event-stream"),
+                        (header::CACHE_CONTROL, "no-cache"),
+                    ],
+                    anthropic::as_stream(&answer),
+                )
+                    .into_response()
+            } else {
+                Json(answer).into_response()
+            };
+            hop_response(res, hop, i, attempts)
+        }
+    }
+}
+
+/// One attempt at one hop (§4.4, §4.5): the request with this hop's model id (and, for a
+/// remote one, the tool-call `extra_content` it gave, never another upstream's), sent with
+/// this hop's key only, and what came back, classified.
+async fn attempt_hop(
+    inner: &Inner,
+    role: &Role,
+    hop: &Hop,
+    endpoint: Endpoint,
+    req: &Value,
+    stream: bool,
+    key: Option<&str>,
+) -> HopOutcome {
+    use crate::fallback::{Failure, Hit, Same, Scope};
+    let fail =
+        |reason, same, hit, scope| HopOutcome::Failed(Failure::new(reason, same, hit, scope));
+    let max = inner.models.limits.max_answer_bytes;
+    let mut req = req.clone();
+    req["model"] = json!(hop.model);
+    if hop.kind == UpstreamKind::ClaudeTest {
+        return attempt_claude(inner, hop, &req, key.unwrap_or_default()).await;
+    }
+    let whole_for_stream =
+        stream && workarounds::needs_whole_answer(&hop.workarounds, inner.workarounds_on);
+    if whole_for_stream {
+        req["stream"] = json!(false);
+        if let Some(o) = req.as_object_mut() {
+            o.remove("stream_options");
+        }
+    }
+    let upstream_stream = stream && !whole_for_stream;
+    if hop.kind == UpstreamKind::RemoteOpenAi {
+        inner.extras.restore(&hop.upstream, &mut req);
+    }
+    let client = if upstream_stream {
+        &inner.http
+    } else {
+        &inner.whole_http
+    };
+    let post = client.post(format!("{}/{}", hop.upstream, endpoint.path()));
+    let post = match key {
+        Some(k) => post.bearer_auth(k),
+        None => post,
+    };
+    let res = match post.json(&req).send().await {
+        Ok(r) => r,
+        Err(e) if e.is_timeout() => return fail("timeout", Same::No, Hit::Count, Scope::Upstream),
+        Err(e) if e.is_connect() => {
+            return fail("connect", Same::Backoff, Hit::Count, Scope::Upstream)
+        }
+        Err(_) => return fail("connect", Same::No, Hit::Count, Scope::Upstream),
+    };
+    let status = res.status().as_u16();
+    if !res.status().is_success() {
+        let headers = res.headers().clone();
+        let body = read_capped(res, max.min(ERROR_BODY_MAX))
+            .await
+            .unwrap_or_default();
+        return match crate::fallback::classify_status(
+            status,
+            &headers,
+            &body,
+            inner.models.routing.short_retry_after(),
+        ) {
+            crate::fallback::Verdict::Answer => HopOutcome::Final {
+                status,
+                headers,
+                body,
+            },
+            crate::fallback::Verdict::Fail(failure) => {
+                if failure.reason == "auth" {
+                    tracing::warn!(
+                        role = %role.alias(), model = %hop.reported_model(),
+                        "upstream refused the key"
+                    );
+                }
+                HopOutcome::Failed(failure)
+            }
+        };
+    }
+    if upstream_stream {
+        return match crate::fallback::first_content(
+            Box::pin(res.bytes_stream()),
+            inner.models.routing.first_token(),
+        )
+        .await
+        {
+            Ok((held, rest)) => HopOutcome::Committed(Committed::Stream { held, rest }),
+            Err(_) => fail("first_token", Same::No, Hit::Count, Scope::Model),
+        };
+    }
+    let Ok(bytes) = read_capped(res, max).await else {
+        return fail("bad_answer", Same::No, Hit::Count, Scope::Model);
+    };
+    match serde_json::from_slice::<Value>(&bytes) {
+        Ok(v @ Value::Object(_)) => HopOutcome::Committed(Committed::Whole(v)),
+        _ => fail("bad_answer", Same::No, Hit::Count, Scope::Model),
+    }
+}
+
+/// The largest upstream error body read (to classify it; it never reaches a caller).
+const ERROR_BODY_MAX: usize = 1024 * 1024;
+
+/// One attempt at a Claude test upstream hop: the Messages API's whole answer, translated.
+async fn attempt_claude(inner: &Inner, hop: &Hop, req: &Value, key: &str) -> HopOutcome {
+    use crate::fallback::{Failure, Hit, Same, Scope};
+    let fail =
+        |reason, same, hit, scope| HopOutcome::Failed(Failure::new(reason, same, hit, scope));
+    let body = match anthropic::to_messages(req, &hop.model, hop.effort.as_deref()) {
+        Ok(b) => b,
+        Err(m) => {
+            return HopOutcome::Final {
+                status: 400,
+                headers: HeaderMap::new(),
+                body: Bytes::from(m),
+            }
+        }
+    };
+    let res = match inner
+        .whole_http
+        .post(format!("{}/v1/messages", hop.upstream))
+        .header("x-api-key", key)
+        .header("anthropic-version", anthropic::API_VERSION)
+        .header("anthropic-beta", anthropic::FALLBACK_BETA)
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) if e.is_timeout() => return fail("timeout", Same::No, Hit::Count, Scope::Upstream),
+        Err(e) if e.is_connect() => {
+            return fail("connect", Same::Backoff, Hit::Count, Scope::Upstream)
+        }
+        Err(_) => return fail("connect", Same::No, Hit::Count, Scope::Upstream),
+    };
+    let status = res.status().as_u16();
+    let headers = res.headers().clone();
+    let Ok(bytes) = read_capped(res, inner.models.limits.max_answer_bytes).await else {
+        return fail("bad_answer", Same::No, Hit::Count, Scope::Model);
+    };
+    if !(200..300).contains(&status) {
+        return match crate::fallback::classify_status(
+            status,
+            &headers,
+            &bytes,
+            inner.models.routing.short_retry_after(),
+        ) {
+            crate::fallback::Verdict::Answer => HopOutcome::Final {
+                status,
+                headers,
+                body: bytes,
+            },
+            crate::fallback::Verdict::Fail(failure) => HopOutcome::Failed(failure),
+        };
+    }
+    match serde_json::from_slice::<Value>(&bytes) {
+        Ok(v @ Value::Object(_)) => HopOutcome::Committed(Committed::Whole(
+            anthropic::from_messages(&v, hop.reported_model()),
+        )),
+        _ => fail("bad_answer", Same::No, Hit::Count, Scope::Model),
+    }
+}
+
 /// One call to the testing-only Claude upstream (`anthropic.rs`): the request translated to
 /// the Messages API and the answer back. A streamed request gets the whole answer as one
 /// event stream once it is ready.
@@ -1356,10 +2331,28 @@ async fn claude(
             return error(StatusCode::BAD_REQUEST, "invalid_request_error", m);
         }
     };
+    let key = match upstream_key(inner, &role.hops()[0]) {
+        Ok(k) => k.unwrap_or_default(),
+        Err(why) => {
+            tracing::warn!(
+                role = %role.alias(), upstream = role.upstream_kind_label(), reason = why.as_str(),
+                "the upstream's key file can't be used; nothing was sent"
+            );
+            event.status = 502;
+            return error(
+                StatusCode::BAD_GATEWAY,
+                "upstream_error",
+                format!(
+                    "the `{}` model (Claude test upstream) is unavailable",
+                    role.name
+                ),
+            );
+        }
+    };
     let res = inner
         .whole_http
         .post(format!("{}/v1/messages", role.upstream))
-        .header("x-api-key", &inner.anthropic_key)
+        .header("x-api-key", &key)
         .header("anthropic-version", anthropic::API_VERSION)
         .header("anthropic-beta", anthropic::FALLBACK_BETA)
         .json(&body)
@@ -1434,6 +2427,20 @@ async fn claude(
     } else {
         Json(answer).into_response()
     }
+}
+
+/// The key a hop's upstream is sent (slice MP2, §4.11): the one in its `key-file:`, else the
+/// environment's key for its kind (`PMOS_GATEWAY_REMOTE_KEY`, `PMOS_GATEWAY_ANTHROPIC_KEY`), or
+/// none for a local model server. `Err`: its key file can't be used, so nothing may be sent.
+fn upstream_key(inner: &Inner, hop: &Hop) -> Result<Option<String>, Unusable> {
+    if let Some(path) = &hop.key_file {
+        return inner.keys.get(path).map(Some);
+    }
+    Ok(match hop.kind {
+        UpstreamKind::RemoteOpenAi => Some(inner.remote_key.clone()),
+        UpstreamKind::ClaudeTest => Some(inner.anthropic_key.clone()),
+        UpstreamKind::OpenAi => None,
+    })
 }
 
 /// A transport error as the logs and callers see it (V3, slice H4): its kind only, never its

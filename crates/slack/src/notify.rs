@@ -258,8 +258,8 @@ impl Notifier {
                 }
                 self.finish_progress(&task_id, Stage::Done).await;
                 if !text.trim().is_empty() {
-                    self.say(&task_id, &bot, &username, cards::answer(&text))
-                        .await;
+                    let answer = personas::mark_fallback(cards::answer(&text), item);
+                    self.say(&task_id, &bot, &username, answer).await;
                     // The first answer a new member gets: one closing line, once.
                     if let (Some(handle), Some((channel, thread))) = (
                         item["requested_by"].as_str(),
@@ -277,8 +277,8 @@ impl Notifier {
             "needs_approval" => {
                 self.finish_progress(&task_id, Stage::Waiting).await;
                 if !text.trim().is_empty() {
-                    self.say(&task_id, &bot, &username, cards::answer(&text))
-                        .await;
+                    let answer = personas::mark_fallback(cards::answer(&text), item);
+                    self.say(&task_id, &bot, &username, answer).await;
                 }
                 let ids: Vec<String> = item["approvals"]
                     .as_array()
@@ -290,7 +290,8 @@ impl Notifier {
                 // bot an item only for the member it belongs to.
                 let requester = item["requested_by"].as_str().unwrap_or_default();
                 for id in ids {
-                    let card = self.card(&id, requester).await;
+                    // Each draft card of a task a fallback model answered says so (MP7).
+                    let card = personas::mark_fallback(self.card(&id, requester).await, item);
                     self.say(&task_id, &bot, &username, card).await;
                 }
                 self.refresh_home(item);

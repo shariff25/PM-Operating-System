@@ -132,12 +132,19 @@ export function taskModelSource(claim: Claim): string {
  * source every call of the task expects (X4: the gateway refuses another before forwarding).
  */
 export function gatewayHeaders(claim: Claim): Record<string, string> {
-  return {
+  const headers: Record<string, string> = {
     "X-Pmos-User": claim.task.requested_by,
     "X-Pmos-Run": claim.task.id,
     "X-Pmos-Priority": claim.task.priority,
     "X-Pmos-Model-Source": taskModelSource(claim),
   };
+  // docs/model-providers-spec.md §4.10 (slice MP7): the runtime pins an eval task's calls (and,
+  // with PMOS_FALLBACK_FOR_BENCHMARKED=refuse, a benchmarked bot's) to each role's primary.
+  // Only `off` is passed on: it can only narrow what the gateway may do.
+  if (claim.gateway?.headers?.["X-Pmos-Fallback"] === "off") {
+    headers["X-Pmos-Fallback"] = "off";
+  }
+  return headers;
 }
 
 const LEVEL_TITLES: Record<Claim["level"], string> = {
@@ -624,7 +631,16 @@ export function createWorker(config: WorkerConfig): Worker {
         );
       }
       progress.finish();
-      return { result: answer, approvals: [...approvals] };
+      // Slice MP7: which labelled models answered, and whether a fallback did, as the
+      // gateway's answers said, for the runtime to keep on the task (and the mark).
+      const used = sourceGuard.modelsUsed();
+      return {
+        result: answer,
+        approvals: [...approvals],
+        ...(used.length > 0 || sourceGuard.fallbackUsed
+          ? { models_used: used, fallback_used: sourceGuard.fallbackUsed }
+          : {}),
+      };
     } finally {
       await toolset?.close().catch(() => {});
       rmSync(stagingRoot, { recursive: true, force: true });

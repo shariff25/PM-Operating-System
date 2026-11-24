@@ -80,6 +80,9 @@ export class ModelSourceChangedError extends Error {
  */
 export class ModelSourceGuard {
   changed = false;
+  /** A call of the task was answered by a fallback model (`x-pmos-fallback: 1`). */
+  fallbackUsed = false;
+  private readonly used = new Map<string, ModelUse>();
 
   constructor(
     readonly expected: string,
@@ -96,9 +99,52 @@ export class ModelSourceGuard {
       await res.body?.cancel().catch(() => {});
       throw new ModelSourceChangedError();
     }
+    this.record(res);
     return res;
   };
+
+  /**
+   * Which labelled models answered (docs/model-providers-spec.md §4.9, slice MP7): the
+   * gateway's `x-pmos-model`, `x-pmos-model-sha256` and `x-pmos-fallback` on every answer.
+   * Labels and hashes only; anything that isn't one is ignored.
+   */
+  private record(res: Response): void {
+    if (!res.ok) {
+      return;
+    }
+    const label = res.headers.get("x-pmos-model");
+    if (label === null || !LABEL.test(label)) {
+      return;
+    }
+    const sha = res.headers.get("x-pmos-model-sha256");
+    const key = `${label} ${sha ?? ""}`;
+    const entry = this.used.get(key) ?? {
+      label,
+      ...(sha !== null && SHA256.test(sha) ? { model_sha256: sha } : {}),
+      calls: 0,
+    };
+    entry.calls += 1;
+    this.used.set(key, entry);
+    if (res.headers.get("x-pmos-fallback") === "1") {
+      this.fallbackUsed = true;
+    }
+  }
+
+  /** The models that answered the task's calls so far, for the runtime. */
+  modelsUsed(): ModelUse[] {
+    return [...this.used.values()].map((u) => ({ ...u }));
+  }
 }
+
+/** One labelled model's calls for a task (slice MP7). */
+export interface ModelUse {
+  label: string;
+  model_sha256?: string;
+  calls: number;
+}
+
+const LABEL = /^[A-Za-z0-9._-]{1,64}$/;
+const SHA256 = /^[0-9a-f]{64}$/;
 
 export interface GatewayModelOptions {
   /** Base URL of the gateway's OpenAI-compatible API, e.g. `https://gateway.pmos.internal/v1`. */

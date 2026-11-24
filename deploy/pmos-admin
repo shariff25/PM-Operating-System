@@ -54,6 +54,16 @@
 #                                     the eval gate for a checkout's changes (default: this
 #                                     one; CI passes the PR's head, which is only read as data)
 #   pmos-admin smoke <handle>         one Docs-bot question through the whole stack
+#   pmos-admin upstream-key set <u>   a model upstream's key, read from standard input, into
+#                                     deploy/secrets/upstream-<u>.key (hosted-test routes; never
+#                                     printed, never in an argument; docs/model-providers-spec.md)
+#   pmos-admin route disable <label> --reason <text> | route enable <label>
+#                                     take a model out of every route, or put it back, without a
+#                                     restart (logged in $PMOS_STATE_DIR/route-control/log)
+#   pmos-admin routes                 each route's models, circuits and probes (the gateway's
+#                                     admin client, PMOS_GW_ADMIN_TOKEN)
+#   pmos-admin usage --by-label       tokens per model label from the usage log, priced from
+#                                     $PMOS_STATE_DIR/prices.yaml when it exists
 set -euo pipefail
 
 DEPLOY="$(cd "$(dirname "$0")" && pwd)"
@@ -129,10 +139,41 @@ compose() {
   if [ "${PMOS_MODEL_SOURCE:-}" = hosted-test ]; then
     files+=(-f "$DEPLOY/compose.hosted-test.yaml")
     [ -z "${PMOS_GATEWAY_CA_FILE:-}" ] || files+=(-f "$DEPLOY/compose.gateway-ca.yaml")
+    # Slice MP2: one Compose secret per upstream key file, mounted into the gateway only.
+    if upstream_keys_overlay; then files+=(-f "$PMOS_STATE_DIR/compose.upstream-keys.yaml"); fi
   elif [ "${PMOS_MODEL_SOURCE:-}" = local ] && [ "${PMOS_GATEWAY_STUB:-0}" != 1 ]; then
     files+=(-f "$DEPLOY/compose.local.yaml")
   fi
   docker compose --project-directory "$DEPLOY" "${files[@]}" --env-file "$ENV" "$@"
+}
+
+# Slice MP2 (docs/model-providers-spec.md §4.11): deploy/secrets/upstream-<u>.key, each mounted by
+# a Compose secret into the gateway container only, at /run/secrets/pmos-upstream-<u>.key, where
+# the route config's `key-file:` names it. Writes $PMOS_STATE_DIR/compose.upstream-keys.yaml
+# (paths only, never a key) and succeeds when there is at least one key file.
+UPSTREAM_NAME_RE='^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$'
+upstream_keys_overlay() {
+  local f u out lines=() secrets=()
+  [ -d "${PMOS_STATE_DIR:-}" ] || return 1
+  for f in "$DEPLOY"/secrets/upstream-*.key; do
+    [ -f "$f" ] || continue
+    u=${f##*/upstream-}
+    u=${u%.key}
+    [[ "$u" =~ $UPSTREAM_NAME_RE ]] || continue
+    lines+=("      - {source: pmos-upstream-$u, target: pmos-upstream-$u.key}")
+    secrets+=("  pmos-upstream-$u: {file: \"$f\"}")
+  done
+  [ "${#lines[@]}" -gt 0 ] || return 1
+  out="$PMOS_STATE_DIR/compose.upstream-keys.yaml"
+  {
+    say "# Written by deploy/pmos-admin (slice MP2): each upstream's key file, for the gateway only."
+    say "services:"
+    say "  gateway:"
+    say "    secrets:"
+    printf '%s\n' "${lines[@]}"
+    say "secrets:"
+    printf '%s\n' "${secrets[@]}"
+  } >"$out.new" && mv -f "$out.new" "$out"
 }
 
 # deploy/.env holds the vault key and every service token, so (the security review of 6bb806f):
@@ -499,6 +540,31 @@ model_source_checks() {
     hosted) say "PMOS_MODEL_SOURCE=hosted (an approved provider) isn't built yet (slice H12): use local, or hosted-test with fake data only" >&2; return 1 ;;
     *) say "PMOS_MODEL_SOURCE=$(printf '%q' "$source") in deploy/.env: use local or hosted-test" >&2; return 1 ;;
   esac
+  # Routes (docs/model-providers-spec.md §4.12, slice MP8): with PMOS_HOSTED_TEST_ROUTES=1 the
+  # operator writes the route config at $PMOS_STATE_DIR/gateway.hosted-test.yaml (outside the
+  # repository: it names the providers' URLs and model ids) with one `key-file:` per upstream;
+  # pmos-admin doesn't write it, and `up` checks it with the gateway's --check-config first.
+  if [ "${PMOS_HOSTED_TEST_ROUTES:-0}" = 1 ]; then
+    if [ "${PMOS_CONNECTORS:-fake}" != fake ]; then
+      say "PMOS_MODEL_SOURCE=hosted-test sends prompts to endpoints nobody approved, so it allows fake data only: PMOS_CONNECTORS must be fake (it is ${PMOS_CONNECTORS})" >&2
+      return 1
+    fi
+    if [ -n "${PMOS_GATEWAY_REMOTE_KEY:-}" ]; then
+      say "PMOS_HOSTED_TEST_ROUTES=1: each upstream's key is its own file (deploy/pmos-admin upstream-key set <u>); clear PMOS_GATEWAY_REMOTE_KEY, which the gateway refuses beside two upstreams" >&2
+      return 1
+    fi
+    if ! problems=$(test_content_problems); then
+      while IFS= read -r p; do say "PMOS_MODEL_SOURCE=hosted-test allows fake data only: $p" >&2; done <<<"$problems"
+      return 1
+    fi
+    [ -d "${PMOS_STATE_DIR:-}" ] || { say "PMOS_STATE_DIR isn't a directory: run deploy/setup.sh" >&2; return 1; }
+    [ -f "$PMOS_STATE_DIR/gateway.hosted-test.yaml" ] || {
+      say "PMOS_HOSTED_TEST_ROUTES=1 needs the route config at $PMOS_STATE_DIR/gateway.hosted-test.yaml (docs/gateway.md, \"Routes\")" >&2
+      return 1
+    }
+    say "model source: hosted-test, the operator's route config (TESTING ONLY: prompts leave this host; fake data only)"
+    return 0
+  fi
   url=${PMOS_HOSTED_TEST_URL:-}
   model=${PMOS_HOSTED_TEST_MODEL:-}
   label=${PMOS_HOSTED_TEST_LABEL:-hosted-model-a}
@@ -569,7 +635,7 @@ clients:
   runtime: {trusted: true, max-in-flight: 2}
   bot-pm-*: {trusted: true, max-in-flight: 3, user: from-name}
   bot-*: {trusted: true, max-in-flight: 3}
-  evals: {max-in-flight: 1, priority: personal}
+  evals: {max-in-flight: 1, priority: personal, route: pin}
 EOF
   ) && mv -f "$cfg.new" "$cfg" || { say "couldn't write $cfg" >&2; return 1; }
   say "model source: hosted-test, every role as $label (TESTING ONLY: prompts leave this host; fake data only)"
@@ -1679,7 +1745,7 @@ case "$cmd" in pause | host-names | help | -h | --help) ;; *)
   # (they talk to the running stack, or only stop or read it), so a PMOS_UID=0 left by an older
   # install must not stop `revoke` in the middle of an incident. Every other command, anything
   # that can create or recreate a container, keeps the check (`up` refuses).
-  case "$cmd" in status | logs | backup | reindex | revoke | preflight | host-firewall | host) ;; *) uid_checks ;; esac
+  case "$cmd" in status | logs | backup | reindex | revoke | preflight | host-firewall | host | route | routes | usage | upstream-key) ;; *) uid_checks ;; esac
   port_checks
   ;;
 esac
@@ -1733,6 +1799,16 @@ case "$cmd" in
     run_preflight up "${pf[@]}"
     if [ -z "${PMOS_SLACK_APP_TOKEN:-}" ] || [ -z "${PMOS_SLACK_BOT_TOKEN:-}" ]; then
       say "note: the Slack bot is off until PMOS_SLACK_APP_TOKEN and PMOS_SLACK_BOT_TOKEN are set"
+    fi
+    # `route disable` writes here and the gateway reads it (slice MP8); made before Compose
+    # would make it as root.
+    if [ -d "${PMOS_STATE_DIR:-}" ]; then
+      mkdir -p "$PMOS_STATE_DIR/route-control" && chmod 755 "$PMOS_STATE_DIR/route-control"
+    fi
+    if [ "${PMOS_MODEL_SOURCE:-}" = hosted-test ] && [ "${PMOS_HOSTED_TEST_ROUTES:-0}" = 1 ]; then
+      say "== checking the route config (pmos-gateway --check-config)"
+      compose run --rm --no-deps -T gateway pmos-gateway --check-config /etc/pmos/gateway.yaml ||
+        { say "the gateway refuses the route config; nothing was started" >&2; exit 2; }
     fi
     compose "${prof[@]}" up -d
     say "started; check with: deploy/pmos-admin status"
@@ -1857,6 +1933,29 @@ for a in d["attestations"]:
       row gateway WARN "the STUB model answers every call (PMOS_GATEWAY_STUB=1): set it to 0 once the model servers are up (docs/runbooks/install.md)"
     elif [[ "$gw" == *'"class":"'* && "$gw" != *'"class":"production"'* ]]; then
       row gateway WARN "not a production-class gateway: its eval runs don't count (deploy/gateway.yaml has class: production; docs/gateway.md)"
+    fi
+    # Slice MP8: each role ok, degraded (on fallback) or down, from /readyz's counts (no labels).
+    if [ -n "$gw" ] && command -v python3 >/dev/null; then
+      python3 -I -c '
+import json, sys
+try:
+    d = json.JSONDecoder().raw_decode(sys.stdin.read().strip())[0]
+except ValueError:
+    sys.exit(0)
+if not isinstance(d, dict):
+    sys.exit(0)
+for role, r in sorted((d.get("upstreams") or {}).items()):
+    if not isinstance(r, dict):
+        continue
+    hops, usable = r.get("hops"), r.get("hops_usable")
+    if r.get("status") != "ok":
+        state, note = "DOWN", "no model of its route is usable"
+    elif isinstance(hops, int) and isinstance(usable, int) and usable < hops:
+        state, note = "WARN", "degraded (on fallback): %d of %d models usable" % (usable, hops)
+    else:
+        state, note = "ok", ("%d models usable" % hops) if isinstance(hops, int) else "ok"
+    print("  %-12s %-6s %s" % ("role " + role[:7], state, note))
+' <<<"$gw" || true
     fi
     check bots "http://127.0.0.1:$PMOS_BOTS_PORT/readyz"
     if compose --profile console ps --status running --services 2>/dev/null | grep -qx console; then
@@ -2468,6 +2567,112 @@ print(json.dumps({"bot": "docs", "requested_by": sys.argv[1],
     rt_curl "http://127.0.0.1:$PMOS_BOTS_PORT/v1/tasks/$id/events" | tr '{' '\n' | sed -n 's/.*"kind":"\([a-z_]*\)".*"text":"\([^"]*\)".*/  \1: \2/p'
     echo
     if [ "$status" = done ]; then say "smoke test passed"; else say "smoke test ended as: $status" >&2; exit 1; fi
+    ;;
+
+  upstream-key)
+    # Slice MP2 (docs/model-providers-spec.md §4.11): one key per upstream, read from standard
+    # input (never an argument, never printed), into deploy/secrets/upstream-<u>.key (dir 700,
+    # file 600), which `up` mounts into the gateway only.
+    [ $# -eq 2 ] && [ "$1" = set ] || { say "usage: pmos-admin upstream-key set <upstream> (the key on standard input)" >&2; exit 2; }
+    u=$2
+    [[ "$u" =~ $UPSTREAM_NAME_RE ]] || { say "an upstream's name is 1 to 32 lowercase letters, digits and inner hyphens (as in the route config's upstreams:)" >&2; exit 2; }
+    dir="$DEPLOY/secrets"
+    (umask 077 && mkdir -p "$dir") && chmod 700 "$dir"
+    if [ -t 0 ]; then
+      printf 'key for upstream %s (not shown): ' "$u" >&2
+      IFS= read -rs key || true
+      printf '\n' >&2
+    else
+      IFS= read -r key || true
+    fi
+    key=${key%$'\r'}
+    if [ -z "$key" ] || [[ "$key" == *[[:space:]]* ]]; then
+      say "no key was read, or it has spaces in it; nothing was written" >&2
+      exit 2
+    fi
+    dest="$dir/upstream-$u.key"
+    (umask 077 && printf '%s\n' "$key" >"$dest.new") && chmod 600 "$dest.new" && mv -f "$dest.new" "$dest" ||
+      { rm -f "$dest.new"; say "couldn't write $dest" >&2; exit 1; }
+    unset key
+    say "wrote deploy/secrets/upstream-$u.key (mode 600); the gateway reads a changed key within a second, or restart it to mount a new upstream's"
+    ;;
+
+  route)
+    # Slice MP8 (§4.11): $PMOS_STATE_DIR/route-control/disabled-<label>, which the gateway looks
+    # at before every call, takes that model out of every route without a restart; each change
+    # is a line in route-control/log.
+    usage_route() { say "usage: pmos-admin route disable <label> --reason <text> | route enable <label>" >&2; exit 2; }
+    [ $# -ge 2 ] || usage_route
+    action=$1 label=$2
+    shift 2
+    [ ${#label} -le 64 ] && [ -n "$label" ] && only_chars "$label" "$LABEL_CHARS" || { say "a label is 1 to 64 letters, digits, . _ and -" >&2; exit 2; }
+    [ -d "${PMOS_STATE_DIR:-}" ] || { say "PMOS_STATE_DIR isn't a directory: run deploy/setup.sh" >&2; exit 2; }
+    dir="$PMOS_STATE_DIR/route-control"
+    mkdir -p "$dir" && chmod 755 "$dir"
+    who=${SUDO_USER:-$(id -un)}
+    case "$action" in
+      disable)
+        [ $# -eq 2 ] && [ "$1" = --reason ] || usage_route
+        reason=$2
+        valid_reason "$reason" || { say "a reason is 1 to 200 printable characters on one line" >&2; exit 2; }
+        (umask 022 && printf 'at=%s by=%s reason=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$who" "$reason" >"$dir/disabled-$label")
+        (umask 022 && printf '%s\t%s\tdisable\t%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$who" "$label" "$reason" >>"$dir/log")
+        say "disabled $label: no route uses it from the gateway's next call (a role with no other model answers 503)"
+        ;;
+      enable)
+        [ $# -eq 0 ] || usage_route
+        rm -f -- "$dir/disabled-$label"
+        (umask 022 && printf '%s\t%s\tenable\t%s\t\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$who" "$label" >>"$dir/log")
+        say "enabled $label"
+        ;;
+      *) usage_route ;;
+    esac
+    ;;
+
+  routes)
+    # Slice MP8 (§4.12): GET /v1/pmos/routes as the gateway's read-only admin client, whose
+    # token is read by curl from standard input, never its arguments.
+    [ $# -eq 0 ] || { say "usage: pmos-admin routes" >&2; exit 2; }
+    token_ok PMOS_GW_ADMIN_TOKEN || { say "set PMOS_GW_ADMIN_TOKEN in deploy/.env (openssl rand -hex 24) and restart the gateway" >&2; exit 2; }
+    bearer_config PMOS_GW_ADMIN_TOKEN | curl -sS --noproxy '*' -m 10 --config - "http://127.0.0.1:${PMOS_GATEWAY_PORT:-8740}/v1/pmos/routes"
+    echo
+    ;;
+
+  usage)
+    # Slice MP8 (§4.9): the gateway records tokens, never money. Tokens per model label from
+    # the usage log, times $PMOS_STATE_DIR/prices.yaml (`<label>: <price per million tokens>`,
+    # outside the repository: prices can identify a vendor) when it exists.
+    [ $# -eq 1 ] && [ "$1" = --by-label ] || { say "usage: pmos-admin usage --by-label" >&2; exit 2; }
+    log="${PMOS_STATE_DIR:-}/usage/usage.jsonl"
+    [ -f "$log" ] || { say "no usage log at $log yet" >&2; exit 1; }
+    python3 -I - "$log" "${PMOS_STATE_DIR:-}/prices.yaml" <<'PY'
+import json, os, re, sys
+log, prices_path = sys.argv[1], sys.argv[2]
+prices = {}
+if os.path.isfile(prices_path):
+    for line in open(prices_path, encoding="utf-8"):
+        m = re.match(r"^\s*([A-Za-z0-9._-]{1,64})\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*(#.*)?$", line)
+        if m:
+            prices[m.group(1)] = float(m.group(2))
+totals = {}
+for line in open(log, encoding="utf-8"):
+    try:
+        e = json.loads(line)
+    except ValueError:
+        continue
+    if not isinstance(e, dict):
+        continue
+    label = e.get("model") or "?"
+    t = totals.setdefault(label, [0, 0, 0])
+    t[0] += 1
+    t[1] += e.get("prompt_tokens") or 0
+    t[2] += e.get("completion_tokens") or 0
+print("%-24s %8s %14s %14s %12s" % ("label", "attempts", "prompt", "completion", "cost"))
+for label in sorted(totals):
+    n, p, c = totals[label]
+    cost = "%.4f" % ((p + c) / 1e6 * prices[label]) if label in prices else "-"
+    print("%-24s %8d %14d %14d %12s" % (label[:24], n, p, c, cost))
+PY
     ;;
 
   help|-h|--help)

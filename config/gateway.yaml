@@ -44,4 +44,4 @@ clients:
   # A PM's own bot (bot-pm-<handle>) may name only that PM; a team bot (bot-docs) anyone.
   bot-pm-*: {trusted: true, max-in-flight: 3, user: from-name}
   bot-*: {trusted: true, max-in-flight: 3, person-pool: team-bots}
-  evals: {max-in-flight: 1, priority: personal}
+  evals: {max-in-flight: 1, priority: personal, route: pin}

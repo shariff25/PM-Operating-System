@@ -15,6 +15,9 @@ services:
       HTTPS_PROXY: ${HTTPS_PROXY:-}
       NO_PROXY: localhost,127.0.0.1,.pmos.internal,postgres,vllm-default,vllm-extraction,${NO_PROXY:-}
       PMOS_GATEWAY_CLOUD_TEST: "1"
-      PMOS_GATEWAY_REMOTE_KEY: ${PMOS_GATEWAY_REMOTE_KEY:?PMOS_MODEL_SOURCE=hosted-test needs PMOS_GATEWAY_REMOTE_KEY in deploy/.env}
+      # One upstream: its key here (pmos-admin requires it). Routes (PMOS_HOSTED_TEST_ROUTES=1):
+      # blank, and each upstream's key is a Compose secret pmos-admin adds
+      # ($PMOS_STATE_DIR/compose.upstream-keys.yaml, gateway only; docs/model-providers-spec.md).
+      PMOS_GATEWAY_REMOTE_KEY: ${PMOS_GATEWAY_REMOTE_KEY:-}
     volumes:
       - ${PMOS_STATE_DIR:?}/gateway.hosted-test.yaml:/etc/pmos/gateway.yaml:ro

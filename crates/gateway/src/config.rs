@@ -10,8 +10,13 @@ use std::path::PathBuf;
 use pmos_contract::model_source::ModelSource;
 use serde::Deserialize;
 
+pub use crate::route::{Feature, Hop, RouteRule, Routing};
 use crate::scheduler::{PersonPool, Priority};
 use crate::workarounds;
+
+/// The read-only client (§4.12): it may read `GET /v1/pmos/routes`, which no other client may,
+/// and the gateway refuses it on every model route (`403`).
+pub const ADMIN_CLIENT: &str = "admin";
 
 /// How many requests run at once, how many any one person may have running, how many may
 /// wait before the gateway answers "busy", and how long and how large one call may be.
@@ -151,6 +156,9 @@ struct ClientSpec {
     /// `person-pools:` is given; refused when it isn't.
     #[serde(default)]
     person_pool: Option<String>,
+    /// Who may fall back (§4.10): `fallback` (default), `primary-only` or `pin`.
+    #[serde(default)]
+    route: Option<String>,
 }
 
 /// Which people a trusted client may name in `X-Pmos-User` (review finding R1).
@@ -188,6 +196,8 @@ pub struct ClientPolicy {
     /// and W1). `None` for a `from-name` client (it names only its own PM) and an untrusted
     /// one (it names no one).
     pub pool: Option<PersonPool>,
+    /// Who may fall back (`clients.<…>.route`, §4.10).
+    pub route: RouteRule,
 }
 
 impl ClientPolicy {
@@ -251,26 +261,98 @@ pub fn valid_client_name(name: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
+/// A role: the one-hop form (`upstream`, `model`, and optionally `label`, `workarounds`,
+/// `effort`), or the route form (`route:` naming models of `models:` by label, with
+/// `requires:` and `allow-smaller-context:`; `docs/model-providers-spec.md` §4.1).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 struct RoleSpec {
-    upstream: String,
-    model: String,
     #[serde(default)]
-    workarounds: Vec<String>,
+    upstream: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    workarounds: Option<Vec<String>>,
     /// Claude test upstream only: `output_config.effort`.
     #[serde(default)]
     effort: Option<String>,
     /// A neutral name reported to clients in place of `model` ([`Role::label`]).
     #[serde(default)]
     label: Option<String>,
+    /// The route form: labels of `models:`, the primary first.
+    #[serde(default)]
+    route: Option<Vec<String>>,
+    /// Features every hop of the route must declare.
+    #[serde(default)]
+    requires: Option<Vec<String>>,
+    /// A fallback may declare a smaller `context-tokens` than the primary.
+    #[serde(default)]
+    allow_smaller_context: Option<bool>,
+}
+
+/// One entry of `upstreams:`: a URL (the form every config had before routes), or
+/// `{url, key-file, max-in-flight}` (§4.1, §4.7, §4.11).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum UpstreamEntry {
+    Url(String),
+    Full(UpstreamSpec),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+struct UpstreamSpec {
+    url: String,
+    /// The file holding this upstream's key, read by the gateway only (§4.11).
+    #[serde(default)]
+    key_file: Option<PathBuf>,
+    /// The most calls in flight to this upstream (default `limits.max-in-flight`).
+    #[serde(default)]
+    max_in_flight: Option<usize>,
+}
+
+impl UpstreamEntry {
+    fn url(&self) -> &String {
+        match self {
+            Self::Url(u) => u,
+            Self::Full(s) => &s.url,
+        }
+    }
+    fn key_file(&self) -> Option<&PathBuf> {
+        match self {
+            Self::Url(_) => None,
+            Self::Full(s) => s.key_file.as_ref(),
+        }
+    }
+}
+
+/// One model of `models:`, keyed by its label (§4.1).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+struct ModelSpec {
+    upstream: String,
+    model: String,
+    #[serde(default)]
+    features: Vec<String>,
+    #[serde(default)]
+    context_tokens: Option<u64>,
+    #[serde(default)]
+    workarounds: Vec<String>,
+    #[serde(default)]
+    effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 struct ModelsFile {
-    upstreams: BTreeMap<String, String>,
+    upstreams: BTreeMap<String, UpstreamEntry>,
     roles: BTreeMap<String, RoleSpec>,
+    /// The models routes name, by label (§4.1).
+    #[serde(default)]
+    models: BTreeMap<String, ModelSpec>,
+    /// How routed roles move between hops (§4.1).
+    #[serde(default)]
+    routing: Routing,
     #[serde(default)]
     local_hosts: Vec<String>,
     #[serde(default)]
@@ -330,6 +412,14 @@ pub struct Role {
     /// upstream. A label names one model: give it a new label when the model changes, since
     /// benchmark reports compare roles by what the gateway reports.
     pub label: Option<String>,
+    /// The `upstreams:` key, config-local: never logged or reported (§4.9).
+    pub upstream_id: String,
+    /// The upstream's `key-file:`, when it has one (§4.11).
+    pub key_file: Option<PathBuf>,
+    /// The route form's models, the primary first (`docs/model-providers-spec.md` §4.1);
+    /// `None` for a role in the one-hop form, whose one model is the fields above. For a
+    /// routed role those fields are its primary's.
+    pub route: Option<Vec<Hop>>,
 }
 
 /// What an upstream speaks.
@@ -342,8 +432,11 @@ pub enum UpstreamKind {
     ClaudeTest,
     /// **Testing only:** an OpenAI-compatible API on the public internet, written
     /// `openai+https://<host>/<base path>` and allowed only with `PMOS_GATEWAY_CLOUD_TEST=1`.
-    /// Requests are forwarded as they are (no translation), with `PMOS_GATEWAY_REMOTE_KEY` as
-    /// the bearer token and the fields in `app::REMOTE_DROPPED_FIELDS` removed.
+    /// Requests are forwarded as they are: no translation, and no field removed (checked in
+    /// slice MP1: there is no `REMOTE_DROPPED_FIELDS`; only the Claude test upstream's
+    /// translation drops fields, its sampling parameters). The bearer token is the upstream's
+    /// own key: its `key-file:`, or `PMOS_GATEWAY_REMOTE_KEY` for a config with one remote
+    /// upstream (`docs/model-providers-spec.md` §4.11).
     RemoteOpenAi,
 }
 
@@ -351,6 +444,16 @@ impl UpstreamKind {
     /// A testing-only upstream: prompts sent to it leave this machine.
     pub fn is_cloud_test(self) -> bool {
         matches!(self, Self::ClaudeTest | Self::RemoteOpenAi)
+    }
+
+    /// The neutral name for the kind, never an address: `local`, `claude-test` or
+    /// `remote-test`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OpenAi => "local",
+            Self::ClaudeTest => "claude-test",
+            Self::RemoteOpenAi => "remote-test",
+        }
     }
 }
 
@@ -378,11 +481,42 @@ impl Role {
     /// The neutral name for the upstream's kind, never its address: `local`, `claude-test` or
     /// `remote-test`.
     pub fn upstream_kind_label(&self) -> &'static str {
-        match self.kind {
-            UpstreamKind::OpenAi => "local",
-            UpstreamKind::ClaudeTest => "claude-test",
-            UpstreamKind::RemoteOpenAi => "remote-test",
+        self.kind.label()
+    }
+
+    /// Whether the role is in the route form (§4.1). A one-hop role keeps every behaviour it
+    /// had before routes: its retries are `PMOS_GATEWAY_RETRY_*`, it has no circuit, and its
+    /// errors are returned as before.
+    pub fn routed(&self) -> bool {
+        self.route.is_some()
+    }
+
+    /// The role's models in order, the primary first: the route form's, or for a one-hop role
+    /// the one model its own fields name (read afresh, so a test that points a role's
+    /// `upstream` at a mock after parsing is followed).
+    pub fn hops(&self) -> Vec<Hop> {
+        match &self.route {
+            Some(r) => r.clone(),
+            None => vec![Hop {
+                label: self.label.clone(),
+                upstream_id: self.upstream_id.clone(),
+                upstream: self.upstream.clone(),
+                kind: self.kind,
+                model: self.model.clone(),
+                workarounds: self.workarounds.clone(),
+                effort: self.effort.clone(),
+                features: None,
+                context_tokens: None,
+                key_file: self.key_file.clone(),
+            }],
         }
+    }
+
+    /// Whether any of the role's models switches on workaround `id`.
+    pub fn uses_workaround(&self, id: &str) -> bool {
+        self.hops()
+            .iter()
+            .any(|h| h.workarounds.iter().any(|w| w == id))
     }
 
     /// The upstream as the gateway's logs name it: its base URL, or, for a labelled role, its
@@ -435,6 +569,13 @@ pub struct Models {
     /// client (a PM's own bot) may hold of its PM's slots, and its default share. `None`
     /// without `person-pools:`, where that is `per-user`.
     pub own_bot_slots: Option<usize>,
+    /// `routing:` (§4.1), for routed roles.
+    pub routing: Routing,
+    /// `upstreams.<u>.max-in-flight`, by `upstreams:` key (§4.7). An upstream not listed here
+    /// is bounded by `limits.max-in-flight` alone.
+    pub upstream_caps: BTreeMap<String, usize>,
+    /// The `upstreams:` keys some role uses, with their kind (for [`Config::check_keys`]).
+    pub upstream_kinds: BTreeMap<String, UpstreamKind>,
 }
 
 impl Models {
@@ -615,6 +756,21 @@ impl Models {
                 None if own => most,
                 None => limits.per_user,
             };
+            let route = match spec.route.as_deref() {
+                None => RouteRule::Fallback,
+                Some(r) => RouteRule::parse(r).ok_or_else(|| {
+                    format!(
+                        "gateway config: client `{name}`: route must be fallback, primary-only or \
+                         pin, not `{r}`"
+                    )
+                })?,
+            };
+            if name == ADMIN_CLIENT && spec.route.is_some() {
+                return Err(format!(
+                    "gateway config: client `{ADMIN_CLIENT}` is read-only and makes no model calls, \
+                     so it takes no `route`"
+                ));
+            }
             let max_in_flight = spec.max_in_flight.unwrap_or(limits.client_default());
             let priority = match spec.priority.as_deref() {
                 None if spec.trusted => Priority::Interactive,
@@ -638,6 +794,7 @@ impl Models {
                     user,
                     per_user_share,
                     pool,
+                    route,
                 },
             );
         }
@@ -648,6 +805,39 @@ impl Models {
                 ));
             }
         }
+        let routing = file.routing;
+        routing.check()?;
+        let mut upstream_caps = BTreeMap::new();
+        for (id, entry) in &file.upstreams {
+            let UpstreamEntry::Full(u) = entry else {
+                continue;
+            };
+            // An upstream's key is config-local (§4.9): these refusals don't name it.
+            if u.max_in_flight == Some(0) {
+                return Err(
+                    "gateway config: an upstream's `max-in-flight` must be at least 1".into(),
+                );
+            }
+            if let Some(cap) = u.max_in_flight {
+                upstream_caps.insert(id.clone(), cap);
+            }
+            if u.key_file.as_ref().is_some_and(|k| !k.is_absolute()) {
+                return Err(
+                    "gateway config: an upstream's `key-file` must be an absolute path".into(),
+                );
+            }
+        }
+        let ctx = UpstreamCtx {
+            local_hosts: &file.local_hosts,
+            cloud_test,
+            class,
+        };
+        let mut models_by_label: BTreeMap<String, Hop> = BTreeMap::new();
+        for (label, m) in &file.models {
+            let hop = model_hop(label, m, (&file.roles, &file.upstreams), &ctx)?;
+            models_by_label.insert(label.clone(), hop);
+        }
+        let mut upstream_kinds = BTreeMap::new();
         let mut roles = BTreeMap::new();
         for (name, spec) in file.roles {
             if !valid_role_name(&name) {
@@ -655,25 +845,41 @@ impl Models {
                     "gateway config: role `{name}` must be lowercase letters, digits and `-`"
                 ));
             }
-            let base = file.upstreams.get(&spec.upstream).ok_or_else(|| {
+            if let Some(route) = &spec.route {
+                let role = routed_role(&name, route, &spec, &models_by_label)?;
+                for hop in role.route.iter().flatten() {
+                    upstream_kinds.insert(hop.upstream_id.clone(), hop.kind);
+                }
+                roles.insert(name, role);
+                continue;
+            }
+            if spec.requires.is_some() || spec.allow_smaller_context.is_some() {
+                return Err(format!(
+                    "gateway config: role `{name}`: `requires` and `allow-smaller-context` are for \
+                     a role with a `route:`"
+                ));
+            }
+            let (Some(upstream), Some(model)) = (spec.upstream.clone(), spec.model.clone()) else {
+                return Err(format!(
+                    "gateway config: role `{name}` needs `upstream` and `model`, or a `route:` of \
+                     models"
+                ));
+            };
+            let workarounds_on = spec.workarounds.clone().unwrap_or_default();
+            let entry = file.upstreams.get(&upstream).ok_or_else(|| {
                 format!(
                     "gateway config: role `{name}` names upstream `{}`, which isn't listed",
-                    spec.upstream
+                    upstream
                 )
             })?;
-            let (kind, base) = if let Some(rest) = base.strip_prefix("anthropic+") {
-                (UpstreamKind::ClaudeTest, rest)
-            } else if let Some(rest) = base.strip_prefix("openai+") {
-                (UpstreamKind::RemoteOpenAi, rest)
-            } else {
-                (UpstreamKind::OpenAi, base.as_str())
-            };
+            let base = entry.url();
+            let (kind, base) = split_kind(base);
             let url = reqwest::Url::parse(base)
-                .map_err(|e| format!("gateway config: upstream `{}`: {e}", spec.upstream))?;
+                .map_err(|e| format!("gateway config: upstream `{}`: {e}", upstream))?;
             if !matches!(url.scheme(), "http" | "https") {
                 return Err(format!(
                     "gateway config: upstream `{}` must be http or https",
-                    spec.upstream
+                    upstream
                 ));
             }
             let host = url.host_str().unwrap_or_default();
@@ -683,13 +889,13 @@ impl Models {
                         UpstreamKind::ClaudeTest => format!(
                             "gateway config: upstream `{}` is the Claude test upstream; it needs \
                              PMOS_GATEWAY_CLOUD_TEST=1 (testing only: prompts leave this machine)",
-                            spec.upstream
+                            upstream
                         ),
                         _ => format!(
                             "gateway config: upstream `{}` is a remote test upstream (an \
                              OpenAI-compatible API on the internet), so prompts would leave this \
                              machine; it is for testing only and needs PMOS_GATEWAY_CLOUD_TEST=1",
-                            spec.upstream
+                            upstream
                         ),
                     });
                 }
@@ -697,17 +903,17 @@ impl Models {
                 if url.scheme() != "https" && !is_local_host(host, &file.local_hosts) {
                     return Err(format!(
                         "gateway config: upstream `{}` must use https",
-                        spec.upstream
+                        upstream
                     ));
                 }
             } else if !is_local_host(host, &file.local_hosts) {
                 return Err(format!(
                     "gateway config: upstream `{}` ({host}) is not on this machine or its private network; \
                      PM OS sends prompts only to local models",
-                    spec.upstream
+                    upstream
                 ));
             }
-            if spec.model.trim().is_empty() {
+            if model.trim().is_empty() {
                 return Err(format!("gateway config: role `{name}` has no model"));
             }
             if let Some(l) = &spec.label {
@@ -731,7 +937,7 @@ impl Models {
                     ));
                 }
             }
-            for w in &spec.workarounds {
+            for w in &workarounds_on {
                 if !workarounds::known(w) {
                     return Err(format!(
                         "gateway config: role `{name}` enables unknown workaround `{w}`; known: {}",
@@ -756,7 +962,7 @@ impl Models {
                 return Err(format!(
                     "gateway config: upstream `{}` ({host}): a `class: production` gateway's \
                      model servers must be named `<name>.pmos.internal`",
-                    spec.upstream
+                    upstream
                 ));
             }
             // Slice H4 (spec §3.6, "Which gateway may serve `local`"): only the two model
@@ -767,7 +973,7 @@ impl Models {
                     "gateway config: upstream `{}` ({host}): a `class: production` gateway's \
                      model servers are {}, each pinned to its own address; another model server \
                      is a reviewed code change",
-                    spec.upstream,
+                    upstream,
                     PINNED_MODEL_SERVERS
                         .iter()
                         .map(|(n, _)| *n)
@@ -775,18 +981,42 @@ impl Models {
                         .join(" and ")
                 ));
             }
+            if kind == UpstreamKind::OpenAi && entry.key_file().is_some() {
+                return Err(format!(
+                    "gateway config: role `{name}`: its upstream is a local model server, which \
+                     takes no `key-file`"
+                ));
+            }
+            upstream_kinds.insert(upstream.clone(), kind);
             roles.insert(
                 name.clone(),
                 Role {
                     name,
                     upstream: base.trim_end_matches('/').to_string(),
-                    model: spec.model,
-                    workarounds: spec.workarounds,
+                    model,
+                    workarounds: workarounds_on,
                     kind,
                     effort: spec.effort,
                     label: spec.label,
+                    upstream_id: upstream,
+                    key_file: entry.key_file().cloned(),
+                    route: None,
                 },
             );
+        }
+        // One label, one model: a one-hop role's label may not also be a routed model's.
+        for r in roles.values().filter(|r| !r.routed()) {
+            if let Some(l) = r
+                .label
+                .as_ref()
+                .filter(|l| models_by_label.contains_key(*l))
+            {
+                return Err(format!(
+                    "gateway config: role `{}` has label `{l}`, which is also a model's label \
+                     under `models:`; a label names one model",
+                    r.name
+                ));
+            }
         }
         Ok(Self {
             roles,
@@ -795,6 +1025,9 @@ impl Models {
             class,
             pools,
             own_bot_slots,
+            routing,
+            upstream_caps,
+            upstream_kinds,
         })
     }
 
@@ -816,6 +1049,7 @@ impl Models {
             // Untrusted: it names no one, so no person's slots are counted for it.
             per_user_share: self.limits.per_user,
             pool: None,
+            route: RouteRule::Fallback,
         };
         if let Some(p) = self.clients.get(client) {
             return *p;
@@ -953,6 +1187,243 @@ fn person_pools(
             .collect(),
         Some(limits.per_user - total),
     ))
+}
+
+/// An upstream URL's kind, from its prefix, and the URL without it.
+fn split_kind(base: &str) -> (UpstreamKind, &str) {
+    if let Some(rest) = base.strip_prefix("anthropic+") {
+        (UpstreamKind::ClaudeTest, rest)
+    } else if let Some(rest) = base.strip_prefix("openai+") {
+        (UpstreamKind::RemoteOpenAi, rest)
+    } else {
+        (UpstreamKind::OpenAi, base)
+    }
+}
+
+/// What the start-up checks of a routed model's upstream need.
+struct UpstreamCtx<'a> {
+    local_hosts: &'a [String],
+    cloud_test: bool,
+    class: GatewayClass,
+}
+
+/// One model of `models:`, checked as a one-hop role's upstream is (MP-3: every hop passes
+/// the source's start-up rules, and one that fails stops the gateway). The refusals name the
+/// model's label and the setting, never the upstream's key, URL, host or the model id (§4.12).
+fn model_hop(
+    label: &str,
+    m: &ModelSpec,
+    (roles, upstreams): (
+        &BTreeMap<String, RoleSpec>,
+        &BTreeMap<String, UpstreamEntry>,
+    ),
+    ctx: &UpstreamCtx<'_>,
+) -> Result<Hop, String> {
+    let fail = |why: &str| Err(format!("gateway config: models.{label}: {why}"));
+    if !valid_label(label) {
+        return Err(format!(
+            "gateway config: model label `{label}` must be 1 to 64 letters, digits, `.`, `_` and `-`"
+        ));
+    }
+    if roles.contains_key(label) {
+        return fail("a model's label must not be a role's name");
+    }
+    let Some(entry) = upstreams.get(&m.upstream) else {
+        return fail("its `upstream` isn't listed under `upstreams:`");
+    };
+    let (kind, base) = split_kind(entry.url());
+    let Ok(url) = reqwest::Url::parse(base) else {
+        return fail("its upstream's URL doesn't parse");
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return fail("its upstream must be http or https");
+    }
+    let host = url.host_str().unwrap_or_default();
+    if kind.is_cloud_test() {
+        if !ctx.cloud_test {
+            return fail(
+                "its upstream is a testing-only one (prompts would leave this machine); it needs \
+                 PMOS_GATEWAY_CLOUD_TEST=1",
+            );
+        }
+        if url.scheme() != "https" && !is_local_host(host, ctx.local_hosts) {
+            return fail("its upstream must use https");
+        }
+    } else if !is_local_host(host, ctx.local_hosts) {
+        return fail(
+            "its upstream is not on this machine or its private network; PM OS sends prompts \
+             only to local models",
+        );
+    }
+    if ctx.class == GatewayClass::Production {
+        if kind.is_cloud_test() {
+            return fail(
+                "its upstream is testing-only, which a `class: production` gateway never serves",
+            );
+        }
+        if !is_production_host(host) || pinned_address(host).is_none() {
+            return fail(&format!(
+                "a `class: production` gateway's model servers are {}, each pinned to its own \
+                 address; another model server is a reviewed code change",
+                PINNED_MODEL_SERVERS
+                    .iter()
+                    .map(|(n, _)| *n)
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            ));
+        }
+    }
+    if kind == UpstreamKind::OpenAi && entry.key_file().is_some() {
+        return fail("its upstream is a local model server, which takes no `key-file`");
+    }
+    if m.model.trim().is_empty() {
+        return fail("it has no `model` id");
+    }
+    let mut features = Vec::new();
+    for f in &m.features {
+        let Some(f) = Feature::parse(f) else {
+            return fail(&format!(
+                "unknown feature `{f}`; known: {}",
+                Feature::ALL.map(Feature::as_str).join(", ")
+            ));
+        };
+        if !features.contains(&f) {
+            features.push(f);
+        }
+    }
+    features.sort();
+    if kind == UpstreamKind::ClaudeTest && features.contains(&Feature::Embeddings) {
+        return fail("the Claude test upstream has no embeddings");
+    }
+    if m.context_tokens == Some(0) {
+        return fail("`context-tokens` must be at least 1");
+    }
+    if let Some(e) = &m.effort {
+        if kind != UpstreamKind::ClaudeTest {
+            return fail("`effort` is taken only by the Claude test upstream");
+        }
+        if !crate::anthropic::EFFORTS.contains(&e.as_str()) {
+            return fail(&format!(
+                "effort `{e}` must be one of {}",
+                crate::anthropic::EFFORTS.join(", ")
+            ));
+        }
+    }
+    for w in &m.workarounds {
+        if !workarounds::known(w) {
+            return fail(&format!(
+                "unknown workaround `{w}`; known: {}",
+                workarounds::REGISTRY
+                    .iter()
+                    .map(|w| w.id)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    Ok(Hop {
+        label: Some(label.to_string()),
+        upstream_id: m.upstream.clone(),
+        upstream: base.trim_end_matches('/').to_string(),
+        kind,
+        model: m.model.clone(),
+        workarounds: m.workarounds.clone(),
+        effort: m.effort.clone(),
+        features: Some(features),
+        context_tokens: m.context_tokens,
+        key_file: entry.key_file().cloned(),
+    })
+}
+
+/// A role in the route form (§4.1, §4.8, §4.12): every label names a model of `models:`, none
+/// twice; every hop has every feature in `requires:`; and no fallback declares a smaller
+/// `context-tokens` than the primary (nor leaves it out when the primary declares one) unless
+/// the role says `allow-smaller-context: true`. The role's own fields are its primary's.
+fn routed_role(
+    name: &str,
+    route: &[String],
+    spec: &RoleSpec,
+    models: &BTreeMap<String, Hop>,
+) -> Result<Role, String> {
+    if spec.upstream.is_some()
+        || spec.model.is_some()
+        || spec.label.is_some()
+        || spec.workarounds.is_some()
+        || spec.effort.is_some()
+    {
+        return Err(format!(
+            "gateway config: role `{name}`: a role with a `route:` names models by label; \
+             `upstream`, `model`, `label`, `workarounds` and `effort` belong to each model under \
+             `models:`"
+        ));
+    }
+    if route.is_empty() {
+        return Err(format!(
+            "gateway config: role `{name}` has an empty `route:`"
+        ));
+    }
+    let mut hops: Vec<Hop> = Vec::new();
+    for l in route {
+        let Some(hop) = models.get(l) else {
+            return Err(format!(
+                "gateway config: role `{name}`: route names `{l}`, which isn't a model under \
+                 `models:`"
+            ));
+        };
+        if hops.iter().any(|h| h.label == hop.label) {
+            return Err(format!(
+                "gateway config: role `{name}`: route names `{l}` twice"
+            ));
+        }
+        hops.push(hop.clone());
+    }
+    let mut requires = Vec::new();
+    for f in spec.requires.iter().flatten() {
+        let Some(f) = Feature::parse(f) else {
+            return Err(format!(
+                "gateway config: role `{name}`: unknown required feature `{f}`; known: {}",
+                Feature::ALL.map(Feature::as_str).join(", ")
+            ));
+        };
+        requires.push(f);
+    }
+    for hop in &hops {
+        if let Some(f) = requires.iter().find(|f| !hop.has(**f)) {
+            return Err(format!(
+                "gateway config: role `{name}`: model `{}` lacks `{}`, which the role requires",
+                hop.reported_model(),
+                f.as_str()
+            ));
+        }
+    }
+    if !spec.allow_smaller_context.unwrap_or(false) {
+        if let Some(primary) = hops[0].context_tokens {
+            if let Some(h) = hops[1..]
+                .iter()
+                .find(|h| h.context_tokens.is_none_or(|c| c < primary))
+            {
+                return Err(format!(
+                    "gateway config: role `{name}`: fallback `{}` declares a smaller \
+                     `context-tokens` than the primary (or none); set \
+                     `allow-smaller-context: true` on the role to allow it",
+                    h.reported_model()
+                ));
+            }
+        }
+    }
+    let p = &hops[0];
+    Ok(Role {
+        name: name.to_string(),
+        upstream: p.upstream.clone(),
+        model: p.model.clone(),
+        workarounds: p.workarounds.clone(),
+        kind: p.kind,
+        effort: p.effort.clone(),
+        label: p.label.clone(),
+        upstream_id: p.upstream_id.clone(),
+        key_file: p.key_file.clone(),
+        route: Some(hops),
+    })
 }
 
 /// Lowercase hex SHA-256 of `text`.
@@ -1184,6 +1655,24 @@ impl Config {
                             .into(),
                     );
                 }
+                // MP-3, MP-4: every hop of every route is one of the two pinned model servers
+                // (the class's own start-up rules already refuse anything else; this is the
+                // source's own check, so no fallback can leave the host).
+                for r in models.roles.values() {
+                    for h in r.hops() {
+                        let host = reqwest::Url::parse(&h.upstream)
+                            .ok()
+                            .and_then(|u| u.host_str().map(String::from))
+                            .unwrap_or_default();
+                        if h.kind != UpstreamKind::OpenAi || pinned_address(&host).is_none() {
+                            return Err(format!(
+                                "PMOS_MODEL_SOURCE=local: role `{}` has a model that isn't one of \
+                                 the two pinned model servers on this host",
+                                r.name
+                            ));
+                        }
+                    }
+                }
             }
             ModelSource::HostedTest => {
                 if models.class != GatewayClass::Test {
@@ -1201,7 +1690,11 @@ impl Config {
                             .into(),
                     );
                 }
-                if let Some(r) = models.roles.values().find(|r| r.label.is_none()) {
+                if let Some(r) = models
+                    .roles
+                    .values()
+                    .find(|r| r.label.is_none() || r.hops().iter().any(|h| h.label.is_none()))
+                {
                     return Err(format!(
                         "PMOS_MODEL_SOURCE=hosted-test: role `{}` has no `label:`; every role \
                          needs one, so the gateway reports and logs a label, never a model id",
@@ -1232,16 +1725,53 @@ impl Config {
         (models.class, None)
     }
 
-    /// Refuses to start when a role uses a testing-only upstream whose key is missing.
+    /// Refuses to start when a role uses a testing-only upstream whose key is missing, and
+    /// keeps one key per upstream (`docs/model-providers-spec.md` §4.11): an upstream with a
+    /// `key-file:` reads its key from that file only; `PMOS_GATEWAY_REMOTE_KEY` serves a config
+    /// with one remote test upstream and no `key-file:`, and is refused beside two or more, or
+    /// beside a `key-file:`, so no key can reach an upstream it wasn't given for.
     pub fn check_keys(&self, models: &Models) -> Result<(), String> {
-        let uses = |kind| models.roles.values().any(|r| r.kind == kind);
-        if uses(UpstreamKind::ClaudeTest) && self.anthropic_key.trim().is_empty() {
+        let hops: Vec<Hop> = models.roles.values().flat_map(Role::hops).collect();
+        if hops
+            .iter()
+            .any(|h| h.kind == UpstreamKind::ClaudeTest && h.key_file.is_none())
+            && self.anthropic_key.trim().is_empty()
+        {
             return Err(
                 "a role uses the Claude test upstream; set PMOS_GATEWAY_ANTHROPIC_KEY to a Claude API key"
                     .into(),
             );
         }
-        if uses(UpstreamKind::RemoteOpenAi) && self.remote_key.trim().is_empty() {
+        let mut remote: Vec<(&str, bool)> = hops
+            .iter()
+            .filter(|h| h.kind == UpstreamKind::RemoteOpenAi)
+            .map(|h| (h.upstream_id.as_str(), h.key_file.is_some()))
+            .collect();
+        remote.sort();
+        remote.dedup();
+        let env_key = !self.remote_key.trim().is_empty();
+        if remote.len() >= 2 {
+            if env_key {
+                return Err(
+                    "PMOS_GATEWAY_REMOTE_KEY is for a config with one remote test upstream; with \
+                     two or more, each upstream's key is in its own `key-file:`"
+                        .into(),
+                );
+            }
+            if remote.iter().any(|(_, file)| !file) {
+                return Err(
+                    "with two or more remote test upstreams, each needs its own `key-file:`".into(),
+                );
+            }
+        }
+        if env_key && remote.iter().any(|(_, file)| *file) {
+            return Err(
+                "PMOS_GATEWAY_REMOTE_KEY is set, but the remote test upstream has a `key-file:`; \
+                 give its key one way only"
+                    .into(),
+            );
+        }
+        if remote.iter().any(|(_, file)| !file) && !env_key {
             return Err(
                 "a role uses a remote test upstream (openai+https://…); set PMOS_GATEWAY_REMOTE_KEY \
                  to that API's key"
@@ -1250,6 +1780,82 @@ impl Config {
         }
         Ok(())
     }
+}
+
+/// `pmos-gateway --check-config [path]` (§4.12): the config at `path` (else
+/// `PMOS_GATEWAY_CONFIG`) put through every start-up check the gateway makes against this
+/// environment (`PMOS_MODEL_SOURCE`, `PMOS_GATEWAY_CLOUD_TEST`, the keys), without serving.
+/// `PMOS_GATEWAY_TOKENS` may be left out. `Ok`: a summary by label only, never a URL, host,
+/// upstream key or model id.
+pub fn check_config(
+    get: impl Fn(&str) -> Option<String>,
+    path: Option<PathBuf>,
+) -> Result<String, String> {
+    let placeholder = format!("check-config={}", "x".repeat(32));
+    let config = Config::from_lookup(|k| match k {
+        "PMOS_GATEWAY_TOKENS" => get(k).or_else(|| Some(placeholder.clone())),
+        _ => get(k),
+    })?;
+    let path = path.unwrap_or_else(|| config.models_path.clone());
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("{}: can't read the gateway config: {e}", path.display()))?;
+    let models = Models::parse(&text, config.cloud_test)?;
+    config.check_keys(&models)?;
+    config.check_source(&models)?;
+    // §4.11: only the gateway reaches a provider, through the egress proxy; an upstream whose
+    // host NO_PROXY names would bypass it.
+    let no_proxy = get("NO_PROXY")
+        .or_else(|| get("no_proxy"))
+        .unwrap_or_default();
+    for r in models.roles.values() {
+        for h in r.hops().iter().filter(|h| h.kind.is_cloud_test()) {
+            let host = reqwest::Url::parse(&h.upstream)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+                .unwrap_or_default();
+            if no_proxy_matches(&no_proxy, &host) {
+                return Err(format!(
+                    "gateway config: role `{}`, model `{}`: its upstream's host is in NO_PROXY, \
+                     so its calls would bypass the egress proxy",
+                    r.name,
+                    h.reported_model()
+                ));
+            }
+        }
+    }
+    let mut out = vec![format!(
+        "ok: class {}, model source {}",
+        models.class.as_str(),
+        config.served_source()
+    )];
+    for r in models.roles.values() {
+        let hops = r.hops();
+        let labels: Vec<&str> = hops
+            .iter()
+            .map(|h| h.label.as_deref().unwrap_or("(unlabelled)"))
+            .collect();
+        out.push(format!(
+            "role {}: {} {}",
+            r.name,
+            if r.routed() { "route" } else { "one model" },
+            labels.join(", ")
+        ));
+    }
+    Ok(out.join("\n"))
+}
+
+/// Whether a `NO_PROXY` list (comma-separated: `*`, a host, or a domain with or without a
+/// leading `.`) covers `host`.
+pub fn no_proxy_matches(list: &str, host: &str) -> bool {
+    !host.is_empty()
+        && list
+            .split(',')
+            .map(|e| e.trim().to_ascii_lowercase())
+            .filter(|e| !e.is_empty())
+            .any(|e| {
+                let bare = e.trim_start_matches('.');
+                e == "*" || host == bare || host.ends_with(&format!(".{bare}"))
+            })
 }
 
 /// What a gateway reports as its source: `stub` with the stub on, else `source`.

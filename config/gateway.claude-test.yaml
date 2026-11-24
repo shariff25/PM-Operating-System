@@ -38,4 +38,4 @@ limits:
 clients:
   runtime: {trusted: true, max-in-flight: 4, per-user-share: 2}
   worker: {trusted: true, max-in-flight: 4, per-user-share: 2}
-  evals: {max-in-flight: 2, priority: personal}
+  evals: {max-in-flight: 2, priority: personal, route: pin}

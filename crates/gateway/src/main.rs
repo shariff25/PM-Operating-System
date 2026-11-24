@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use pmos_gateway::config::{Config, Models, UpstreamKind};
 use pmos_gateway::usage::UsageLog;
-use pmos_gateway::{router, GatewayConfig};
+use pmos_gateway::{router_with, GatewayConfig, RouterOptions};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -14,6 +14,25 @@ async fn main() -> Result<()> {
     let mut filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
     for quiet in ["reqwest", "hyper", "hyper_util", "h2", "rustls"] {
         filter = filter.add_directive(format!("{quiet}=warn").parse().expect("a valid directive"));
+    }
+    // `pmos-gateway --check-config [path]` (docs/model-providers-spec.md §4.12): every start-up
+    // check of the config against this environment, then exit, serving nothing. Prints the
+    // roles and their routes by label only, never a URL, host, key or model id.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--check-config") {
+        return match pmos_gateway::config::check_config(
+            |k| std::env::var(k).ok(),
+            args.get(1).map(std::path::PathBuf::from),
+        ) {
+            Ok(summary) => {
+                println!("{summary}");
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        };
     }
     tracing_subscriber::fmt()
         .json()
@@ -98,18 +117,43 @@ async fn main() -> Result<()> {
             person_pool_slots = ?p.pool.map(|pool| pool.cap), "client"
         );
     }
-    let app = router(GatewayConfig {
-        models,
-        clients: config.clients.clone(),
-        usage: usage.clone(),
-        stub: config.stub,
-        workarounds_on: config.workarounds_on,
-        anthropic_key: config.anthropic_key.clone(),
-        remote_key: config.remote_key.clone(),
-        retry: config.retry,
-        timeouts: Default::default(),
-        model_source: config.model_source,
-    });
+    // Slice MP2: the upstreams' key files are read afresh on SIGHUP (and on a change of size or
+    // modification time, looked at once a second at most).
+    let keys = std::sync::Arc::new(pmos_gateway::keys::KeyStore::default());
+    #[cfg(unix)]
+    {
+        let keys = keys.clone();
+        let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+            .context("listening for SIGHUP")?;
+        tokio::spawn(async move {
+            while hup.recv().await.is_some() {
+                keys.reload();
+                tracing::info!("SIGHUP: the upstreams' key files will be read afresh");
+            }
+        });
+    }
+    let app = router_with(
+        GatewayConfig {
+            models,
+            clients: config.clients.clone(),
+            usage: usage.clone(),
+            stub: config.stub,
+            workarounds_on: config.workarounds_on,
+            anthropic_key: config.anthropic_key.clone(),
+            remote_key: config.remote_key.clone(),
+            retry: config.retry,
+            timeouts: Default::default(),
+            model_source: config.model_source,
+        },
+        RouterOptions {
+            keys: keys.clone(),
+            // Slice MP8: `disabled-<label>` files here take a model out of every route.
+            route_control: std::env::var("PMOS_GATEWAY_ROUTE_CONTROL")
+                .ok()
+                .filter(|p| !p.is_empty())
+                .map(std::path::PathBuf::from),
+        },
+    );
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .with_context(|| format!("binding {}", config.bind))?;

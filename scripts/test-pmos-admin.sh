@@ -2294,6 +2294,101 @@ SUDO_USER=ana FAKE_UID=0 run_fw host attest local-gpu --clear >/dev/null 2>&1 ||
 # No secret reached the log or a command line in all of this.
 ! grep -q 'secret\|rt-web-\|ts-web-' "$ACKLOG" || fail "a token reached the acknowledgement log"
 
+# --- Model routes (docs/model-providers-spec.md, slices MP2 and MP8) ---------------------------
+# upstream-key set: the key from standard input into deploy/secrets (700/600), never printed,
+# never in an argument; a hosted-test stack mounts each key file into the gateway by a Compose
+# secret; route disable/enable write and log route-control; routes reads the gateway's routes
+# with the admin token from curl's standard input; usage --by-label sums tokens per label;
+# status shows a role on its fallback; with PMOS_HOSTED_TEST_ROUTES=1 `up` checks the
+# operator's route config with the gateway's --check-config before anything starts.
+rm -rf "$WORK/stack/deploy/secrets" "$WORK/state/route-control" "$WORK/state/compose.upstream-keys.yaml"
+stack_env require "${ht[@]}"
+out=$(printf 'k-up-a-0123456789\n' | run_stack upstream-key set up-a 2>&1) || fail "upstream-key set failed: $out"
+keyf="$WORK/stack/deploy/secrets/upstream-up-a.key"
+[ "$(cat "$keyf")" = k-up-a-0123456789 ] || fail "the key file doesn't hold the key"
+[ "$(stat -c %a "$keyf")" = 600 ] && [ "$(stat -c %a "$WORK/stack/deploy/secrets")" = 700 ] ||
+  fail "the key file or its directory isn't private: $(stat -c %a "$keyf" "$WORK/stack/deploy/secrets")"
+[[ "$out" != *k-up-a-0123456789* ]] || fail "upstream-key set printed the key"
+for bad in "Up-A" "-x" "a/b" ""; do
+  code=0
+  printf 'k\n' | run_stack upstream-key set "$bad" >/dev/null 2>&1 || code=$?
+  [ "$code" = 2 ] || fail "upstream-key set '$bad' exits $code, not 2"
+done
+code=0
+printf '' | run_stack upstream-key set up-b >/dev/null 2>&1 || code=$?
+[ "$code" = 2 ] && [ ! -e "$WORK/stack/deploy/secrets/upstream-up-b.key" ] || fail "an empty key was written ($code)"
+printf 'k-up-b-0123456789\n' | run_stack upstream-key set up-b >/dev/null 2>&1 || fail "the second key"
+: >"$DOCKER_LOG"
+run_stack status >/dev/null 2>&1 || true
+grep -q -- "-f $WORK/state/compose.upstream-keys.yaml" "$DOCKER_LOG" || fail "the key overlay isn't added: $(cat "$DOCKER_LOG")"
+ov="$WORK/state/compose.upstream-keys.yaml"
+grep -q 'target: pmos-upstream-up-a.key' "$ov" && grep -q "file: \"$WORK/stack/deploy/secrets/upstream-up-b.key\"" "$ov" ||
+  fail "the overlay doesn't mount both keys: $(cat "$ov")"
+! grep -q 'k-up-' "$ov" "$DOCKER_LOG" "$CURL_LOG" "$ARGV_LOG" || fail "a key reached the overlay, docker or a command line"
+# route disable / enable.
+out=$(run_stack route disable hosted-model-b --reason "flaky in the test" 2>&1) || fail "route disable failed: $out"
+[ -f "$WORK/state/route-control/disabled-hosted-model-b" ] || fail "route disable wrote no file"
+grep -q $'\tdisable\thosted-model-b\tflaky in the test$' "$WORK/state/route-control/log" || fail "route disable wasn't logged"
+run_stack route enable hosted-model-b >/dev/null 2>&1 || fail "route enable failed"
+[ ! -e "$WORK/state/route-control/disabled-hosted-model-b" ] || fail "route enable left the file"
+grep -q $'\tenable\thosted-model-b\t$' "$WORK/state/route-control/log" || fail "route enable wasn't logged"
+for args in "disable bad/label --reason x" "disable hosted-model-b" "disable hosted-model-b --reason" "pause hosted-model-b"; do
+  code=0
+  # shellcheck disable=SC2086
+  run_stack route $args >/dev/null 2>&1 || code=$?
+  [ "$code" = 2 ] || fail "route $args exits $code, not 2"
+done
+# routes: the admin token through curl's standard input.
+code=0
+run_stack routes >/dev/null 2>&1 || code=$?
+[ "$code" = 2 ] || fail "routes without PMOS_GW_ADMIN_TOKEN exits $code, not 2"
+stack_env require "${ht[@]}" "PMOS_GW_ADMIN_TOKEN=gw-admin-0123456789abcdef0123456789"
+run_stack routes >/dev/null 2>&1 || fail "routes failed"
+grep -q '8740/v1/pmos/routes' "$CURL_LOG" || fail "routes didn't ask the gateway: $(cat "$CURL_LOG")"
+grep -q 'gw-admin-0123456789abcdef' "$CURL_CONFIG_LOG" && ! grep -q 'gw-admin-' "$CURL_LOG" ||
+  fail "the admin token reached curl's arguments, or not its standard input"
+# usage --by-label.
+mkdir -p "$WORK/state/usage"
+printf '%s\n' '{"model":"hosted-model-a","prompt_tokens":1000,"completion_tokens":500}' \
+  '{"model":"hosted-model-a","prompt_tokens":500,"completion_tokens":0}' \
+  '{"model":"hosted-model-b","prompt_tokens":10,"completion_tokens":10,"reason":"rate_limit"}' 'not json' >"$WORK/state/usage/usage.jsonl"
+printf 'hosted-model-a: 2.0   # per million tokens\n' >"$WORK/state/prices.yaml"
+out=$(run_stack usage --by-label 2>&1) || fail "usage --by-label failed: $out"
+grep -Eq '^hosted-model-a +2 +1500 +500 +0\.0040$' <<<"$out" || fail "usage --by-label for a: $out"
+grep -Eq '^hosted-model-b +1 +10 +10 +-$' <<<"$out" || fail "usage --by-label for b: $out"
+rm -f "$WORK/state/prices.yaml"
+# status: a routed role on its fallback is degraded, one with no usable model is down.
+out=$(FAKE_GW_READYZ='{"ready":false,"class":"test","stub":false,"upstreams":{"default":{"upstream":"remote-test","status":"ok","hops":2,"hops_usable":1},"extraction":{"upstream":"remote-test","status":"down","hops":1,"hops_usable":0}}}' \
+  run_stack status 2>&1) || true
+[[ "$out" == *"role default"*"degraded (on fallback): 1 of 2 models usable"* ]] || fail "status doesn't show the fallback: $out"
+[[ "$out" == *"role extract"*"DOWN"* ]] || fail "status doesn't show the role that's down: $out"
+# PMOS_HOSTED_TEST_ROUTES=1: the operator's config, checked before anything starts.
+routes_env=("PMOS_STATE_DIR=$WORK/state" "PMOS_MODEL_SOURCE=hosted-test" "PMOS_HOSTED_TEST_ROUTES=1")
+rm -f "$WORK/state/gateway.hosted-test.yaml"
+stack_env require "${routes_env[@]}"
+code=0
+run_stack up >/dev/null 2>&1 || code=$?
+[ "$code" = 2 ] && ! grep -q ' up -d' "$DOCKER_LOG" || fail "routes mode without the config exits $code or started something"
+printf 'class: test\n# the operator'"'"'s route config\n' >"$WORK/state/gateway.hosted-test.yaml"
+stack_env require "${routes_env[@]}" "PMOS_GATEWAY_REMOTE_KEY=one-key-for-all"
+code=0
+run_stack up >/dev/null 2>&1 || code=$?
+[ "$code" = 2 ] || fail "routes mode with PMOS_GATEWAY_REMOTE_KEY exits $code, not 2"
+stack_env require "${routes_env[@]}"
+run_stack up >/dev/null 2>&1 || fail "routes mode up failed: $(cat "$DOCKER_LOG")"
+[ "$(cat "$WORK/state/gateway.hosted-test.yaml")" = $'class: test\n# the operator\'s route config' ] ||
+  fail "pmos-admin rewrote the operator's route config"
+check_line=$(grep -n 'run --rm --no-deps -T gateway pmos-gateway --check-config /etc/pmos/gateway.yaml' "$DOCKER_LOG" | head -1 | cut -d: -f1)
+up_line=$(grep -n ' up -d' "$DOCKER_LOG" | head -1 | cut -d: -f1)
+[ -n "$check_line" ] && [ -n "$up_line" ] && [ "$check_line" -lt "$up_line" ] ||
+  fail "up didn't check the route config before starting: $(cat "$DOCKER_LOG")"
+code=0
+FAKE_DOCKER_FAIL=1 run_stack up >/dev/null 2>&1 || code=$?
+[ "$code" = 2 ] || fail "a refused route config exits $code, not 2"
+[ -d "$WORK/state/route-control" ] || fail "up didn't make the route-control directory"
+rm -rf "$WORK/stack/deploy/secrets" "$WORK/state/compose.upstream-keys.yaml" "$WORK/state/usage" "$WORK/state/gateway.hosted-test.yaml"
+echo "model routes checked"
+
 # --- compose renders (C9, C14): without docker compose, say so and skip ---------------------
 if docker compose version >/dev/null 2>&1; then
   mkdir -p "$WORK/checkout" "$WORK/state"

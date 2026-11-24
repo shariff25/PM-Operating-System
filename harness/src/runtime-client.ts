@@ -193,7 +193,17 @@ export class RuntimeClient {
     await this.post(this.taskPath(id, "trace"), { entries });
   }
 
-  async complete(id: string, body: { result: string; approvals: string[] }): Promise<void> {
+  async complete(
+    id: string,
+    body: {
+      result: string;
+      approvals: string[];
+      /** Which labelled models answered the task (slice MP7), when the gateway said. */
+      models_used?: { label: string; model_sha256?: string; calls: number }[];
+      /** A call was answered by a fallback model. */
+      fallback_used?: boolean;
+    },
+  ): Promise<void> {
     await this.post(this.taskPath(id, "complete"), body);
   }
 

@@ -117,6 +117,8 @@ pub struct Config {
     /// is here for the database's `held_real_data` marker only (spec §3.6): a start with `live`
     /// writes it, for good.
     pub connectors_live: bool,
+    /// `PMOS_FALLBACK_FOR_BENCHMARKED` (`mark`, the default, or `refuse`; slice MP7).
+    pub fallback_for_benchmarked: crate::runtime::FallbackMode,
 }
 
 /// The benchmark member the `evals` client runs tasks as when `PMOS_EVALS_AS` is unset.
@@ -187,6 +189,9 @@ impl Config {
             evals_as: parse_evals_as(get("PMOS_EVALS_AS").as_deref())?,
             model_source: pmos_contract::model_source::ModelSource::from_lookup(&get)?,
             connectors_live: connectors_live(get("PMOS_CONNECTORS").as_deref())?,
+            fallback_for_benchmarked: crate::runtime::FallbackMode::parse(
+                get("PMOS_FALLBACK_FOR_BENCHMARKED").as_deref(),
+            )?,
         })
     }
 }

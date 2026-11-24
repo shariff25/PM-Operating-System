@@ -711,6 +711,14 @@ when all of these hold:
   `../deploy/gateway.yaml`, the config the production gateway runs. A run on any other model,
   such as a test stack's remote model, doesn't count, whatever its note says. Changing a model
   there (a model swap) means every streak starts again.
+- **Answered by the primaries only** (`docs/model-providers-spec.md` §4.10, slice MP6, built
+  before review): for a role with a `route:` in the production config, the production role
+  model is the route's primary (its label and the hash of its model id). Every run is pinned to
+  the primaries (judges send `X-Pmos-Fallback: off`; the runtime pins every eval task's calls),
+  and the report's `route` records which labels answered. A report whose `route` says a fallback
+  answered, or names a label that is no role's primary (or the right label with another hash),
+  never counts; with routes in production, neither does one without `route` or with a task that
+  didn't record its models. Reports from before routes still count where production has none.
 - **No stub and no testing-only upstream:** `stub` and `cloud_test` false, every upstream
   `local`. A `hosted-test` run (fake data, an endpoint nobody approved) never counts. `hosted`,
   one owner-approved hosted model, is not built; how its runs count is decided with it (slice
