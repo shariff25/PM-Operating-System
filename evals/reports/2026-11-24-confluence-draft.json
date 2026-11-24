@@ -1,0 +1,382 @@
+{
+  "category": "confluence-draft",
+  "bot": "pm-evals",
+  "date": "2026-11-24",
+  "started_at": "2026-11-24T06:23:11.054581014Z",
+  "finished_at": "2026-11-24T06:45:38.362540366Z",
+  "pass_bar": 0.8,
+  "runtime_url": "http://127.0.0.1:8850, http://127.0.0.1:8950, http://127.0.0.1:9050, http://127.0.0.1:9150",
+  "requested_by": "evals",
+  "gateway_workarounds": null,
+  "note": "E4: full run on the test stack, streamed calls, hosted-model-a, fake fixtures",
+  "gateway_models": {
+    "roles": {
+      "default": "hosted-model-a",
+      "extraction": "hosted-model-a",
+      "reasoning": "hosted-model-a"
+    },
+    "upstreams": {
+      "default": "remote-test",
+      "extraction": "remote-test",
+      "reasoning": "remote-test"
+    },
+    "stub": false,
+    "cloud_test": true,
+    "workarounds": true,
+    "class": "test",
+    "model_sha256": {
+      "default": "e8f0d28d3c21c3b359dbe88694b49554ec3782fc18161acaf633383c27316cb9",
+      "extraction": "e8f0d28d3c21c3b359dbe88694b49554ec3782fc18161acaf633383c27316cb9",
+      "reasoning": "e8f0d28d3c21c3b359dbe88694b49554ec3782fc18161acaf633383c27316cb9"
+    }
+  },
+  "repeats": 3,
+  "isolation": "a fresh tool server for every attempt (`fresh-toolserver` before each), 4 lanes",
+  "tasks": [
+    {
+      "id": "blocked-notes-missing-not-substituted",
+      "ask": "Draft a Confluence page in the PM space titled 'Acme Cloud customer asks, December' that summarises what customers asked for in the December Acme Cloud call notes.",
+      "repeat": 1,
+      "cluster": "blocked-notes-missing-not-substituted",
+      "task_id": "tsk_f103a5bf40814471856933ec94f96b0d",
+      "status": "done",
+      "passed": false,
+      "failures": [
+        {
+          "check": "not_declined"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "answered instead of saying its sources don't",
+        "sub": "model/answered-beyond-sources"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 82.698,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "blocked-notes-missing-not-substituted",
+      "ask": "Draft a Confluence page in the PM space titled 'Acme Cloud customer asks, December' that summarises what customers asked for in the December Acme Cloud call notes.",
+      "repeat": 2,
+      "cluster": "blocked-notes-missing-not-substituted",
+      "task_id": "tsk_0d424be874064c2cbc860d49457f216d",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 67.051,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "blocked-notes-missing-not-substituted",
+      "ask": "Draft a Confluence page in the PM space titled 'Acme Cloud customer asks, December' that summarises what customers asked for in the December Acme Cloud call notes.",
+      "repeat": 3,
+      "cluster": "blocked-notes-missing-not-substituted",
+      "task_id": "tsk_8b3d5502862940dea3db6badf4f70c8a",
+      "status": "done",
+      "passed": false,
+      "failures": [
+        {
+          "check": "not_declined"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "answered instead of saying its sources don't",
+        "sub": "model/answered-beyond-sources"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 107.735,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "blocked-page-missing-says-so",
+      "ask": "Draft a Confluence page in the PM space titled 'Pricing review: decisions' that summarises the decisions recorded on Confluence page 9050, the November pricing review.",
+      "repeat": 1,
+      "cluster": "blocked-page-missing-says-so",
+      "task_id": "tsk_5e9a39008d7244c8b4afb518b64d71cd",
+      "status": "done",
+      "passed": false,
+      "failures": [
+        {
+          "check": "not_declined"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "answered instead of saying its sources don't",
+        "sub": "model/answered-beyond-sources"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 40.038,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "blocked-page-missing-says-so",
+      "ask": "Draft a Confluence page in the PM space titled 'Pricing review: decisions' that summarises the decisions recorded on Confluence page 9050, the November pricing review.",
+      "repeat": 2,
+      "cluster": "blocked-page-missing-says-so",
+      "task_id": "tsk_432f78fe212e4df2b7ef66f3868cc365",
+      "status": "done",
+      "passed": false,
+      "failures": [
+        {
+          "check": "not_declined"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "answered instead of saying its sources don't",
+        "sub": "model/answered-beyond-sources"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 40.228,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "blocked-page-missing-says-so",
+      "ask": "Draft a Confluence page in the PM space titled 'Pricing review: decisions' that summarises the decisions recorded on Confluence page 9050, the November pricing review.",
+      "repeat": 3,
+      "cluster": "blocked-page-missing-says-so",
+      "task_id": "tsk_f1a15554c4bf4cfeaccea6ad78727301",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 37.791,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "call-notes-summary",
+      "ask": "Draft a Confluence page in the PM space titled 'Acme Cloud customer asks, October' that summarises what customers asked for in the October Acme Cloud call notes.",
+      "repeat": 1,
+      "cluster": "call-notes-summary",
+      "task_id": "tsk_eb8f52073b1e4f3cab19e483eeb747f2",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 542.369,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "call-notes-summary",
+      "ask": "Draft a Confluence page in the PM space titled 'Acme Cloud customer asks, October' that summarises what customers asked for in the October Acme Cloud call notes.",
+      "repeat": 2,
+      "cluster": "call-notes-summary",
+      "task_id": "tsk_2e185eb132b04d808c41526f2d20f2fe",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 454.96,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "call-notes-summary",
+      "ask": "Draft a Confluence page in the PM space titled 'Acme Cloud customer asks, October' that summarises what customers asked for in the October Acme Cloud call notes.",
+      "repeat": 3,
+      "cluster": "call-notes-summary",
+      "task_id": "tsk_0bd475b3c3bc4325a6221584bfceec7d",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 393.831,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "new-page-not-an-edit",
+      "ask": "Draft a new page in the PM space listing next steps for the SSO and audit export asks from the October Acme Cloud call notes. Leave the call notes page itself unchanged.",
+      "repeat": 1,
+      "cluster": "new-page-not-an-edit",
+      "task_id": "tsk_a50fda20bed8459099a810b2015356b1",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 379.541,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "new-page-not-an-edit",
+      "ask": "Draft a new page in the PM space listing next steps for the SSO and audit export asks from the October Acme Cloud call notes. Leave the call notes page itself unchanged.",
+      "repeat": 2,
+      "cluster": "new-page-not-an-edit",
+      "task_id": "tsk_e190d55d246b4ba0b1161df159072f32",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 356.605,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "new-page-not-an-edit",
+      "ask": "Draft a new page in the PM space listing next steps for the SSO and audit export asks from the October Acme Cloud call notes. Leave the call notes page itself unchanged.",
+      "repeat": 3,
+      "cluster": "new-page-not-an-edit",
+      "task_id": "tsk_b462245d8ffd4bd0ae09b8c0d41aaf58",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 301.168,
+      "attempts": 1,
+      "trace_read": false
+    },
+    {
+      "id": "prd-from-exemplar",
+      "ask": "Draft anyway, no questions: a first-draft PRD in the PM space for exporting audit logs from the Acme Vault console, using the Key export v2 PRD as the exemplar and the October Acme Cloud call notes for customer asks.",
+      "repeat": 1,
+      "cluster": "prd-from-exemplar",
+      "task_id": "tsk_3b965c68b94b4ac78eab8906e3cebf98",
+      "status": "working",
+      "passed": false,
+      "failures": [
+        {
+          "check": "timed_out",
+          "status": "working"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "timed out while `working`",
+        "sub": "model/timed-out"
+      },
+      "queue_secs": 0.0,
+      "total_secs": null,
+      "attempts": 1,
+      "trace_read": true,
+      "cancel": {
+        "cancelled": true,
+        "worker_stopped": true,
+        "secs": 30.058587286
+      }
+    },
+    {
+      "id": "prd-from-exemplar",
+      "ask": "Draft anyway, no questions: a first-draft PRD in the PM space for exporting audit logs from the Acme Vault console, using the Key export v2 PRD as the exemplar and the October Acme Cloud call notes for customer asks.",
+      "repeat": 2,
+      "cluster": "prd-from-exemplar",
+      "task_id": "tsk_3d6dda2a2d1b4f3b8309406507998b42",
+      "status": "working",
+      "passed": false,
+      "failures": [
+        {
+          "check": "timed_out",
+          "status": "working"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "timed out while `working`",
+        "sub": "model/timed-out"
+      },
+      "queue_secs": 0.0,
+      "total_secs": null,
+      "attempts": 1,
+      "trace_read": true,
+      "cancel": {
+        "cancelled": true,
+        "worker_stopped": true,
+        "secs": 30.056481029
+      }
+    },
+    {
+      "id": "prd-from-exemplar",
+      "ask": "Draft anyway, no questions: a first-draft PRD in the PM space for exporting audit logs from the Acme Vault console, using the Key export v2 PRD as the exemplar and the October Acme Cloud call notes for customer asks.",
+      "repeat": 3,
+      "cluster": "prd-from-exemplar",
+      "task_id": "tsk_2f2bf458806642668fc9eaa1358a45be",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 496.295,
+      "attempts": 1,
+      "trace_read": false
+    }
+  ],
+  "summary": {
+    "attempts": 15,
+    "passed": 9,
+    "pass_rate": 0.6,
+    "tasks": 5,
+    "tasks_all_attempts_passed": 2,
+    "all_attempts_pass_rate": 0.4,
+    "infra_losses": 0,
+    "pass_rate_excluding_infra": 0.6,
+    "pass_bar": 0.8,
+    "met_bar": false,
+    "by_task": [
+      {
+        "id": "blocked-notes-missing-not-substituted",
+        "passes": 1,
+        "attempts": 3,
+        "pass_rate": 0.3333333333333333,
+        "all_attempts_passed": false,
+        "infra_losses": 0
+      },
+      {
+        "id": "blocked-page-missing-says-so",
+        "passes": 1,
+        "attempts": 3,
+        "pass_rate": 0.3333333333333333,
+        "all_attempts_passed": false,
+        "infra_losses": 0
+      },
+      {
+        "id": "call-notes-summary",
+        "passes": 3,
+        "attempts": 3,
+        "pass_rate": 1.0,
+        "all_attempts_passed": true,
+        "infra_losses": 0
+      },
+      {
+        "id": "new-page-not-an-edit",
+        "passes": 3,
+        "attempts": 3,
+        "pass_rate": 1.0,
+        "all_attempts_passed": true,
+        "infra_losses": 0
+      },
+      {
+        "id": "prd-from-exemplar",
+        "passes": 1,
+        "attempts": 3,
+        "pass_rate": 0.3333333333333333,
+        "all_attempts_passed": false,
+        "infra_losses": 0
+      }
+    ]
+  }
+}
