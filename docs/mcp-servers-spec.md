@@ -29,10 +29,11 @@ them.
   reviewer, as §2 proposes, is for the reviewer to weigh and the owner to confirm.
 - **Removal (question 6): each connector's removal needs the owner's explicit go-ahead,** in
   addition to the tests, the comparison and the eval run.
-- **Still open (question 5):** whether the side-by-side comparison may run on real data, and
-  for how long. The conductor's recommendation: fake data first; then real data, reads only,
-  for two weeks, and only for a server the owner has approved for real data.
-
+- **The side-by-side comparison (question 5): fake data only.** The old connector and the new
+  route are compared on fake data, reads only. No real data reaches an MCP server during the
+  comparison. The comparison therefore shows agreement on the fixtures only; differences that
+  appear only on real projects are found after the switch, so the switch for each system keeps
+  a quick way back to the built-in connector until its removal is approved.
 
 ## 0. Summary
 

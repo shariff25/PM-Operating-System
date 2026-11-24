@@ -156,7 +156,8 @@ follow-up tracking.
   `docs/mcp-servers-spec.md`, `docs/openshell-prover-and-sandbox-audit-spec.md`.
 - **MCP servers:** all three kinds are supported (the vendor's hosted server, a self-hosted
   open-source one, one PM OS builds), chosen per deployment; an Admin approves a server and a
-  tool; removing each built-in connector needs the owner's explicit go-ahead.
+  tool; removing each built-in connector needs the owner's explicit go-ahead. The side-by-side
+  comparison of old and new runs on fake data only.
 
 ## Where the build stands (2026-11-23)
 
