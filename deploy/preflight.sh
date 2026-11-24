@@ -234,7 +234,9 @@ NETWORK_IP_RANGE_DEFAULT=10.201.77.128/25
 NETWORK_INSPECT_FORMAT='{{range .IPAM.Config}}{{.Subnet}} {{.Gateway}} {{.IPRange}};{{end}}{{index .Options "com.docker.network.bridge.name"}}'
 # The published ports (deploy/compose.yaml, always on 127.0.0.1) as deploy/pmos-admin's
 # port_checks reads them; the admin door (8772, slice H10: on PMOS_WEB_ADMIN_PUBLISH) and OpenShell's gateway (17670).
-PORT_KEYS=(TOOLSERVER:8710 GATEWAY:8740 BOTS:8750 CONSOLE:8760 WEB:8770)
+# 8780 is the sandbox-audit collector (docs/openshell-prover-and-sandbox-audit-spec.md §B.1): OpenShell
+# exports to it on 127.0.0.1, so it is loopback only like the rest.
+PORT_KEYS=(TOOLSERVER:8710 GATEWAY:8740 BOTS:8750 CONSOLE:8760 WEB:8770 SANDBOX_AUDIT:8780)
 ADMIN_PORT=8772
 # The web app's internal listener (PMOS_WEB_INTERNAL_BIND, slice H9): on the `pmos` network only,
 # never published, so no listener on the host may hold it.

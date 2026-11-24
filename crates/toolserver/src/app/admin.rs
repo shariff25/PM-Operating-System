@@ -74,6 +74,8 @@ pub(super) fn routes(state: AppState) -> Router<AppState> {
         .route("/admin/protection", get(protection))
         // MCP servers (`docs/mcp-servers-spec.md` §5): Policy Admin's read-only view.
         .route("/admin/mcp", get(mcp_servers))
+        .route("/admin/policy/proofs", get(policy_proofs))
+        .route("/admin/sandbox", get(sandbox_denials))
         .route("/admin/actions", axum::routing::post(record_action))
         .route("/admin/events", axum::routing::post(sign_in_event))
         .layer(middleware::from_fn_with_state(state, identify_admin_client))
@@ -431,6 +433,7 @@ pub fn safe_detail(detail: &str) -> Option<String> {
         || crate::users::detail::is_purge_detail(detail)
         || crate::password::is_safe_detail(detail)
         || crate::team::is_safe_detail(detail)
+        || crate::openshell::sandbox::is_safe_detail(detail)
         || is_sign_in_detail(detail)
         || detail
             .strip_prefix("reason: ")
@@ -531,14 +534,35 @@ async fn audit(
     let next = more
         .then(|| found.last().map(|s| s.cursor().encode()))
         .flatten();
+    // A sandbox decision's own columns (`crate::openshell::sandbox`): an Admin sees host,
+    // address, port, method and path; an Auditor the rule, reason, port and a destination class
+    // only (spec §B.7, SBA-11).
+    let sandbox_ids: Vec<i64> = found
+        .iter()
+        .filter(|e| e.event.client == Client::SandboxAudit)
+        .map(|e| e.id)
+        .collect();
+    let sandbox: std::collections::HashMap<i64, crate::openshell::sandbox::Fields> =
+        match state.svc.openshell().sandbox_fields(&sandbox_ids).await {
+            Ok(f) => f.into_iter().collect(),
+            Err(e) => return unavailable(e),
+        };
     let events: Vec<Value> = found
         .iter()
         .map(|e| {
-            if admin_view {
+            let mut v = if admin_view {
                 event_json(e)
             } else {
                 auditor_event_json(e)
+            };
+            if let Some(f) = sandbox.get(&e.id) {
+                v["sandbox"] = if admin_view {
+                    crate::openshell::sandbox::fields_json(f)
+                } else {
+                    crate::openshell::sandbox::auditor_fields_json(f)
+                };
             }
+            v
         })
         .collect();
     Json(json!({ "events": events, "next": next })).into_response()
@@ -764,7 +788,12 @@ async fn overview(
         Ok(r) => r.unwrap_or_default(),
         Err(e) => return unavailable(e),
     };
+    let sandbox = match crate::openshell::overview(&state.svc, Utc::now()).await {
+        Ok(s) => s,
+        Err(e) => return unavailable(e),
+    };
     Json(json!({
+        "sandbox": sandbox,
         "since": since,
         "pending_drafts": pending,
         "held_drafts": held,
@@ -1283,6 +1312,166 @@ async fn mcp_servers(
     }
     Json(json!({ "servers": crate::mcp_client::policy_view(state.svc.mcp_servers()) }))
         .into_response()
+}
+
+/// `GET /internal/admin/policy/proofs?user=<viewer>`: the newest host proof of each bot
+/// (`docs/openshell-prover-and-sandbox-audit-spec.md` §A.5), for Policy Admin's Prover row.
+/// `view-policies` (admins and auditors): a proof holds only policy terms (a status, a reason
+/// code, a counterexample naming a path, host, port or route of the policy, hashes). Not
+/// recorded when allowed (Policy Admin asks on every load, as for `protection`); a refusal is.
+/// The tool server runs no prover: these are what `pmos-admin policy prove` recorded.
+async fn policy_proofs(
+    State(state): State<AppState>,
+    Extension(client): Extension<Client>,
+    Query(q): Query<ViewerParams>,
+) -> Response {
+    let user = match named(q.user.as_deref()) {
+        Ok(u) => u,
+        Err(r) => return *r,
+    };
+    let allowed = match state.svc.people().user(user).await {
+        Ok(u) => u.is_some_and(|m| permits(&m, Permission::ViewPolicies)),
+        Err(e) => return unavailable(e),
+    };
+    if !allowed {
+        record(&state, client, user, "admin.policy_proofs", Outcome::Denied).await;
+        return coded(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "this person's role doesn't allow this",
+        );
+    }
+    let proofs = match state.svc.openshell().latest_proofs().await {
+        Ok(p) => p,
+        Err(e) => return unavailable(e),
+    };
+    // Each sandbox's last policy load OpenShell reported (Part B): a proof older than it is stale.
+    let loads = match state
+        .svc
+        .openshell()
+        .sandbox_rows(&crate::openshell::sandbox::SandboxQuery {
+            tools: vec!["sandbox.policy_loaded".into()],
+            limit: 1000,
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(rows) => {
+            let mut m: std::collections::BTreeMap<String, DateTime<Utc>> = Default::default();
+            for r in rows {
+                if let Some(b) = r.event.bot {
+                    let at = m.entry(b).or_insert(r.event.at);
+                    *at = (*at).max(r.event.at);
+                }
+            }
+            m
+        }
+        Err(e) => return unavailable(e),
+    };
+    Json(json!({
+        "policy_loads": loads,
+        "proofs": proofs,
+        "not_proved": pmos_policy::prove::NOT_PROVED,
+        "domains": pmos_policy::prove::DOMAINS,
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize, Default)]
+struct SandboxParams {
+    user: Option<String>,
+    bot: Option<String>,
+}
+
+/// `GET /internal/admin/sandbox?user=<viewer>[&bot=<bot>]`: each bot's latest sandbox denials and
+/// findings (at most 20 a bot, the last 7 days), the policy loads Policy Admin compares proofs
+/// with, and the collector's state (spec §B.5). `view-audit-log` or `view-policies` (admins and
+/// auditors); an Auditor sees a destination class, not the host, address or path (§B.7). Not
+/// recorded when allowed (Policy Admin reads it on every load); a refusal is.
+async fn sandbox_denials(
+    State(state): State<AppState>,
+    Extension(client): Extension<Client>,
+    Query(q): Query<SandboxParams>,
+) -> Response {
+    use crate::openshell::sandbox::SandboxQuery;
+    let user = match named(q.user.as_deref()) {
+        Ok(u) => u,
+        Err(r) => return *r,
+    };
+    let found = match state.svc.people().user(user).await {
+        Ok(u) => u,
+        Err(e) => return unavailable(e),
+    };
+    let allowed = found.as_ref().is_some_and(|m| {
+        permits(m, Permission::ViewAuditLog) || permits(m, Permission::ViewPolicies)
+    });
+    if !allowed {
+        record(&state, client, user, "admin.sandbox", Outcome::Denied).await;
+        return coded(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "this person's role doesn't allow this",
+        );
+    }
+    let admin = found.as_ref().is_some_and(|m| m.has(UserRole::Admin));
+    let bot = match q.bot.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
+        None => None,
+        Some(b) if pmos_contract::bots::valid_name(b) => Some(b.to_string()),
+        Some(_) => {
+            return coded(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "`bot` must be a bot's name",
+            )
+        }
+    };
+    let now = Utc::now();
+    let store = state.svc.openshell();
+    let rows = match store
+        .sandbox_rows(&SandboxQuery {
+            bot: bot.clone(),
+            since: Some(now - Duration::days(7)),
+            tools: vec![
+                "sandbox.deny".into(),
+                "sandbox.deny_summary".into(),
+                "sandbox.finding".into(),
+                "sandbox.policy_loaded".into(),
+            ],
+            limit: 1000,
+        })
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return unavailable(e),
+    };
+    let mut latest: std::collections::BTreeMap<String, Vec<Value>> = Default::default();
+    let mut loads: std::collections::BTreeMap<String, DateTime<Utc>> = Default::default();
+    for r in &rows {
+        let Some(b) = r.event.bot.clone() else {
+            continue;
+        };
+        if r.event.tool == "sandbox.policy_loaded" {
+            let at = loads.entry(b).or_insert(r.event.at);
+            *at = (*at).max(r.event.at);
+            continue;
+        }
+        let list = latest.entry(b).or_default();
+        if list.len() < 20 {
+            list.push(crate::openshell::row_json(r, admin));
+        }
+    }
+    let collector = match store.collector_state(now).await {
+        Ok(c) => c,
+        Err(e) => return unavailable(e),
+    };
+    Json(json!({
+        "configured": state.svc.sandbox_audit_token().is_some(),
+        "collector": collector,
+        "denials": latest,
+        "policy_loads": loads,
+        "view": if admin { "admin" } else { "auditor" },
+    }))
+    .into_response()
 }
 
 /// The actions `pmos-web` may record ([`record_action`]).

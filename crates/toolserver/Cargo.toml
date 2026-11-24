@@ -65,6 +65,8 @@ pmos-toolserver = { path = ".", features = ["test-support"] }
 # The runtime, for the end-to-end conversation test (tests/history_e2e.rs).
 pmos-bots = { path = "../bots" }
 pmos-docs = { path = "../docs" }
+# The sandbox-audit collector's wire types: what it sends must be what the batch routes take.
+pmos-sandbox-audit = { path = "../sandbox-audit" }
 # Test keys and a fake tenant (discovery and JWKS) for the first-link tests.
 pmos-entra = { workspace = true, features = ["test-support"] }
 rmcp = { version = "3.10", features = ["client", "transport-streamable-http-client-reqwest"] }

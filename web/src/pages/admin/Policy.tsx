@@ -7,7 +7,7 @@ import { applySpecPatch, parseRawPatch, patchSize, specPatch, splitTools, stable
 import { unifiedDiff } from '../../admin/unified';
 import { useLoad } from '../../admin/useLoad';
 import { useProposalFlow } from '../../admin/useProposalFlow';
-import type { Issue, PolicyBot, PolicySpec, PolicyView, SpecPatch } from '../../api';
+import type { Issue, PolicyBot, PolicySpec, PolicyView, ProverRow, SandboxAuditState, SandboxDenial, SpecPatch } from '../../api';
 import { useApp } from '../../app-context';
 import { Empty, ErrorNote, Skeleton, systemTone } from '../../components/bits';
 import { Icon } from '../../components/icons';
@@ -46,16 +46,141 @@ function Chips({ items, mono, tone, label }: { items: string[]; mono?: boolean; 
   );
 }
 
+// ---------- OpenShell's prover, per bot (spec §A.5) ----------
+
+const P = B.prover;
+
+/** What a proof never covers (the server's list; this copy only if an older server sends none). */
+const NOT_PROVED_FALLBACK = [
+  'which paths are readable (the boundary allows reading /; `fs-readable` covers it)',
+  'the MCP methods and tool allowlist (`net-tools`)',
+  'credential bindings (`cred-binding`, `cred-providers`)',
+  'uploads and the launch spec (`fs-uploads`, `spec-*`)',
+  'name resolution (the prover does not resolve hostnames)',
+  'what a running sandbox enforces',
+];
+
+const PROVED_DOMAINS = 5;
+
+/**
+ * The text and tone of a bot's Prover row. Only a current `proved` reads as proved; every other
+ * state (stale, missing, unknown, and each failure) says what it is and is never a pass.
+ */
+export function proverLine(p: ProverRow | undefined): { text: string; sub: string | null; tone: 'good' | 'bad' | 'warn' } {
+  const reason = p?.reason ?? p?.reason_code ?? 'no reason given';
+  const when = p?.at ? P.when(new Date(p.at).toLocaleString()) : null;
+  switch (p?.state) {
+    case 'proved':
+      return {
+        text: P.proved(Math.min(p.coverage?.length ?? 0, PROVED_DOMAINS), PROVED_DOMAINS),
+        sub: P.provedSub(p.prover_version ?? 'unknown version', p.at ? new Date(p.at).toLocaleString() : 'unknown time'),
+        tone: 'good',
+      };
+    case 'stale':
+      return { text: P.stale, sub: p.stale_reason === 'policy_loaded_after' ? P.staleLoaded : P.staleChanged, tone: 'warn' };
+    case 'exceeds':
+      return { text: p.counterexample ? P.exceeds(p.counterexample) : P.exceedsNone, sub: when, tone: 'bad' };
+    case 'unsupported':
+      return { text: P.unsupported(reason), sub: when, tone: 'warn' };
+    case 'inconclusive':
+      return { text: P.inconclusive, sub: p.reason ?? when, tone: 'warn' };
+    case 'error':
+      return { text: P.error, sub: p.reason ?? p.reason_code ?? when, tone: 'bad' };
+    case 'not_available':
+      return { text: P.notAvailable, sub: when, tone: 'warn' };
+    case 'version_mismatch':
+      return { text: P.versionMismatch(reason), sub: when, tone: 'warn' };
+    case 'missing':
+      return { text: P.missing, sub: null, tone: 'warn' };
+    default:
+      return { text: P.unknown, sub: null, tone: 'warn' };
+  }
+}
+
+function ProverFact({ bot, notProved }: { bot: PolicyBot; notProved: string[] }) {
+  const line = proverLine(bot.prover);
+  const proved = bot.prover?.state === 'proved';
+  return (
+    <div className="bot-fact bot-fact-wide bot-prover" data-state={bot.prover?.state ?? 'unknown'}>
+      <dt>{P.label}</dt>
+      <dd>
+        <span className={`pill pill-${line.tone}`}>
+          <span className="pill-dot" aria-hidden="true" />
+          {line.text}
+        </span>
+        {line.sub && <span className="fact-quiet small bot-prover-sub">{line.sub}</span>}
+        {proved && <span className="fact-quiet small bot-prover-sub">{copy.admin.policy.bots.prover.viewNote}</span>}
+        <details className="bot-sentences bot-prover-limits">
+          <summary>
+            <Icon name="chevronRight" size={14} className="disclose-icon" />
+            {P.notProvedHeading}
+            <span className="sr-only"> {bot.bot}</span>
+          </summary>
+          <ul aria-label={`${P.notProvedHeading}, ${bot.bot}`}>
+            {notProved.map((n) => <li key={n}>{n}</li>)}
+          </ul>
+        </details>
+      </dd>
+    </div>
+  );
+}
+
+/** Where a denial went: the host and port for an admin, the destination class for an auditor. */
+export function denialDest(d: SandboxDenial): string {
+  const where = d.dest_host ?? d.dest_class ?? 'unknown destination';
+  const port = d.dest_port !== null && d.dest_port !== undefined ? `:${d.dest_port}` : '';
+  const path = d.http_method && d.http_path ? ` (${d.http_method} ${d.http_path})` : '';
+  return `${where}${port}${path}`;
+}
+
+/** The sandbox's latest denials OpenShell recorded (spec §B.5): rule, destination, time. */
+function DenialsFact({ bot, audit }: { bot: PolicyBot; audit: SandboxAuditState | undefined }) {
+  const list = bot.sandbox_denials ?? [];
+  const note = !audit || !audit.available
+    ? P.denialsUnknown
+    : !audit.configured
+      ? P.denialsOff
+      : audit.silent_since
+        ? P.denialsSilent(new Date(audit.silent_since).toLocaleString())
+        : list.length === 0
+          ? P.denialsNone
+          : null;
+  return (
+    <div className="bot-fact bot-fact-wide bot-denials">
+      <dt>{P.denialsLabel}</dt>
+      <dd>
+        {note && <span className="fact-quiet small">{note}</span>}
+        {list.length > 0 && (
+          <ul className="path-list" aria-label={`${P.denialsLabel}, ${bot.bot}`}>
+            {list.map((d) => (
+              <li key={`${d.at}-${d.action}-${d.rule ?? ''}-${denialDest(d)}`}>
+                <span className="mono-val">
+                  {d.action === 'sandbox.deny_summary' ? P.denialSummary : d.action === 'sandbox.finding' ? P.denialFinding : P.denialLine(d.rule ?? '-', denialDest(d))}
+                </span>{' '}
+                <span className="fact-quiet small">{new Date(d.at).toLocaleString()}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </dd>
+    </div>
+  );
+}
+
 function BotCard({
   bot,
   owner,
   violations,
+  notProved,
+  sandboxAudit,
   open,
   onToggle,
 }: {
   bot: PolicyBot;
   owner: string | null;
   violations: Issue[];
+  notProved: string[];
+  sandboxAudit: SandboxAuditState | undefined;
   open: boolean;
   onToggle: () => void;
 }) {
@@ -113,6 +238,8 @@ function BotCard({
           <dt>{B.tools}</dt>
           <dd>{bot.tools.length ? <Chips items={bot.tools} mono tone label={`${B.tools}, ${bot.bot}`} /> : <span className="fact-quiet">{B.toolsNone}</span>}</dd>
         </div>
+        <ProverFact bot={bot} notProved={notProved} />
+        <DenialsFact bot={bot} audit={sandboxAudit} />
       </dl>
       {!a && <p className="bot-missing"><Icon name="alert" size={14} /> {B.noAllowances}</p>}
       {a && (
@@ -231,6 +358,8 @@ function BotsSection({ data }: { data: PolicyView }) {
               bot={b}
               owner={data.spec.bots[b.bot]?.owner ?? null}
               violations={violationsOf(b, data.drift.violations)}
+              notProved={data.prover_notes?.not_proved ?? NOT_PROVED_FALLBACK}
+              sandboxAudit={data.sandbox_audit}
               open={isOpen(b)}
               onToggle={() => setChosen((c) => ({ ...c, [b.bot]: !isOpen(b) }))}
             />
@@ -791,10 +920,12 @@ function PolicyBody({ data, part }: { data: PolicyView; part: PolicyPart | undef
           {!data.proposals_configured && (
             <p className="meta-line"><Icon name="info" size={15} /><span>{copy.admin.repo.proposalsOff}</span></p>
           )}
+          <p className="meta-line prover-not-here"><Icon name="info" size={15} /><span>{B.prover.notRunHere}</span></p>
           <Editor data={data} onOpened={bump} proposalsVersion={bump} />
         </div>
       )}
       <div hidden={current !== 'proposals'}>
+        <p className="meta-line prover-not-here"><Icon name="info" size={15} /><span>{B.prover.notRunHere}</span></p>
         <ProposalsCard kind="policy" id={PROPOSALS_ID} load={loadProposals} version={version} />
       </div>
     </>

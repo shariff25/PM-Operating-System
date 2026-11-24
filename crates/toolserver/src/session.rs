@@ -95,6 +95,15 @@ pub trait SessionRepo: Send + Sync {
     /// (live, or expired but not yet purged), or `None` if there are none. A task claimed
     /// more than once has a session per claim.
     async fn run_sensitivity(&self, run_id: &str) -> StoreResult<Option<Sensitivity>>;
+    /// The `(user, run_id)` of every stored session of `bot` open at `at` (created at or before
+    /// it, expiring after it), at most three: enough to tell none, one and several apart, for
+    /// attributing a sandbox's decision (`crate::openshell::sandbox::attribute`). A revoked
+    /// session is deleted, so it isn't seen.
+    async fn open_bot_sessions(
+        &self,
+        bot: &str,
+        at: DateTime<Utc>,
+    ) -> StoreResult<Vec<(String, String)>>;
 }
 
 #[derive(Default)]
@@ -137,6 +146,23 @@ impl SessionRepo for MemorySessions {
             s.sources_sensitivity = s.sources_sensitivity.max(read);
         }
         Ok(())
+    }
+
+    async fn open_bot_sessions(
+        &self,
+        bot: &str,
+        at: DateTime<Utc>,
+    ) -> StoreResult<Vec<(String, String)>> {
+        let sessions = self.sessions.lock().expect("session lock");
+        let mut found: Vec<(String, String)> = sessions
+            .values()
+            .filter(|s| s.bot.as_deref() == Some(bot) && s.created_at <= at && s.expires_at > at)
+            .map(|s| (s.user.clone(), s.run_id.clone()))
+            .collect();
+        found.sort();
+        found.dedup();
+        found.truncate(3);
+        Ok(found)
     }
 
     async fn run_sensitivity(&self, run_id: &str) -> StoreResult<Option<Sensitivity>> {

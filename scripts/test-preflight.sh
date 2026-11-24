@@ -310,6 +310,17 @@ printf 'LISTEN 0 4096 [::]:18770 [::]:*\n' >>"$R/cmd/ss"
 pf
 expect H-EXPOSURE fail 1 "the configured web port on [::]"
 env_lines
+# The sandbox-audit collector (docs/openshell-prover-and-sandbox-audit-spec.md §B.1, slice B3):
+# 8780 on loopback only.
+host
+printf 'LISTEN 0 4096 0.0.0.0:8780 0.0.0.0:*\n' >>"$R/cmd/ss"
+pf
+expect H-EXPOSURE fail 1 "the sandbox-audit collector's 8780 on 0.0.0.0"
+host
+printf 'LISTEN 0 4096 127.0.0.1:8780 0.0.0.0:*\n' >>"$R/cmd/ss"
+setcmd docker-ps-ports '127.0.0.1:8780->8780/tcp'
+pf
+expect H-EXPOSURE pass 0 "the sandbox-audit collector's 8780 on loopback, this stack's"
 host
 printf 'LISTEN 0 4096 *:8772 *:*\n' >>"$R/cmd/ss"
 pf

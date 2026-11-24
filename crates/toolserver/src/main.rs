@@ -39,6 +39,11 @@ async fn main() -> Result<()> {
     if args.first().map(String::as_str) == Some("mcp") {
         std::process::exit(pmos_toolserver::mcp_client::host::main(args[1..].to_vec()).await);
     }
+    // `pmos-toolserver policy-proof record`: the host's prover results (`pmos-admin policy
+    // prove`, docs/openshell-prover-and-sandbox-audit-spec.md §A.5), not the server.
+    if args.first().map(String::as_str) == Some("policy-proof") {
+        std::process::exit(pmos_toolserver::openshell::proofs::host_main(args[1..].to_vec()).await);
+    }
 
     tracing_subscriber::fmt()
         .json()
@@ -81,6 +86,8 @@ async fn main() -> Result<()> {
     // MCP servers' per-PM tokens (slice M4): their own table beside the vault's.
     let mut mcp_store: Arc<dyn pmos_toolserver::mcp_client::oauth::McpCredentials> =
         Arc::new(pmos_toolserver::mcp_client::oauth::MemoryMcpCredentials::default());
+    // The policy proofs and sandbox decisions (crate::openshell) live in the same database.
+    let mut openshell_pg: Option<PgStore> = None;
     let mut stores = match &config.database_url {
         Some(url) => {
             let pg = PgStore::connect(url)
@@ -107,6 +114,7 @@ async fn main() -> Result<()> {
                 "context indexed"
             );
             spawn_pruner(pg.clone(), cancel.clone());
+            openshell_pg = Some(pg.clone());
             pg.with_deactivation_cap(config.users_deactivations_per_hour)
                 .stores()
         }
@@ -385,6 +393,17 @@ async fn main() -> Result<()> {
             config.model_source,
             &config.gateway_url,
         )));
+    if let Some(pg) = openshell_pg {
+        svc = svc.with_openshell(Arc::new(pg));
+    }
+    // The sandbox-audit collector (docs/openshell-prover-and-sandbox-audit-spec.md §B.2): off
+    // unless PMOS_SANDBOX_AUDIT_TOKEN is set; then its two routes answer and the silence check
+    // runs every minute.
+    let sandbox_audit = config.sandbox_audit_token.is_some();
+    if let Some(t) = &config.sandbox_audit_token {
+        svc = svc.with_sandbox_audit_token(t.expose());
+        tracing::info!("sandbox-audit collector accepted (PMOS_SANDBOX_AUDIT_TOKEN)");
+    }
     // Password sign-in (docs/password-sign-in.md): on when the vault has a key to seal
     // authenticator secrets with; its routes also need assertion `require`.
     match &config.password_keys {
@@ -433,6 +452,9 @@ async fn main() -> Result<()> {
         Err(e) => tracing::error!(error = %e, "reconciling interrupted writes failed"),
     }
     spawn_reconciler(svc.clone(), cancel.clone());
+    if sandbox_audit {
+        pmos_toolserver::openshell::spawn_watchdog(svc.clone(), cancel.clone());
+    }
     spawn_draft_sweeper(svc.clone(), cancel.clone());
     spawn_deactivation_sweeper(svc.clone(), cancel.clone());
     let mut onboarding = Onboarding::new(svc.clone(), oauth.clone(), github_setup);

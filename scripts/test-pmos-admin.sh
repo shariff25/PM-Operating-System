@@ -188,6 +188,13 @@ fi
 if [[ " $* " == *" config --services "* ]]; then
   printf '%s\n' ${FAKE_SERVICES:-postgres docs toolserver gateway bots slack console web worker-docs vllm-default vllm-extraction}
 fi
+# `docker run … pmos policy prove …` (slice A3): the report the test gives (FAKE_PROVE_JSON) and
+# its exit code (FAKE_PROVE_EXIT); `… policy-proof record`: what it read on standard input.
+if [[ " $* " == *" pmos policy prove "* ]] && [ -n "${FAKE_PROVE_JSON:-}" ]; then
+  cat "$FAKE_PROVE_JSON"
+  exit "${FAKE_PROVE_EXIT:-0}"
+fi
+if [[ " $* " == *" policy-proof record "* ]]; then cat >>"${PROOF_STDIN_LOG:-/dev/null}"; fi
 # What reached docker through its environment, never its arguments (S1).
 printf 'evals_token=%s https_proxy=%s personal_rt=%s personal_gw=%s\n' "${PMOS_EVALS_TOKEN-unset}" "${HTTPS_PROXY-unset}" \
   "${PMOS_BRINGUP_PERSONAL_RT_TOKEN-unset}" "${PMOS_BRINGUP_PERSONAL_GW_TOKEN-unset}" >>"${DOCKER_ENV_LOG:-/dev/null}"
@@ -2439,6 +2446,138 @@ FAKE_DOCKER_FAIL=1 run_stack up >/dev/null 2>&1 || code=$?
 rm -rf "$WORK/stack/deploy/secrets" "$WORK/state/compose.upstream-keys.yaml" "$WORK/state/usage" "$WORK/state/gateway.hosted-test.yaml"
 echo "model routes checked"
 
+# --- policy prove: OpenShell's prover on each sandbox's effective policy (slice A3) ------------
+# docs/openshell-prover-and-sandbox-audit-spec.md §A.1, §A.5, §A.8: refuses root and bad names
+# before anything runs; for each bot it saves `openshell sandbox get pmos-<bot> --policy-only`,
+# runs `pmos policy prove` in the image as this user with no network and everything read-only,
+# and records the report with `pmos-toolserver policy-proof record` and PMOS_HOST_USER; a missing
+# prover is recorded (not_available), never skipped.
+mkdir -p "$checkout/policies/boundary"
+cp "$ROOT_SRC/policies/boundary/pmos-bot.yaml" "$checkout/policies/boundary/"
+printf '#!/bin/sh\nexit 0\n' >"$WORK/fake-prover"
+chmod 755 "$WORK/fake-prover"
+export PROOF_STDIN_LOG="$WORK/proof-stdin.log"
+printf '{"prover":{"version":"0.1.9","sha256":null},"boundary_sha256":null,"results":[{"bot":"docs","status":"not_available","coverage":[]}]}\n' >"$WORK/prove.json"
+bot_env "PMOS_PROVER=$WORK/fake-prover"
+: >"$DOCKER_LOG"
+for bad in "../x" "A" "x;id" "--dry-run"; do
+  code=0
+  run_bot policy prove "$bad" >/dev/null 2>&1 || code=$?
+  [ "$code" = 2 ] || fail "policy prove $(printf '%q' "$bad") exits $code, not 2"
+done
+code=0
+run_bot policy >/dev/null 2>&1 || code=$?
+[ "$code" = 2 ] || fail "policy without prove exits $code, not 2"
+code=0
+out=$(FAKE_UID=0 run_bot policy prove docs 2>&1) || code=$?
+[ "$code" = 2 ] && [[ "$out" == *"not as root"* ]] || fail "policy prove as root ($code): $out"
+[ ! -s "$OPENSHELL_LOG" ] && [ ! -s "$DOCKER_LOG" ] || fail "a refused policy prove reached openshell or docker"
+: >"$PROOF_STDIN_LOG"
+FAKE_PROVE_JSON="$WORK/prove.json" FAKE_PROVE_EXIT=1 run_bot policy prove --all >/dev/null 2>&1 || true
+for b in abcdefghijklmnopqrstuvwxyz-12345 docs pm pm-ana; do
+  grep -q "^args=sandbox get pmos-$b --policy-only" "$OPENSHELL_LOG" || fail "policy prove --all didn't read pmos-$b's policy: $(cat "$OPENSHELL_LOG")"
+  grep -q "args=run --rm --network none --user [0-9]*:[0-9]* .*pmos:local pmos policy prove .* --candidate /run/pmos-prove/$b.yaml --bot $b --format json" "$DOCKER_LOG" ||
+    fail "policy prove didn't run pmos for $b without network: $(cat "$DOCKER_LOG")"
+done
+! grep -q 'sandbox get pmos-docs.sandbox' "$OPENSHELL_LOG" || fail "policy prove --all took a launch spec for a bot"
+line=$(grep 'pmos policy prove' "$DOCKER_LOG" | head -1)
+for m in "$checkout:/srv/content-repo:ro" ":/run/pmos-prove:ro" "openshell-prover.lock:/run/pmos-prove-lock/openshell-prover.lock:ro" "$WORK/fake-prover:/run/pmos-prover/openshell-prover:ro"; do
+  [[ "$line" == *"$m"* ]] || fail "policy prove's container doesn't mount $m read-only: $line"
+done
+[ "$(grep -c -- "--profile cli run --rm --no-deps -T -e PMOS_HOST_USER=pmosop toolserver-cli pmos-toolserver policy-proof record" "$DOCKER_LOG")" = 4 ] ||
+  fail "policy prove didn't record one report per bot with PMOS_HOST_USER: $(cat "$DOCKER_LOG")"
+[ "$(grep -c '"not_available"' "$PROOF_STDIN_LOG")" = 4 ] || fail "the reports didn't reach policy-proof record: $(cat "$PROOF_STDIN_LOG")"
+! grep -rq 'SECRET\|token' "$PROOF_STDIN_LOG" || fail "a report carried a token"
+# No prover on the host: still run and recorded, without the prover's mount, and said so.
+bot_env
+: >"$DOCKER_LOG"
+code=0
+out=$(PATH="$SBIN:$WORK/bin:/usr/bin:/bin" FAKE_PROVE_JSON="$WORK/prove.json" FAKE_PROVE_EXIT=1 "${stack[@]}" policy prove docs 2>&1) || code=$?
+[ "$code" = 1 ] || fail "policy prove with no prover exits $code, not 1: $out"
+[[ "$out" == *"every bot is recorded not_available"* ]] || fail "policy prove didn't say the prover is missing: $out"
+! grep -q '/run/pmos-prover/openshell-prover:ro' "$DOCKER_LOG" || fail "a missing prover was mounted"
+grep -q 'policy-proof record' "$DOCKER_LOG" || fail "a missing prover wasn't recorded"
+# A sandbox it can't read is recorded as what the prover makes of no file (an error), not skipped.
+: >"$DOCKER_LOG"
+FAKE_OPENSHELL_FAIL=1 FAKE_PROVE_JSON="$WORK/prove.json" run_bot policy prove docs >/dev/null 2>&1 || true
+grep -q 'policy-proof record' "$DOCKER_LOG" || fail "an unreadable sandbox policy wasn't recorded"
+# A pmos that couldn't run (exit 2) records nothing and fails.
+: >"$DOCKER_LOG"
+code=0
+FAKE_PROVE_JSON="$WORK/prove.json" FAKE_PROVE_EXIT=2 run_bot policy prove docs >/dev/null 2>&1 || code=$?
+[ "$code" = 1 ] && ! grep -q 'policy-proof record' "$DOCKER_LOG" || fail "policy prove recorded a run that couldn't happen ($code)"
+echo "policy prove checks passed"
+
+# --- sandbox-audit configure, check and up (slice B3) ----------------------------------------
+# docs/openshell-prover-and-sandbox-audit-spec.md §B.1 and §B.9: configure makes both tokens
+# (deploy/.env, and the headers file mode 640) and prints OpenShell's lines, never a token; check
+# fails on each missing line, on a trace export and on a loose headers file; up runs only after it.
+SA_TOML="$WORK/openshell-gateway.toml"
+stack_env require "PMOS_STATE_DIR=$WORK/sa-state" "PMOS_OPENSHELL_GATEWAY_TOML=$SA_TOML"
+rm -rf "$WORK/sa-state"
+code=0
+out=$(run_stack sandbox-audit check 2>&1) || code=$?
+[ "$code" = 1 ] && [[ "$out" == *"PMOS_SANDBOX_AUDIT_TOKEN isn't set"* ]] || fail "check before configure ($code): $out"
+code=0
+run_stack sandbox-audit bogus >/dev/null 2>&1 || code=$?
+[ "$code" = 2 ] || fail "sandbox-audit bogus exits $code, not 2"
+out=$(run_stack sandbox-audit configure 2>&1) || fail "configure failed: $out"
+tok=$(grep -E '^PMOS_SANDBOX_AUDIT_TOKEN=' "$WORK/stack/deploy/.env" | cut -d= -f2-)
+[[ "$tok" =~ ^[0-9a-f]{48}$ ]] || fail "configure didn't write a token to deploy/.env"
+HDR="$WORK/sa-state/secrets/otlp-ocsf.headers"
+[ "$(stat -c %a "$HDR")" = 640 ] || fail "the headers file is mode $(stat -c %a "$HDR"), not 640"
+grep -qE '^authorization=Bearer [0-9a-f]{48}$' "$HDR" || fail "the headers file isn't authorization=Bearer <token>"
+otlp=$(sed 's/^authorization=Bearer //' "$HDR")
+[ "$otlp" != "$tok" ] || fail "the two tokens are the same"
+[[ "$out" != *"$tok"* && "$out" != *"$otlp"* ]] || fail "configure printed a token"
+expected="[openshell.gateway.otlp.ocsf]
+enabled = true
+endpoint = \"http://127.0.0.1:8780\"
+protocol = \"http/protobuf\"
+headers_file = \"$HDR\""
+[[ "$out" == *"$expected"* ]] || fail "configure didn't print OpenShell's lines: $out"
+# Again: both kept.
+out=$(run_stack sandbox-audit configure 2>&1)
+[[ "$out" == *"is kept"* ]] && grep -qxF "PMOS_SANDBOX_AUDIT_TOKEN=$tok" "$WORK/stack/deploy/.env" &&
+  grep -qxF "authorization=Bearer $otlp" "$HDR" || fail "configure replaced a token"
+good_toml() { printf '# OpenShell gateway\n[openshell.gateway]\nport = 17670\n\n%s\n\n[other]\nx = 1\n' "$expected" >"$SA_TOML"; }
+good_toml
+run_stack sandbox-audit check >/dev/null 2>&1 || fail "check failed on a good configuration: $(run_stack sandbox-audit check 2>&1)"
+# Each line missing fails, naming it.
+while IFS= read -r line; do
+  good_toml
+  grep -vxF -- "$line" "$SA_TOML" >"$SA_TOML.new" && mv "$SA_TOML.new" "$SA_TOML"
+  code=0
+  out=$(run_stack sandbox-audit check 2>&1) || code=$?
+  [ "$code" = 1 ] && [[ "$out" == *"lacks: "* ]] || fail "check passed without $line ($code): $out"
+done <<<"$expected"
+# A line in the wrong section doesn't count.
+printf '[openshell.gateway]\nenabled = true\n%s\n' "$(sed 1d <<<"$expected")" >"$SA_TOML"
+code=0
+run_stack sandbox-audit check >/dev/null 2>&1 || code=$?
+[ "$code" = 1 ] || fail "check took the lines outside [openshell.gateway.otlp.ocsf]"
+# Trace export on: refused.
+good_toml
+printf '\n[openshell.gateway.otlp]\nendpoint = "http://collector:4318"\n' >>"$SA_TOML"
+code=0
+out=$(run_stack sandbox-audit check 2>&1) || code=$?
+[ "$code" = 1 ] && [[ "$out" == *"no traces may be exported"* ]] || fail "check allowed a trace export ($code): $out"
+# A loose headers file: refused.
+good_toml
+chmod 644 "$HDR"
+code=0
+out=$(run_stack sandbox-audit check 2>&1) || code=$?
+[ "$code" = 1 ] && [[ "$out" == *"mode 640 or stricter"* ]] || fail "check allowed a world-readable headers file ($code): $out"
+: >"$DOCKER_LOG"
+code=0
+run_stack sandbox-audit up >/dev/null 2>&1 || code=$?
+[ "$code" = 1 ] && ! grep -q 'sandbox-audit' "$DOCKER_LOG" || fail "up started the collector while the check fails"
+chmod 640 "$HDR"
+run_stack sandbox-audit up >/dev/null 2>&1 || fail "sandbox-audit up failed"
+grep -q -- 'args=compose .*--profile sandbox-audit up -d toolserver sandbox-audit' "$DOCKER_LOG" || fail "up didn't start the collector: $(cat "$DOCKER_LOG")"
+! sed 's/^.* args=//' "$DOCKER_LOG" | grep -qF -e "$tok" -e "$otlp" || fail "a sandbox-audit token reached docker's arguments"
+echo "sandbox-audit checks passed"
+
 # --- compose renders (C9, C14): without docker compose, say so and skip ---------------------
 if docker compose version >/dev/null 2>&1; then
   mkdir -p "$WORK/checkout" "$WORK/state"
@@ -2652,6 +2791,41 @@ for name, svc in c.items():
     if name != "web":
         assert "PMOS_WEB_INTERNAL_BIND" not in svc.get("environment", {}), name
 assert "web.pmos.internal" in web["networks"]["pmos"]["aliases"], web["networks"]
+PY
+  # The sandbox-audit collector (slice B3; spec §B.2, SBA-2): off unless its profile is asked for;
+  # then 127.0.0.1:8780 only, its own uid, no Docker socket and no OpenShell configuration
+  # mounted, and the tool server gets the collector's token from deploy/.env only.
+  plain=$(docker compose --project-directory "$DEPLOY_SRC" -f "$DEPLOY_SRC/compose.yaml" \
+    --env-file "$WORK/full.env" config --format json) || fail "compose doesn't render without the collector"
+  sa=$(docker compose --project-directory "$DEPLOY_SRC" -f "$DEPLOY_SRC/compose.yaml" \
+    --env-file "$WORK/full.env" --profile sandbox-audit config --format json) ||
+    fail "compose doesn't render the sandbox-audit collector"
+  printf '%s\n' "$plain" >"$WORK/plain.json"
+  printf '%s\n' "$sa" >"$WORK/sa.json"
+  python3 -I - "$WORK/plain.json" "$WORK/sa.json" <<'PY' || fail "the sandbox-audit collector renders wrong"
+import json, sys
+plain = json.load(open(sys.argv[1]))["services"]
+assert "sandbox-audit" not in plain, "the collector is on without its profile"
+c = json.load(open(sys.argv[2]))["services"]
+sa = c["sandbox-audit"]
+assert [(p["target"], p["host_ip"], str(p["published"])) for p in sa["ports"]] == [(8780, "127.0.0.1", "8780")], sa["ports"]
+assert sa["user"].startswith("10002:"), sa["user"]
+assert sa["command"] == ["pmos-sandbox-audit"], sa["command"]
+for v in sa.get("volumes", []):
+    src = str(v.get("source", ""))
+    assert "docker.sock" not in src and "openshell" not in src.lower(), v
+    if v.get("target") == "/run/pmos-sandbox-audit/otlp-ocsf.headers":
+        assert v.get("read_only"), v
+assert set(v["target"] for v in sa["volumes"]) == {"/run/pmos-sandbox-audit/otlp-ocsf.headers", "/var/lib/pmos-sandbox-audit"}, sa["volumes"]
+assert "ipv4_address" not in json.dumps(sa.get("networks", {})), sa["networks"]
+env = sa["environment"]
+assert env["PMOS_SANDBOX_AUDIT_BIND"] == "0.0.0.0:8780"
+assert "PMOS_SERVICE_TOKEN" not in env and "PMOS_DATABASE_URL" not in env, sorted(env)
+# Nothing else publishes 8780.
+for name, svc in c.items():
+    if name != "sandbox-audit":
+        for p in svc.get("ports", []):
+            assert p["target"] != 8780 and str(p.get("published")) != "8780", (name, p)
 PY
   # PMOS_WEB_BRIEF_URL reaches the Slack service as PMOS_WEB_URL, unchanged.
   sed -i 's|^PMOS_WEB_BRIEF_URL=.*|PMOS_WEB_BRIEF_URL=http://web.pmos.internal:8771|' "$WORK/full.env"

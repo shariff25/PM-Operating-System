@@ -27,6 +27,7 @@ pub mod memory_repo;
 pub mod model_source;
 pub mod oauth;
 pub mod onboarding;
+pub mod openshell;
 pub mod password;
 pub mod pg;
 pub mod proposals;

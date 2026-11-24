@@ -1,5 +1,52 @@
 # OpenShell's policy prover in Policy Admin, and sandbox decisions in the audit log
 
+> **Build status (2026-11-24), on `build/prover-and-sandbox-audit`: slices A1, A2, A3, A4, B1,
+> B2, B3 and B5 are built, built before review (owner's instruction of 2026-11-24).** None has
+> been read by the security reviewer; all of it goes to the reviewer, and the gate (no open High
+> or Critical) applies before real data or a pilot. Not built: A5 and B6 (need a real host), A6
+> and B4 (need their own review and the owner's answer on GitHub permissions and the canary).
+> Nothing here has run against a real OpenShell or a real prover: every statement about either
+> is still from the documentation, marked "verify on a real host" (or "with the real pinned
+> prover") in the code, and §5 stands as written.
+>
+> - **A1** `policies/boundary/pmos-bot.yaml` (hand-written), `crates/policy/src/prove.rs`
+>   (classifier, network view, pin, comparison with the check, boundary-alone rule),
+>   `pmos policy prove` and `pmos policy boundary-alone`, the stand-in
+>   `deploy/test/stand-ins/openshell-prover`. The prover runs with an empty environment (only a
+>   fixed `PATH`) and is killed at 90 seconds.
+> - **A2** CI job `policy-prover` (`scripts/policy-prover-ci.sh`, checked by
+>   `scripts/test-policy-prover-ci.sh`). **`deploy/openshell-prover.lock` pins nothing yet, so the
+>   job fails with "prover not available" on every run until the owner pins a release** (version,
+>   release tag, the SHA-256 of each archive and of each extracted binary). It is never a pass.
+>   When the base branch has no boundary (the pull request that adds it) the job proves against
+>   the checked-out one and says "BOOTSTRAP"; the boundary-alone rule applies from the next change.
+> - **A3** migration `0033_policy_proofs.sql`, `pmos-toolserver
+>   policy-proof record`, `pmos-admin policy prove <bot>|--all`. Deviation: `sandbox` and
+>   `resume` print the next step (`policy prove`) instead of running it, because the kit's
+>   existing tests check their exact OpenShell calls; running it there is left for review.
+> - **A4** Policy Admin's Prover row (`GET /api/admin/policy` reads `GET /internal/admin/policy/
+>   proofs`), "not run here" on the propose and proposals parts. A proof is current only when its
+>   `candidate_sha256` (the SHA-256 of the policy's canonical form, so formatting and key order
+>   don't matter) is the checked-in file's and it is not older than the sandbox's last
+>   `sandbox.policy_loaded`.
+> - **B1** migration `0034_sandbox_audit.sql` ( adds `policy_hash` and
+>   `os_correlation_uid` beyond §B.3's list), client `sandbox_audit`, `POST /internal/sandbox-
+>   audit/{batch,heartbeat}`, attribution, gap, down and silence detection, `denials_since` and
+>   `sandbox_gaps_since`.
+> - **B2** crate `pmos-sandbox-audit` (OTLP/HTTP protobuf decoded by hand, uncompressed only).
+> - **B3** compose service `sandbox-audit` (profile of that name, off unless asked for),
+>   `pmos-admin sandbox-audit configure|check|up`, 8780 in H-PORTS and H-EXPOSURE. The tokens are
+>   made by `configure`, not by `setup.sh`, so nothing turns on by itself (env.example lists
+>   them blank).
+> - **B5** the overview's "Sandbox denials, last 24 hours" and collector state, the audit list's
+>   sandbox columns and action suggestions, each bot's latest denials on Policy Admin, and the
+>   Auditor's destination class (`GET /internal/admin/sandbox`).
+>
+> Defaults taken for §6's open questions (the owner's to change): 1 and 2, nothing set (GitHub
+> settings and CODEOWNERS are the owner's); 3, an Auditor sees the destination class only; 4,
+> 5-minute allow counts; 5, no canary (B4 not built); 6, no Checks permission (A6 not built);
+> 7, nobody is notified, the overview only; 8, `policy_proofs` is append-only and not purged.
+
 Status: **design spec; not built.** Scope item c (`CLAUDE.md`): "add OpenShell's policy prover to
 Policy Admin, and bring OpenShell's sandbox allow and deny decisions into the audit log" (owner,
 2026-11-18, plan only). Owner, 2026-11-24: go ahead and build to the PRD; this spec is the first

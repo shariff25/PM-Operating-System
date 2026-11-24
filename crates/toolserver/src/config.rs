@@ -134,6 +134,12 @@ pub struct Config {
     /// `PMOS_BOT_TOKEN`: the Slack bot's own token, at least 32 characters and different from
     /// the service token. Optional; without it the bot can't connect.
     pub bot_token: Option<Secret>,
+    /// `PMOS_SANDBOX_AUDIT_TOKEN`: the `pmos-sandbox-audit` collector's own token, at least 32
+    /// characters and different from every other client's. It may call
+    /// `POST /internal/sandbox-audit/{batch,heartbeat}` and nothing else (it can't read, edit or
+    /// delete audit events). Optional: without it those routes answer `404` and nothing else
+    /// changes (fake-data mode, CI's stack and the test stack run without a collector).
+    pub sandbox_audit_token: Option<Secret>,
     /// `PMOS_WEB_TOKEN`: `pmos-web`'s own token, for the approvals routes only. Optional; at
     /// least 32 characters and different from every other token.
     pub web_token: Option<Secret>,
@@ -360,6 +366,9 @@ impl Config {
         };
         let web_token = person_token("PMOS_WEB_TOKEN")?;
         let console_token = person_token("PMOS_CONSOLE_TS_TOKEN")?;
+        // The sandbox-audit collector's own token (docs/openshell-prover-and-sandbox-audit-spec.md
+        // §B.2): it may append sandbox decisions and nothing else. Off unless set.
+        let sandbox_audit_token = person_token("PMOS_SANDBOX_AUDIT_TOKEN")?;
         // A client that acts for a person makes `require` the default, and `off` or `verify`
         // refuses to start without the development override (W2).
         let person_clients: Vec<(&str, &str)> = [
@@ -601,6 +610,7 @@ impl Config {
             bot_token: bot_token.map(Secret::new),
             web_token: web_token.map(Secret::new),
             console_token: console_token.map(Secret::new),
+            sandbox_audit_token: sandbox_audit_token.map(Secret::new),
             assertions,
             bot_skills,
             database_url,

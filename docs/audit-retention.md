@@ -24,6 +24,20 @@ what never is, how the database enforces it, how to check, and what an auditor s
   else). A day with nothing to delete still records `purged 0 events …`. A purge that isn't
   recorded didn't happen: if the insert fails, the delete is rolled back with it.
 
+- **Sandbox decisions are audit events too** (`docs/openshell-prover-and-sandbox-audit-spec.md`
+  Part B, slices B1 to B5; built before review, owner's instruction of 2026-11-24). What the
+  `pmos-sandbox-audit` collector forwards from OpenShell (`sandbox.deny`, `sandbox.deny_summary`,
+  `sandbox.allow_summary`, `sandbox.finding`, `sandbox.policy_loaded`, `sandbox.source_gap`,
+  `sandbox.unparsed`) and what the tool server detects about the collector itself
+  (`sandbox.collector_gap`, `sandbox.collector_down`) are `audit_events` rows (client
+  `sandbox_audit`, migration 0031), so this same job deletes them at 90 days and nothing else can:
+  the append-only triggers refuse UPDATE, DELETE and TRUNCATE for them as for every row, and only
+  the collector's client may write a `sandbox.*` row. `tests/sandbox_audit.rs` checks a 120-day
+  row goes and an 89-day row stays. The JSON-lines copy gets each with its sandbox columns under
+  `sandbox`.
+- **Policy proofs** (`policy_proofs`, migration 0030) are append-only and **not purged** in v1
+  (the spec's open question 8); their `policy.prove` audit events are purged with the rest.
+
 ## What is never deleted
 
 - **No event newer than 90 days**, whatever `PMOS_AUDIT_RETENTION_DAYS` says and whoever asks

@@ -56,6 +56,33 @@ jobs:
       - name: Model promises
         run: scripts/check-model-promises.sh --self-test && scripts/check-model-promises.sh
 
+  # OpenShell's policy prover beside `pmos policy check` (docs/openshell-prover-and-sandbox-audit-
+  # spec.md, slice A2). Every bot's policy is proved against the base branch's hand-written
+  # boundary with the prover pinned in deploy/openshell-prover.lock; a change to the boundary must
+  # come alone. Until the owner pins a prover this job FAILS with "prover not available": a proof
+  # that didn't run is never a pass. No secrets, no write token.
+  policy-prover:
+    name: Policy prover (OpenShell, pinned)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: The job's own checks (stand-in prover)
+        run: scripts/test-policy-prover-ci.sh
+      - name: Prove every bot's policy
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [ -n "$BASE_REF" ]; then
+            git fetch --no-tags origin "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF"
+            scripts/policy-prover-ci.sh --base "origin/$BASE_REF"
+          else
+            scripts/policy-prover-ci.sh
+          fi
+
   harness:
     name: Harness (typecheck, test)
     runs-on: ubuntu-latest
@@ -114,7 +141,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Scripts parse
-        run: for f in deploy/setup.sh deploy/pmos-admin deploy/postgres-init.sh deploy/preflight.sh deploy/pmos-metadata-block deploy/sandbox-create.sh scripts/claude-test-stack.sh scripts/test-pmos-admin.sh scripts/test-preflight.sh policies/redteam/lib.sh policies/redteam/isolation.sh policies/redteam/exposure.sh policies/redteam/stack.sh scripts/test-redteam.sh scripts/check-nginx-examples.sh; do bash -n "$f"; done
+        run: for f in deploy/setup.sh deploy/pmos-admin deploy/postgres-init.sh deploy/preflight.sh deploy/pmos-metadata-block deploy/sandbox-create.sh scripts/claude-test-stack.sh scripts/test-pmos-admin.sh scripts/test-preflight.sh policies/redteam/lib.sh policies/redteam/isolation.sh policies/redteam/exposure.sh policies/redteam/stack.sh scripts/test-redteam.sh scripts/check-nginx-examples.sh scripts/policy-prover-ci.sh scripts/test-policy-prover-ci.sh deploy/test/stand-ins/openshell-prover; do bash -n "$f"; done
       - name: pmos-admin checks (the eval gate's arguments; the checkout stays data)
         run: scripts/test-pmos-admin.sh
       # docs/openshell-any-host-spec.md §5 (slice H7): the red-team scripts' dry runs, refusals,

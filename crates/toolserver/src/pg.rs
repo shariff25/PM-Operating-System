@@ -459,6 +459,23 @@ impl SessionRepo for PgStore {
         Ok(highest)
     }
 
+    async fn open_bot_sessions(
+        &self,
+        bot: &str,
+        at: DateTime<Utc>,
+    ) -> StoreResult<Vec<(String, String)>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT DISTINCT user_handle, run_id FROM sessions
+             WHERE bot = $1 AND created_at <= $2 AND expires_at > $2
+             ORDER BY user_handle, run_id LIMIT 3",
+        )
+        .bind(bot)
+        .bind(at)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     async fn revoke(&self, token: &str) -> StoreResult<bool> {
         let done = sqlx::query("DELETE FROM sessions WHERE token_hash = $1")
             .bind(token_hash(token))

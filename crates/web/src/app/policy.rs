@@ -65,9 +65,26 @@ async fn read(State(state): State<AppState>, signed: Signed) -> ApiResult {
     let today = now(&state).date_naive();
     let revision = state.0.proposals.config.content_revision.clone();
     let edit = signed.member.allows(Permission::EditContent);
-    // The branch-protection check (a tool server call) runs beside the file-system work.
-    let (protection, body) = tokio::join!(
+    // The branch-protection check and the host proofs (tool server calls) run beside the
+    // file-system work.
+    let (protection, proofs, sandbox, body) = tokio::join!(
         proposal::protection(&state, &signed),
+        async {
+            signed
+                .toolserver(&state)
+                .policy_proofs(&signed.member.handle)
+                .await
+                .map_err(|e| tracing::warn!(error = ?e, "policy proofs unknown"))
+                .ok()
+        },
+        async {
+            signed
+                .toolserver(&state)
+                .admin(&signed.member.handle, "sandbox", &[])
+                .await
+                .map_err(|e| tracing::warn!(error = ?e, "sandbox denials unknown"))
+                .ok()
+        },
         blocking(move || {
             let cur = policy_admin::current(&w.content, w.policies.as_deref(), today);
             let spec = policy_admin::current_spec(&cur.report);
@@ -111,6 +128,14 @@ async fn read(State(state): State<AppState>, signed: Signed) -> ApiResult {
                             } else {
                                 "generated"
                             });
+                            // What a host proof must have proved to be current (§A.5).
+                            let text = cur
+                                .checked_in
+                                .as_ref()
+                                .and_then(|c| c.get(&rel))
+                                .or_else(|| g.files.get(&rel));
+                            v["policy_sha256"] =
+                                json!(text.map(|t| pmos_policy::prove::policy_hash(t)));
                             v
                         })
                         .collect()
@@ -155,7 +180,253 @@ async fn read(State(state): State<AppState>, signed: Signed) -> ApiResult {
     };
     body["proposals_configured"] = json!(configured);
     body["protection"] = protection;
+    with_prover(&mut body, proofs.as_ref());
+    with_denials(&mut body, sandbox.as_ref());
     Ok(Json(body).into_response())
+}
+
+/// The most recent sandbox denials shown per bot.
+pub const DENIALS_SHOWN: usize = 5;
+
+/// Add each bot's latest sandbox denials (`sandbox_denials`: rule, destination, time; spec
+/// §B.5) and the collector's state (`sandbox_audit`) to a policy read, from the tool server's
+/// `GET /internal/admin/sandbox`, which already projected them for the viewer (an Auditor gets
+/// a destination class, not the host or path). `None` (it didn't answer): `available: false`.
+fn with_denials(body: &mut Value, sandbox: Option<&Value>) {
+    let pick = |r: &Value| {
+        let s = &r["sandbox"];
+        json!({
+            "at": r.get("at"),
+            "action": r.get("action"),
+            "detail": r.get("detail"),
+            "task_id": r.get("task_id"),
+            "rule": s.get("rule"),
+            "reason": s.get("reason"),
+            "dest_class": s.get("dest_class"),
+            "dest_host": s.get("dest_host"),
+            "dest_port": s.get("dest_port"),
+            "http_method": s.get("http_method"),
+            "http_path": s.get("http_path"),
+        })
+    };
+    if let Some(bots) = body.get_mut("bots").and_then(Value::as_array_mut) {
+        for b in bots {
+            let name = b.get("bot").and_then(Value::as_str).unwrap_or_default();
+            let rows: Vec<Value> = sandbox
+                .and_then(|s| s.get("denials"))
+                .and_then(|d| d.get(name))
+                .and_then(Value::as_array)
+                .map(|rows| rows.iter().take(DENIALS_SHOWN).map(pick).collect())
+                .unwrap_or_default();
+            b["sandbox_denials"] = json!(rows);
+        }
+    }
+    body["sandbox_audit"] = match sandbox {
+        None => json!({"available": false}),
+        Some(s) => json!({
+            "available": true,
+            "configured": s.get("configured").and_then(Value::as_bool).unwrap_or(false),
+            "receiving": s["collector"].get("receiving").and_then(Value::as_bool).unwrap_or(false),
+            "silent_since": s["collector"].get("silent_since"),
+            "last_gap_at": s["collector"].get("last_gap_at"),
+        }),
+    };
+}
+
+/// What Policy Admin says of the prover on validate and proposals: it never runs here.
+pub const PROVER_NOT_HERE: &str =
+    "The prover runs on the pull request (CI check `policy-prover`). Not run here.";
+
+/// Add each bot's `prover` and the fixed `prover_notes` to a policy read: the newest host proof
+/// (`proofs`, from the tool server; `None` when it didn't answer) against the policy's own hash.
+fn with_prover(body: &mut Value, proofs: Option<&Value>) {
+    let empty = Vec::new();
+    let rows = proofs
+        .and_then(|p| p.get("proofs"))
+        .and_then(Value::as_array)
+        .unwrap_or(&empty);
+    let loads = proofs.and_then(|p| p.get("policy_loads"));
+    if let Some(bots) = body.get_mut("bots").and_then(Value::as_array_mut) {
+        for b in bots {
+            let name = b.get("bot").and_then(Value::as_str).unwrap_or_default();
+            let proof = rows
+                .iter()
+                .find(|r| r.get("bot").and_then(Value::as_str) == Some(name));
+            let loaded = loads
+                .and_then(|l| l.get(name))
+                .and_then(Value::as_str)
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|t| t.with_timezone(&chrono::Utc));
+            let sha = b.get("policy_sha256").and_then(Value::as_str);
+            b["prover"] = prover_view(proofs.is_some(), proof, sha, loaded);
+        }
+    }
+    body["prover_notes"] = json!({
+        "not_proved": pmos_policy::prove::NOT_PROVED,
+        "domains": pmos_policy::prove::DOMAINS,
+        "view": pmos_policy::prove::VIEW_NOTE,
+        "not_run_here": PROVER_NOT_HERE,
+    });
+}
+
+/// One bot's Prover row (spec §A.5, PRV-10). `state` is what the screen shows:
+///
+/// - `proved` only for a host proof whose status is `proved`, whose `candidate_sha256` is this
+///   policy's hash, and which is not older than the sandbox's last policy load;
+/// - `stale` for a `proved` row that fails either test: never shown as proved;
+/// - the row's own status otherwise (`exceeds`, `unsupported`, `inconclusive`, `error`,
+///   `not_available`, `version_mismatch`), each a failure;
+/// - `missing` when the host has recorded no proof for this bot, and `unknown` when the tool
+///   server didn't answer: neither is a pass.
+pub(crate) fn prover_view(
+    reachable: bool,
+    proof: Option<&Value>,
+    policy_sha256: Option<&str>,
+    last_load: Option<chrono::DateTime<chrono::Utc>>,
+) -> Value {
+    if !reachable {
+        return json!({"state": "unknown", "passed": false});
+    }
+    let Some(p) = proof else {
+        return json!({"state": "missing", "passed": false});
+    };
+    let status = p.get("status").and_then(Value::as_str).unwrap_or("error");
+    let known = pmos_policy::prove::Status::parse(status);
+    let at = p
+        .get("at")
+        .and_then(Value::as_str)
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| t.with_timezone(&chrono::Utc));
+    let candidate = p.get("candidate_sha256").and_then(Value::as_str);
+    let stale_reason = if candidate.is_none() || candidate != policy_sha256 {
+        Some("policy_changed")
+    } else if matches!((at, last_load), (Some(a), Some(l)) if a < l) || at.is_none() {
+        Some("policy_loaded_after")
+    } else {
+        None
+    };
+    let state = match known {
+        Some(pmos_policy::prove::Status::Proved) if stale_reason.is_none() => "proved",
+        Some(pmos_policy::prove::Status::Proved) => "stale",
+        Some(s) => s.as_str(),
+        None => "error",
+    };
+    json!({
+        "state": state,
+        "passed": state == "proved",
+        "status": status,
+        "stale": stale_reason.is_some(),
+        "stale_reason": stale_reason,
+        "at": p.get("at"),
+        "reason_code": p.get("reason_code"),
+        "reason": p.get("reason"),
+        "counterexample": p.get("counterexample"),
+        "coverage": p.get("coverage"),
+        "prover_version": p.get("prover_version"),
+        "host_user": p.get("host_user"),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn proof(status: &str, sha: &str, at: &str) -> Value {
+        json!({"bot": "docs", "status": status, "candidate_sha256": sha, "at": at,
+               "coverage": ["filesystem", "landlock", "network_l4", "network_rest", "process"],
+               "prover_version": "0.1.9"})
+    }
+
+    #[test]
+    fn only_a_current_proof_is_proved() {
+        let at = "2026-11-24T10:00:00Z";
+        let sha = "a".repeat(64);
+        let p = proof("proved", &sha, at);
+        let v = prover_view(true, Some(&p), Some(&sha), None);
+        assert_eq!(v["state"], "proved");
+        assert_eq!(v["passed"], true);
+        // Another policy since: stale.
+        let v = prover_view(true, Some(&p), Some(&"b".repeat(64)), None);
+        assert_eq!(v["state"], "stale");
+        assert_eq!(v["passed"], false);
+        assert_eq!(v["stale_reason"], "policy_changed");
+        // A policy load after the proof: stale.
+        let later = "2026-11-24T11:00:00Z".parse().unwrap();
+        let v = prover_view(true, Some(&p), Some(&sha), Some(later));
+        assert_eq!(v["state"], "stale");
+        assert_eq!(v["stale_reason"], "policy_loaded_after");
+        // No hash to compare: never proved.
+        let v = prover_view(true, Some(&p), None, None);
+        assert_eq!(v["state"], "stale");
+        // Missing, unreachable.
+        assert_eq!(
+            prover_view(true, None, Some(&sha), None)["state"],
+            "missing"
+        );
+        assert_eq!(
+            prover_view(false, Some(&p), Some(&sha), None)["state"],
+            "unknown"
+        );
+        for s in [
+            "exceeds",
+            "unsupported",
+            "inconclusive",
+            "error",
+            "not_available",
+            "version_mismatch",
+        ] {
+            let v = prover_view(true, Some(&proof(s, &sha, at)), Some(&sha), None);
+            assert_eq!(v["state"], s);
+            assert_eq!(v["passed"], false, "{s}");
+        }
+        let v = prover_view(true, Some(&proof("passed", &sha, at)), Some(&sha), None);
+        assert_eq!(v["state"], "error", "an unknown status is never a pass");
+    }
+
+    #[test]
+    fn every_bot_gets_its_latest_denials_and_the_collectors_state() {
+        let rows: Vec<Value> = (0..8)
+            .map(|i| {
+                json!({"at": format!("2026-11-24T10:0{i}:00Z"), "action": "sandbox.deny",
+                            "detail": "no task", "task_id": "sandbox", "actor": "x",
+                            "sandbox": {"rule": "-", "reason": "no_matching_policy",
+                                        "dest_class": "public", "dest_port": 443}})
+            })
+            .collect();
+        let sandbox = json!({"configured": true, "collector": {"receiving": true},
+                             "denials": {"docs": rows}});
+        let mut body = json!({"bots": [{"bot": "docs"}, {"bot": "pm-ana"}]});
+        with_denials(&mut body, Some(&sandbox));
+        let d = body["bots"][0]["sandbox_denials"].as_array().unwrap();
+        assert_eq!(d.len(), DENIALS_SHOWN);
+        assert_eq!(d[0]["dest_class"], "public");
+        assert!(
+            d[0].get("actor").is_none(),
+            "re-picked: only the listed fields"
+        );
+        assert_eq!(body["bots"][1]["sandbox_denials"], json!([]));
+        assert_eq!(body["sandbox_audit"]["receiving"], true);
+        let mut body = json!({"bots": [{"bot": "docs"}]});
+        with_denials(&mut body, None);
+        assert_eq!(body["sandbox_audit"]["available"], false);
+    }
+
+    #[test]
+    fn every_bot_gets_a_prover_row_and_the_fixed_notes() {
+        let mut body = json!({"bots": [{"bot": "docs", "policy_sha256": "a".repeat(64)}, {"bot": "pm-ana", "policy_sha256": null}]});
+        let proofs = json!({"proofs": [proof("proved", &"a".repeat(64), "2026-11-24T10:00:00Z")]});
+        with_prover(&mut body, Some(&proofs));
+        assert_eq!(body["bots"][0]["prover"]["state"], "proved");
+        assert_eq!(body["bots"][1]["prover"]["state"], "missing");
+        assert_eq!(
+            body["prover_notes"]["not_proved"].as_array().unwrap().len(),
+            6
+        );
+        assert_eq!(body["prover_notes"]["not_run_here"], PROVER_NOT_HERE);
+        let mut body = json!({"bots": [{"bot": "docs"}]});
+        with_prover(&mut body, None);
+        assert_eq!(body["bots"][0]["prover"]["state"], "unknown");
+    }
 }
 
 #[derive(Deserialize)]

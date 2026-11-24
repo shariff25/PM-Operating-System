@@ -890,6 +890,20 @@ impl ToolServer {
         self.0.read(res).await
     }
 
+    /// `GET /internal/admin/policy/proofs?user=`: the newest host proof of each bot
+    /// (`docs/openshell-prover-and-sandbox-audit-spec.md` §A.5). pmos-web runs no prover.
+    pub async fn policy_proofs(&self, viewer: &str) -> UpstreamResult<Value> {
+        let url = self.0.url(&["internal", "admin", "policy", "proofs"])?;
+        let res = self
+            .0
+            .send(
+                self.0.http.get(url).query(&[("user", viewer)]),
+                Some(viewer),
+            )
+            .await?;
+        self.0.read(res).await
+    }
+
     /// Record a sign-in event (`POST /internal/admin/events`, `docs/web-api.md`, "Sign-in
     /// events"): for `member` (named as `user=`, with an assertion for them) on a sign-in or
     /// sign-out, for no one on a refusal. `body` holds fixed action names and codes only.

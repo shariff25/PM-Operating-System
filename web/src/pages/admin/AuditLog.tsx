@@ -3,7 +3,7 @@ import type { FormEvent, ReactNode } from 'react';
 import { canExport } from '../../admin/access';
 import { saveBlob } from '../../admin/download';
 import { AUDIT_OUTCOMES } from '../../api/types';
-import type { AuditEvent } from '../../api/types';
+import type { AuditEvent, SandboxCols } from '../../api/types';
 import { NO_FILTERS, auditHash, countFilters, parseFilters, rangeBackwards, toQuery } from '../../admin/filters';
 import type { AuditFilters } from '../../admin/filters';
 import { auditTime } from '../../admin/format';
@@ -16,6 +16,19 @@ import { copy } from '../../copy';
 import { AdminHead, NoAccess, OutcomePill } from './parts';
 
 const A = copy.admin.audit;
+
+/** OpenShell's sandbox decisions (spec §B.3), offered as the action filter's suggestions. */
+const SANDBOX_ACTIONS = [
+  'sandbox.deny',
+  'sandbox.deny_summary',
+  'sandbox.allow_summary',
+  'sandbox.finding',
+  'sandbox.policy_loaded',
+  'sandbox.source_gap',
+  'sandbox.collector_gap',
+  'sandbox.collector_down',
+  'sandbox.unparsed',
+];
 
 /** A value, or the words for "the log has none". */
 function Value({ v, mono }: { v: string | number | null; mono?: boolean }) {
@@ -62,7 +75,37 @@ function EventDetails({ e }: { e: AuditEvent }) {
         <Field label={f.target} wide><Value v={e.target} mono /></Field>
         <Field label={f.detail} wide><Value v={e.detail} /></Field>
       </dl>
+      {e.sandbox && <SandboxDetails s={e.sandbox} />}
     </div>
+  );
+}
+
+/**
+ * A sandbox decision's own columns (spec §B.3), as plain text: the tool server has already left
+ * out the host, address, path and process for an auditor, who sees the destination class.
+ */
+export function SandboxDetails({ s }: { s: SandboxCols }) {
+  const f = A.sandboxFields;
+  const dest = s.dest_host || s.dest_ip ? `${s.dest_host ?? s.dest_ip}${s.dest_port != null ? `:${s.dest_port}` : ''}` : null;
+  const request = s.http_method || s.http_path ? `${s.http_method ?? ''} ${s.http_path ?? ''}`.trim() : null;
+  return (
+    <dl className="kv-grid" aria-label={f.label}>
+      <Field label={f.sandbox}><Value v={s.sandbox ?? null} mono /></Field>
+      <Field label={f.decision}><Value v={s.decision ?? null} mono /></Field>
+      <Field label={f.rule}><Value v={s.rule ?? null} mono /></Field>
+      <Field label={f.reason}><Value v={s.reason ?? null} mono /></Field>
+      <Field label={f.destClass}><Value v={s.dest_class ?? null} /></Field>
+      {dest !== null && <Field label={f.destination}><Value v={dest} mono /></Field>}
+      {dest === null && s.dest_port != null && <Field label={f.destination}><Value v={`:${s.dest_port}`} mono /></Field>}
+      {request !== null && <Field label={f.request} wide><Value v={request} mono /></Field>}
+      {s.process && <Field label={f.process}><Value v={s.process} mono /></Field>}
+      {s.allow_count != null && (
+        <Field label={f.allowCount}>
+          <Value v={s.allow_count} mono />
+          <span className="kv-note">{f.allowNote}</span>
+        </Field>
+      )}
+    </dl>
   );
 }
 
@@ -150,7 +193,10 @@ function FilterBar({ filters, onApply }: { filters: AuditFilters; onApply: (f: A
       </div>
       <div className="filter-field filter-action">
         <label className="field-label" htmlFor={`${id}-action`}>{A.fields.action}</label>
-        <input id={`${id}-action`} type="text" value={draft.action} placeholder="jira.create_issue" autoComplete="off" spellCheck={false} maxLength={100} onChange={(e) => set('action', e.target.value)} />
+        <input id={`${id}-action`} type="text" list={`${id}-actions`} value={draft.action} placeholder="jira.create_issue" autoComplete="off" spellCheck={false} maxLength={100} onChange={(e) => set('action', e.target.value)} />
+        <datalist id={`${id}-actions`}>
+          {SANDBOX_ACTIONS.map((a) => <option key={a} value={a} />)}
+        </datalist>
       </div>
       <div className="filter-field filter-outcome">
         <label className="field-label" htmlFor={`${id}-outcome`}>{A.fields.outcome}</label>

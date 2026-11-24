@@ -1,0 +1,96 @@
+# PM OS's boundary for every bot's sandbox policy: what OpenShell's policy prover checks each
+# bot's policy against (`pmos policy prove`; docs/openshell-prover-and-sandbox-audit-spec.md §A.2).
+#
+# WRITTEN BY HAND AND REVIEWED. NEVER GENERATED. It restates, independently, the claim that
+# crates/policy/src/lib.rs makes in code, so a change to the generator's constants that this file
+# does not also carry fails the prover. A pull request that changes anything under
+# policies/boundary/ may change no other file (CI's `policy-prover` job fails otherwise), needs a
+# second platform owner's review (POL-2) and its own CODEOWNERS line; CI proves a pull request's
+# policies against the BASE branch's copy of this file, so a policy and its boundary can't be
+# widened together.
+#
+# Properties (spec §A.2):
+#   P-NET   only /usr/local/bin/node connects, and only to the three services, each at exactly its
+#           own pinned /32 (toolserver .10, gateway .11, bots .12)
+#   P-REST  the gateway allows only POST /v1/chat/completions; the runtime only the six worker
+#           routes; both enforced
+#   P-WRITE no write outside /sandbox/workspace, /tmp, /dev/null; include_workdir false
+#           (reads: `/` covers every path, because the prover compares paths exactly and each bot
+#           reads different skill folders; readable paths are `pmos policy check`'s fs-readable)
+#   P-PROC  the workload runs as sandbox:sandbox, never root
+#   P-LL    Landlock is a hard requirement
+#
+# Not here, and never proved: the MCP methods and tools (the tool server's endpoint is plain L4 in
+# this file; `pmos policy prove` proves each policy's network view, with the MCP rules removed,
+# which only widens), credential bindings, uploads, name resolution, what a running sandbox
+# enforces. Verify with the real pinned prover (slice A2): that it reads this file, that
+# `read_only: [/]` covers the skill paths, and that the `*` route globs compare.
+version: 1
+filesystem_policy:
+  include_workdir: false
+  read_only:
+    - /
+  read_write:
+    - /dev/null
+    - /sandbox/workspace
+    - /tmp
+landlock:
+  compatibility: hard_requirement
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+network_policies:
+  pmos_toolserver:
+    name: pmos_toolserver
+    binaries:
+      - path: /usr/local/bin/node
+    endpoints:
+      - host: toolserver.pmos.internal
+        port: 8710
+        allowed_ips:
+          - "10.201.77.10/32"
+  pmos_gateway:
+    name: pmos_gateway
+    binaries:
+      - path: /usr/local/bin/node
+    endpoints:
+      - host: gateway.pmos.internal
+        port: 8740
+        allowed_ips:
+          - "10.201.77.11/32"
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: POST
+              path: /v1/chat/completions
+  pmos_runtime:
+    name: pmos_runtime
+    binaries:
+      - path: /usr/local/bin/node
+    endpoints:
+      - host: bots.pmos.internal
+        port: 8750
+        allowed_ips:
+          - "10.201.77.12/32"
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: POST
+              path: /v1/worker/claim
+          - allow:
+              method: POST
+              path: "/v1/worker/tasks/*/heartbeat"
+          - allow:
+              method: POST
+              path: "/v1/worker/tasks/*/events"
+          - allow:
+              method: POST
+              path: "/v1/worker/tasks/*/trace"
+          - allow:
+              method: POST
+              path: "/v1/worker/tasks/*/complete"
+          - allow:
+              method: POST
+              path: "/v1/worker/tasks/*/fail"

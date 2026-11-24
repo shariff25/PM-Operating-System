@@ -127,6 +127,10 @@ pub enum Client {
     /// A host command, `pmos-admin users …` (`docs/user-database-spec.md` §5): the event's
     /// detail names the OS user who ran it. Never a token's client.
     Host,
+    /// The `pmos-sandbox-audit` collector, with `PMOS_SANDBOX_AUDIT_TOKEN`: OpenShell's own
+    /// sandbox decisions (`sandbox.*`, `crate::openshell::sandbox`), and the tool server's own
+    /// gap and down events about the collector. Its token appends those and nothing else.
+    SandboxAudit,
 }
 
 impl Client {
@@ -139,6 +143,7 @@ impl Client {
             Self::Console => "console",
             Self::System => "system",
             Self::Host => "host",
+            Self::SandboxAudit => "sandbox_audit",
         }
     }
 
@@ -151,6 +156,7 @@ impl Client {
             Self::Console,
             Self::System,
             Self::Host,
+            Self::SandboxAudit,
         ]
         .into_iter()
         .find(|c| c.as_str() == s)
@@ -381,6 +387,18 @@ pub trait AuditSink: Send + Sync {
     /// sink can't be read back.
     async fn retention(&self) -> StoreResult<Option<RetentionFacts>> {
         Ok(None)
+    }
+
+    /// A sandbox decision the OpenShell store already recorded (`crate::openshell`), copied to
+    /// this sink with its sandbox columns as `fields` (JSON): the JSON-lines file gets it as it
+    /// gets every event (spec §B.7), the in-memory log keeps the event. Postgres does nothing:
+    /// the row is already in `audit_events`.
+    async fn mirror_sandbox(
+        &self,
+        _event: AuditEvent,
+        _fields: serde_json::Value,
+    ) -> StoreResult<()> {
+        Ok(())
     }
 }
 
@@ -629,6 +647,14 @@ impl AuditSink for MemoryAudit {
             last_purge,
         }))
     }
+
+    async fn mirror_sandbox(
+        &self,
+        event: AuditEvent,
+        _fields: serde_json::Value,
+    ) -> StoreResult<()> {
+        self.record(event).await
+    }
 }
 
 /// Records every event in several sinks, such as Postgres plus a JSON-lines file that is
@@ -723,6 +749,21 @@ impl AuditSink for TeeAudit {
         }
         Ok(None)
     }
+
+    /// In every sink, after trying them all.
+    async fn mirror_sandbox(
+        &self,
+        event: AuditEvent,
+        fields: serde_json::Value,
+    ) -> StoreResult<()> {
+        let mut first_error = None;
+        for sink in &self.0 {
+            if let Err(e) = sink.mirror_sandbox(event.clone(), fields.clone()).await {
+                first_error.get_or_insert(e);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
 }
 
 /// Appends one JSON object per line to a file.
@@ -743,6 +784,23 @@ impl JsonlAudit {
 impl AuditSink for JsonlAudit {
     async fn record(&self, event: AuditEvent) -> StoreResult<()> {
         let line = serde_json::to_string(&event).map_err(|e| StoreError(e.to_string()))?;
+        let mut file = self.file.lock().expect("audit lock");
+        writeln!(file, "{line}")
+            .and_then(|_| file.flush())
+            .map_err(|e| StoreError(e.to_string()))
+    }
+
+    /// The event with its sandbox columns under `sandbox`.
+    async fn mirror_sandbox(
+        &self,
+        event: AuditEvent,
+        fields: serde_json::Value,
+    ) -> StoreResult<()> {
+        let mut value = serde_json::to_value(&event).map_err(|e| StoreError(e.to_string()))?;
+        if let serde_json::Value::Object(map) = &mut value {
+            map.insert("sandbox".into(), fields);
+        }
+        let line = serde_json::to_string(&value).map_err(|e| StoreError(e.to_string()))?;
         let mut file = self.file.lock().expect("audit lock");
         writeln!(file, "{line}")
             .and_then(|_| file.flush())

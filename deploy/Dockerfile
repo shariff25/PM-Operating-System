@@ -36,7 +36,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     fi \
  && cargo build --release --locked --bins \
  && mkdir -p /out \
- && for b in pmos pmos-toolserver pmos-docs pmos-gateway pmos-bots pmos-slack pmos-console pmos-web pmos-evals; do \
+ && for b in pmos pmos-toolserver pmos-docs pmos-gateway pmos-bots pmos-slack pmos-console pmos-web pmos-evals pmos-sandbox-audit; do \
       cp "target/release/$b" /out/; \
     done
 
@@ -44,6 +44,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # all already in this base, so the runtime image needs no package installs.
 FROM buildpack-deps:bookworm-scm
 RUN useradd --uid 10001 --create-home --shell /usr/sbin/nologin pmos
+# The sandbox-audit collector's own uid and its spool directory (docs/openshell-prover-and-
+# sandbox-audit-spec.md §B.2), so its named volume starts owned by it and by nobody else.
+RUN useradd --uid 10002 --no-create-home --shell /usr/sbin/nologin pmos-sandbox-audit \
+ && mkdir -p /var/lib/pmos-sandbox-audit \
+ && chown 10002:10001 /var/lib/pmos-sandbox-audit \
+ && chmod 750 /var/lib/pmos-sandbox-audit
 COPY --from=build /out/ /usr/local/bin/
 COPY config/ /etc/pmos/config/
 COPY --from=webbuild /src/web/dist/ /usr/share/pmos/web/
