@@ -119,9 +119,12 @@ pub fn acknowledgement_needed(
 
 /// Where the history and the acknowledgements are kept: the tool server's database, or memory
 /// (`PMOS_DEV=1` and tests).
+/// The in-memory history: the sources by name, and the acknowledgements.
+type MemoryHistory = std::sync::Arc<Mutex<(BTreeMap<String, SourceRecord>, Vec<Acknowledgement>)>>;
+
 #[derive(Clone)]
 pub enum History {
-    Memory(std::sync::Arc<Mutex<(BTreeMap<String, SourceRecord>, Vec<Acknowledgement>)>>),
+    Memory(MemoryHistory),
     Pg(crate::pg::PgStore),
 }
 
