@@ -8,6 +8,7 @@
 
 pub mod bots;
 pub mod cite;
+pub mod codeowners;
 pub mod frontmatter;
 pub mod lint;
 pub mod model;

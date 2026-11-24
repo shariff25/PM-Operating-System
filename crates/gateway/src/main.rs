@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use pmos_contract::model_source::ModelSource;
 use pmos_gateway::config::{Config, Models, UpstreamKind};
 use pmos_gateway::usage::UsageLog;
 use pmos_gateway::{router_with, GatewayConfig, RouterOptions};
@@ -19,6 +20,32 @@ async fn main() -> Result<()> {
     // check of the config against this environment, then exit, serving nothing. Prints the
     // roles and their routes by label only, never a URL, host, key or model id.
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `pmos-gateway --digest-from-stdin` and `--model-digest-from-stdin` (spec §3.6, "A
+    // reviewer can check an entry's digests"): one URL (or model id) from standard input,
+    // never a command-line argument, normalised exactly as the gateway does; prints its digest
+    // and nothing else, or the gateway's refusal.
+    if let Some(flag @ ("--digest-from-stdin" | "--model-digest-from-stdin")) =
+        args.first().map(String::as_str)
+    {
+        let mut input = String::new();
+        std::io::Read::read_to_string(&mut std::io::Read::take(std::io::stdin(), 4096), &mut input)
+            .context("reading standard input")?;
+        let digest = if flag == "--digest-from-stdin" {
+            pmos_gateway::hosted::url_digest_from(&input)
+        } else {
+            pmos_gateway::hosted::model_digest_from(&input)
+        };
+        return match digest {
+            Ok(d) => {
+                println!("{d}");
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        };
+    }
     if args.first().map(String::as_str) == Some("--check-config") {
         return match pmos_gateway::config::check_config(
             |k| std::env::var(k).ok(),
@@ -56,14 +83,51 @@ async fn main() -> Result<()> {
     config.check_keys(&models).map_err(anyhow::Error::msg)?;
     // Slice H4: the config must fit PMOS_MODEL_SOURCE, checked on its own class.
     config.check_source(&models).map_err(anyhow::Error::msg)?;
+    // Slice H12: under `hosted`, the compiled list, the host's URL and model ids against its
+    // digests, the key file, the CA, the stop file and the ceiling. The list ships empty, so a
+    // gateway built from a fresh checkout stops here ("no approved entry").
+    let list = pmos_gateway::hosted::compiled().map_err(anyhow::Error::msg)?;
+    let hosted = if config.model_source == ModelSource::Hosted {
+        let build = pmos_gateway::hosted::BuildInfo::compiled();
+        let binding = pmos_gateway::hosted::bind(
+            &mut models,
+            &list,
+            &config.hosted,
+            std::path::Path::new(pmos_gateway::hosted::CONTROL_DIR),
+            build.clone(),
+        )
+        .map_err(anyhow::Error::msg)?;
+        // Built only from committed code (X5): `pmos-admin build` passes the commit and the
+        // merged branch's commit; a binary built any other way doesn't serve `hosted`.
+        if build.commit.is_none() || build.merged_commit.is_none() {
+            anyhow::bail!(
+                "PMOS_MODEL_SOURCE=hosted: this gateway was not built by `pmos-admin build` (no \
+                 commit and merged commit compiled in), so it can't show it carries the merged \
+                 approved list; rebuild with `pmos-admin build`"
+            );
+        }
+        Some(binding)
+    } else {
+        None
+    };
     let (class, warning) = config.served_class(&models);
     if let Some(w) = warning {
         tracing::warn!("{w}");
     }
     models.class = class;
+    let build = pmos_gateway::hosted::BuildInfo::compiled();
     tracing::info!(
         class = models.class.as_str(),
-        model_source = config.served_source(),
+        model_source = hosted
+            .as_ref()
+            .filter(|_| !config.stub)
+            .map(|b| b.source())
+            .unwrap_or_else(|| config.served_source().to_string()),
+        approved_list = list.kind.as_str(),
+        approved_list_sha256 = %list.sha256,
+        commit = build.commit.as_deref().unwrap_or("unknown"),
+        merged_commit = build.merged_commit.as_deref().unwrap_or("unknown"),
+        max_data_class = hosted.as_ref().map(|b| b.max_data_class.to_string()).unwrap_or_default(),
         "gateway class and model source"
     );
     if models
@@ -152,6 +216,13 @@ async fn main() -> Result<()> {
                 .ok()
                 .filter(|p| !p.is_empty())
                 .map(std::path::PathBuf::from),
+            hosted,
+            // The test-only list's mock is on the compose network (a private address), which
+            // the hosted resolver refuses for a real entry; only that build accepts it.
+            hosted_net: Some(pmos_gateway::hosted::HostedNet {
+                allow_private: cfg!(feature = "stack-test-list"),
+                ..pmos_gateway::hosted::HostedNet::strict()
+            }),
         },
     );
     let listener = tokio::net::TcpListener::bind(config.bind)

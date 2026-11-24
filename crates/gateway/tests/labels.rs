@@ -412,6 +412,12 @@ fn http_as(source: &str) -> reqwest::Client {
         "x-pmos-model-source",
         reqwest::header::HeaderValue::from_str(source).unwrap(),
     );
+    // Under `local` and `hosted` every model call names its task (slice H12); a call that
+    // names its own run keeps it.
+    h.insert(
+        "x-pmos-run",
+        reqwest::header::HeaderValue::from_static("test-run"),
+    );
     reqwest::Client::builder()
         .default_headers(h)
         .build()

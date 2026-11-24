@@ -822,9 +822,13 @@ mod tests {
         assert!(run("", Some(("PMOS_MODEL_SOURCE", " ")))
             .unwrap_err()
             .contains("PMOS_MODEL_SOURCE is required"));
-        assert!(run("", Some(("PMOS_MODEL_SOURCE", "hosted")))
-            .unwrap_err()
-            .contains("not built yet"));
+        // Slice H12: `hosted` is taken; the gateway's compiled list decides whether it serves.
+        assert_eq!(
+            run("", Some(("PMOS_MODEL_SOURCE", "hosted")))
+                .unwrap()
+                .model_source,
+            pmos_contract::model_source::ModelSource::Hosted
+        );
         assert!(run("PMOS_GATEWAY_URL", None)
             .unwrap_err()
             .contains("PMOS_GATEWAY_URL is required"));

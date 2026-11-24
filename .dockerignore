@@ -11,3 +11,5 @@ deploy/.env
 !deploy/env.example
 !deploy/live.env.example
 deploy/backups/
+# The hosted model's key (slice H12): never in a build context or an image.
+deploy/secrets/

@@ -278,9 +278,15 @@ mod tests {
         assert!(with("PMOS_MODEL_SOURCE", "")
             .unwrap_err()
             .contains("PMOS_MODEL_SOURCE is required"));
-        assert!(with("PMOS_MODEL_SOURCE", "hosted")
+        // Slice H12: `hosted` is a setting every service takes; whether it can be served is
+        // the gateway's compiled list's to decide (empty as shipped, so it refuses).
+        assert_eq!(
+            with("PMOS_MODEL_SOURCE", "hosted").unwrap().model_source,
+            ModelSource::Hosted
+        );
+        assert!(with("PMOS_MODEL_SOURCE", "hosted:owner-hosted")
             .unwrap_err()
-            .contains("not built yet"));
+            .contains("must be"));
         assert!(with("PMOS_CONNECTORS", "")
             .unwrap_err()
             .contains("PMOS_CONNECTORS is required"));

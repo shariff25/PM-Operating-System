@@ -159,6 +159,36 @@ struct Inner {
     source: &'static str,
     /// `PMOS_MODEL_SOURCE=hosted-test`: every upstream error body is replaced (V3).
     hosted_test: bool,
+    /// `PMOS_MODEL_SOURCE`, as configured (the stub reports `stub` in `source`).
+    model_source: ModelSource,
+    /// Under `hosted`: the binding, and its two clients (streamed, whole).
+    hosted: Option<HostedClients>,
+}
+
+/// The hosted model's binding and its own clients (slice H12): compiled-in roots, no
+/// redirects, the hosted resolver.
+struct HostedClients {
+    binding: crate::hosted::Binding,
+    http: reqwest::Client,
+    whole_http: reqwest::Client,
+}
+
+impl Inner {
+    /// Every upstream error body is replaced with a neutral one (V3): under `hosted-test` and
+    /// `hosted`.
+    fn neutral_errors(&self) -> bool {
+        self.hosted_test || self.model_source == ModelSource::Hosted
+    }
+
+    /// The client for `kind`: the hosted ones for the hosted model, else the gateway's own.
+    fn client_for(&self, kind: UpstreamKind, whole: bool) -> Option<&reqwest::Client> {
+        match (kind, &self.hosted) {
+            (UpstreamKind::Hosted, Some(h)) => Some(if whole { &h.whole_http } else { &h.http }),
+            // A hosted role with no binding is sent nothing.
+            (UpstreamKind::Hosted, None) => None,
+            (_, _) => Some(if whole { &self.whole_http } else { &self.http }),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -183,13 +213,18 @@ impl Endpoint {
 }
 
 /// What the router takes beside [`GatewayConfig`], each with a default that changes nothing.
-#[derive(Debug, Default, Clone)]
+#[derive(Default, Clone)]
 pub struct RouterOptions {
     /// The upstreams' keys (`keys.rs`); `main` keeps a handle to reload them on `SIGHUP`.
     pub keys: Arc<KeyStore>,
     /// `$PMOS_STATE_DIR/route-control` (§4.11, slice MP8): `disabled-<label>` there takes that
     /// model out of every route, looked at before every call. `None`: no model is disabled.
     pub route_control: Option<std::path::PathBuf>,
+    /// Under `PMOS_MODEL_SOURCE=hosted` (slice H12): the checked binding to the approved entry
+    /// (`hosted::bind`). Required then: a `hosted` router without one serves nothing.
+    pub hosted: Option<crate::hosted::Binding>,
+    /// How the hosted clients are built ([`crate::hosted::HostedNet::strict`] when `None`).
+    pub hosted_net: Option<crate::hosted::HostedNet>,
 }
 
 pub fn router(cfg: GatewayConfig) -> Router {
@@ -230,9 +265,37 @@ pub fn router_with(mut cfg: GatewayConfig, opts: RouterOptions) -> Router {
         .timeout(cfg.timeouts.whole_answer)
         .build()
         .expect("http client builds");
-    let served = crate::config::served_source(cfg.model_source, cfg.stub);
-    // A remote test upstream's probe carries its key: at most one round per 30 seconds.
-    let ready_cache = if cfg.models.roles.values().any(|r| r.kind.is_cloud_test()) {
+    // Under `hosted` every answer reports `hosted:<name>` (one string per router, kept for the
+    // process's life).
+    let served: &'static str = match (&opts.hosted, cfg.stub) {
+        (Some(b), false) if cfg.model_source == ModelSource::Hosted => {
+            Box::leak(b.source().into_boxed_str())
+        }
+        _ => crate::config::served_source(cfg.model_source, cfg.stub),
+    };
+    let hosted = opts
+        .hosted
+        .clone()
+        .filter(|_| cfg.model_source == ModelSource::Hosted)
+        .map(|binding| {
+            let net = opts
+                .hosted_net
+                .clone()
+                .unwrap_or_else(crate::hosted::HostedNet::strict);
+            HostedClients {
+                http: crate::hosted::client(&binding, &net, &cfg.timeouts, false),
+                whole_http: crate::hosted::client(&binding, &net, &cfg.timeouts, true),
+                binding,
+            }
+        });
+    // A remote test upstream's probe carries its key, as does the hosted model's: at most one
+    // round per 30 seconds.
+    let ready_cache = if cfg
+        .models
+        .roles
+        .values()
+        .any(|r| r.kind.is_cloud_test() || r.kind == UpstreamKind::Hosted)
+    {
         cfg.timeouts.ready_cache.max(REMOTE_READY_CACHE)
     } else {
         cfg.timeouts.ready_cache
@@ -303,6 +366,8 @@ pub fn router_with(mut cfg: GatewayConfig, opts: RouterOptions) -> Router {
         probe: tokio::sync::Mutex::new(None),
         source: served,
         hosted_test: cfg.model_source == ModelSource::HostedTest,
+        model_source: cfg.model_source,
+        hosted,
     }));
     let v1 = Router::new()
         .route("/models", get(models))
@@ -460,15 +525,18 @@ async fn list_roles(State(state): State<AppState>) -> Response {
         .roles
         .values()
         .any(|r| r.kind.is_cloud_test());
-    Json(json!({
+    let mut body = json!({
         "class": state.0.models.class.as_str(),
         "model_source": state.0.source,
         "stub": state.0.stub,
         "cloud_test": cloud_test,
         "workarounds": state.0.workarounds_on,
         "roles": roles,
-    }))
-    .into_response()
+    });
+    if let Some(h) = &state.0.hosted {
+        body["hosted_name"] = json!(h.binding.name);
+    }
+    Json(body).into_response()
 }
 
 /// `GET /readyz`. Every answer says the gateway's `class` as served (`production` only for a
@@ -489,10 +557,11 @@ async fn readyz(State(state): State<AppState>) -> Response {
     let (running, waiting) = state.0.sched.snapshot();
     let class = state.0.models.class.as_str();
     if state.0.stub {
-        return Json(json!({"ready": true, "class": class, "stub": true,
+        let mut body = json!({"ready": true, "class": class, "stub": true,
                            "model_source": state.0.source,
-                           "running": running, "waiting": waiting}))
-        .into_response();
+                           "running": running, "waiting": waiting});
+        build_fields(&state.0, &mut body);
+        return Json(body).into_response();
     }
     let cloud_test = state
         .0
@@ -536,20 +605,69 @@ async fn readyz(State(state): State<AppState>) -> Response {
             )
         })
         .collect();
+    // Slice H12: the hosted model's own state, by word only.
+    let hosted_state = state.0.hosted.as_ref().map(|h| {
+        if h.binding.stopped() {
+            "stopped"
+        } else if state.0.keys.get(&h.binding.key_file).is_err() {
+            "no key"
+        } else if ok {
+            "ok"
+        } else {
+            "down"
+        }
+    });
+    if state.0.model_source == ModelSource::Hosted && hosted_state != Some("ok") {
+        ok = false;
+    }
     let status = if ok {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    (
-        status,
-        Json(
-            json!({"ready": ok, "class": class, "stub": false, "upstreams": checks,
+    let mut body = json!({"ready": ok, "class": class, "stub": false, "upstreams": checks,
                     "model_source": state.0.source,
-                    "cloud_test": cloud_test, "running": running, "waiting": waiting}),
-        ),
-    )
-        .into_response()
+                    "cloud_test": cloud_test, "running": running, "waiting": waiting});
+    if let Some(h) = hosted_state {
+        body["hosted"] = json!(h);
+    }
+    build_fields(&state.0, &mut body);
+    (status, Json(body)).into_response()
+}
+
+/// What every `/readyz` answer says about the build and the approved list (spec §3.6, "Built
+/// only from committed code", V5 and X5): which list is compiled in (`release`, or
+/// `stack-test` for the test-only build) and its SHA-256, the commit and the merged branch's
+/// commit it was built from, and under `hosted` the entry name, the effective data-class
+/// ceiling and whether TLS interception is allowed (with the bundle's SHA-256). Names and
+/// digests only, never a URL, host or model id.
+fn build_fields(inner: &Inner, body: &mut Value) {
+    let (kind, sha) = match &inner.hosted {
+        Some(h) => (h.binding.list_kind, h.binding.list_sha256.clone()),
+        None => match crate::hosted::compiled() {
+            Ok(l) => (l.kind, l.sha256),
+            Err(_) => (crate::hosted::ListKind::Release, String::new()),
+        },
+    };
+    body["approved_list"] = json!(kind.as_str());
+    body["approved_list_sha256"] = json!(sha);
+    let build = match &inner.hosted {
+        Some(h) => h.binding.build.clone(),
+        None => crate::hosted::BuildInfo::compiled(),
+    };
+    body["commit"] = json!(build.commit);
+    body["merged_commit"] = json!(build.merged_commit);
+    if let Some(at) = build.list_checked_at {
+        body["list_checked_at"] = json!(at);
+    }
+    if let Some(h) = &inner.hosted {
+        body["hosted_name"] = json!(h.binding.name);
+        body["max_data_class"] = json!(h.binding.max_data_class.to_string());
+        body["tls_interception"] = json!(h.binding.tls_interception.as_str());
+        if let Some((_, sha)) = &h.binding.extra_ca {
+            body["ca_bundle_sha256"] = json!(sha);
+        }
+    }
 }
 
 /// Whether a routed hop can be used now: its upstream answered the last probe, neither its
@@ -709,19 +827,33 @@ async fn probe_now(inner: &Inner) -> std::collections::HashMap<String, bool> {
             .roles
             .values()
             .flat_map(Role::hops)
-            .find(|h| h.upstream == base && h.kind == UpstreamKind::RemoteOpenAi);
+            .find(|h| h.upstream == base && h.kind.is_remote_openai());
         let remote = hop.is_some();
+        let hosted = hop.as_ref().is_some_and(|h| h.kind == UpstreamKind::Hosted);
+        // The hosted model while stopped (the stop file, read now), or with no binding: no
+        // probe is sent, and it reads as down.
+        if hosted && inner.hosted.as_ref().is_none_or(|h| h.binding.stopped()) {
+            up_by_base.insert(base, false);
+            continue;
+        }
+        let client = match hop.as_ref().map(|h| h.kind) {
+            Some(kind) => inner.client_for(kind, false),
+            None => Some(&inner.http),
+        };
+        let Some(client) = client else {
+            up_by_base.insert(base, false);
+            continue;
+        };
         let probe = match hop.map(|h| upstream_key(inner, &h)) {
             // Its key file can't be used: nothing is sent, and it reads as down.
             Some(Err(_)) => {
                 up_by_base.insert(base, false);
                 continue;
             }
-            Some(Ok(key)) => inner
-                .http
+            Some(Ok(key)) => client
                 .get(format!("{base}/models"))
                 .bearer_auth(key.unwrap_or_default()),
-            None => inner.http.get(format!("{base}/models")),
+            None => client.get(format!("{base}/models")),
         };
         let up = tokio::time::timeout(
             Duration::from_secs(if remote { 5 } else { 2 }),
@@ -971,6 +1103,8 @@ enum Attempt {
     },
     /// No answer at all.
     Down(reqwest::Error),
+    /// A hosted role with no binding: nothing was sent.
+    Unbound,
 }
 
 /// Logs the event when a streamed answer ends (finished or the caller hung up), and holds the
@@ -1163,6 +1297,17 @@ async fn forward(
         );
         return refused;
     }
+    // Slice H12 (spec §3.6, "The usage log joins the audit log"): under `local` and `hosted`
+    // every model call names its task (`X-Pmos-Run`), so each usage line joins the audit log.
+    if matches!(inner.model_source, ModelSource::Local | ModelSource::Hosted)
+        && headers.get("x-pmos-run").is_none()
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "run_required",
+            "say which task this call is for in X-Pmos-Run",
+        );
+    }
     // A usage line for a call refused before it reached the queue or a slot.
     let refused_line = |status: u16,
                         user: Option<String>,
@@ -1200,6 +1345,7 @@ async fn forward(
         reason: None,
         skipped: Vec::new(),
         upstream_sha256: None,
+        model_source: Some(inner.source),
     };
     let who = match caller(&headers, &client, &policy) {
         Ok(c) => c,
@@ -1319,6 +1465,7 @@ async fn forward(
         reason: None,
         skipped: Vec::new(),
         upstream_sha256: None,
+        model_source: Some(inner.source),
     };
     let model_header = HeaderValue::from_str(role.reported_model()).ok();
     let primary_sha = role.model_sha256();
@@ -1406,11 +1553,43 @@ async fn forward(
     }
     let upstream_stream = stream && !whole_for_stream;
     let url = format!("{}/{}", role.upstream, endpoint.path());
-    let remote = role.kind == UpstreamKind::RemoteOpenAi;
+    let remote = role.kind.is_remote_openai();
+    let hosted_role = role.kind == UpstreamKind::Hosted;
+    // Slice H12 (spec §3.6, "The stop file", r7 V7): before every hosted call, the stop file,
+    // read now (a `stat`, never cached). Present, or no binding: nothing is sent.
+    if hosted_role && inner.hosted.as_ref().is_none_or(|h| h.binding.stopped()) {
+        event.status = 503;
+        event.attempts = 0;
+        event.latency_ms = started.elapsed().as_millis() as u64;
+        inner.usage.record(event);
+        tracing::warn!(role = %role.alias(), upstream = "hosted", "the hosted model is stopped; nothing was sent");
+        return finish(error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "hosted_stopped",
+            "the hosted model is stopped by an administrator; nothing was sent",
+        ));
+    }
     // The upstream's own key (slice MP2): its `key-file:`, else `PMOS_GATEWAY_REMOTE_KEY`. A
-    // key file that can't be used sends nothing.
+    // key file that can't be used sends nothing. The hosted model's key file is
+    // `PMOS_GATEWAY_HOSTED_KEY_FILE`, re-read on a change and on `SIGHUP`; empty or unreadable
+    // is `503 hosted_key_missing` (V7).
     let key = match upstream_key(inner, &role.hops()[0]) {
         Ok(k) => k.unwrap_or_default(),
+        Err(why) if hosted_role => {
+            tracing::warn!(
+                role = %role.alias(), upstream = "hosted", reason = why.as_str(),
+                "the hosted model's key file can't be used; nothing was sent"
+            );
+            event.status = 503;
+            event.attempts = 0;
+            event.latency_ms = started.elapsed().as_millis() as u64;
+            inner.usage.record(event);
+            return finish(error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "hosted_key_missing",
+                "the hosted model's key is missing; nothing was sent",
+            ));
+        }
         Err(why) => {
             tracing::warn!(
                 role = %role.alias(), upstream = role.upstream_kind_label(), reason = why.as_str(),
@@ -1455,10 +1634,8 @@ async fn forward(
         attempt += 1;
         // Not streamed: nothing arrives until the answer is whole, so the silence limit
         // would cut off every long generation.
-        let client = if upstream_stream {
-            &inner.http
-        } else {
-            &inner.whole_http
+        let Some(client) = inner.client_for(role.kind, !upstream_stream) else {
+            break Attempt::Unbound;
         };
         let post = client.post(&url);
         // The client's own gateway token never goes upstream; the remote key does.
@@ -1487,7 +1664,7 @@ async fn forward(
                 body,
             } => (*status, headers.clone(), body.clone()),
             Attempt::Down(e) if e.is_connect() => (0, HeaderMap::new(), Bytes::new()),
-            Attempt::Down(_) => break this,
+            Attempt::Down(_) | Attempt::Unbound => break this,
         };
         let Some(wait) =
             inner
@@ -1539,11 +1716,21 @@ async fn forward(
             event.status = status;
             event.latency_ms = started.elapsed().as_millis() as u64;
             inner.usage.record(event);
-            let mut res = upstream_error_answer(&role, inner.hosted_test, status, body);
+            let mut res = upstream_error_answer(&role, inner.neutral_errors(), status, body);
             if let Some(v) = headers.get(header::RETRY_AFTER) {
                 res.headers_mut().insert(header::RETRY_AFTER, v.clone());
             }
             return finish(res);
+        }
+        Attempt::Unbound => {
+            event.status = 503;
+            event.latency_ms = started.elapsed().as_millis() as u64;
+            inner.usage.record(event);
+            return finish(error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "upstream_error",
+                format!("the `{}` model server is unavailable", role.name),
+            ));
         }
         Attempt::Down(e) => {
             // V3: the role and its kind label, and the error's kind, never its text (which
@@ -1644,7 +1831,7 @@ async fn forward(
         // for a labelled role it may name the model, so a neutral one takes its place.
         return finish(upstream_error_answer(
             &role,
-            inner.hosted_test,
+            inner.neutral_errors(),
             status.as_u16(),
             bytes,
         ));
@@ -2170,13 +2357,13 @@ async fn attempt_hop(
         }
     }
     let upstream_stream = stream && !whole_for_stream;
-    if hop.kind == UpstreamKind::RemoteOpenAi {
+    if hop.kind.is_remote_openai() {
         inner.extras.restore(&hop.upstream, &mut req);
     }
-    let client = if upstream_stream {
-        &inner.http
-    } else {
-        &inner.whole_http
+    // A route across the hosted entry's models is slice MP9 and refused at start; a hosted hop
+    // with no binding is sent nothing.
+    let Some(client) = inner.client_for(hop.kind, !upstream_stream) else {
+        return fail("connect", Same::No, Hit::Count, Scope::Upstream);
     };
     let post = client.post(format!("{}/{}", hop.upstream, endpoint.path()));
     let post = match key {
@@ -2440,6 +2627,8 @@ fn upstream_key(inner: &Inner, hop: &Hop) -> Result<Option<String>, Unusable> {
         UpstreamKind::RemoteOpenAi => Some(inner.remote_key.clone()),
         UpstreamKind::ClaudeTest => Some(inner.anthropic_key.clone()),
         UpstreamKind::OpenAi => None,
+        // `hosted::bind` gives every hosted role its key file; without one, nothing is sent.
+        UpstreamKind::Hosted => return Err(Unusable::Missing),
     })
 }
 
@@ -2532,7 +2721,8 @@ pub fn neutral_error(status: u16, body: &[u8]) -> Value {
 
 /// The answer a caller gets for an upstream's non-2xx answer: as it came for a role without
 /// a label under `local` (PM OS's own vLLM, whose messages, such as "context too long", help
-/// the caller); for a labelled role, and for every role under `hosted-test` (V3, slice H4),
+/// the caller); for a labelled role, and for every role under `hosted-test` (V3, slice H4)
+/// and `hosted` (slice H12),
 /// [`neutral_error`] with the same status, so a provider's `401` body (a masked key, an
 /// account id, the vendor's name) never reaches a worker, a trace or a draft. The caller adds
 /// any `Retry-After`.

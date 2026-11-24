@@ -1,0 +1,76 @@
+# PM OS gateway for PMOS_MODEL_SOURCE=hosted: every role on the one owner-approved hosted model
+# (docs/openshell-any-host-spec.md §3.6, "The hosted model as a production source"; slice H12).
+#
+# No URL and no model id here (r7, X1: no committed file may identify the hosted model's vendor):
+# the upstream is `hosted:<name>`, the entry name on the approved list compiled into the gateway
+# (crates/gateway/approved-hosted.yaml, which ships EMPTY, so this config is refused until the
+# owner's slice H13 adds the entry and renames `owner-hosted` below if the entry's name differs).
+# Each role's model is `host:<ref>`; the host gives the URL in PMOS_GATEWAY_HOSTED_URL and each
+# ref's model id in PMOS_GATEWAY_HOSTED_MODELS (deploy/.env), and the gateway refuses to start
+# unless the URL's digest is the entry's url_sha256 and every role's id hashes to one of its
+# model_sha256. Every role has a role label, which is what the gateway reports in place of the
+# id, and no label may equal an entry name. The key is never in a config file:
+# PMOS_GATEWAY_HOSTED_KEY_FILE (deploy/secrets/hosted-model.key, the gateway container only).
+#
+# `class: production`: one `hosted:<name>` upstream, never beside a `*.pmos.internal` model
+# server, and never a testing-only `openai+` or `anthropic+` upstream. Routes across models of one
+# approved entry are slice MP9 (docs/model-providers-spec.md), not built: one model per role.
+class: production
+upstreams:
+  hosted: "hosted:owner-hosted"
+roles:
+  default: {upstream: hosted, model: "host:main", label: hosted-model-a}
+  reasoning: {upstream: hosted, model: "host:main", label: hosted-model-a}
+  extraction: {upstream: hosted, model: "host:main", label: hosted-model-a}
+limits:
+  max-in-flight: 4
+  # One PM's running calls: one for the runtime, one for the team bots together and one for
+  # their own bot (person-pools below). So one PM can hold 3 of the 4 model slots at once.
+  per-user: 3
+  # A client not listed under `clients:` holds at most this many slots, as before per-user
+  # went to 3 (it would otherwise default to per-user).
+  per-client: 2
+  max-queue: 64
+  # How long a call may wait for a slot (then 503 with Retry-After), how long a streamed
+  # answer may take in all, and the largest answer taken from a model server. These are the
+  # defaults, written out (docs/gateway.md, "Sharing the GPU").
+  queue-wait-secs: 300
+  stream-max-secs: 900
+  max-answer-bytes: 16777216
+  # How many calls one person may have waiting for a slot through each client. Each client may
+  # have twice its max-in-flight waiting (its `max-queue`), so no one token fills the queue
+  # (review finding R2). Kept at 4 when per-user went from 2 to 3 (W1).
+  per-user-queue: 4
+# Person pools (finding W1 of the review at 52dbae2): how many of one PM's per-user (3) running
+# slots the clients of each pool hold together. The runtime has a pool of its own, so a team
+# bot's token, even a stolen one, can never keep the slot a PM's routine parsing needs; the team
+# bots share the other; and what the pools leave (3 - 1 - 1 = 1) is the PM's own bot's
+# (bot-pm-*), whose share can be no more than that, so every pool's slot is really kept.
+person-pools:
+  runtime: 1
+  team-bots: 1
+# Who may say which person a call is for (X-Pmos-User) and how urgent it is (X-Pmos-Priority),
+# and how many calls each client token may have in flight (review findings N3 and N4). A client
+# not listed here is not trusted: its calls are keyed by its own name, run as `personal`, and
+# hold at most `per-client` (2) slots.
+clients:
+  # What is guaranteed for each PM (W1, review at 52dbae2; G3 and U1 before it): one of their
+  # three running slots is only ever the runtime's, one only ever the team bots' (all of them
+  # together), and one only ever their own bot's. So each of the three starts as soon as a GPU
+  # slot (max-in-flight) is free, whatever the other two are doing for that PM, and no PM ever
+  # has more than 3 running (docs/gateway.md, "A person's slots").
+  # The bot runtime: it parses routines for the PM its caller verified. In its own pool of
+  # one, it runs one call per PM at a time (U2): a PM's second routine waits for the first,
+  # up to queue-wait-secs (300), then gets 503 with Retry-After (docs/gateway.md, U2).
+  runtime: {trusted: true, max-in-flight: 2, person-pool: runtime}
+  # Each PM's own bot's worker (bot-pm-<handle>): it may name only the PM its name spells
+  # (`user: from-name`; naming anyone else is 403, in the usage log; review finding R1). It
+  # holds the one slot of its PM's the pools leave.
+  bot-pm-*: {trusted: true, max-in-flight: 3, user: from-name}
+  # Each team bot's worker (bot-docs, ...): it names the PM whose task it runs, any PM, in the
+  # team bots' pool of one per PM. At most 3 of the 4 slots each, so no one bot's token holds
+  # them all.
+  bot-*: {trusted: true, max-in-flight: 3, person-pool: team-bots}
+  # The eval stack (deploy/compose.evals.yaml): its runtime, workers and judges share this
+  # token. One slot, background priority, so a benchmark never takes production's capacity.
+  evals: {max-in-flight: 1, priority: personal, route: pin}

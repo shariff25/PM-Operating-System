@@ -1,0 +1,16 @@
+# TEST ONLY: the approved list a gateway built with the `stack-test-list` feature carries
+# INSTEAD of approved-hosted.yaml (docs/openshell-any-host-spec.md §3.6, "How H12's stack test
+# runs `hosted`"). Built only by deploy/test/Dockerfile.gateway-stack-test; CI checks no release
+# build can enable the feature. Every PM OS service treats a gateway that reports
+# `hosted:stack-test` as fake-data mode, so even a misplaced test image can't take real data.
+#
+# The digests name only the stack test's local mock: deploy/test/hosted-stack-test.url,
+# deploy/test/hosted-stack-test.model and deploy/test/hosted-stack-test-record.md (a stand-in
+# record that approves nothing). A test checks they match.
+- name: stack-test
+  url_sha256: "697282c638eb35787ca704d77a62de1d5013f5b423b513982156895d6c2155b7"
+  model_sha256: ["d94ac8c24535dea103eb072799929ea6ae0e7d4ec08077ebdd9cbfd29d11247b"]
+  record_sha256: "2c3a73d27a3b5dfb427b775d23ac166280248a48b64836a6af954372cfb2a55f"
+  pull: 1
+  max_data_class: restricted
+  tls_interception: allowed

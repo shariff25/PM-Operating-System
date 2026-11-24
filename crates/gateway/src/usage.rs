@@ -97,6 +97,10 @@ pub struct UsageEvent {
     /// upstreams can be told apart without naming either.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_sha256: Option<String>,
+    /// The source the gateway served the call from (`local`, `hosted:<name>`, `hosted-test`,
+    /// `stub`; slice H12), so each line joins the audit log's `model_source` on `run`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_source: Option<&'static str>,
 }
 
 /// A model of a route that a call didn't try (§4.9): its label and why (`disabled`,
@@ -318,6 +322,7 @@ mod tests {
             reason: None,
             skipped: Vec::new(),
             upstream_sha256: None,
+            model_source: None,
         }
     }
 
