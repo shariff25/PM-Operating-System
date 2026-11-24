@@ -47,6 +47,12 @@ async fn main() -> Result<()> {
         fake_data_only = fake_only,
         "model source"
     );
+    // Slice H12: under `hosted`, whether this stack would pass every fake-data check (for a
+    // gateway built with the test-only list, which every service treats as fake-data mode).
+    let fake_eligible = config.fake_settings
+        && matches!(config.connectors, Connectors::Fake)
+        && config.memory != MemoryBackend::Github
+        && pmos_contract::model_source::check_test_content(&config.content_root).is_ok();
     // Fake-data mode (slice H4): the content checkout must be test content.
     if fake_only {
         pmos_contract::model_source::check_test_content(&config.content_root).map_err(|c| {
@@ -60,6 +66,10 @@ async fn main() -> Result<()> {
     let catalog =
         Catalog::load(&config.content_root, Utc::now().date_naive()).context("loading content")?;
     let cancel = CancellationToken::new();
+    // Slice H12: the model-source history (the switch acknowledgement, X3) lives in the
+    // database; `held_real_data` is read once, here, where it is written.
+    let mut source_history = pmos_toolserver::model_source::History::default();
+    let mut held_real_data = false;
 
     let mut stores = match &config.database_url {
         Some(url) => {
@@ -74,6 +84,11 @@ async fn main() -> Result<()> {
             pg.check_held_real_data(real, fake_only)
                 .await
                 .map_err(anyhow::Error::msg)?;
+            held_real_data = pg
+                .held_real_data()
+                .await
+                .context("reading held_real_data")?;
+            source_history = pmos_toolserver::model_source::History::Pg(pg.clone());
             let report = pg
                 .reindex(&load_docs(&config.content_root))
                 .await
@@ -254,10 +269,17 @@ async fn main() -> Result<()> {
         .with_slack_draft_ttl_hours(config.slack_draft_ttl_hours)
         .with_audit_retention_days(config.audit_retention_days)
         // Slice H4: every session open and tool call checks the gateway's model source.
-        .with_model_source(Arc::new(pmos_toolserver::model_source::SourceGuard::new(
-            config.model_source,
-            &config.gateway_url,
-        )));
+        .with_model_source(Arc::new(
+            pmos_toolserver::model_source::SourceGuard::new(
+                config.model_source,
+                &config.gateway_url,
+            )
+            .with_history(source_history)
+            .with_held_real_data(held_real_data)
+            // A gateway with the test-only list (`hosted:stack-test`) is taken under
+            // `hosted` only when this stack would pass every fake-data check.
+            .with_fake_eligible(fake_eligible && !held_real_data),
+        ));
     // Password sign-in (docs/password-sign-in.md): on when the vault has a key to seal
     // authenticator secrets with; its routes also need assertion `require`.
     match &config.password_keys {

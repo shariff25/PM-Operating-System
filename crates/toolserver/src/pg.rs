@@ -147,6 +147,97 @@ impl PgStore {
         Ok(())
     }
 
+    /// Slice H12 (r7, X3): records that `source` was served at `now` (first or again); returns
+    /// the source served last before it.
+    pub async fn source_served(
+        &self,
+        source: &str,
+        real: bool,
+        now: DateTime<Utc>,
+    ) -> StoreResult<Option<String>> {
+        let mut tx = self.pool.begin().await?;
+        // One writer at a time, so "the last before it" is the real one.
+        sqlx::query("LOCK TABLE model_source_history IN SHARE ROW EXCLUSIVE MODE")
+            .execute(&mut *tx)
+            .await?;
+        let before: Option<String> = sqlx::query_scalar(
+            "SELECT source FROM model_source_history ORDER BY last_at DESC, source LIMIT 1",
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO model_source_history (source, real, first_at, last_at)
+             VALUES ($1, $2, $3, $3)
+             ON CONFLICT (source) DO UPDATE
+               SET last_at = GREATEST(model_source_history.last_at, EXCLUDED.last_at)",
+        )
+        .bind(source)
+        .bind(real)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(before)
+    }
+
+    /// Every source this database has served.
+    pub async fn source_history(&self) -> StoreResult<Vec<crate::model_source::SourceRecord>> {
+        let rows = sqlx::query(
+            "SELECT source, real, first_at, last_at FROM model_source_history ORDER BY first_at",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(crate::model_source::SourceRecord {
+                    source: r.try_get("source")?,
+                    real: r.try_get("real")?,
+                    first_at: r.try_get("first_at")?,
+                    last_at: r.try_get("last_at")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Every acknowledgement of a switch to a hosted entry.
+    pub async fn source_acknowledgements(
+        &self,
+    ) -> StoreResult<Vec<crate::model_source::Acknowledgement>> {
+        let rows = sqlx::query(
+            "SELECT to_source, by_user, reason, at FROM model_source_acknowledgements ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(crate::model_source::Acknowledgement {
+                    to: r.try_get("to_source")?,
+                    by: r.try_get("by_user")?,
+                    reason: r.try_get("reason")?,
+                    at: r.try_get("at")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Records an acknowledgement (permanent).
+    pub async fn acknowledge_source(
+        &self,
+        ack: &crate::model_source::Acknowledgement,
+    ) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO model_source_acknowledgements (to_source, by_user, reason, at)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(&ack.to)
+        .bind(&ack.by)
+        .bind(&ack.reason)
+        .bind(ack.at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Every store, backed by this database.
     pub fn stores(&self) -> Stores {
         let s = std::sync::Arc::new(self.clone());

@@ -602,11 +602,69 @@ impl ToolService {
         }
     }
 
-    /// Records the source `session` opened under.
-    fn record_source(&self, session: &Session, source: Option<String>) {
-        if let (Some(guard), Some(source)) = (&self.model_source, source) {
-            guard.record(&session.token, source);
+    /// The model-source guard, when the gateway is checked (`main` always sets it).
+    pub fn model_source_guard(&self) -> Option<&Arc<crate::model_source::SourceGuard>> {
+        self.model_source.as_ref()
+    }
+
+    /// Records the source `session` opened under, and that the database served it (slice
+    /// H12): a `session.open` audit event with the source, the approved list's digest and the
+    /// gateway's commit (§3.9), and `system.model_source` when it differs from the source the
+    /// database served last. A history that can't be written refuses the session.
+    async fn record_source(
+        &self,
+        session: &Session,
+        source: Option<String>,
+        now: DateTime<Utc>,
+    ) -> Result<(), SessionError> {
+        let (Some(guard), Some(source)) = (&self.model_source, source) else {
+            return Ok(());
+        };
+        let changed = match guard.record(&session.token, source.clone(), now).await {
+            Ok(c) => c,
+            Err(why) => {
+                tracing::error!(reason = %why, "recording the session's model source failed");
+                let _ = self.revoke_session(&session.token).await;
+                guard.forget(&session.token);
+                return Err(SessionError::ModelSourceChanged(format!(
+                    "{why}; refused until it can be recorded"
+                )));
+            }
+        };
+        let report = guard.last_report().unwrap_or_default();
+        let event = |tool: &str, detail: String| AuditEvent {
+            client: Client::System,
+            at: now,
+            run_id: session.run_id.clone(),
+            user: session.user.clone(),
+            skill: session.skill.clone(),
+            bot: session.bot.clone(),
+            tool: tool.to_string(),
+            outcome: Outcome::Ok,
+            sources: Vec::new(),
+            source_titles: Default::default(),
+            args_hash: None,
+            output_ref: None,
+            detail: Some(detail),
+            persona: session.persona.clone(),
+        };
+        if let Some(from) = changed {
+            self.audit(event(
+                crate::model_source::SYSTEM_MODEL_SOURCE,
+                format!("from: {from}; to: {source}"),
+            ))
+            .await;
         }
+        self.audit(event(
+            crate::model_source::SESSION_OPEN,
+            format!(
+                "model_source: {source}; approved_list_sha256: {}; commit: {}",
+                report.approved_list_sha256.as_deref().unwrap_or("unknown"),
+                report.commit.as_deref().unwrap_or("unknown")
+            ),
+        ))
+        .await;
+        Ok(())
     }
 
     /// Before a tool call: the gateway still serves the session's source. Otherwise the
@@ -891,7 +949,7 @@ impl ToolService {
         let mut session = Session::new(user, skill, run_id, ttl, now);
         session.sources_sensitivity = floor;
         self.stores.sessions.insert(&session, now).await?;
-        self.record_source(&session, source);
+        self.record_source(&session, source, now).await?;
         Ok(session)
     }
 
@@ -986,7 +1044,7 @@ impl ToolService {
         session.persona = persona.map(String::from);
         session.sources_sensitivity = floor;
         self.stores.sessions.insert(&session, now).await?;
-        self.record_source(&session, source);
+        self.record_source(&session, source, now).await?;
         Ok(session)
     }
 
@@ -1337,6 +1395,19 @@ impl ToolService {
         session: &Session,
         read: Option<Sensitivity>,
     ) -> Result<(), ToolError> {
+        // Slice H12 (r6, V11): under `hosted`, a result above the gateway's effective
+        // data-class ceiling is refused, naming the class, never the content; the call's audit
+        // event records it as denied.
+        if let (Some(class), Some(ceiling)) =
+            (read, self.model_source.as_ref().and_then(|g| g.ceiling()))
+        {
+            if class > ceiling {
+                return Err(ToolError::Forbidden(format!(
+                    "this result holds `{class}` data, above the hosted model's data-class \
+                     ceiling (`{ceiling}`), so it is not sent to the model"
+                )));
+            }
+        }
         match read {
             // Every session starts at public.
             Some(class) if class > Sensitivity::Public => Ok(self
