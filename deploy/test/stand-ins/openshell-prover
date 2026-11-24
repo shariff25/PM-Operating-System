@@ -40,6 +40,20 @@ if [ -f "$here/answers" ]; then
   [ -n "$found" ] && answer=$found
 fi
 if [ "$answer" = within ] && grep -q 'protocol: mcp' "$candidate"; then answer=unsupported; fi
+# The planted widenings of scripts/policy-prover-ci.sh, as the real prover should see them.
+planted=""
+if [ "$answer" = within ]; then
+  if grep -q 'planted\.example' "$candidate"; then planted="network_l4 planted.example:443"
+  elif grep -q '10\.201\.77\.0/24' "$candidate"; then planted="network_l4 10.201.77.0/24"
+  elif grep -qx '    - /sandbox' "$candidate"; then planted="filesystem write /sandbox"
+  elif grep -q 'best_effort' "$candidate"; then planted="landlock best_effort"
+  elif grep -q 'run_as_user: root' "$candidate"; then planted="process run_as_user root"
+  fi
+fi
+if [ -n "$planted" ]; then
+  printf '{"result":"exceeds_boundary","counterexample":"%s",%s}\n' "$planted" "$all"
+  exit 1
+fi
 case "$answer" in
   within) printf '{"result":"within_boundary",%s}\n' "$all"; exit 0 ;;
   exceeds) printf '{"result":"exceeds_boundary","counterexample":"filesystem write /sandbox",%s}\n' "$all"; exit 1 ;;
