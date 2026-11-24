@@ -1,0 +1,720 @@
+{
+  "category": "staff-craft",
+  "bot": "pm-evals",
+  "date": "2026-11-24",
+  "started_at": "2026-11-24T05:41:47.483636797Z",
+  "finished_at": "2026-11-24T06:23:10.738861662Z",
+  "pass_bar": 0.8,
+  "runtime_url": "http://127.0.0.1:8850, http://127.0.0.1:8950, http://127.0.0.1:9050, http://127.0.0.1:9150",
+  "requested_by": "evals",
+  "gateway_workarounds": null,
+  "note": "E4: full run on the test stack, streamed calls, hosted-model-a, fake fixtures",
+  "gateway_models": {
+    "roles": {
+      "default": "hosted-model-a",
+      "extraction": "hosted-model-a",
+      "reasoning": "hosted-model-a"
+    },
+    "upstreams": {
+      "default": "remote-test",
+      "extraction": "remote-test",
+      "reasoning": "remote-test"
+    },
+    "stub": false,
+    "cloud_test": true,
+    "workarounds": true,
+    "class": "test",
+    "model_sha256": {
+      "default": "e8f0d28d3c21c3b359dbe88694b49554ec3782fc18161acaf633383c27316cb9",
+      "extraction": "e8f0d28d3c21c3b359dbe88694b49554ec3782fc18161acaf633383c27316cb9",
+      "reasoning": "e8f0d28d3c21c3b359dbe88694b49554ec3782fc18161acaf633383c27316cb9"
+    }
+  },
+  "repeats": 3,
+  "isolation": "a fresh tool server for every attempt (`fresh-toolserver` before each), 4 lanes",
+  "judges": [
+    {
+      "name": "says-what-stops",
+      "blocking": false,
+      "reason": "advisory: not calibrated"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "coach-feedback-creates-no-draft",
+      "ask": "Coach me on how to give feedback to the PM who wrote the Key export v2 PRD (Confluence page 9002). What are the three changes that matter most?",
+      "repeat": 1,
+      "cluster": "coach-feedback",
+      "task_id": "tsk_8365fae2318a4f97b3df02d7010c4790",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 163.613,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "says-what-stops",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "coach-feedback-creates-no-draft",
+      "ask": "Coach me on how to give feedback to the PM who wrote the Key export v2 PRD (Confluence page 9002). What are the three changes that matter most?",
+      "repeat": 2,
+      "cluster": "coach-feedback",
+      "task_id": "tsk_9cf03ab5493e471584812cf0796cc37e",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 268.441,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "says-what-stops",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "coach-feedback-creates-no-draft",
+      "ask": "Coach me on how to give feedback to the PM who wrote the Key export v2 PRD (Confluence page 9002). What are the three changes that matter most?",
+      "repeat": 3,
+      "cluster": "coach-feedback",
+      "task_id": "tsk_f5fab03d29624dfa813184bfb683000f",
+      "status": "done",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 207.027,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "says-what-stops",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "open-bet-records-one-draft",
+      "ask": "Draft anyway, no questions: open a bet in my bets register. Key sso-unlocks-enterprise, title \"SSO unlocks enterprise deals\". The bet: shipping SAML SSO for the Acme Vault console lets us close the two customers who asked for it (Confluence page 9001). Metric: enterprise deals won that named SSO, 4 by 2027-06-30, from the sales log. Riskiest assumption: SSO, not audit export, is what blocks those deals. Test: ask both customers whether SSO alone would let them sign. Review by 2027-02-01.",
+      "repeat": 1,
+      "cluster": "bets-register",
+      "task_id": "tsk_6cabbb3d1076400baabf3b09122c3db2",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 62.596,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "says-what-stops",
+          "verdict": false,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "open-bet-records-one-draft",
+      "ask": "Draft anyway, no questions: open a bet in my bets register. Key sso-unlocks-enterprise, title \"SSO unlocks enterprise deals\". The bet: shipping SAML SSO for the Acme Vault console lets us close the two customers who asked for it (Confluence page 9001). Metric: enterprise deals won that named SSO, 4 by 2027-06-30, from the sales log. Riskiest assumption: SSO, not audit export, is what blocks those deals. Test: ask both customers whether SSO alone would let them sign. Review by 2027-02-01.",
+      "repeat": 2,
+      "cluster": "bets-register",
+      "task_id": "tsk_15719badc86447fdb14544751ea3e4eb",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 76.263,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "says-what-stops",
+          "verdict": false,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "open-bet-records-one-draft",
+      "ask": "Draft anyway, no questions: open a bet in my bets register. Key sso-unlocks-enterprise, title \"SSO unlocks enterprise deals\". The bet: shipping SAML SSO for the Acme Vault console lets us close the two customers who asked for it (Confluence page 9001). Metric: enterprise deals won that named SSO, 4 by 2027-06-30, from the sales log. Riskiest assumption: SSO, not audit export, is what blocks those deals. Test: ask both customers whether SSO alone would let them sign. Review by 2027-02-01.",
+      "repeat": 3,
+      "cluster": "bets-register",
+      "task_id": "tsk_8e4bfb1113a3489c863b2216222aad93",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 74.814,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "says-what-stops",
+          "verdict": false,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "strategy-doc-cross-team-effects",
+      "ask": "Draft anyway, no questions: a strategy doc in the PM space for enterprise identity across Acme Vault and Acme Cloud (SAML SSO and SCIM), from Jira epic PM-101, story PM-102 and the October Acme Cloud call notes (Confluence page 9001).",
+      "repeat": 1,
+      "cluster": "strategy-doc",
+      "task_id": "tsk_b8e1d8d890b54f25842f251954cc608b",
+      "status": "working",
+      "passed": false,
+      "failures": [
+        {
+          "check": "timed_out",
+          "status": "working"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "timed out while `working`",
+        "sub": "model/timed-out"
+      },
+      "queue_secs": 0.0,
+      "total_secs": null,
+      "attempts": 1,
+      "trace_read": true,
+      "cancel": {
+        "cancelled": true,
+        "worker_stopped": true,
+        "secs": 12.024943565
+      }
+    },
+    {
+      "id": "strategy-doc-cross-team-effects",
+      "ask": "Draft anyway, no questions: a strategy doc in the PM space for enterprise identity across Acme Vault and Acme Cloud (SAML SSO and SCIM), from Jira epic PM-101, story PM-102 and the October Acme Cloud call notes (Confluence page 9001).",
+      "repeat": 2,
+      "cluster": "strategy-doc",
+      "task_id": "tsk_b91920b6732f4b4bb2fa9afc213a3378",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 374.303,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "says-what-stops",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "strategy-doc-cross-team-effects",
+      "ask": "Draft anyway, no questions: a strategy doc in the PM space for enterprise identity across Acme Vault and Acme Cloud (SAML SSO and SCIM), from Jira epic PM-101, story PM-102 and the October Acme Cloud call notes (Confluence page 9001).",
+      "repeat": 3,
+      "cluster": "strategy-doc",
+      "task_id": "tsk_7ba505f76ecc4a6c8ba3a43f8d449072",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 498.09,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "says-what-stops",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-alignment-plan",
+      "ask": "Draft anyway, no questions: an alignment plan in the PM space for moving SCIM user provisioning (Jira story PM-102) ahead of audit log export. The Acme Cloud team would have to wait; we need their lead and the engineering director to agree.",
+      "repeat": 1,
+      "cluster": "alignment-plan",
+      "task_id": "tsk_15294b2539374cc49d565d77f5f8c9a9",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 379.913,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "says-what-stops",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-alignment-plan",
+      "ask": "Draft anyway, no questions: an alignment plan in the PM space for moving SCIM user provisioning (Jira story PM-102) ahead of audit log export. The Acme Cloud team would have to wait; we need their lead and the engineering director to agree.",
+      "repeat": 2,
+      "cluster": "alignment-plan",
+      "task_id": "tsk_5fe2be59a7db4820a5cf8a6a5584bca7",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 288.418,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "says-what-stops",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-alignment-plan",
+      "ask": "Draft anyway, no questions: an alignment plan in the PM space for moving SCIM user provisioning (Jira story PM-102) ahead of audit log export. The Acme Cloud team would have to wait; we need their lead and the engineering director to agree.",
+      "repeat": 3,
+      "cluster": "alignment-plan",
+      "task_id": "tsk_4779d773bafc428cb17c9926a9f2b1b7",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 504.951,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "says-what-stops",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-business-review",
+      "ask": "Draft anyway, no questions: a business review in the PM space for the Acme Vault console last quarter, from the PM and CLD Jira projects and the October Acme Cloud call notes (Confluence page 9001), for the directors.",
+      "repeat": 1,
+      "cluster": "business-review",
+      "task_id": "tsk_7d77d06de4a242fba49881e0133c6d9c",
+      "status": "working",
+      "passed": false,
+      "failures": [
+        {
+          "check": "timed_out",
+          "status": "working"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "timed out while `working`",
+        "sub": "model/timed-out"
+      },
+      "queue_secs": 0.0,
+      "total_secs": null,
+      "attempts": 1,
+      "trace_read": true,
+      "cancel": {
+        "cancelled": true,
+        "worker_stopped": true,
+        "secs": 30.072318534
+      }
+    },
+    {
+      "id": "structure-business-review",
+      "ask": "Draft anyway, no questions: a business review in the PM space for the Acme Vault console last quarter, from the PM and CLD Jira projects and the October Acme Cloud call notes (Confluence page 9001), for the directors.",
+      "repeat": 2,
+      "cluster": "business-review",
+      "task_id": "tsk_395e1685630b4d3c8f019c73c0199055",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 422.051,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "says-what-stops",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes, no nor unknown"
+        }
+      ]
+    },
+    {
+      "id": "structure-business-review",
+      "ask": "Draft anyway, no questions: a business review in the PM space for the Acme Vault console last quarter, from the PM and CLD Jira projects and the October Acme Cloud call notes (Confluence page 9001), for the directors.",
+      "repeat": 3,
+      "cluster": "business-review",
+      "task_id": "tsk_a121a799a23949c785a270b358fcce2e",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 498.565,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "says-what-stops",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-okr-draft",
+      "ask": "Draft anyway, no questions: OKRs in the PM space for the next two quarters for enterprise identity across Acme Vault (SAML SSO, Jira epic PM-101, and SCIM, story PM-102).",
+      "repeat": 1,
+      "cluster": "okr-draft",
+      "task_id": "tsk_68e45c53034141d888dac65fc54ebe35",
+      "status": "failed",
+      "passed": false,
+      "failures": [
+        {
+          "check": "status",
+          "expected": "`needs_approval`",
+          "got": "failed"
+        },
+        {
+          "check": "approvals",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "draft_count",
+          "tool": "confluence.create_draft",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "no_answer"
+        }
+      ],
+      "tag": {
+        "tag": "harness",
+        "rule": "interrupted",
+        "reason": "error mentions `gateway`: the model gateway's answer was cut off before it finished. please try again in a few minutes.",
+        "sub": "harness/interrupted"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 302.114,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "structure-okr-draft",
+      "ask": "Draft anyway, no questions: OKRs in the PM space for the next two quarters for enterprise identity across Acme Vault (SAML SSO, Jira epic PM-101, and SCIM, story PM-102).",
+      "repeat": 2,
+      "cluster": "okr-draft",
+      "task_id": "tsk_2244023b8c7a4c108f5759878b76c34b",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 535.662,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "says-what-stops",
+          "verdict": null,
+          "blocking": false,
+          "error": "the reply was neither yes, no nor unknown"
+        }
+      ]
+    },
+    {
+      "id": "structure-okr-draft",
+      "ask": "Draft anyway, no questions: OKRs in the PM space for the next two quarters for enterprise identity across Acme Vault (SAML SSO, Jira epic PM-101, and SCIM, story PM-102).",
+      "repeat": 3,
+      "cluster": "okr-draft",
+      "task_id": "tsk_acc20f52c039442ab52ffe20c73d830c",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 353.939,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "says-what-stops",
+          "verdict": false,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-portfolio-review",
+      "ask": "Draft anyway, no questions: a portfolio review in the PM space across the PM project and the CLD project (use the cross-team rollup for project in (PM, CLD)), for the Acme Vault and Acme Cloud directors.",
+      "repeat": 1,
+      "cluster": "portfolio-review",
+      "task_id": "tsk_18f51004a08e4f85800a17b189dab977",
+      "status": "failed",
+      "passed": false,
+      "failures": [
+        {
+          "check": "status",
+          "expected": "`needs_approval`",
+          "got": "failed"
+        },
+        {
+          "check": "approvals",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "draft_count",
+          "tool": "confluence.create_draft",
+          "expected": 1,
+          "got": 0
+        },
+        {
+          "check": "no_answer"
+        }
+      ],
+      "tag": {
+        "tag": "harness",
+        "rule": "interrupted",
+        "reason": "error mentions `gateway`: the model gateway's answer was cut off before it finished. please try again in a few minutes.",
+        "sub": "harness/interrupted"
+      },
+      "queue_secs": 0.0,
+      "total_secs": 195.233,
+      "attempts": 1,
+      "trace_read": true
+    },
+    {
+      "id": "structure-portfolio-review",
+      "ask": "Draft anyway, no questions: a portfolio review in the PM space across the PM project and the CLD project (use the cross-team rollup for project in (PM, CLD)), for the Acme Vault and Acme Cloud directors.",
+      "repeat": 2,
+      "cluster": "portfolio-review",
+      "task_id": "tsk_ee2b80bb4f534a7085d20c72fb2aa428",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 426.301,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "says-what-stops",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-portfolio-review",
+      "ask": "Draft anyway, no questions: a portfolio review in the PM space across the PM project and the CLD project (use the cross-team rollup for project in (PM, CLD)), for the Acme Vault and Acme Cloud directors.",
+      "repeat": 3,
+      "cluster": "portfolio-review",
+      "task_id": "tsk_f4f8897c1b9d4e398d1c874ec7cfdfac",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 433.341,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "says-what-stops",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    },
+    {
+      "id": "structure-roadmap-tradeoffs",
+      "ask": "Draft anyway, no questions: roadmap trade-offs in the PM space for next year: audit log export or SCIM user provisioning (Jira story PM-102) for the Acme Vault console, given the October Acme Cloud call notes (Confluence page 9001).",
+      "repeat": 1,
+      "cluster": "roadmap-tradeoffs",
+      "task_id": "tsk_1abc80a576234a63a7c9b4b440f637d5",
+      "status": "working",
+      "passed": false,
+      "failures": [
+        {
+          "check": "timed_out",
+          "status": "working"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "timed out while `working`",
+        "sub": "model/timed-out"
+      },
+      "queue_secs": 0.0,
+      "total_secs": null,
+      "attempts": 1,
+      "trace_read": true,
+      "cancel": {
+        "cancelled": true,
+        "worker_stopped": true,
+        "secs": 30.057514617
+      }
+    },
+    {
+      "id": "structure-roadmap-tradeoffs",
+      "ask": "Draft anyway, no questions: roadmap trade-offs in the PM space for next year: audit log export or SCIM user provisioning (Jira story PM-102) for the Acme Vault console, given the October Acme Cloud call notes (Confluence page 9001).",
+      "repeat": 2,
+      "cluster": "roadmap-tradeoffs",
+      "task_id": "tsk_fe319a5fa761441d8ecdefe4db5e74a5",
+      "status": "working",
+      "passed": false,
+      "failures": [
+        {
+          "check": "timed_out",
+          "status": "working"
+        }
+      ],
+      "tag": {
+        "tag": "model",
+        "rule": "model",
+        "reason": "timed out while `working`",
+        "sub": "model/timed-out"
+      },
+      "queue_secs": 0.0,
+      "total_secs": null,
+      "attempts": 1,
+      "trace_read": true,
+      "cancel": {
+        "cancelled": true,
+        "worker_stopped": true,
+        "secs": 30.059349432
+      }
+    },
+    {
+      "id": "structure-roadmap-tradeoffs",
+      "ask": "Draft anyway, no questions: roadmap trade-offs in the PM space for next year: audit log export or SCIM user provisioning (Jira story PM-102) for the Acme Vault console, given the October Acme Cloud call notes (Confluence page 9001).",
+      "repeat": 3,
+      "cluster": "roadmap-tradeoffs",
+      "task_id": "tsk_76755eef08bd4595aba18d9f801a3d6c",
+      "status": "needs_approval",
+      "passed": true,
+      "failures": [],
+      "tag": null,
+      "queue_secs": 0.0,
+      "total_secs": 532.554,
+      "attempts": 1,
+      "trace_read": true,
+      "judges": [
+        {
+          "name": "says-what-stops",
+          "verdict": true,
+          "blocking": false
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "attempts": 24,
+    "passed": 18,
+    "pass_rate": 0.75,
+    "tasks": 8,
+    "tasks_all_attempts_passed": 3,
+    "all_attempts_pass_rate": 0.375,
+    "infra_losses": 2,
+    "pass_rate_excluding_infra": 0.8181818181818182,
+    "pass_bar": 0.8,
+    "met_bar": false,
+    "by_task": [
+      {
+        "id": "coach-feedback-creates-no-draft",
+        "passes": 3,
+        "attempts": 3,
+        "pass_rate": 1.0,
+        "all_attempts_passed": true,
+        "infra_losses": 0
+      },
+      {
+        "id": "open-bet-records-one-draft",
+        "passes": 3,
+        "attempts": 3,
+        "pass_rate": 1.0,
+        "all_attempts_passed": true,
+        "infra_losses": 0
+      },
+      {
+        "id": "strategy-doc-cross-team-effects",
+        "passes": 2,
+        "attempts": 3,
+        "pass_rate": 0.6666666666666666,
+        "all_attempts_passed": false,
+        "infra_losses": 0
+      },
+      {
+        "id": "structure-alignment-plan",
+        "passes": 3,
+        "attempts": 3,
+        "pass_rate": 1.0,
+        "all_attempts_passed": true,
+        "infra_losses": 0
+      },
+      {
+        "id": "structure-business-review",
+        "passes": 2,
+        "attempts": 3,
+        "pass_rate": 0.6666666666666666,
+        "all_attempts_passed": false,
+        "infra_losses": 0
+      },
+      {
+        "id": "structure-okr-draft",
+        "passes": 2,
+        "attempts": 3,
+        "pass_rate": 0.6666666666666666,
+        "all_attempts_passed": false,
+        "infra_losses": 1
+      },
+      {
+        "id": "structure-portfolio-review",
+        "passes": 2,
+        "attempts": 3,
+        "pass_rate": 0.6666666666666666,
+        "all_attempts_passed": false,
+        "infra_losses": 1
+      },
+      {
+        "id": "structure-roadmap-tradeoffs",
+        "passes": 1,
+        "attempts": 3,
+        "pass_rate": 0.3333333333333333,
+        "all_attempts_passed": false,
+        "infra_losses": 0
+      }
+    ]
+  }
+}
