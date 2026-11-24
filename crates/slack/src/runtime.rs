@@ -265,6 +265,18 @@ impl Runtime {
         }
     }
 
+    /// `GET /v1/model-source` (slice H12): the App Home's first line, where prompts go, by
+    /// label only. `None` when the runtime can't say (then the line says so).
+    pub async fn model_line(&self) -> String {
+        match self
+            .send(self.request(Method::GET, "/v1/model-source", None))
+            .await
+        {
+            Ok(v) => model_line(&v),
+            Err(_) => model_line(&serde_json::Value::Null),
+        }
+    }
+
     /// `GET /v1/notifications`: long-polls up to `wait`.
     pub async fn notifications(
         &self,
@@ -464,5 +476,57 @@ mod tests {
         assert_eq!(list_of(json!({"bots": [2]}), "bots"), vec![json!(2)]);
         assert_eq!(list_of(json!({"items": [3]}), "routines"), vec![json!(3)]);
         assert!(list_of(json!(null), "bots").is_empty());
+    }
+}
+
+/// The App Home's model line (slice H12, spec §3.6 "The indicator"), from `GET
+/// /v1/model-source`: the entry name for `hosted`, never a host; the switch notice while one
+/// waits. Anything this build doesn't know reads as unknown.
+pub fn model_line(v: &serde_json::Value) -> String {
+    let fake = v["fake_data"].as_bool().unwrap_or(false);
+    let base = match (v["source"].as_str(), v["name"].as_str()) {
+        _ if fake => "Model: test endpoint (fake data only)".to_string(),
+        (Some("hosted"), Some(name))
+            if pmos_contract::model_source::hosted_name(&format!("hosted:{name}")).is_some() =>
+        {
+            format!("Model: hosted ({name})")
+        }
+        (Some("local"), _) => "Model: local".to_string(),
+        (Some("hosted-test"), _) => "Model: test endpoint (fake data only)".to_string(),
+        (Some("stub"), _) => "Model: stub (no model)".to_string(),
+        _ => "Model: unknown".to_string(),
+    };
+    if v["switch_pending"].as_bool().unwrap_or(false) {
+        format!("{base}. An administrator must confirm the model source switch")
+    } else {
+        base
+    }
+}
+
+#[cfg(test)]
+mod model_line_tests {
+    use super::model_line;
+    use serde_json::json;
+
+    #[test]
+    fn the_model_line_names_labels_only() {
+        assert_eq!(
+            model_line(&json!({"source": "hosted", "name": "owner-hosted"})),
+            "Model: hosted (owner-hosted)"
+        );
+        assert_eq!(model_line(&json!({"source": "local"})), "Model: local");
+        assert_eq!(
+            model_line(&json!({"source": "hosted", "name": "stack-test", "fake_data": true})),
+            "Model: test endpoint (fake data only)"
+        );
+        assert_eq!(
+            model_line(&json!({"source": "hosted", "name": "models.example.test"})),
+            "Model: unknown"
+        );
+        assert_eq!(model_line(&serde_json::Value::Null), "Model: unknown");
+        assert!(
+            model_line(&json!({"source": "hosted", "name": "a", "switch_pending": true}))
+                .ends_with("An administrator must confirm the model source switch")
+        );
     }
 }

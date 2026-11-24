@@ -246,6 +246,17 @@ fn confirm(title: &str, text: &str, yes: &str, no: &str) -> Value {
 
 /// The whole view: the header, the section buttons, a notice if there is one, the section.
 pub fn view(tab: Tab, notice: Option<&str>, body: Vec<Value>) -> Value {
+    view_with_model(tab, None, notice, body)
+}
+
+/// [`view`], with the model line at its top (slice H12, spec §3.6 "The indicator": where
+/// prompts go, by label only), when there is one.
+pub fn view_with_model(
+    tab: Tab,
+    model: Option<&str>,
+    notice: Option<&str>,
+    body: Vec<Value>,
+) -> Value {
     let tabs = [
         ("Inbox", action::TAB_INBOX, Tab::Inbox),
         ("Skills", action::TAB_SKILLS, Tab::Skills),
@@ -259,6 +270,10 @@ pub fn view(tab: Tab, notice: Option<&str>, body: Vec<Value>) -> Value {
         header("PM OS"),
         json!({"type": "actions", "block_id": "home_tabs", "elements": elements}),
     ];
+    // Under the header and the section buttons, before anything else.
+    if let Some(m) = model.filter(|m| !m.trim().is_empty()) {
+        blocks.push(context(m));
+    }
     if let Some(notice) = notice.filter(|n| !n.trim().is_empty()) {
         blocks.push(section(notice));
     }
@@ -982,7 +997,8 @@ impl Bots {
                     }
                     Tab::Accounts => self.accounts_body(&handle).await,
                 };
-                view(tab, notice.as_deref(), body)
+                let model = self.runtime().model_line().await;
+                view_with_model(tab, Some(&model), notice.as_deref(), body)
             }
         };
         if let Err(e) = self.slack().publish_view(user, view).await {

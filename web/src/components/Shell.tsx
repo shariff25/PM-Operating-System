@@ -8,6 +8,7 @@ import { canAsk } from '../bots';
 import { copy } from '../copy';
 import { useData } from '../data';
 import { PHONE_QUERY, useMediaQuery } from '../theme';
+import type { ModelSourceView } from '../api/types';
 import type { Route } from '../url';
 import { Icon, Mark } from './icons';
 import type { IconName } from './icons';
@@ -72,6 +73,38 @@ export function navKey(route: Route): NavKey {
 
 export function isMac(): boolean {
   return typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
+}
+
+/**
+ * The model indicator (slice H12, spec §3.6 "The indicator"): where prompts go, from `/api/me`,
+ * on every page. Nothing when the server doesn't say (an older server).
+ */
+export function modelLabel(model: ModelSourceView | undefined): string | null {
+  if (!model) return null;
+  if (model.fake_data) return copy.nav.modelTest;
+  switch (model.source) {
+    case 'hosted':
+      return model.name ? copy.nav.modelHosted(model.name) : copy.nav.modelUnknown;
+    case 'local':
+      return copy.nav.modelLocal;
+    case 'hosted-test':
+      return copy.nav.modelTest;
+    case 'stub':
+      return copy.nav.modelStub;
+    default:
+      return copy.nav.modelUnknown;
+  }
+}
+
+export function ModelIndicator({ model, className }: { model?: ModelSourceView; className: string }) {
+  const label = modelLabel(model);
+  if (!label) return null;
+  return (
+    <p className={className} data-testid="model-source">
+      <span>{label}</span>
+      {model?.switch_pending && <span className="model-source-warn">{copy.nav.modelSwitchPending}</span>}
+    </p>
+  );
 }
 
 /** A connected system and how it is doing, for the rail's Connected block. */
@@ -234,6 +267,7 @@ export function Shell({ route, children, onSignOut }: { route: Route; children: 
               <ul className="rail-list">{items.map((it) => link(it, 'rail'))}</ul>
             </nav>
             <ConnectedSystems />
+            <ModelIndicator model={me?.model} className="rail-model" />
             <div className="rail-foot">
               <UserMenu variant="rail" collapsed={compact} onSignOut={onSignOut} />
             </div>
@@ -255,6 +289,7 @@ export function Shell({ route, children, onSignOut }: { route: Route; children: 
               <div className="topbar-lead" ref={setLead}>
                 {!detail && <span className="topbar-title">{pageTitle}</span>}
               </div>
+              <ModelIndicator model={me?.model} className="topbar-model" />
               <button
                 type="button"
                 className="icon-btn topbar-btn"

@@ -756,6 +756,13 @@ export const copy = {
     askButton: 'Ask or jump to…',
     admin: 'Admin',
     connected: 'Connected',
+    // Slice H12: where prompts go, on every page. Labels only, never a host.
+    modelHosted: (name: string) => `Model: hosted (${name})`,
+    modelLocal: 'Model: local',
+    modelTest: 'Model: test endpoint (fake data only)',
+    modelStub: 'Model: stub (no model)',
+    modelUnknown: 'Model: unknown',
+    modelSwitchPending: 'An administrator must confirm the model source switch',
     railLabel: 'App',
     shortcutMac: '⌘K',
     shortcutOther: 'Ctrl K',

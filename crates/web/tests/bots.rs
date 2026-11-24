@@ -235,6 +235,12 @@ fn review_item(id: &str, persona: Option<&str>, restricted: bool) -> Value {
 }
 
 async fn runtime(State(m): State<Arc<Mocks>>, method: Method, uri: Uri, body: Bytes) -> Response {
+    // Slice H12: the indicator's read on every `/api/me`, not recorded (the tests count the
+    // calls a route made).
+    if uri.path() == "/v1/model-source" {
+        return Json(json!({"source": "local", "fake_data": false, "switch_pending": false}))
+            .into_response();
+    }
     m.record("runtime", &method, &uri, &body);
     let b: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     match (method.as_str(), uri.path()) {
