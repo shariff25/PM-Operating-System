@@ -1036,6 +1036,60 @@ measure_local_gpu() {
   LOCAL_GPUS=$(sed -nE 's/^GPU [0-9]+: (.*) \(UUID: .*/\1/p' <<<"$list" | sort | uniq -c | awk '{ c = $1; $1 = ""; sub(/^ /, ""); printf "%s%dx %s", (n++ ? ", " : ""), c, $0 }')
   LOCAL_FP=$(printf 'machine-id=%s\ngpus=%s\n' "$mid" "$(paste -sd, - <<<"$uuids")" | sha256sum | cut -d' ' -f1)
 }
+# H-MCP (docs/mcp-servers-spec.md §5, slice M5): with systems switched onto MCP servers
+# (PMOS_MCP_SYSTEMS), the tool server's own /readyz says how each server's last connection went:
+# it connects exactly as it will for a call (the host resolves to a public address, TLS verifies
+# and the pin matches, no redirect, an internal server at its pinned address, every approved
+# tool's digest as listed). A per-user server is checked at each PM's link instead (its OAuth
+# metadata against the record). The preflight can't see what an outbound proxy allows: with
+# HTTPS_PROXY set it warns that the proxy should allow no more than these hosts.
+c_mcp() {
+  local systems body verdict
+  systems=$(ev PMOS_MCP_SYSTEMS)
+  if [ -z "$systems" ]; then
+    res H-MCP skip "PMOS_MCP_SYSTEMS is empty: every system on its built-in connector" "each MCP server's connection and approved tools as the tool server checks them"
+    return
+  fi
+  if [ "$STAGE" = install ] || [ "$STARTING" = 1 ]; then
+    res H-MCP pass "not started" "each MCP server's connection and approved tools as the tool server checks them"
+    return
+  fi
+  read_ports
+  body=$(cmd_out toolserver-readyz curl -sS --noproxy '*' -m 15 "http://127.0.0.1:${PORTS[0]}/readyz") || body=""
+  if [ -z "$body" ]; then
+    res H-MCP pass "not started (no answer on 127.0.0.1:${PORTS[0]})" "each MCP server's connection and approved tools as the tool server checks them"
+    return
+  fi
+  verdict=$(python3 -I -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    m = d.get("mcp")
+    if not isinstance(m, dict) or not m:
+        print("none\t")
+    else:
+        bad = sorted("%s=%s" % (k, v.get("status")) for k, v in m.items()
+                     if not isinstance(v, dict) or v.get("status") not in ("ok", "per_user"))
+        hosts = sorted({h for v in m.values() if isinstance(v, dict) for h in (v.get("hosts") or [])})
+        print(("bad " + ",".join(bad) if bad else "ok") + "\t" + " ".join(hosts))
+except Exception:
+    print("unreadable\t")
+' <<<"$body")
+  local hosts=${verdict#*$'\t'}
+  verdict=${verdict%%$'\t'*}
+  local exp="each MCP server's connection and approved tools as the tool server checks them"
+  case "$verdict" in
+    ok)
+      if [ -n "$(ev HTTPS_PROXY)$(ev https_proxy)" ]; then
+        res H-MCP warn "every server ok; egress through HTTPS_PROXY, which this can't check" "$exp" "the outbound proxy should allow the tool server these hosts and no more: $hosts"
+      else
+        res H-MCP pass "every server ok ($hosts)" "$exp"
+      fi
+      ;;
+    none) res H-MCP fail "PMOS_MCP_SYSTEMS=$systems, but the tool server reports no MCP server" "$exp" "check the tool server's log: a record in content/mcp may be missing or refused" ;;
+    *) res H-MCP fail "tool server /readyz: $verdict" "$exp" "changed: an approved tool changed at its server and needs an Admin's review (pmos-toolserver mcp digests); down: the server, its TLS or its pin" ;;
+  esac
+}
 c_local() {
   local att live=()
   if [ "$MS" != local ]; then
@@ -1283,6 +1337,7 @@ else
   run_check H-ADMIN c_admin
   run_check H-ASSERT c_assert
   run_check H-LOCAL c_local
+  run_check H-MCP c_mcp
   c_stray_acks
   if [ "$OPENSHELL" = 1 ]; then
     run_check O-CLI c_ocli

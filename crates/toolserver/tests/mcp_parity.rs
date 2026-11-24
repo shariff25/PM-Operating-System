@@ -289,3 +289,67 @@ async fn the_fake_mcp_mode_serves_jira_through_the_tool_server_as_the_fakes_do()
     assert_eq!(svc.served_by("confluence.search"), "fake");
     cancel.cancel();
 }
+
+#[tokio::test]
+async fn readyz_and_policy_admin_show_each_server_and_its_approved_tools() {
+    let cancel = CancellationToken::new();
+    let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../content"));
+    let (stores, _) = pmos_toolserver::Stores::in_memory(root);
+    let (served, fake) = pmos_toolserver::mcp_client::start_fake(None, cancel.clone())
+        .await
+        .unwrap();
+    let catalog =
+        pmos_toolserver::catalog::Catalog::load(root, chrono::Utc::now().date_naive()).unwrap();
+    let mut connectors = served.connectors;
+    connectors.push(Arc::new(FakeConnector::confluence()));
+    connectors.push(Arc::new(FakeConnector::slack()));
+    connectors.push(Arc::new(FakeConnector::docs()));
+    let servers = served.servers;
+    let svc = Arc::new(
+        pmos_toolserver::ToolService::new(catalog, stores, connectors)
+            .unwrap()
+            .with_open_directory()
+            .with_mcp_servers(servers.clone()),
+    );
+    let ready = pmos_toolserver::mcp_client::readiness(svc.mcp_servers()).await;
+    assert_eq!(
+        ready,
+        json!({"fake-jira": {"status": "ok", "hosts": ["fake-mcp.pmos.internal"]}})
+    );
+    let view = pmos_toolserver::mcp_client::policy_view(svc.mcp_servers());
+    let s = &view[0];
+    assert_eq!(s["id"], "fake-jira");
+    assert_eq!(
+        (s["operator"].as_str(), s["auth"].as_str()),
+        (Some("pmos"), Some("service_token"))
+    );
+    let tools = s["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 4);
+    assert!(tools.iter().all(|t| t["state"] == "approved"));
+    assert_eq!(
+        tools
+            .iter()
+            .find(|t| t["registry"] == "jira.create_issue")
+            .unwrap()["class"],
+        "write"
+    );
+    assert!(
+        !view.to_string().to_lowercase().contains("token\":"),
+        "no token field"
+    );
+    // A changed tool shows on both.
+    fake.tricks
+        .change_search
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let fresh = pmos_toolserver::mcp_client::start_fake(None, cancel.clone())
+        .await
+        .unwrap();
+    fresh
+        .1
+        .tricks
+        .change_search
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let ready = pmos_toolserver::mcp_client::readiness(&fresh.0.servers).await;
+    assert_eq!(ready["fake-jira"]["status"], "changed");
+    cancel.cancel();
+}

@@ -44,6 +44,77 @@ pub use server::{McpServer, ServerAuth, UserTokens};
 /// (slice M6) and the public docs (slice M3). Confluence and Slack wait for slice M8.
 pub const SWITCHABLE_SYSTEMS: [&str; 2] = ["jira", "docs"];
 
+/// Policy Admin's view of `servers` (`GET /internal/admin/mcp`).
+pub fn policy_view(servers: &[Arc<McpServer>]) -> serde_json::Value {
+    let out: Vec<serde_json::Value> = servers
+        .iter()
+        .map(|s| {
+            let r = s.record();
+            let st = s.status();
+            let state_of = |upstream: &str| {
+                st.tools
+                    .iter()
+                    .find(|t| t.upstream == upstream)
+                    .map(|t| t.state)
+                    .unwrap_or("unchecked")
+            };
+            serde_json::json!({
+                "id": r.id,
+                "operator": r.operator.as_str(),
+                "host": pmos_contract::mcp::parse_url(&r.url).map(|u| u.host).unwrap_or_default(),
+                "auth": r.auth.as_str(),
+                "scopes": r.oauth.as_ref().map(|o| o.scopes.clone()).unwrap_or_default(),
+                "data_class": r.data_class,
+                "systems": r.systems,
+                "hosts": r.hosts(),
+                "egress": r.egress,
+                "approved_by": r.approved_by,
+                "pull": r.pull,
+                "tools": r.tools.iter().map(|t| serde_json::json!({
+                    "registry": t.registry,
+                    "upstream": t.upstream,
+                    "class": match t.class() { pmos_contract::mcp::ToolClass::Read => "read", pmos_contract::mcp::ToolClass::Write => "write" },
+                    "digest": t.digest,
+                    "state": state_of(&t.upstream),
+                    "approved_by": t.approved_by,
+                })).collect::<Vec<_>>(),
+                "last_check": {
+                    "checked_at": st.checked_at,
+                    "outcome": st.outcome,
+                    "server_name": st.server_name,
+                    "server_version": st.server_version,
+                },
+                "refused_requests": st.refused_requests,
+                "dropped_notifications": st.dropped_notifications,
+            })
+        })
+        .collect();
+    serde_json::Value::Array(out)
+}
+
+/// `/readyz`'s `mcp` section: per server `ok`, `changed` (an approved tool changed or went
+/// away), `down` (no connection), or `per_user` (checked at each PM's link), and its hosts.
+pub async fn readiness(servers: &[Arc<McpServer>]) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for s in servers {
+        let r = s.record();
+        let status = if r.auth == AuthKind::OauthPerUser {
+            "per_user"
+        } else {
+            match s.check().await {
+                Err(_) => "down",
+                Ok(()) if s.status().tools.iter().any(|t| t.state != "approved") => "changed",
+                Ok(()) => "ok",
+            }
+        };
+        out.insert(
+            r.id.clone(),
+            serde_json::json!({"status": status, "hosts": r.hosts()}),
+        );
+    }
+    serde_json::Value::Object(out)
+}
+
 /// Each record's `approved_by`, and each of its tools', must be an active user with the Admin
 /// role (the owner's decision of 2026-11-24).
 pub fn check_approvals(records: &[ServerRecord], dir: &Directory) -> Result<(), Vec<String>> {

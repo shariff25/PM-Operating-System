@@ -415,6 +415,34 @@ mod tests {
     }
 
     #[test]
+    fn mcp_23_the_allowed_hosts_are_the_records_own() {
+        let mut r = crate::mcp_client::fake::fake_records("127.0.0.1:9".parse().unwrap()).remove(0);
+        let hosts = allowed_hosts(std::slice::from_ref(&r));
+        assert_eq!(
+            hosts.into_iter().collect::<Vec<_>>(),
+            vec!["fake-mcp.pmos.internal"]
+        );
+        r.url = "https://mcp.example.com/mcp".into();
+        r.oauth = Some(pmos_contract::mcp::OAuthSettings {
+            client_id: "c".into(),
+            client_secret_env: None,
+            issuer: "https://auth.example.com".into(),
+            authorization_endpoint: "https://auth.example.com/authorize".into(),
+            token_endpoint: "https://login.example.com/token".into(),
+            scopes: vec![],
+            resource: r.url.clone(),
+        });
+        let hosts = allowed_hosts(std::slice::from_ref(&r));
+        assert_eq!(
+            hosts.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["auth.example.com", "login.example.com", "mcp.example.com"]
+        );
+        assert!(host_allowed(&hosts, "https://mcp.example.com/other"));
+        assert!(!host_allowed(&hosts, "https://evil.example.com/mcp"));
+        assert!(!host_allowed(&hosts, "https://169.254.169.254/latest"));
+    }
+
+    #[test]
     fn test_routes_only_rewrite_listed_https_hosts() {
         let routes =
             TestRoutes::default().route("mcp.example.test", "127.0.0.1:9".parse().unwrap());

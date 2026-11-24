@@ -138,6 +138,21 @@ async fn read(State(state): State<AppState>, signed: Signed) -> ApiResult {
     );
     let (protection, configured) = protection;
     let mut body = body?;
+    // MCP servers (`docs/mcp-servers-spec.md` §5): the tool server's view, read-only. The
+    // sandbox's own egress stays `fixed` above.
+    body["mcp"] = match signed
+        .toolserver(&state)
+        .admin(&signed.member.handle, "mcp", &[])
+        .await
+    {
+        Ok(v) => {
+            json!({"available": true, "servers": v.get("servers").cloned().unwrap_or(json!([]))})
+        }
+        Err(e) => {
+            tracing::warn!(error = ?e, "the MCP servers' view is unavailable");
+            json!({"available": false, "servers": []})
+        }
+    };
     body["proposals_configured"] = json!(configured);
     body["protection"] = protection;
     Ok(Json(body).into_response())

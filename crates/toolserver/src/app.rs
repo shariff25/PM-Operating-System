@@ -364,6 +364,11 @@ async fn readyz(State(state): State<AppState>) -> Response {
         StatusCode::SERVICE_UNAVAILABLE
     };
     let mut answer = json!({ "ready": ok, "checks": body });
+    // MCP servers (slice M5): each one's last connection and `tools/list` check, for the host
+    // preflight's H-MCP. Labels and host names only; absent when no system is on MCP.
+    if !state.svc.mcp_servers().is_empty() {
+        answer["mcp"] = crate::mcp_client::readiness(state.svc.mcp_servers()).await;
+    }
     // Not readiness checks: plain counts since start-up for an operator, with password sign-in
     // on (docs/password-sign-in.md, the gate review of 04c175f): wrong setup codes tried (G2;
     // each is in the audit log too), refusals past a block's setup guesses (the review of
