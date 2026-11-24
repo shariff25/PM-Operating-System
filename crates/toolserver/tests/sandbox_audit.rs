@@ -628,3 +628,60 @@ async fn the_json_lines_copy_gets_each_stored_row_with_its_fields() {
     assert_eq!(line["sandbox"]["dest_class"], "public");
     s.stop().await;
 }
+
+#[test]
+fn what_the_collector_sends_is_what_the_batch_route_takes() {
+    use pmos_sandbox_audit::wire as c;
+    let now = Utc::now();
+    let kinds = [
+        c::Kind::Deny,
+        c::Kind::DenySummary,
+        c::Kind::AllowSummary,
+        c::Kind::Finding,
+        c::Kind::PolicyLoaded,
+        c::Kind::SourceGap,
+        c::Kind::Unparsed,
+    ];
+    let events: Vec<c::WireEvent> = kinds
+        .iter()
+        .enumerate()
+        .map(|(i, k)| c::WireEvent {
+            seq: i as u64 + 1,
+            kind: Some(*k),
+            at: Some(now),
+            sandbox: Some("pmos-docs".into()),
+            sandbox_uid: Some("sb-1".into()),
+            rule: Some("pmos_gateway".into()),
+            reason: Some("l7_deny".into()),
+            dest_host: Some("gateway.pmos.internal".into()),
+            dest_ip: Some("10.201.77.11".into()),
+            dest_port: Some(8740),
+            http_method: Some("POST".into()),
+            http_path: (*k != c::Kind::AllowSummary).then(|| "/v1/x".into()),
+            process: Some("/usr/local/bin/node".into()),
+            os_event_uid: Some(format!("u-{i}")),
+            os_correlation_uid: Some("corr".into()),
+            os_version: Some("0.1.9".into()),
+            policy_hash: Some("sha256:abc".into()),
+            count: Some(3),
+            since: Some(now),
+            rules: vec!["-".into()],
+            note: (*k == c::Kind::Unparsed).then_some(c::Note::FormatUnverified),
+        })
+        .collect();
+    let sent = serde_json::to_string(&c::Batch {
+        collector_run: "r0123456789abcdef01234567".into(),
+        events,
+    })
+    .unwrap();
+    let taken: Batch =
+        serde_json::from_str(&sent).expect("the tool server reads the collector's batch");
+    pmos_toolserver::openshell::sandbox::check_batch(&taken, now).expect("and accepts it");
+    let hb = serde_json::to_string(&c::Heartbeat {
+        collector_run: "r0123456789abcdef01234567".into(),
+        acked_seq: 7,
+    })
+    .unwrap();
+    let hb: Heartbeat = serde_json::from_str(&hb).unwrap();
+    assert_eq!(hb.acked_seq, 7);
+}

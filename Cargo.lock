@@ -1928,6 +1928,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "pmos-sandbox-audit"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "getrandom 0.3.4",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "subtle",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "pmos-slack"
 version = "0.1.0"
 dependencies = [
@@ -1997,6 +2017,7 @@ dependencies = [
  "pmos-entra",
  "pmos-policy",
  "pmos-runtime",
+ "pmos-sandbox-audit",
  "pmos-toolserver",
  "pulldown-cmark",
  "reqwest",
