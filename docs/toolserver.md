@@ -1799,7 +1799,7 @@ Tokens are sealed with AES-256-GCM before any store sees them (`src/vault.rs`, t
 
 ## MCP servers
 
-Built before review (owner's instruction of 2026-11-24), slices M1 to M7 of
+Built before review (owner's instruction of 2026-11-24), slices M1 to M8 of
 `docs/mcp-servers-spec.md`. Off by default: with `PMOS_MCP_SYSTEMS` unset every system stays on
 its built-in connector, and nothing below changes CI's stack, the test stack or the eval tasks.
 No built-in connector is removed (each removal needs the owner's go-ahead).
@@ -1819,9 +1819,14 @@ client id, issuer, endpoints, exact scopes, `resource` = the URL), `identity_che
 "who am I" tool and the path of its email), `data_class`, `systems`, `tools`, `approved_by` and
 `pull`, and `owner_approval` for `third_party`. Each tool maps one registry name to one upstream
 tool by exact name and `digest`, with `class` (absent is a write), its `scopes`, `approved_by`,
-and the declarative `args`, `result`, `errors` (and `adapter: jira_rollup`). A record is added by
+and the declarative `args`, `result`, `errors` (and `adapter`: `jira_rollup`, and since M8
+`confluence_storage` and `slack_text`, which Confluence's and Slack's writes must name). Since M8
+a record may also list `checks`: tools PM OS calls itself and never lists to a bot, with no
+registry name (`slack_conversation` and `slack_members`, for Slack's audience check), approved
+like a tool (exact name, digest, their own `approved_by`) and always `class: read` (lint refuses
+anything else, and the tool server never calls one that isn't). A record is added by
 a pull request like any content; at start the tool server refuses one whose `approved_by` (on the
-record or any tool) isn't an active Admin, every `third_party` record (until the owner decides
+record, any tool or any check) isn't an active Admin, every `third_party` record (until the owner decides
 where an approval of one is kept), and in fake-data mode every record but a `pmos-docs`-shaped one.
 
 **The definition digest:** `sha256:` of the canonical JSON (keys sorted) of the tool's `name`,
@@ -1865,24 +1870,64 @@ vault key re-seals these tokens only when they are next refreshed.
 **Audit and ledger:** the call's event is the connector's, with `via mcp server <id>, tool
 sha256:…` in its detail (metadata, so Auditors see it); `mcp.connect`, `mcp.tool_changed`,
 `mcp.server_request_refused`, `mcp.link` and `mcp.compare` are the client's own events, fixed
-text and ids only. Ledger rows are as for a connector write.
+text and ids only. Ledger rows are as for a connector write, plus `served_by` (M8, migration
+0035): `builtin`, `fake` or the server's id, kept on the approval item when it is drafted and
+read by its ledger row (absent for items from before). A write sent to an MCP server keeps the
+SHA-256 of exactly what it sends upstream (after the mapping, the marker and Confluence's
+escaping): on the item as `upstream_args_hash` (migration 0035; a hash, never the text) and in its
+`started` audit event's detail (`upstream args sha256:…`). A built-in connector's write keeps
+neither, and its events read as before.
+
+**Confluence over MCP** (M8): `confluence.search`, `confluence.read`, `confluence.create_draft`
+and `confluence.update_page`, each mapped to one upstream tool. Before a write the tool server
+checks the space key and page ids as the built-in connector does; for an update it reads the
+page through the approved `confluence.read` with the PM's own token and refuses, with nothing
+sent, unless the page is still at the `version` the draft names (the lint requires
+`confluence.read` on the same record). The body is sent as Confluence storage, HTML-escaped by PM
+OS, ending with the "Drafted with PM OS · run <id>" footer, the same text the built-in connector
+sends (`adapter: confluence_storage`). Whether the upstream tool keeps a page's status on update
+and creates a draft (not a published page) is the server's behaviour, which the Admin approving
+the record must confirm; PM OS cannot check it from the arguments.
+
+**Slack over MCP** (M8): `slack.search` and `slack.read_thread` (each thread message clipped to
+2,000 characters and a search cut to the limit asked for, whatever the server sends), and
+`slack.post_reply` and `slack.send_message` (the PM's text plus Slack's marker,
+`adapter: slack_text`; a reply's `message_ts` must be dropped by the record and never leaves PM
+OS). A post needs the audience check, so **Slack posts move to the server only when its record
+approves both checks** (`slack_conversation`: the channel's `external`, `shared` and `im`, which
+must be given, never guessed, plus kind and name; `slack_members`: member ids page by page, each
+shaped like a member id or the check fails closed, up to 1,000). Both are called with the PM's own
+token, never a team bot's. The lint refuses a record mapping a Slack post without both checks.
+A Slack record that approves reads only is served split (`mcp_client/split.rs`): reads from the
+server; posts, the audience check, a draft's channel label and readiness from the built-in
+connector, exactly as before. The rules around a post stay in the tool server on both routes:
+the approval gate, the audience check, one draft per thread and per tagged message, and the
+24-hour removal of Slack text (SLK-8, the approvals store's sweep); none is the server's to keep.
+A changed check tool is revoked like any tool, so the audience check then fails closed and
+nothing is posted.
 
 **Settings** (the tool server only):
-- `PMOS_MCP_SYSTEMS` (default empty): `jira` and `docs`; `confluence` and `slack` are refused
-  until slice M8. With live connectors each system named is served by its record. With
-  `PMOS_CONNECTORS=fake`, `jira` is the spec's `fake-mcp` mode: Jira through the fake MCP server
+- `PMOS_MCP_SYSTEMS` (default empty): any of `jira`, `confluence`, `slack` and `docs`. With live
+  connectors each system named is served by its record (Slack split as above when its record
+  lacks the checks; the tool server logs it). With `PMOS_CONNECTORS=fake`, `jira`, `confluence`
+  and `slack` are the spec's `fake-mcp` mode: those systems through the fake MCP server
   (`pmos-fake-mcp`, in this process on a loopback port with a fresh random token), serving the
-  same fixtures. `docs` is served by the deployment's `pmos-docs` record (`secret_env:
+  same fixtures; its Slack record approves both checks, so posts go to it too. `docs` is served by the deployment's `pmos-docs` record (`secret_env:
   PMOS_DOCS_TOKEN`); `pmos-docs` names the site in its tool descriptions, so each deployment
   approves its own digests (and a site configured later changes them).
-- `PMOS_MCP_COMPARE=jira` (fake connectors only, not with Jira switched): each Jira read runs on
-  the fake and on the fake MCP server; the caller gets the fake's answer, and `mcp.compare`
-  records `same` or `differ` with counts, ids and field names only.
+- `PMOS_MCP_COMPARE`: any of `jira`, `confluence`, `slack` (fake connectors only, never a
+  system that is also switched): each read of those systems runs on the fake and on the fake MCP
+  server; the caller gets the fake's answer, and `mcp.compare` records `same` or `differ` with
+  counts, ids and field names only. Writes, Slack's audience check and its channel label go to
+  the fake only. On the fixtures: Jira 32 reads compared, 0 differed; Confluence 18, 0; Slack
+  22, 0.
 
 **Operators:** `/readyz` has an `mcp` section when a system is on MCP (per server `ok`,
 `changed`, `down` or `per_user`, and its hosts), which the host preflight's H-MCP reads; Policy
 Admin's read is `GET /internal/admin/mcp` (Admins and Auditors), served by `pmos-web` in
-`GET /api/admin/policy` as `mcp`.
+`GET /api/admin/policy` as `mcp`. Since M8 each server there also lists its `checks` (role,
+upstream, class, digest, state, approver) and `slack_posts` (`mcp`, `builtin`, or null for a
+server not serving Slack).
 
 ## Storage
 
@@ -1896,7 +1941,7 @@ implementation for tests and `PMOS_DEV=1`, and a Postgres one for real use
 | Memory | `memory_notes` | One row per user and key, with the note's `sensitivity` (migration 0009; null for older notes, read as `internal`) |
 | Sessions | `sessions` | Only the SHA-256 of each token is stored. Each names a `skill` or a `bot` (a check constraint keeps it to one) |
 | Grants | `grants` | Taken with `DELETE … RETURNING` on a row locked `FOR UPDATE SKIP LOCKED`: one grant, one call, even under concurrency |
-| Approvals | `approvals` | A decision locks the item (`SELECT … FOR UPDATE`) and changes it only while it is `pending`: exactly one of several concurrent decisions wins. A Slack reply is created under an advisory lock per user and thread. The Slack draft sweep takes items `FOR UPDATE SKIP LOCKED`, leaving one a decision holds to the decision. A saved edit takes the same lock. `drafted_args` and `edited_at` (migration 0012) keep the bot's own arguments and the last save, once a person changed them |
+| Approvals | `approvals` | `served_by` and `upstream_args_hash` (migration 0035, see **MCP servers**). A decision locks the item (`SELECT … FOR UPDATE`) and changes it only while it is `pending`: exactly one of several concurrent decisions wins. A Slack reply is created under an advisory lock per user and thread. The Slack draft sweep takes items `FOR UPDATE SKIP LOCKED`, leaving one a decision holds to the decision. A saved edit takes the same lock. `drafted_args` and `edited_at` (migration 0012) keep the bot's own arguments and the last save, once a person changed them |
 | Feedback ledger | `ledger` | One row per approval item, written in the same transaction as the item on create, decide, complete and expire. `expired` is stored for Slack drafts and worked out on read for the rest |
 | Audit | `audit_events` | Append-only: triggers reject `UPDATE`, `DELETE` and `TRUNCATE`. Each event records the caller (`mcp`, `orchestrator`, `bot`, `web` or `console`; migration 0011) and the session's skill or bot, and for a read the titles of its non-Slack sources (`source_titles`, null before migration 0010; see **What an item is shown with**). |
 | Credentials | `credentials` | Tokens sealed by the vault; the database never sees plaintext. Providers `atlassian`, `slack`, `github` |
