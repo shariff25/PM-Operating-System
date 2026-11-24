@@ -15,6 +15,7 @@
 pub mod anthropic;
 pub mod app;
 pub mod config;
+pub mod fallback;
 pub mod keys;
 pub mod remote;
 pub mod resolve;

@@ -101,7 +101,7 @@ impl RetryPolicy {
     }
 
     /// Exponential backoff with jitter: half to all of `base * 2^(attempt-1)`.
-    fn backoff(&self, attempt: u32) -> Duration {
+    pub fn backoff(&self, attempt: u32) -> Duration {
         let full = self.base.saturating_mul(1 << (attempt - 1).min(16));
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

@@ -78,6 +78,33 @@ pub struct UsageEvent {
     /// c78b5fb). On a summary line, the last refusal's.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_key: Option<String>,
+    /// The 1-based place in the role's route of the model this line's attempt went to (slice
+    /// MP3, `docs/model-providers-spec.md` §4.9): 1 for a one-hop role.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hop: Option<u32>,
+    /// True when that model isn't the role's primary.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub fallback: bool,
+    /// On a routed role's failed attempt: why it failed (`connect`, `timeout`, `rate_limit`,
+    /// `quota_exhausted`, `overloaded`, `server_error`, `model_unavailable`, `auth`,
+    /// `redirect`, `bad_answer`, `first_token`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<&'static str>,
+    /// On a routed call's final line: the models of its route it didn't try, and why.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<Skipped>,
+    /// Under `hosted-test` only: the SHA-256 of the upstream's normalised URL, so two test
+    /// upstreams can be told apart without naming either.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_sha256: Option<String>,
+}
+
+/// A model of a route that a call didn't try (§4.9): its label and why (`disabled`,
+/// `circuit`, `feature`, `key`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Skipped {
+    pub label: String,
+    pub why: &'static str,
 }
 
 /// How long a client's refusals of one status are counted into one summary line, after the
@@ -286,6 +313,11 @@ mod tests {
             refused_users: Vec::new(),
             refused_users_more: None,
             user_key: None,
+            hop: None,
+            fallback: false,
+            reason: None,
+            skipped: Vec::new(),
+            upstream_sha256: None,
         }
     }
 

@@ -117,7 +117,10 @@ async fn each_upstream_gets_only_its_own_key_from_its_own_file() {
             },
             model_source: ModelSource::HostedTest,
         },
-        RouterOptions { keys: keys.clone() },
+        RouterOptions {
+            keys: keys.clone(),
+            ..Default::default()
+        },
     ))
     .await;
     let call = |role: &str| {

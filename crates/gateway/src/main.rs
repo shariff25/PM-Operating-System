@@ -145,7 +145,14 @@ async fn main() -> Result<()> {
             timeouts: Default::default(),
             model_source: config.model_source,
         },
-        RouterOptions { keys: keys.clone() },
+        RouterOptions {
+            keys: keys.clone(),
+            // Slice MP8: `disabled-<label>` files here take a model out of every route.
+            route_control: std::env::var("PMOS_GATEWAY_ROUTE_CONTROL")
+                .ok()
+                .filter(|p| !p.is_empty())
+                .map(std::path::PathBuf::from),
+        },
     );
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await

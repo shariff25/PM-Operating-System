@@ -178,6 +178,9 @@ impl Endpoint {
 pub struct RouterOptions {
     /// The upstreams' keys (`keys.rs`); `main` keeps a handle to reload them on `SIGHUP`.
     pub keys: Arc<KeyStore>,
+    /// `$PMOS_STATE_DIR/route-control` (§4.11, slice MP8): `disabled-<label>` there takes that
+    /// model out of every route, looked at before every call. `None`: no model is disabled.
+    pub route_control: Option<std::path::PathBuf>,
 }
 
 pub fn router(cfg: GatewayConfig) -> Router {
@@ -952,6 +955,11 @@ async fn forward(
         refused_users: Vec::new(),
         refused_users_more: None,
         user_key: None,
+        hop: None,
+        fallback: false,
+        reason: None,
+        skipped: Vec::new(),
+        upstream_sha256: None,
     };
     let who = match caller(&headers, &client, &policy) {
         Ok(c) => c,
@@ -1041,12 +1049,21 @@ async fn forward(
         refused_users: Vec::new(),
         refused_users_more: None,
         user_key: None,
+        hop: Some(1),
+        fallback: false,
+        reason: None,
+        skipped: Vec::new(),
+        upstream_sha256: None,
     };
     let model_header = HeaderValue::from_str(role.reported_model()).ok();
+    let primary_sha = role.model_sha256();
     let finish = |mut res: Response| {
         if let Some(v) = model_header.clone() {
             res.headers_mut().insert("x-pmos-model", v);
         }
+        // §4.9: every answer says which model of the route answered. A one-hop role's (and a
+        // stub's) is always its primary.
+        route_headers(&mut res, primary_sha.as_deref(), 1, false);
         res
     };
 
@@ -1067,6 +1084,25 @@ async fn forward(
                 Json(stub::embeddings(&req, role.reported_model())).into_response()
             }
         });
+    }
+
+    if role.routed() {
+        return forward_routed(
+            inner,
+            Routed {
+                role,
+                endpoint,
+                req,
+                stream,
+                event,
+                permit,
+                owner,
+                priority: who.priority,
+                started,
+                only: None,
+            },
+        )
+        .await;
     }
 
     if role.kind == UpstreamKind::ClaudeTest {
@@ -1363,6 +1399,500 @@ async fn forward(
         );
     }
     finish(Json(answer).into_response())
+}
+
+/// The headers every answer carries about the model that answered (§4.9): its
+/// `model_sha256` (labelled models only), its 1-based place in the role's route, and whether
+/// it is a fallback. `x-pmos-model` is set beside them.
+fn route_headers(res: &mut Response, sha: Option<&str>, hop: u32, fallback: bool) {
+    let h = res.headers_mut();
+    if let Some(v) = sha.and_then(|s| HeaderValue::from_str(s).ok()) {
+        h.insert("x-pmos-model-sha256", v);
+    }
+    h.insert("x-pmos-route-hop", HeaderValue::from(hop));
+    h.insert(
+        "x-pmos-fallback",
+        HeaderValue::from_static(if fallback { "1" } else { "0" }),
+    );
+}
+
+/// A routed role's call, admitted: its slot is held (one slot covers every hop, §4.3).
+struct Routed {
+    role: Role,
+    endpoint: Endpoint,
+    req: Value,
+    stream: bool,
+    event: UsageEvent,
+    permit: Permit,
+    owner: Owner,
+    priority: Priority,
+    started: Instant,
+    /// The one hop (index into the route) this call may use, when the client may not fall
+    /// back (§4.10): `Some(0)` for primary-only, the pinned one for `pin`.
+    only: Option<usize>,
+}
+
+/// What one attempt at one hop came to.
+enum HopOutcome {
+    /// The commit point was reached (§4.5): this hop answers, for good.
+    Committed(Committed),
+    /// An answer that is the caller's own (a client `4xx`), never routed around (§4.4).
+    Final {
+        status: u16,
+        headers: HeaderMap,
+        body: Bytes,
+    },
+    /// A failure on the upstream's side: the same hop again, or the next.
+    Failed(crate::fallback::Failure),
+}
+
+enum Committed {
+    /// A whole, valid answer (not streamed, or asked whole for a hop's workaround, or the
+    /// Claude test upstream's translated answer).
+    Whole(Value),
+    /// A stream past its first content: the events held until then, and the rest.
+    Stream { held: Bytes, rest: Upstream },
+}
+
+/// §4.3 and §4.4: the hops of a routed role, in order, until one commits, the list ends, or
+/// `routing.budget-secs` would be passed. Each hop gets up to `routing.same-hop-attempts`; a
+/// failure on the upstream's side moves to the next hop, a client's own error and a refusal are
+/// answers. Nothing left: `503 no_model_available`, naming no hop and no upstream's error. The
+/// caller never sees an upstream's own error text: every hop of a route is labelled, so every
+/// error body is the neutral one (V3). Each attempt gets its usage line (§4.9).
+async fn forward_routed(inner: &Inner, call: Routed) -> Response {
+    let Routed {
+        role,
+        endpoint,
+        req,
+        stream,
+        mut event,
+        permit,
+        owner,
+        priority,
+        started,
+        only,
+    } = call;
+    let routing = inner.models.routing;
+    let hops = role.hops();
+    let mut skipped: Vec<crate::usage::Skipped> = Vec::new();
+    let candidates: Vec<usize> = match only {
+        Some(i) => vec![i],
+        None => (0..hops.len()).collect(),
+    };
+    let mut plan = Vec::new();
+    for i in candidates {
+        let hop = &hops[i];
+        let label = hop.reported_model().to_string();
+        if !crate::fallback::serves(
+            hop,
+            endpoint == Endpoint::Embeddings,
+            &req,
+            stream,
+            inner.workarounds_on,
+        ) {
+            skipped.push(crate::usage::Skipped {
+                label,
+                why: "feature",
+            });
+            continue;
+        }
+        plan.push(i);
+    }
+    let deadline = Instant::now() + routing.budget();
+    let mut permit = Some(permit);
+    let mut attempts = 0u32;
+    let mut first = true;
+    'hops: for &i in &plan {
+        let hop = &hops[i];
+        let key = match upstream_key(inner, hop) {
+            Ok(k) => k,
+            Err(why) => {
+                tracing::warn!(
+                    role = %role.alias(), model = %hop.reported_model(), reason = why.as_str(),
+                    "the upstream's key file can't be used; this model is skipped"
+                );
+                skipped.push(crate::usage::Skipped {
+                    label: hop.reported_model().to_string(),
+                    why: "key",
+                });
+                continue;
+            }
+        };
+        let mut same = 0u32;
+        loop {
+            if !first && Instant::now() >= deadline {
+                break 'hops;
+            }
+            first = false;
+            same += 1;
+            attempts += 1;
+            let outcome =
+                attempt_hop(inner, &role, hop, endpoint, &req, stream, key.as_deref()).await;
+            let mut line = hop_line(inner, &event, hop, i);
+            line.attempt = attempts;
+            line.attempts = attempts;
+            match outcome {
+                HopOutcome::Committed(c) => {
+                    line.skipped = skipped;
+                    let permit = permit.take().expect("a committed hop holds its slot");
+                    return committed(
+                        inner, hop, i, endpoint, stream, c, line, permit, started, attempts,
+                    );
+                }
+                HopOutcome::Final {
+                    status,
+                    headers,
+                    body,
+                } => {
+                    line.status = status;
+                    line.skipped = skipped;
+                    line.latency_ms = started.elapsed().as_millis() as u64;
+                    inner.usage.record(line);
+                    drop(permit.take());
+                    let mut res = (
+                        StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+                        Json(neutral_error(status, &body)),
+                    )
+                        .into_response();
+                    if let Some(v) = headers.get(header::RETRY_AFTER) {
+                        res.headers_mut().insert(header::RETRY_AFTER, v.clone());
+                    }
+                    return hop_response(res, hop, i, attempts);
+                }
+                HopOutcome::Failed(failure) => {
+                    tracing::warn!(
+                        role = %role.alias(), model = %hop.reported_model(),
+                        upstream = hop.upstream_kind_label(), reason = failure.reason, attempt = attempts,
+                        "a model of the route failed"
+                    );
+                    line.status = 502;
+                    line.retrying = true;
+                    line.reason = Some(failure.reason);
+                    line.latency_ms = started.elapsed().as_millis() as u64;
+                    inner.usage.record(line);
+                    let wait = match failure.same {
+                        crate::fallback::Same::No => None,
+                        crate::fallback::Same::After(d) => Some(d),
+                        crate::fallback::Same::Backoff => Some(inner.retry.backoff(same)),
+                    };
+                    let Some(wait) = wait.filter(|w| {
+                        same < routing.same_hop_attempts && Instant::now() + *w < deadline
+                    }) else {
+                        continue 'hops;
+                    };
+                    // The slot is given back while waiting, as a one-hop role's retry does.
+                    drop(permit.take());
+                    tokio::time::sleep(wait).await;
+                    let waited = Instant::now();
+                    match slot(inner, &owner, priority).await {
+                        Ok(p) => permit = Some(p),
+                        Err(why) => {
+                            event.status = why.status().as_u16();
+                            event.attempts = attempts;
+                            event.latency_ms = started.elapsed().as_millis() as u64;
+                            inner.usage.record(event);
+                            return busy(why);
+                        }
+                    }
+                    event.queue_ms += waited.elapsed().as_millis() as u64;
+                }
+            }
+        }
+    }
+    drop(permit);
+    // Nothing left (§4.3, step 5): no hop, no upstream's error, named.
+    event.status = 503;
+    event.attempt = attempts;
+    event.attempts = attempts;
+    event.skipped = skipped;
+    event.latency_ms = started.elapsed().as_millis() as u64;
+    inner.usage.record(event);
+    no_model_available(1)
+}
+
+/// `503 no_model_available` (§4.3, step 5), with `Retry-After` (at least a second).
+fn no_model_available(retry_after_secs: u64) -> Response {
+    let mut res = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"error": {
+            "type": "no_model_available",
+            "status": 503,
+            "message": "no model of this role is available now; try again shortly",
+        }})),
+    )
+        .into_response();
+    res.headers_mut().insert(
+        header::RETRY_AFTER,
+        HeaderValue::from(retry_after_secs.max(1)),
+    );
+    res
+}
+
+/// The usage line for an attempt at `hop` (index `i` of the route): the call's line with the
+/// hop's label, hash, kind, place and fallback flag (§4.9).
+fn hop_line(inner: &Inner, event: &UsageEvent, hop: &Hop, i: usize) -> UsageEvent {
+    let mut line = event.clone();
+    line.model = hop.reported_model().to_string();
+    line.model_sha256 = hop.model_sha256();
+    line.upstream = hop.logged_upstream_host();
+    line.hop = Some(i as u32 + 1);
+    line.fallback = i > 0;
+    line.upstream_sha256 = inner.hosted_test.then(|| hop.upstream_sha256());
+    line.status = 200;
+    line.retrying = false;
+    line.reason = None;
+    line
+}
+
+/// An answer from `hop` (index `i`), with the headers that say which model answered (§4.9).
+fn hop_response(mut res: Response, hop: &Hop, i: usize, attempts: u32) -> Response {
+    if let Ok(v) = HeaderValue::from_str(hop.reported_model()) {
+        res.headers_mut().insert("x-pmos-model", v);
+    }
+    route_headers(&mut res, hop.model_sha256().as_deref(), i as u32 + 1, i > 0);
+    res.headers_mut()
+        .insert("x-pmos-upstream-attempts", HeaderValue::from(attempts));
+    res
+}
+
+/// The answer once `hop` has committed: a whole answer with the hop's workarounds and label
+/// applied, or its stream (held events first) under the gateway's usual limits.
+#[allow(clippy::too_many_arguments)]
+fn committed(
+    inner: &Inner,
+    hop: &Hop,
+    i: usize,
+    endpoint: Endpoint,
+    stream: bool,
+    c: Committed,
+    mut event: UsageEvent,
+    permit: Permit,
+    started: Instant,
+    attempts: u32,
+) -> Response {
+    let label = hop.reported_model().to_string();
+    let remote = hop.kind == UpstreamKind::RemoteOpenAi;
+    match c {
+        Committed::Stream { held, rest } => {
+            let end = StreamEnd {
+                usage: inner.usage.clone(),
+                event,
+                started,
+                _permit: permit,
+            };
+            let scanner = remote.then(|| StreamScanner::new(inner.extras.clone(), &hop.upstream));
+            let limits = inner.models.limits;
+            let upstream: Upstream =
+                Box::pin(futures_util::stream::once(async move { Ok(held) }).chain(rest));
+            let body = bounded_stream(
+                upstream,
+                end,
+                scanner,
+                tokio::time::Instant::now() + Duration::from_secs(limits.stream_max_secs),
+                limits.max_answer_bytes,
+            );
+            let res = (
+                [
+                    (header::CONTENT_TYPE, "text/event-stream"),
+                    (header::CACHE_CONTROL, "no-cache"),
+                ],
+                Body::from_stream(relabel_stream(body, label)),
+            )
+                .into_response();
+            hop_response(res, hop, i, attempts)
+        }
+        Committed::Whole(mut answer) => {
+            if remote && endpoint == Endpoint::Chat {
+                inner.extras.remember_answer(&hop.upstream, &answer);
+            }
+            if endpoint == Endpoint::Chat && hop.kind != UpstreamKind::ClaudeTest {
+                event.workarounds =
+                    workarounds::apply(&hop.workarounds, inner.workarounds_on, &mut answer);
+            }
+            relabel(&mut answer, &label);
+            event.prompt_tokens = answer["usage"]["prompt_tokens"].as_u64();
+            event.completion_tokens = answer["usage"]["completion_tokens"].as_u64();
+            event.latency_ms = started.elapsed().as_millis() as u64;
+            inner.usage.record(event);
+            drop(permit);
+            let res = if stream {
+                (
+                    [
+                        (header::CONTENT_TYPE, "text/event-stream"),
+                        (header::CACHE_CONTROL, "no-cache"),
+                    ],
+                    anthropic::as_stream(&answer),
+                )
+                    .into_response()
+            } else {
+                Json(answer).into_response()
+            };
+            hop_response(res, hop, i, attempts)
+        }
+    }
+}
+
+/// One attempt at one hop (§4.4, §4.5): the request with this hop's model id (and, for a
+/// remote one, the tool-call `extra_content` it gave, never another upstream's), sent with
+/// this hop's key only, and what came back, classified.
+async fn attempt_hop(
+    inner: &Inner,
+    role: &Role,
+    hop: &Hop,
+    endpoint: Endpoint,
+    req: &Value,
+    stream: bool,
+    key: Option<&str>,
+) -> HopOutcome {
+    use crate::fallback::{Failure, Hit, Same, Scope};
+    let fail =
+        |reason, same, hit, scope| HopOutcome::Failed(Failure::new(reason, same, hit, scope));
+    let max = inner.models.limits.max_answer_bytes;
+    let mut req = req.clone();
+    req["model"] = json!(hop.model);
+    if hop.kind == UpstreamKind::ClaudeTest {
+        return attempt_claude(inner, hop, &req, key.unwrap_or_default()).await;
+    }
+    let whole_for_stream =
+        stream && workarounds::needs_whole_answer(&hop.workarounds, inner.workarounds_on);
+    if whole_for_stream {
+        req["stream"] = json!(false);
+        if let Some(o) = req.as_object_mut() {
+            o.remove("stream_options");
+        }
+    }
+    let upstream_stream = stream && !whole_for_stream;
+    if hop.kind == UpstreamKind::RemoteOpenAi {
+        inner.extras.restore(&hop.upstream, &mut req);
+    }
+    let client = if upstream_stream {
+        &inner.http
+    } else {
+        &inner.whole_http
+    };
+    let post = client.post(format!("{}/{}", hop.upstream, endpoint.path()));
+    let post = match key {
+        Some(k) => post.bearer_auth(k),
+        None => post,
+    };
+    let res = match post.json(&req).send().await {
+        Ok(r) => r,
+        Err(e) if e.is_timeout() => return fail("timeout", Same::No, Hit::Count, Scope::Upstream),
+        Err(e) if e.is_connect() => {
+            return fail("connect", Same::Backoff, Hit::Count, Scope::Upstream)
+        }
+        Err(_) => return fail("connect", Same::No, Hit::Count, Scope::Upstream),
+    };
+    let status = res.status().as_u16();
+    if !res.status().is_success() {
+        let headers = res.headers().clone();
+        let body = read_capped(res, max.min(ERROR_BODY_MAX))
+            .await
+            .unwrap_or_default();
+        return match crate::fallback::classify_status(
+            status,
+            &headers,
+            &body,
+            inner.models.routing.short_retry_after(),
+        ) {
+            crate::fallback::Verdict::Answer => HopOutcome::Final {
+                status,
+                headers,
+                body,
+            },
+            crate::fallback::Verdict::Fail(failure) => {
+                if failure.reason == "auth" {
+                    tracing::warn!(
+                        role = %role.alias(), model = %hop.reported_model(),
+                        "upstream refused the key"
+                    );
+                }
+                HopOutcome::Failed(failure)
+            }
+        };
+    }
+    if upstream_stream {
+        return match crate::fallback::first_content(
+            Box::pin(res.bytes_stream()),
+            inner.models.routing.first_token(),
+        )
+        .await
+        {
+            Ok((held, rest)) => HopOutcome::Committed(Committed::Stream { held, rest }),
+            Err(_) => fail("first_token", Same::No, Hit::Count, Scope::Model),
+        };
+    }
+    let Ok(bytes) = read_capped(res, max).await else {
+        return fail("bad_answer", Same::No, Hit::Count, Scope::Model);
+    };
+    match serde_json::from_slice::<Value>(&bytes) {
+        Ok(v @ Value::Object(_)) => HopOutcome::Committed(Committed::Whole(v)),
+        _ => fail("bad_answer", Same::No, Hit::Count, Scope::Model),
+    }
+}
+
+/// The largest upstream error body read (to classify it; it never reaches a caller).
+const ERROR_BODY_MAX: usize = 1024 * 1024;
+
+/// One attempt at a Claude test upstream hop: the Messages API's whole answer, translated.
+async fn attempt_claude(inner: &Inner, hop: &Hop, req: &Value, key: &str) -> HopOutcome {
+    use crate::fallback::{Failure, Hit, Same, Scope};
+    let fail =
+        |reason, same, hit, scope| HopOutcome::Failed(Failure::new(reason, same, hit, scope));
+    let body = match anthropic::to_messages(req, &hop.model, hop.effort.as_deref()) {
+        Ok(b) => b,
+        Err(m) => {
+            return HopOutcome::Final {
+                status: 400,
+                headers: HeaderMap::new(),
+                body: Bytes::from(m),
+            }
+        }
+    };
+    let res = match inner
+        .whole_http
+        .post(format!("{}/v1/messages", hop.upstream))
+        .header("x-api-key", key)
+        .header("anthropic-version", anthropic::API_VERSION)
+        .header("anthropic-beta", anthropic::FALLBACK_BETA)
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) if e.is_timeout() => return fail("timeout", Same::No, Hit::Count, Scope::Upstream),
+        Err(e) if e.is_connect() => {
+            return fail("connect", Same::Backoff, Hit::Count, Scope::Upstream)
+        }
+        Err(_) => return fail("connect", Same::No, Hit::Count, Scope::Upstream),
+    };
+    let status = res.status().as_u16();
+    let headers = res.headers().clone();
+    let Ok(bytes) = read_capped(res, inner.models.limits.max_answer_bytes).await else {
+        return fail("bad_answer", Same::No, Hit::Count, Scope::Model);
+    };
+    if !(200..300).contains(&status) {
+        return match crate::fallback::classify_status(
+            status,
+            &headers,
+            &bytes,
+            inner.models.routing.short_retry_after(),
+        ) {
+            crate::fallback::Verdict::Answer => HopOutcome::Final {
+                status,
+                headers,
+                body: bytes,
+            },
+            crate::fallback::Verdict::Fail(failure) => HopOutcome::Failed(failure),
+        };
+    }
+    match serde_json::from_slice::<Value>(&bytes) {
+        Ok(v @ Value::Object(_)) => HopOutcome::Committed(Committed::Whole(
+            anthropic::from_messages(&v, hop.reported_model()),
+        )),
+        _ => fail("bad_answer", Same::No, Hit::Count, Scope::Model),
+    }
 }
 
 /// One call to the testing-only Claude upstream (`anthropic.rs`): the request translated to
