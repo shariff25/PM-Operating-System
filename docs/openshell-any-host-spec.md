@@ -212,6 +212,21 @@ verified: anything on a real host or OpenShell; the test stack itself was not st
 `deploy/preflight.sh` still reads a blank source as `local`, the reading that runs the most
 checks.
 
+**Slice H6 status (2026-11-24): built and merged on `claude/web-app`, not yet reviewed.** Docs,
+runbooks, kit comments and code comments say "PM OS's host"; the §3.9 promises are rewritten;
+`scripts/check-model-promises.sh` (with a self-test) runs in CI; the install runbook covers any
+host, the three model paths, and the web app on a private host only until H10. Kept: the runner
+label `pmos-spark` and `PMOS_SPARK_DIR` (historical, until the owner places the eval gate's
+runner), the content decision file (the owner's), H12's tests and H7's red-team files. Not
+verified: anything on a real host.
+
+**Kit follow-ups (2026-11-24), merged, not yet reviewed, and not yet in §3.2:** a new preflight
+check, H-SETTINGS, fails a blank `PMOS_MODEL_SOURCE` or `PMOS_EXPOSURE` at the run stage and
+`hosted` at every stage (at install a blank passes, because `setup.sh` writes them); a blank
+still counts as `local` and `public` for the checks that depend on it. `pmos-admin up` refuses a
+`PMOS_WEB_BRIEF_URL` that is not `http://<name>:8771`, and `up --web` on a `public` host refuses
+before anything else runs, saying the web app waits for H10.
+
 **The owner's requirement, 2026-11-22:** "I want to deploy it in another platform apart from
 spark", and, asked which cloud, "OpenShell on another platform generic implementation". So PM OS's
 bots must be able to run in NVIDIA OpenShell sandboxes on hosts other than the DGX Spark, through

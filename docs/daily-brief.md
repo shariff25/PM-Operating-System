@@ -164,7 +164,7 @@ pmos-web has. With either unset the feed is off: the block is still taken out, n
 pmos-web needs `PMOS_WEB_BRIEF=1` and the same `PMOS_WEB_BRIEF_TOKEN`
 (`crates/web/README.md`). `scripts/claude-test-stack.sh` with `PMOS_TEST_WEB=1` sets all of it;
 on the server, `deploy/setup.sh` generates the token, and `PMOS_WEB_BRIEF=1` with
-`PMOS_WEB_BRIEF_URL=http://web.pmos.internal:8770` in `deploy/.env` turns it on.
+`PMOS_WEB_BRIEF_URL=http://web.pmos.internal:8771` in `deploy/.env` turns it on.
 
 **Privacy.** A `summary` is a paraphrase the skill wrote, never Slack message text; the skill
 says so, and Slack refuses one with Slack markup. pmos-web keeps Slack follow-ups for 24 hours
