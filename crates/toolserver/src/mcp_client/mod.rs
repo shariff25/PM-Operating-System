@@ -21,6 +21,7 @@ pub mod connector;
 pub mod digest;
 pub mod fake;
 pub mod handler;
+pub mod host;
 pub mod mapping;
 pub mod oauth;
 pub mod server;

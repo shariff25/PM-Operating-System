@@ -104,6 +104,8 @@ pub struct ToolCheck {
     pub approved_digest: String,
     /// `approved`, `changed`, `missing`, or `unchecked` before the first connection.
     pub state: &'static str,
+    /// The digest the server listed it with at the last check, if it listed it.
+    pub listed_digest: Option<String>,
 }
 
 /// The server's last check, for Admins.
@@ -116,6 +118,9 @@ pub struct Status {
     /// `ok`, or why the last connection failed.
     pub outcome: Option<String>,
     pub tools: Vec<ToolCheck>,
+    /// Every tool the server listed at the last check, by name (cleaned: the names are the
+    /// server's), with its digest: for an Admin preparing an approval. Never shown to a bot.
+    pub listed: Vec<(String, String)>,
     pub refused_requests: u64,
     pub dropped_notifications: u64,
 }
@@ -186,6 +191,7 @@ impl McpServer {
                     upstream: upstream.to_string(),
                     approved_digest: digest.to_string(),
                     state: "unchecked",
+                    listed_digest: None,
                 })
                 .collect(),
             ..Default::default()
@@ -601,6 +607,7 @@ impl McpServer {
                     upstream: upstream.to_string(),
                     approved_digest: approved.to_string(),
                     state,
+                    listed_digest: digests.get(upstream).cloned(),
                 });
             }
         }
@@ -609,6 +616,19 @@ impl McpServer {
             s.checked_at = Some(Utc::now());
             s.outcome = Some("ok".into());
             s.tools = checks;
+            let mut listed: Vec<(String, String)> = digests
+                .iter()
+                .map(|(name, d)| {
+                    let clean: String = name
+                        .chars()
+                        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/'))
+                        .take(128)
+                        .collect();
+                    (clean, d.clone())
+                })
+                .collect();
+            listed.sort();
+            s.listed = listed;
         }
         for (upstream, why) in newly {
             tracing::error!(server = %self.record.id, tool = %upstream, why, "an approved MCP tool changed at its server; it is off until an Admin approves it again");

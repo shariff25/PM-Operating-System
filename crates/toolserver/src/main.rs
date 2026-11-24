@@ -34,6 +34,11 @@ async fn main() -> Result<()> {
     if args.first().map(String::as_str) == Some("users") {
         std::process::exit(pmos_toolserver::users::host::main(args[1..].to_vec()).await);
     }
+    // `pmos-toolserver mcp digests <record.yaml>`: an operator's command for an Admin preparing
+    // an approval (docs/toolserver.md, "MCP servers").
+    if args.first().map(String::as_str) == Some("mcp") {
+        std::process::exit(pmos_toolserver::mcp_client::host::main(args[1..].to_vec()).await);
+    }
 
     tracing_subscriber::fmt()
         .json()
