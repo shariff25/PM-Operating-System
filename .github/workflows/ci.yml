@@ -114,9 +114,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Scripts parse
-        run: for f in deploy/setup.sh deploy/pmos-admin deploy/postgres-init.sh deploy/preflight.sh deploy/pmos-metadata-block deploy/sandbox-create.sh scripts/claude-test-stack.sh scripts/test-pmos-admin.sh scripts/test-preflight.sh; do bash -n "$f"; done
+        run: for f in deploy/setup.sh deploy/pmos-admin deploy/postgres-init.sh deploy/preflight.sh deploy/pmos-metadata-block deploy/sandbox-create.sh scripts/claude-test-stack.sh scripts/test-pmos-admin.sh scripts/test-preflight.sh policies/redteam/lib.sh policies/redteam/isolation.sh policies/redteam/exposure.sh policies/redteam/stack.sh scripts/test-redteam.sh; do bash -n "$f"; done
       - name: pmos-admin checks (the eval gate's arguments; the checkout stays data)
         run: scripts/test-pmos-admin.sh
+      # docs/openshell-any-host-spec.md §5 (slice H7): the red-team scripts' dry runs, refusals,
+      # skips and traps, against stand-ins (nothing here reaches OpenShell, Docker or the host).
+      - name: Red-team scripts (dry runs and stand-ins)
+        run: |
+          shellcheck -S warning -x policies/redteam/*.sh scripts/test-redteam.sh
+          scripts/test-redteam.sh
       # docs/openshell-any-host-spec.md §6 (slice H1): every preflight check, pass and fail, on the
       # fixture hosts in deploy/test/preflight/; it also runs the Landlock probe on this runner
       # and prints its answer (not asserted: it depends on the runner's kernel).
