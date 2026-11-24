@@ -198,3 +198,188 @@ async fn writes_go_to_the_built_in_backend_only() {
     assert!(fake.jira_writes().is_empty(), "never sent twice");
     assert!(!fake.calls().iter().any(|c| c.contains("create")));
 }
+
+// ----- slice M8: Confluence and Slack side by side ---------------------------------------------
+
+/// The fixture with `systems` compared side by side, as `PMOS_MCP_COMPARE` builds it.
+async fn compared(
+    systems: &[&str],
+) -> (
+    common::Fixture,
+    pmos_toolserver::mcp_client::fake::FakeMcp,
+    CancellationToken,
+) {
+    let cancel = CancellationToken::new();
+    let mut f = fixture();
+    let systems: Vec<String> = systems.iter().map(|s| s.to_string()).collect();
+    let (served, fake) = pmos_toolserver::mcp_client::start_fake_for(
+        &systems,
+        pmos_toolserver::mcp_client::fake::FakeMcp::new(),
+        Some(f.stores.audit.clone()),
+        cancel.clone(),
+    )
+    .await
+    .unwrap();
+    let builtin: Vec<Arc<dyn Connector>> = vec![
+        f.jira.clone(),
+        f.confluence.clone(),
+        f.slack.clone(),
+        Arc::new(FakeConnector::docs()),
+    ];
+    let connectors = builtin
+        .iter()
+        .map(
+            |b| match served.connectors.iter().find(|s| s.system() == b.system()) {
+                Some(shadow) => Arc::new(SideBySide::new(
+                    b.clone(),
+                    shadow.clone(),
+                    f.stores.audit.clone(),
+                )) as Arc<dyn Connector>,
+                None => b.clone(),
+            },
+        )
+        .collect();
+    let catalog = Catalog::load(&f.root, now().date_naive()).unwrap();
+    f.svc = Arc::new(
+        ToolService::new(catalog, f.stores.clone(), connectors)
+            .unwrap()
+            .with_open_directory(),
+    );
+    (f, fake, cancel)
+}
+
+/// Every Confluence or Slack read the fixtures answer, for a PM and a team bot.
+async fn every_m8_read(f: &common::Fixture, system: &str) -> usize {
+    let s = f
+        .svc
+        .create_session("ana", "field-watch", "r1", None, now())
+        .await
+        .unwrap();
+    let b = f
+        .svc
+        .create_bot_session("ana", "scout", "tsk_1", None, now())
+        .await
+        .unwrap();
+    let mut calls = Vec::new();
+    if system == "confluence" {
+        for cql in ["sso", "PRD", "customer call", "nothing-matches"] {
+            calls.push((&s, "confluence_search", json!({"cql": cql})));
+            calls.push((&s, "confluence_search", json!({"cql": cql, "limit": 1})));
+            calls.push((&b, "confluence_search", json!({"cql": cql})));
+        }
+        for page in ["9001", "9002", "1234"] {
+            calls.push((&s, "confluence_read", json!({"page_id": page})));
+            calls.push((&b, "confluence_read", json!({"page_id": page})));
+        }
+    } else {
+        for q in ["<@U0EVALS>", "SAML", "SCIM", "nothing-matches"] {
+            calls.push((&s, "slack_search", json!({"query": q})));
+            calls.push((&s, "slack_search", json!({"query": q, "limit": 2})));
+            calls.push((&b, "slack_search", json!({"query": q})));
+        }
+        for (channel, ts) in [
+            ("C0FIELD", "1731500000.000100"),
+            ("C0PMTEAM", "1731600300.000200"),
+            ("C0PMTEAM", "1731600360.000300"),
+            ("C0GLOBEXCX", "1731601800.000800"),
+            ("C0PMTEAM", "1999999999.000000"),
+        ] {
+            let args = json!({"channel": channel, "ts": ts});
+            calls.push((&s, "slack_read_thread", args.clone()));
+            calls.push((&b, "slack_read_thread", args));
+        }
+    }
+    let n = calls.len();
+    for (session, tool, args) in calls {
+        let _ = f.svc.call(session, tool, args, now()).await;
+    }
+    n
+}
+
+/// The comparison on the fixtures: (reads made, reads compared, compared that differed).
+async fn on_the_fixtures(system: &str) -> (usize, usize, usize) {
+    let (f, fake, _cancel) = compared(&[system]).await;
+    let n = every_m8_read(&f, system).await;
+    let compared: Vec<_> = f
+        .audit
+        .events()
+        .into_iter()
+        .filter(|e| e.tool == "mcp.compare")
+        .collect();
+    assert!(compared.iter().all(|e| e
+        .detail
+        .as_deref()
+        .unwrap()
+        .starts_with(&format!("{system}."))));
+    let differ: Vec<String> = compared
+        .iter()
+        .filter(|e| e.outcome != Outcome::Ok)
+        .map(|e| e.detail.clone().unwrap())
+        .collect();
+    for e in &compared {
+        let d = e.detail.as_deref().unwrap();
+        assert!(
+            e.args_hash.is_some() && e.sources.is_empty(),
+            "metadata only"
+        );
+        assert!(
+            !d.contains("SSO") && !d.contains("Acme") && !d.contains("SAML"),
+            "no titles or text: {d}"
+        );
+    }
+    assert!(fake.calls().iter().any(|c| c.starts_with("tools/call:")));
+    // Writes are never sent to the fake MCP server.
+    assert!(fake.confluence_writes().is_empty() && fake.slack_writes().is_empty());
+    eprintln!(
+        "side by side on the fixtures: {n} {system} reads made, {} compared, {} differed: {differ:#?}",
+        compared.len(),
+        differ.len()
+    );
+    (n, compared.len(), differ.len())
+}
+
+#[tokio::test]
+async fn on_the_fixtures_every_confluence_read_is_the_same_on_both() {
+    let (n, compared, differ) = on_the_fixtures("confluence").await;
+    // Every read is compared, the team bot's (Confluence space ENG) included: its scope is
+    // applied by each backend, and the refusals must agree too. Recorded in the spec.
+    assert_eq!((n, compared, differ), (18, 18, 0));
+}
+
+#[tokio::test]
+async fn on_the_fixtures_every_slack_read_is_the_same_on_both() {
+    let (n, compared, differ) = on_the_fixtures("slack").await;
+    assert_eq!((n, compared, differ), (22, 22, 0));
+}
+
+#[tokio::test]
+async fn slack_posts_and_the_audience_check_stay_on_the_built_in_backend_while_compared() {
+    let (f, fake, _cancel) = compared(&["slack"]).await;
+    let s = f
+        .svc
+        .create_session("ana", "field-watch", "r1", None, now())
+        .await
+        .unwrap();
+    let args = json!({"channel": "C0PMTEAM", "thread_ts": "1731600000.000100", "text": "Yes"});
+    let res = f
+        .svc
+        .call(&s, "slack_post_reply", args, now())
+        .await
+        .unwrap();
+    let id = res["approval_id"].as_str().unwrap().to_string();
+    let _ = f
+        .svc
+        .decide(
+            &id,
+            "ana",
+            pmos_toolserver::approvals::Decision::Approve,
+            None,
+            now(),
+        )
+        .await;
+    assert!(fake.slack_writes().is_empty(), "never sent twice");
+    assert!(!fake
+        .calls()
+        .iter()
+        .any(|c| c.contains("slack_reply") || c.contains("slack_conversation")));
+}

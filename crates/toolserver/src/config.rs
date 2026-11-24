@@ -222,20 +222,21 @@ pub struct Config {
     /// `PMOS_GATEWAY_URL`: the model gateway, whose `/readyz` says the source it serves; every
     /// session open and tool call checks it (`crate::model_source`). Required.
     pub gateway_url: String,
-    /// Fake connectors with `PMOS_MCP_SYSTEMS=jira` (the spec's `fake-mcp` mode,
-    /// `docs/mcp-servers-spec.md` §4): Jira served through the MCP client by the fake MCP
-    /// server, in this process. (`PMOS_CONNECTORS` keeps its two values: the runtime and
-    /// `pmos-web` read it too.)
+    /// Fake connectors with `PMOS_MCP_SYSTEMS` naming `jira`, `confluence` or `slack` (the
+    /// spec's `fake-mcp` mode, `docs/mcp-servers-spec.md` §4): those systems served through the
+    /// MCP client by the fake MCP server, in this process. (`PMOS_CONNECTORS` keeps its two
+    /// values: the runtime and `pmos-web` read it too.)
     pub fake_mcp: bool,
-    /// `PMOS_MCP_SYSTEMS` (slices M3 and M6): registry systems served through an MCP server
+    /// `PMOS_MCP_SYSTEMS` (slices M3, M6 and M8): registry systems served through an MCP server
     /// instead of the built-in connector. Default empty: every system on its built-in connector,
     /// the quick way back. With live connectors each is served by its approved record in
-    /// `content/mcp/`; with fake ones `jira` is served by the fake MCP server. `docs` is served
-    /// by its record (`pmos-docs`) with either. Confluence and Slack are refused until slice M8.
+    /// `content/mcp/`; with fake ones `jira`, `confluence` and `slack` are served by the fake
+    /// MCP server. `docs` is served by its record (`pmos-docs`) with either. Slack's posts move
+    /// only when its record approves the audience checks; otherwise they stay built-in.
     pub mcp_systems: Vec<String>,
-    /// `PMOS_MCP_COMPARE` (slice M7): systems whose reads run on both the in-process fake and
-    /// the fake MCP server, the answers compared and the comparison audited. Fake connectors
-    /// only, so only fake data is compared. `jira` only.
+    /// `PMOS_MCP_COMPARE` (slices M7 and M8): systems whose reads run on both the in-process
+    /// fake and the fake MCP server, the answers compared and the comparison audited. Fake
+    /// connectors only, so only fake data is compared. `jira`, `confluence`, `slack`.
     pub mcp_compare: Vec<String>,
 }
 
@@ -256,24 +257,18 @@ fn mcp_settings(
 ) -> Result<(Vec<String>, Vec<String>), String> {
     let systems = list_setting(get, "PMOS_MCP_SYSTEMS");
     for s in &systems {
-        match s.as_str() {
-            "jira" | "docs" => {}
-            "confluence" | "slack" => {
-                return Err(format!(
-                    "PMOS_MCP_SYSTEMS: `{s}` can't be served by an MCP server yet (slice M8 of docs/mcp-servers-spec.md)"
-                ))
-            }
-            other => {
-                return Err(format!(
-                    "PMOS_MCP_SYSTEMS must list `jira` or `docs`, not `{other}`"
-                ))
-            }
+        if !crate::mcp_client::SWITCHABLE_SYSTEMS.contains(&s.as_str()) {
+            return Err(format!(
+                "PMOS_MCP_SYSTEMS must list `jira`, `confluence`, `slack` or `docs`, not `{s}`"
+            ));
         }
     }
     let compare = list_setting(get, "PMOS_MCP_COMPARE");
     for s in &compare {
-        if s != "jira" {
-            return Err(format!("PMOS_MCP_COMPARE must be `jira`, not `{s}`"));
+        if !crate::mcp_client::FAKE_SYSTEMS.contains(&s.as_str()) {
+            return Err(format!(
+                "PMOS_MCP_COMPARE must list `jira`, `confluence` or `slack`, not `{s}`"
+            ));
         }
         if live {
             return Err(
@@ -425,8 +420,10 @@ impl Config {
         };
         let (mcp_systems, mcp_compare) =
             mcp_settings(&get, matches!(connectors, Connectors::Live(_)))?;
-        let fake_mcp =
-            matches!(connectors, Connectors::Fake) && mcp_systems.iter().any(|s| s == "jira");
+        let fake_mcp = matches!(connectors, Connectors::Fake)
+            && mcp_systems
+                .iter()
+                .any(|s| crate::mcp_client::FAKE_SYSTEMS.contains(&s.as_str()));
         // The dev seed for the in-memory user store (docs/user-database-spec.md §3): never
         // with a database (users come from the host commands there) or live connectors.
         let users_seed = get("PMOS_USERS_SEED")
@@ -1699,18 +1696,26 @@ mod tests {
         assert!(on.fake_mcp);
         assert_eq!(on.mcp_systems, vec!["jira"]);
         assert!(with(&[("PMOS_MCP_SYSTEMS", "docs")]).is_ok());
-        for refused in ["confluence", "slack"] {
-            assert!(with(&[("PMOS_MCP_SYSTEMS", refused)])
-                .unwrap_err()
-                .contains("slice M8"));
+        // Slice M8: Confluence and Slack may be switched too (this changed with M8).
+        for system in ["confluence", "slack"] {
+            let on = with(&[("PMOS_MCP_SYSTEMS", system)]).unwrap();
+            assert!(on.fake_mcp);
+            assert_eq!(on.mcp_systems, vec![system]);
         }
         assert!(with(&[("PMOS_MCP_SYSTEMS", "github")]).is_err());
-        // The comparison: fake data, Jira, not also switched.
+        // The comparison: fake data, Jira, Confluence or Slack, not also switched.
         assert_eq!(
             with(&[("PMOS_MCP_COMPARE", "jira")]).unwrap().mcp_compare,
             vec!["jira"]
         );
-        assert!(with(&[("PMOS_MCP_COMPARE", "confluence")]).is_err());
+        assert_eq!(
+            with(&[("PMOS_MCP_COMPARE", "confluence slack")])
+                .unwrap()
+                .mcp_compare,
+            vec!["confluence", "slack"]
+        );
+        assert!(with(&[("PMOS_MCP_COMPARE", "docs")]).is_err());
+        assert!(with(&[("PMOS_MCP_COMPARE", "slack"), ("PMOS_MCP_SYSTEMS", "slack")]).is_err());
         assert!(with(&[("PMOS_MCP_COMPARE", "jira"), ("PMOS_MCP_SYSTEMS", "jira")]).is_err());
         // PMOS_CONNECTORS keeps its two values (the runtime and pmos-web read it too).
         assert!(cfg(&[

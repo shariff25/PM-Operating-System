@@ -160,6 +160,10 @@ pub struct LedgerRow {
     pub created_at: DateTime<Utc>,
     pub decided_at: Option<DateTime<Utc>>,
     pub decided_by: Option<String>,
+    /// Which backend serves the write: `builtin`, `fake`, or the MCP server record's id
+    /// (`docs/mcp-servers-spec.md` §2.9, slice M8). `None` for rows from before it was kept.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub served_by: Option<String>,
 }
 
 impl LedgerRow {
@@ -565,6 +569,7 @@ mod tests {
             created_at: at,
             decided_at: (outcome != LedgerOutcome::Pending).then_some(at),
             decided_by: None,
+            served_by: None,
         }
     }
 

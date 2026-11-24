@@ -46,8 +46,8 @@ fn slack_id(value: &str) -> Result<&str, ConnectorError> {
     }
 }
 
-/// Each thread message returned to the model, at most.
-const MAX_MESSAGE_CHARS: usize = 2_000;
+/// Each thread message returned to the model, at most (the MCP route clips to it too).
+pub const MAX_MESSAGE_CHARS: usize = 2_000;
 
 /// A message timestamp, such as `1731500000.000100`.
 fn slack_ts(value: &str) -> Result<&str, ConnectorError> {

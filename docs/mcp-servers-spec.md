@@ -1,6 +1,6 @@
 # MCP servers in place of the built-in connectors
 
-Status: **M1 to M7 built before review** (see "Status of the build" below). Revision r1, 2026-11-24, written from `claude/web-app` at
+Status: **M1 to M8 built before review** (see "Status of the build" below). Revision r1, 2026-11-24, written from `claude/web-app` at
 `0e1316b`. The independent security reviewer reads it before any slice starts (CLAUDE.md, "How
 to work"). No connector code is removed or written until the reviewer has answered.
 
@@ -14,10 +14,10 @@ Line numbers are not cited; file paths are. Where this spec is unsure of a fact 
 
 ## Status of the build (2026-11-24)
 
-**Slices M1 to M7 built before review (owner's instruction of 2026-11-24)**, on branch
-`build/mcp-servers`, one commit per slice; the reviewer has read none of it. Not built: M8
-(Confluence, Slack), M9 (the eval run), M11, and every removal (R-jira, R-confluence, R-slack:
-each needs the owner's go-ahead). The switch is off by default (`PMOS_MCP_SYSTEMS` empty): every
+**Slices M1 to M8 built before review (owner's instruction of 2026-11-24)**, M1 to M7 on branch
+`build/mcp-servers`, one commit per slice, M8 on `build/mcp-m8`; the reviewer has read none of
+it. Not built: M9 (the eval run), M11, and every removal (R-jira, R-confluence, R-slack: each
+needs the owner's go-ahead; no connector code was removed). The switch is off by default (`PMOS_MCP_SYSTEMS` empty): every
 system stays on its built-in connector. Everything ran against fakes on loopback only; no real
 MCP server, authorization server or model was contacted, and no real server's product facts
 are assumed (§10's are still to be confirmed). How it works: `docs/toolserver.md`, "MCP servers".
@@ -39,6 +39,26 @@ are assumed (§10's are still to be confirmed). How it works: `docs/toolserver.m
   tool service answer and audit as the built-in fake.
 - **M7** side by side (`PMOS_MCP_COMPARE=jira`, fake connectors only). **The comparison on the
   fixtures: 32 Jira reads compared, 0 differed.** It shows agreement on the fixtures only.
+- **M8** Confluence, then Slack, behind the same switch (`PMOS_MCP_SYSTEMS=confluence`, `slack`;
+  default off, the built-in connectors untouched and still the default), served by the fake MCP
+  server from the same fixtures. Confluence: its four registry tools mapped; an update's version
+  read through the approved `confluence.read` with the PM's token and checked before anything is
+  sent; the body sent as escaped storage with the built-in connector's footer
+  (`adapter: confluence_storage`). Slack: its four registry tools mapped (`adapter: slack_text`
+  adds the marker; `message_ts` must be dropped), and two **check** tools a record may approve,
+  never listed to a bot (`slack_conversation`, `slack_members`), through which the audience check
+  runs with the PM's token. Without both checks a Slack record serves reads only: posts, the
+  audience check and the channel label stay on the built-in connector (`mcp_client/split.rs`),
+  and the lint refuses a record that maps a post without them. The approval gate, the audience
+  check, one draft per thread and per tagged message, and SLK-8 stay in the tool server on both
+  routes; `slack_reply.rs` runs 13 of its cases on both MCP routes (with and without the checks).
+  Parity on the fixtures: every Confluence and Slack read the same; 7 Confluence writes and 5
+  Slack posts give the same reference or error kind (where the built-in fake accepts a malformed
+  key or id, the MCP route refuses it as the live connector does); every fixture channel's
+  audience and label the same. **The comparison on the fixtures (`PMOS_MCP_COMPARE`): 18
+  Confluence reads compared, 0 differed; 22 Slack reads compared, 0 differed** (a PM and a team
+  bot each). Closed from M1 to M7: the ledger's `served_by` and the items' `upstream_args_hash`
+  (migration 0035; also in the write's `started` audit detail).
 
 Where this build differs from the text above, or chose the more refusing reading:
 - `PMOS_CONNECTORS` keeps its two values (the runtime and `pmos-web` read it); `fake-mcp` is
@@ -52,12 +72,29 @@ Where this build differs from the text above, or chose the more refusing reading
 - Every `third_party` record is refused at start until the owner decides where an approval is
   kept; in fake-data mode every record but a `pmos-docs`-shaped one is refused.
 - The audit's `server` and `tool_digest` are in the event's `detail`, not new columns, so the
-  audit schema and every event stay as they are. The ledger's `served_by` and the items'
-  `upstream_args_hash` are not built (they need fields on structs existing tests construct).
+  audit schema and every event stay as they are (still so after M8: `AuditEvent` is built
+  field by field in some 60 places across the tests, which a new field would all change). The
+  ledger's `served_by` is kept on the approval item (the ledger table is unchanged) and read by
+  its row; `upstream_args_hash` is on the item and in the `started` event's detail.
 - A team bot's scoped Slack search asks the server for 50 and cuts to its limit after dropping
   out-of-scope results.
+- M8: every search over MCP is cut to the limit asked for (default 10), and each Slack thread
+  message to 2,000 characters, whatever the server sends. A Confluence or Slack write without
+  its adapter is refused by the lint and at start. A check must be explicitly `class: read`;
+  one that isn't is never called (Slack posts then stay built-in). A check needs an active
+  Admin's approval like a tool. A conversation check must name where `external`, `shared` and
+  `im` are, and an answer missing one fails the audience check closed; a member entry not shaped
+  like a member id fails it closed; a members answer longer than the cap counts as truncated.
+  Slack posts move only with both checks approved (the spec's §10 question 4 recommendation),
+  and a reads-only Slack record without the built-in connector to pair with refuses to start.
+  The fake MCP server's written ids (`CONFLUENCE-W1`) are accepted only in the `fake-mcp` mode.
 
-Not verified: any real MCP server or authorization server; the SPKI pin against a live TLS server
+Not verified: any real MCP server or authorization server; for M8, whether any real Confluence
+server's update keeps a page's status and its create makes a draft (the server's behaviour,
+which the approving Admin must confirm; PM OS cannot check it), the built-in update's default
+version message ("Updated with PM OS") is not sent when a draft gives none, Slack's audience
+tests against a real server's checks, the `confluence`/`slack` switch on the test stack, and the
+`slack-reply` evals with the switch on (M9); the SPKI pin against a live TLS server
 (unit-tested on the verifier only); the public-address resolver against real DNS; the 256 KiB cap
 on a plain JSON answer (rmcp parses up to 16 MiB first; streamed events are capped before
 parsing); H-MCP on a real stack (fixture-tested only); the `jira-draft` and `docs-qa` evals with
