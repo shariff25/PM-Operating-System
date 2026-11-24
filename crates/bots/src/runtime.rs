@@ -94,12 +94,26 @@ pub enum Error {
     /// can't be read: no routine is parsed (`503 {"code": "model_source_changed"}`).
     #[error("{MODEL_SOURCE_CHANGED}: the model gateway serves another model source than this runtime may use; nothing was sent to it")]
     ModelSourceChanged,
+    /// Slice H12 (r7, X3): the gateway serves a hosted entry this database hasn't been
+    /// cleared for, or the tool server's switch status can't be read (`503 {"code":
+    /// "model_source_acknowledgement_required"}`).
+    #[error("{ACKNOWLEDGEMENT_REQUIRED}: {SWITCH_SENTENCE}")]
+    AcknowledgementRequired,
     #[error(transparent)]
     Store(#[from] StoreError),
 }
 
 /// The code of [`Error::ModelSourceChanged`].
 pub const MODEL_SOURCE_CHANGED: &str = "model_source_changed";
+
+/// The code of [`Error::AcknowledgementRequired`].
+pub const ACKNOWLEDGEMENT_REQUIRED: &str = "model_source_acknowledgement_required";
+
+/// What the web app and the Slack App Home show in place of a reply while a switch waits.
+pub const SWITCH_SENTENCE: &str = "An administrator must confirm the model source switch";
+
+/// How long one reading of the tool server's switch status is reused (as the gateway's).
+pub const SWITCH_CACHE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The kind of the task event that records the model source a task was first claimed under
 /// (slice H4): a later claim waits until the gateway serves it again.
@@ -205,6 +219,10 @@ pub struct Claim {
     /// (its skills, model class and instructions) and `tools` the persona session's.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub persona: Option<ClaimPersona>,
+    /// Slice H12 (r6/r7, V11): under `hosted`, the gateway's effective data-class ceiling. The
+    /// harness refuses to start a task with a master-context file above it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_data_class: Option<String>,
 }
 
 /// The session token never reaches a log through `Debug`.
@@ -284,6 +302,10 @@ pub struct Runtime {
     content_refused: std::sync::Mutex<Option<String>>,
     /// What a benchmarked bot's answer from a fallback model gets (§4.10).
     fallback_mode: FallbackMode,
+    /// Slice H12: the tool server's switch status, at most [`SWITCH_CACHE`] old, dropped on
+    /// any failed read.
+    switch: tokio::sync::Mutex<Option<(Instant, crate::clients::SwitchView)>>,
+    switch_ttl: std::time::Duration,
 }
 
 /// `PMOS_FALLBACK_FOR_BENCHMARKED` (`docs/model-providers-spec.md` §4.10; the owner's open
@@ -366,7 +388,67 @@ impl Runtime {
             not_on_team: std::sync::Mutex::default(),
             content_refused: std::sync::Mutex::default(),
             fallback_mode: FallbackMode::Mark,
+            switch: tokio::sync::Mutex::default(),
+            switch_ttl: SWITCH_CACHE,
         }
+    }
+
+    /// Reuse a reading of the tool server's switch status for `ttl` (at most
+    /// [`SWITCH_CACHE`]; tests use less).
+    pub fn with_switch_cache(mut self, ttl: std::time::Duration) -> Self {
+        self.switch_ttl = ttl.min(SWITCH_CACHE);
+        self
+    }
+
+    /// Slice H12 (r6 V7): what the indicator shows ([`crate::app`]'s `GET /v1/model-source`).
+    pub async fn model_view(&self) -> serde_json::Value {
+        let Ok(report) = self.gateway.report().await else {
+            return json!({"source": "unknown", "fake_data": false, "switch_pending": false});
+        };
+        let s = report.source.as_str();
+        let mut view = match pmos_contract::model_source::hosted_name(s) {
+            Some(name) => json!({"source": "hosted", "name": name}),
+            None => json!({"source": s}),
+        };
+        view["fake_data"] = json!(report.fake_data_only());
+        view["switch_pending"] = json!(self.switch_gate(s).await.is_err());
+        if let Some(c) = report.max_data_class.filter(|_| s.starts_with("hosted:")) {
+            view["max_data_class"] = json!(c);
+        }
+        view
+    }
+
+    /// Slice H12 (r7, X3): may work be sent to `source` now? Only a hosted entry is gated: the
+    /// tool server must say sessions may open (no acknowledgement waiting), and for the
+    /// test-only list that the stack is fake-data mode. No readable answer is a refusal.
+    pub async fn switch_gate(&self, source: &str) -> Result<()> {
+        if pmos_contract::model_source::hosted_name(source).is_none() {
+            return Ok(());
+        }
+        let mut cached = self.switch.lock().await;
+        let view = match cached.as_ref() {
+            Some((at, v)) if at.elapsed() < self.switch_ttl => *v,
+            _ => {
+                *cached = None;
+                match self.toolserver.model_source_status().await {
+                    Ok(v) => {
+                        *cached = Some((Instant::now(), v));
+                        v
+                    }
+                    Err(_) => {
+                        tracing::warn!("the tool server's model-source status can't be read; claiming nothing and parsing no routine");
+                        return Err(Error::AcknowledgementRequired);
+                    }
+                }
+            }
+        };
+        let stack_test = source == pmos_contract::model_source::STACK_TEST_SOURCE;
+        if !view.ok || (stack_test && !view.fake_data) {
+            tracing::warn!(%source, acknowledgement_needed = view.acknowledgement_needed,
+                "the model source switch isn't cleared; claiming nothing and parsing no routine");
+            return Err(Error::AcknowledgementRequired);
+        }
+        Ok(())
     }
 
     /// `PMOS_FALLBACK_FOR_BENCHMARKED` (slice MP7, §4.10).
@@ -629,6 +711,22 @@ impl Runtime {
         let Ok(source) = self.gateway.checked_source().await else {
             return Ok(None);
         };
+        // Slice H12 (r7, X3): nothing is claimed for a hosted entry the tool server hasn't
+        // cleared.
+        if self.switch_gate(&source).await.is_err() {
+            return Ok(None);
+        }
+        // Slice H12 (r6, V11): under `hosted`, the gateway's effective data-class ceiling.
+        let ceiling = if self.gateway.expected() == pmos_contract::model_source::ModelSource::Hosted
+        {
+            match self.gateway.report().await {
+                Ok(r) if r.source == pmos_contract::model_source::STUB => None,
+                Ok(r) => Some(r.ceiling().unwrap_or(Sensitivity::Public)),
+                Err(_) => return Ok(None),
+            }
+        } else {
+            None
+        };
         loop {
             let lease_until = now + chrono::Duration::seconds(LEASE_SECONDS);
             let Some(task) = self.store.claim(bots, worker, lease_until, now).await? else {
@@ -686,6 +784,16 @@ impl Runtime {
                 },
             };
             let role = persona.map_or(base_role, |(_, role)| role);
+            // V11: a bot whose role reads data above the hosted model's ceiling doesn't run.
+            if let Some(ceiling) = ceiling.filter(|c| role.data_class > *c) {
+                let reason = format!(
+                    "this bot works with `{}` data, above the hosted model's data-class ceiling \
+                     (`{ceiling}`), so it can't run while that ceiling is set",
+                    role.data_class
+                );
+                self.fail_claimed(&task, worker, &reason, now).await?;
+                continue;
+            }
             // The history first: its level is where the session starts (W6).
             let (history, history_sensitivity) = self.history(&task, now).await;
             // A task not yet finished carries in `sources_sensitivity` only its own floor
@@ -751,6 +859,7 @@ impl Runtime {
                         level,
                         history,
                         history_sensitivity,
+                        max_data_class: ceiling.map(|c| c.to_string()),
                         persona: persona.map(|(p, _)| ClaimPersona {
                             key: p.name.clone(),
                             display_name: p.display_name.clone(),
@@ -1404,9 +1513,24 @@ impl Runtime {
         if let Some(e) = too_long("the request", &text, 4_000) {
             return Err(e);
         }
+        // Slice H12: the switch gate before any text leaves for the model, and a run id that
+        // joins the gateway's usage line to this log line.
+        let source = self
+            .gateway
+            .checked_source()
+            .await
+            .map_err(|_| Error::ModelSourceChanged)?;
+        self.switch_gate(&source).await?;
+        let run = format!("routine-{}", uuid::Uuid::new_v4().simple());
+        tracing::info!(%run, user = %owner, bot = %bot.name, "parsing a routine");
         let reply = self
             .gateway
-            .extract_json(&routines::system_prompt(&bot.name, tz, now), &text, owner)
+            .extract_json(
+                &routines::system_prompt(&bot.name, tz, now),
+                &text,
+                owner,
+                &run,
+            )
             .await
             .map_err(|e| match e {
                 CallError::ModelSourceChanged => Error::ModelSourceChanged,

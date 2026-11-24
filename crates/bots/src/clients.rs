@@ -4,9 +4,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use pmos_contract::model_source::{ModelSource, HEADER as MODEL_SOURCE_HEADER};
+use pmos_contract::model_source::{ModelSource, HEADER as MODEL_SOURCE_HEADER, STACK_TEST_SOURCE};
 use pmos_contract::Sensitivity;
-use pmos_runtime::model_source::GatewaySource;
+use pmos_runtime::model_source::{GatewayReport, GatewaySource};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -175,6 +175,40 @@ impl ToolServer {
             base: base.trim_end_matches('/').to_string(),
             token: token.to_string(),
             http: http(Duration::from_secs(10)),
+        }
+    }
+
+    /// Slice H12 (r7, X3): the tool server's `GET /internal/system/model-source-status`,
+    /// asked with the service token this runtime already uses for sessions. `Err` when it
+    /// can't be read: the caller refuses (fail closed).
+    pub async fn model_source_status(&self) -> Result<SwitchView, CallError> {
+        let res = self
+            .http
+            .get(format!("{}/internal/system/model-source-status", self.base))
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|_| CallError::Unavailable("the tool server"))?;
+        let status = res.status().as_u16();
+        if status != 200 && status != 503 {
+            return Err(CallError::Unavailable("the tool server"));
+        }
+        let body: Value = res
+            .json()
+            .await
+            .map_err(|_| CallError::Unavailable("the tool server"))?;
+        let flag = |k: &str| body[k].as_bool();
+        match (
+            flag("ok"),
+            flag("acknowledgement_needed"),
+            flag("fake_data"),
+        ) {
+            (Some(ok), needed, fake) => Ok(SwitchView {
+                ok: ok && status == 200,
+                acknowledgement_needed: needed.unwrap_or(false),
+                fake_data: fake.unwrap_or(false),
+            }),
+            _ => Err(CallError::Unavailable("the tool server")),
         }
     }
 
@@ -352,6 +386,16 @@ pub struct Gateway {
     source: Arc<GatewaySource>,
 }
 
+/// The tool server's switch status, as the runtime gates on it (slice H12, r7 X3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SwitchView {
+    /// Sessions may open now.
+    pub ok: bool,
+    pub acknowledgement_needed: bool,
+    /// The gateway is fake-data mode (`hosted-test`, the test-only list).
+    pub fake_data: bool,
+}
+
 /// The model role routine parsing uses: extraction, not drafting.
 pub const EXTRACTION_MODEL: &str = "pmos/extraction";
 
@@ -385,12 +429,26 @@ impl Gateway {
         }
     }
 
+    /// The gateway's whole `/readyz` report (the same cache), for the data-class ceiling and
+    /// the indicator (slice H12).
+    pub async fn report(&self) -> Result<GatewayReport, String> {
+        self.source.report().await
+    }
+
+    /// This runtime's `PMOS_MODEL_SOURCE`.
+    pub fn expected(&self) -> ModelSource {
+        self.expected
+    }
+
     /// The source the gateway serves now, if this runtime may use it: its own
     /// `PMOS_MODEL_SOURCE`, or the stub. `Err(ModelSourceChanged)` for any other, and when it
-    /// can't be read.
+    /// can't be read. Under `hosted`, `hosted:stack-test` (the test-only list) passes here only
+    /// to be checked by the runtime's switch gate, which takes it only when the tool server
+    /// says the stack is fake-data mode.
     pub async fn checked_source(&self) -> Result<String, CallError> {
         match self.source.current().await {
             Ok(s) if self.expected.accepts(&s) => Ok(s),
+            Ok(s) if self.expected == ModelSource::Hosted && s == STACK_TEST_SOURCE => Ok(s),
             Ok(s) => {
                 tracing::warn!(
                     gateway = %s, runtime = self.expected.as_str(),
@@ -413,15 +471,18 @@ impl Gateway {
         system: &str,
         prompt: &str,
         user: &str,
+        run: &str,
     ) -> Result<String, CallError> {
         // Slice H4: checked before the call, named on the call (X4), and checked again on the
-        // answer.
+        // answer. Slice H12: the call names its run (`routine-<id>`), so its usage line joins
+        // the runtime's own log line for it.
         let source = self.checked_source().await?;
         let res = self
             .http
             .post(format!("{}/chat/completions", self.base))
             .bearer_auth(&self.token)
             .header("X-Pmos-User", user)
+            .header("X-Pmos-Run", run)
             .header("X-Pmos-Priority", "interactive")
             .header(MODEL_SOURCE_HEADER, &source)
             .json(&json!({
