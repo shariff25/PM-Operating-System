@@ -509,6 +509,7 @@ async fn a_caller_that_hangs_up_cancels_the_upstream_call_and_frees_its_slot() {
         .post(format!("{}/v1/chat/completions", gw.base))
         .bearer_auth(RUNTIME)
         .header("x-pmos-model-source", "local")
+        .header("x-pmos-run", "run-hang")
         .json(&json!({"model": "pmos/default", "messages": [{"role": "user", "content": "hang"}]}))
         .send()
         .await;
@@ -1851,6 +1852,12 @@ fn http_as(source: &str) -> reqwest::Client {
     h.insert(
         "x-pmos-model-source",
         reqwest::header::HeaderValue::from_str(source).unwrap(),
+    );
+    // Under `local` and `hosted` every model call names its task (slice H12); a call that
+    // names its own run keeps it.
+    h.insert(
+        "x-pmos-run",
+        reqwest::header::HeaderValue::from_static("test-run"),
     );
     reqwest::Client::builder()
         .default_headers(h)

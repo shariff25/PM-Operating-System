@@ -94,6 +94,12 @@ async fn opening_it_shows_the_inbox_or_the_note() {
     assert_eq!(tabs[0]["action_id"], "home_tab_inbox");
     assert_eq!(tabs[0]["style"], "primary");
     assert!(tabs[1].get("style").is_none());
+    // Slice H12: where prompts go, under the section buttons, by label only (this stack's
+    // runtime doesn't say, so the line says so).
+    assert_eq!(
+        published["view"]["blocks"][2]["elements"][0]["text"],
+        "Model: unknown"
+    );
 
     stack
         .send(home_opened("e2", "Ev2", "U0STRANGER", None))

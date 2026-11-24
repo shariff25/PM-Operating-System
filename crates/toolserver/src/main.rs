@@ -57,6 +57,12 @@ async fn main() -> Result<()> {
         fake_data_only = fake_only,
         "model source"
     );
+    // Slice H12: under `hosted`, whether this stack would pass every fake-data check (for a
+    // gateway built with the test-only list, which every service treats as fake-data mode).
+    let fake_eligible = config.fake_settings
+        && matches!(config.connectors, Connectors::Fake)
+        && config.memory != MemoryBackend::Github
+        && pmos_contract::model_source::check_test_content(&config.content_root).is_ok();
     // Fake-data mode (slice H4): the content checkout must be test content.
     if fake_only {
         pmos_contract::model_source::check_test_content(&config.content_root).map_err(|c| {
@@ -82,6 +88,10 @@ async fn main() -> Result<()> {
         anyhow::bail!(refusals.join("\n"));
     }
     let cancel = CancellationToken::new();
+    // Slice H12: the model-source history (the switch acknowledgement, X3) lives in the
+    // database; `held_real_data` is read once, here, where it is written.
+    let mut source_history = pmos_toolserver::model_source::History::default();
+    let mut held_real_data = false;
 
     // MCP servers' per-PM tokens (slice M4): their own table beside the vault's.
     let mut mcp_store: Arc<dyn pmos_toolserver::mcp_client::oauth::McpCredentials> =
@@ -104,6 +114,11 @@ async fn main() -> Result<()> {
             pg.check_held_real_data(real, fake_only)
                 .await
                 .map_err(anyhow::Error::msg)?;
+            held_real_data = pg
+                .held_real_data()
+                .await
+                .context("reading held_real_data")?;
+            source_history = pmos_toolserver::model_source::History::Pg(pg.clone());
             let report = pg
                 .reindex(&load_docs(&config.content_root))
                 .await
@@ -389,10 +404,17 @@ async fn main() -> Result<()> {
         .with_audit_retention_days(config.audit_retention_days)
         .with_mcp_servers(mcp_servers)
         // Slice H4: every session open and tool call checks the gateway's model source.
-        .with_model_source(Arc::new(pmos_toolserver::model_source::SourceGuard::new(
-            config.model_source,
-            &config.gateway_url,
-        )));
+        .with_model_source(Arc::new(
+            pmos_toolserver::model_source::SourceGuard::new(
+                config.model_source,
+                &config.gateway_url,
+            )
+            .with_history(source_history)
+            .with_held_real_data(held_real_data)
+            // A gateway with the test-only list (`hosted:stack-test`) is taken under
+            // `hosted` only when this stack would pass every fake-data check.
+            .with_fake_eligible(fake_eligible && !held_real_data),
+        ));
     if let Some(pg) = openshell_pg {
         svc = svc.with_openshell(Arc::new(pg));
     }

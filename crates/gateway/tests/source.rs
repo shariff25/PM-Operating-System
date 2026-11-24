@@ -140,6 +140,8 @@ fn call(gw: &Gw, expected: Option<&str>, stream: bool) -> reqwest::RequestBuilde
     let mut b = reqwest::Client::new()
         .post(format!("{}/v1/chat/completions", gw.base))
         .bearer_auth(TOKEN)
+        // Under `local` and `hosted` every model call names its task (slice H12).
+        .header("X-Pmos-Run", "run-source")
         .json(&json!({"model": "pmos/default", "stream": stream,
                       "messages": [{"role": "user", "content": "hi"}]}));
     if let Some(s) = expected {
@@ -411,13 +413,15 @@ fn each_source_starts_only_with_its_own_kind_of_config() {
     )
     .unwrap();
 
-    // PMOS_MODEL_SOURCE is required, with no default, and `hosted` isn't built.
+    // PMOS_MODEL_SOURCE is required, with no default. `hosted` is a setting this build takes
+    // (slice H12); whether it can be served is the compiled list's (`tests/hosted.rs`).
     for missing in [vec![], vec![("PMOS_MODEL_SOURCE", "")]] {
         let err = config(&missing).unwrap_err();
         assert!(err.contains("PMOS_MODEL_SOURCE is required"), "{err}");
     }
-    let err = config(&[("PMOS_MODEL_SOURCE", "hosted")]).unwrap_err();
-    assert!(err.contains("not built yet"), "{err}");
+    let hosted = config(&[("PMOS_MODEL_SOURCE", "hosted")]).unwrap();
+    let err = hosted.check_source(&production).unwrap_err();
+    assert!(err.contains("hosted"), "{err}");
 
     let local = |extra: &[(&str, &str)]| {
         let mut p = vec![("PMOS_MODEL_SOURCE", "local")];
@@ -465,15 +469,20 @@ fn each_source_starts_only_with_its_own_kind_of_config() {
         .unwrap_err();
     assert!(err.contains("class: test"), "{err}");
 
-    // A `hosted:` upstream isn't a form any source takes in this build (slice H12).
-    for class in ["", "class: production\n"] {
-        let err = Models::parse(
-            &format!("{class}upstreams: {{h: 'hosted:owner-hosted'}}\nroles: {{default: {{upstream: h, model: m}}}}\n"),
-            true,
-        )
-        .unwrap_err();
-        assert!(err.contains("http or https"), "{err}");
-    }
+    // A `hosted:` upstream is taken only by a `class: production` config, with `host:<ref>`
+    // models (slice H12), and only under `hosted` (`tests/hosted.rs`).
+    let err = Models::parse(
+        "upstreams: {h: 'hosted:owner-hosted'}\nroles: {default: {upstream: h, model: 'host:main', label: l}}\n",
+        true,
+    )
+    .unwrap_err();
+    assert!(err.contains("class: production"), "{err}");
+    let err = Models::parse(
+        "class: production\nupstreams: {h: 'hosted:owner-hosted'}\nroles: {default: {upstream: h, model: m, label: l}}\n",
+        true,
+    )
+    .unwrap_err();
+    assert!(err.contains("host:<ref>"), "{err}");
     // A production config names only the two pinned model servers.
     for other in [
         "http://vllm.pmos.internal:8000/v1",

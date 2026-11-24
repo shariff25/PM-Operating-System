@@ -535,3 +535,37 @@ address"** (`403 proxy_not_trusted`): the requests arrive from somewhere
 reach the published port from the gateway; fix `deploy/.env` and run `deploy/pmos-admin up
 --web` again. Nothing is counted against a shared address meanwhile: every such request is
 refused.
+
+## The approved hosted model (`PMOS_MODEL_SOURCE=hosted`, slice H12)
+
+Only once the owner has added the entry (slice H13; `crates/gateway/approved-hosted.yaml` ships
+empty, and until then the gateway, `pmos-admin`, `setup.sh` and the preflight all refuse
+`hosted`), and only on a host where the conditions of `docs/openshell-any-host-spec.md` §3.9 hold.
+
+1. `sudo deploy/pmos-admin hosted init` (the stop file's directory, root's, mode 755).
+2. In `deploy/.env`: `PMOS_MODEL_SOURCE=hosted`, `PMOS_GATEWAY_HOSTED_URL` and
+   `PMOS_GATEWAY_HOSTED_MODELS` (from the owner; the gateway checks them against the entry's
+   digests), optionally `PMOS_HOSTED_MAX_DATA_CLASS`, and `PMOS_RELEASE_REMOTE` and
+   `PMOS_RELEASE_BRANCH` (the branch the owner's branch protection covers).
+3. `deploy/pmos-admin hosted-key set` with the provider's key on standard input.
+4. `deploy/pmos-admin build` (it fetches the merged branch and refuses a list or gateway code that
+   differs from it), then `deploy/pmos-admin up`; `up` stops a gateway whose list differs, and
+   `status` compares it every time.
+5. If the database has served `local` or another entry, or held real data: `sudo deploy/pmos-admin
+   hosted acknowledge-switch --to hosted:<name> --reason "<text>"`. Until then no session opens,
+   the runtime claims nothing, and PMs see "An administrator must confirm the model source switch".
+
+**Rotate the key.** Create the new key at the provider; `deploy/pmos-admin hosted-key set`; then
+`deploy/pmos-admin restart gateway --signal HUP` (or wait: the next hosted call re-reads it);
+`status` shows `hosted: ok`; revoke the old key at the provider. Nothing else holds a copy: the key
+is in no backup, no environment and no other container. The Mozilla roots the gateway trusts for
+the provider change only with a rebuilt image after a `Cargo.lock` update.
+
+**Stop it (the kill switch).** `sudo deploy/pmos-admin hosted stop --reason "<text>"` writes the
+stop file first, then kills the gateway; the gateway refuses to start while the file is there, and
+checks for it before every hosted call (`503 hosted_stopped`), however it is started. After a
+suspected leak: stop, revoke the key at the provider, rotate as above, then `sudo deploy/pmos-admin
+hosted start --reason "<text>"`, and record the incident (`docs/runbooks/incidents.md`).
+
+**The provider revokes the key.** Calls get the provider's `401`; callers see only `{type,
+status}`; rotate as above.

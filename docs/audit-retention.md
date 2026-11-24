@@ -118,3 +118,23 @@ The auditor's view is metadata only, as for every event: in the audit list a pur
 action `audit.purge`, actor `pmos-retention`, client `system`, outcome `ok`, and its detail
 (the count and the cutoff). The overview shows the retention, the oldest event kept and the
 last purge. Events older than the retention are gone for good: there is no archive to ask for.
+
+## The model source in the audit log (slice H12)
+
+The audit log records which model source served each session (`docs/openshell-any-host-spec.md`
+§3.9). Metadata only, so an Auditor sees it, and purged at 90 days like every event:
+
+- `session.open` (client `system`): written for every session, with `model_source: <source>`
+  (`local`, `hosted:<name>`, `hosted-test` or `stub`), the gateway's `approved_list_sha256` and its
+  `commit` in the detail.
+- `system.model_source`: written when the source a session opens under differs from the one the
+  database served last (`from: …; to: …`), and once per change seen at a refused tool call.
+- `system.model_source_acknowledged`: an administrator's acknowledgement of a switch to a hosted
+  entry (`to`, `by`, `reason`, and the real sources the database has served, with their dates).
+
+The gateway's usage log carries the same `model_source` and the task id (`run`), so the two join
+on the task id. Prompts are not audit events: what the provider keeps of them is in its record
+(`docs/model-providers/README.md`), not here. Not built yet: `model_source` on every other event
+of a session (it is on `session.open`, which shares the session's `run_id`), and a
+`system.model_source` event when the hosted model is stopped and started (those are in the
+root-owned host log, `/var/log/pmos/host-acknowledgements.log`).

@@ -295,6 +295,60 @@ function checkHandle(user: string): void {
   }
 }
 
+export type DataClass = "public" | "internal" | "restricted";
+
+const CLASS_ORDER: Record<DataClass, number> = { public: 0, internal: 1, restricted: 2 };
+
+/**
+ * A master-context file's data class (slice H12, spec §3.6, "An optional data-class ceiling",
+ * V11): `restricted` unless its first line is a `<!-- sensitivity: public -->` or
+ * `<!-- sensitivity: internal -->` marker. Master context carries no front matter, and it
+ * never passes through the tool server, so only this marker can say it holds less.
+ */
+export function masterContextClass(text: string): DataClass {
+  const first = text.split(/\r?\n/, 1)[0] ?? "";
+  const m = /^<!--\s*sensitivity:\s*(public|internal)\s*-->\s*$/.exec(first);
+  return m ? (m[1] as DataClass) : "restricted";
+}
+
+/** A master-context file above the hosted model's ceiling: its path and its class, never its text. */
+export class MasterContextAboveCeilingError extends Error {
+  constructor(
+    readonly file: string,
+    readonly dataClass: DataClass,
+    readonly ceiling: DataClass,
+  ) {
+    super(
+      `${file} counts as ${dataClass} data, above the hosted model's data-class ceiling (${ceiling})`,
+    );
+    this.name = "MasterContextAboveCeilingError";
+  }
+}
+
+/**
+ * Under a ceiling below `restricted` (slice H12, V11): every master-context file this task
+ * would load (the team's, and the PM's own) must be at or below it, by its first-line marker.
+ * With no ceiling, or `restricted` (all data, D1), nothing is checked and no marker is needed.
+ */
+export function checkMasterContext(contentRoot: string, user: string | undefined, ceiling: DataClass | null | undefined): void {
+  if (!ceiling || ceiling === "restricted") {
+    return;
+  }
+  const files = ["master/AGENTS.md"];
+  if (user) {
+    checkHandle(user);
+    if (existsSync(join(contentRoot, "master", "people", user, "AGENTS.md"))) {
+      files.push(`master/people/${user}/AGENTS.md`);
+    }
+  }
+  for (const rel of files) {
+    const cls = masterContextClass(readFileSync(join(contentRoot, rel), "utf8"));
+    if (CLASS_ORDER[cls] > CLASS_ORDER[ceiling]) {
+      throw new MasterContextAboveCeilingError(`content/${rel}`, cls, ceiling);
+    }
+  }
+}
+
 export function memorySources(contentRoot: string, user?: string): string[] {
   const sources = [`${CONTENT_MOUNT}master/AGENTS.md`];
   if (user) {

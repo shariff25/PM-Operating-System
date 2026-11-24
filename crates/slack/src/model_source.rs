@@ -73,8 +73,9 @@ mod tests {
         assert!(run(&tokens)
             .unwrap_err()
             .contains("PMOS_MODEL_SOURCE is required"));
-        assert!(run(&[("PMOS_MODEL_SOURCE", "hosted")])
-            .unwrap_err()
-            .contains("not built yet"));
+        // Slice H12: `hosted` takes Slack tokens (real data) like `local`.
+        let mut hosted = tokens.to_vec();
+        hosted.push(("PMOS_MODEL_SOURCE", "hosted"));
+        assert_eq!(run(&hosted), Ok(ModelSource::Hosted));
     }
 }

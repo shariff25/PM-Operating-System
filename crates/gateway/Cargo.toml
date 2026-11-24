@@ -1,6 +1,6 @@
 [package]
 name = "pmos-gateway"
-description = "PM OS model gateway: one OpenAI-compatible endpoint in front of the local open-weight models"
+description = "PM OS model gateway: one OpenAI-compatible endpoint in front of the deployment's models"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -28,6 +28,23 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+url = "2"
+# The hosted client's only roots (slice H12, spec §3.6, "Which roots the hosted client trusts"):
+# Mozilla's, compiled in, so no file in the container's trust store is ever read for it.
+webpki-root-certs = "1"
+
+[features]
+# TEST ONLY (spec §3.6, "How H12's stack test runs `hosted`"): compiles
+# approved-hosted.stack-test.yaml in place of approved-hosted.yaml. Built only by
+# deploy/test/Dockerfile.gateway-stack-test; tests/stack_test_feature.rs fails if the release
+# Dockerfile or any crate's normal dependency enables it.
+stack-test-list = []
 
 [dev-dependencies]
 tokio-util.workspace = true
+tempfile.workspace = true
+# A TLS mock of the hosted model for tests/hosted.rs (slice H12): a test CA and server
+# certificate made at run time, served over rustls.
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }

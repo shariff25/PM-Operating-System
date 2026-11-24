@@ -1,0 +1,37 @@
+# PMOS_MODEL_SOURCE=hosted (docs/openshell-any-host-spec.md §3.6, "The hosted model as a
+# production source"; slice H12): the gateway on the one owner-approved hosted model.
+#
+# deploy/pmos-admin adds this file to every `docker compose` call when deploy/.env says
+# PMOS_MODEL_SOURCE=hosted, as it adds compose.hosted-test.yaml for hosted-test. Everything here
+# is the gateway's alone: no other container gets the URL, the model ids, the key or the stop
+# file. The gateway refuses to start unless the URL and model ids hash to the approved entry
+# compiled into it; the shipped list is EMPTY, so until the owner's slice H13 it always refuses
+# ("no approved entry").
+services:
+  gateway:
+    environment:
+      # The host's outbound proxy, if it has one (x-proxy in compose.yaml); the hosted host must
+      # not match NO_PROXY (`pmos-admin up` checks it).
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: localhost,127.0.0.1,.pmos.internal,postgres,vllm-default,vllm-extraction,${NO_PROXY:-}
+      PMOS_GATEWAY_CLOUD_TEST: "0"
+      # Neither is a secret: the guarantee is the compiled digest, which an edit here can only
+      # fail (spec §3.6, "Why deploy/.env and not a root-owned file").
+      PMOS_GATEWAY_HOSTED_URL: ${PMOS_GATEWAY_HOSTED_URL:?PMOS_MODEL_SOURCE=hosted needs PMOS_GATEWAY_HOSTED_URL}
+      PMOS_GATEWAY_HOSTED_MODELS: ${PMOS_GATEWAY_HOSTED_MODELS:?PMOS_MODEL_SOURCE=hosted needs PMOS_GATEWAY_HOSTED_MODELS}
+      PMOS_GATEWAY_HOSTED_KEY_FILE: /run/secrets/pmos-hosted-model-key
+      # Optional: lowers the entry's data-class ceiling, never raises it.
+      PMOS_HOSTED_MAX_DATA_CLASS: ${PMOS_HOSTED_MAX_DATA_CLASS:-}
+    secrets:
+      - pmos-hosted-model-key
+    volumes:
+      - ./gateway.hosted.yaml:/etc/pmos/gateway.yaml:ro
+      # The kill switch (r7, V7): a root-owned directory, read-only here; the gateway refuses to
+      # start without it, and checks for the stop file before every hosted call.
+      - /var/lib/pmos/hosted-control:/run/pmos-hosted-control:ro
+
+secrets:
+  pmos-hosted-model-key:
+    # Mode 600, owned by the platform user; setup.sh makes it empty, `pmos-admin hosted-key set`
+    # writes it from standard input. Never in deploy/.env, a backup or another container.
+    file: ./secrets/hosted-model.key

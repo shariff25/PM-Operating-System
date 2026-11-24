@@ -149,6 +149,11 @@ compose() {
     [ -z "${PMOS_GATEWAY_CA_FILE:-}" ] || files+=(-f "$DEPLOY/compose.gateway-ca.yaml")
     # Slice MP2: one Compose secret per upstream key file, mounted into the gateway only.
     if upstream_keys_overlay; then files+=(-f "$PMOS_STATE_DIR/compose.upstream-keys.yaml"); fi
+  elif [ "${PMOS_MODEL_SOURCE:-}" = hosted ]; then
+    # Slice H12: the gateway on the approved hosted model (its URL, model ids, key file and the
+    # stop file's directory, the gateway's alone), and the CA only for tls_interception: allowed.
+    files+=(-f "$DEPLOY/compose.hosted.yaml")
+    [ -z "${PMOS_GATEWAY_CA_FILE:-}" ] || files+=(-f "$DEPLOY/compose.hosted-ca.yaml")
   elif [ "${PMOS_MODEL_SOURCE:-}" = local ] && [ "${PMOS_GATEWAY_STUB:-0}" != 1 ]; then
     files+=(-f "$DEPLOY/compose.local.yaml")
   fi
@@ -636,8 +641,8 @@ model_source_checks() {
       return 0
       ;;
     hosted-test) ;;
-    hosted) say "PMOS_MODEL_SOURCE=hosted (an approved provider) isn't built yet (slice H12): use local, or hosted-test with fake data only" >&2; return 1 ;;
-    *) say "PMOS_MODEL_SOURCE=$(printf '%q' "$source") in deploy/.env: use local or hosted-test" >&2; return 1 ;;
+    hosted) hosted_checks; return ;;
+    *) say "PMOS_MODEL_SOURCE=$(printf '%q' "$source") in deploy/.env: use local, hosted or hosted-test" >&2; return 1 ;;
   esac
   # Routes (docs/model-providers-spec.md §4.12, slice MP8): with PMOS_HOSTED_TEST_ROUTES=1 the
   # operator writes the route config at $PMOS_STATE_DIR/gateway.hosted-test.yaml (outside the
@@ -1431,6 +1436,248 @@ run_preflight() { # command-name preflight-arguments…
   esac
 }
 
+# --- Slice H12: PMOS_MODEL_SOURCE=hosted (docs/openshell-any-host-spec.md §3.6) -------------------
+# The approved list is compiled into the gateway; these read the checkout's copy only to say,
+# before anything starts, what the gateway will refuse, and to compare what it runs with the
+# merged branch's. The URL, the model ids and the key are never printed.
+APPROVED_LIST=crates/gateway/approved-hosted.yaml
+HOSTED_CONTROL=/var/lib/pmos/hosted-control
+HOSTED_KEY_REL=secrets/hosted-model.key
+hosted_stop_file() { printf '%s\n' "$HOST_PREFIX$HOSTED_CONTROL/stopped"; }
+approved_list_has_entry() { [ -f "$ROOT/$APPROVED_LIST" ] && grep -q '^- ' "$ROOT/$APPROVED_LIST"; }
+# The release remote and branch the owner's branch protection covers (X5).
+release_ref() {
+  local remote=${PMOS_RELEASE_REMOTE:-origin} branch=${PMOS_RELEASE_BRANCH:-main}
+  if ! [[ "$remote" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || ! [[ "$branch" =~ ^[A-Za-z0-9._/-]{1,128}$ ]] || [[ "$branch" == -* || "$branch" == *..* ]]; then
+    say "PMOS_RELEASE_REMOTE and PMOS_RELEASE_BRANCH must be a plain remote and branch name" >&2
+    return 1
+  fi
+  printf '%s %s\n' "$remote" "$branch"
+}
+# Fetches the merged branch into its remote-tracking ref; prints the ref.
+fetch_release_ref() {
+  local rb remote branch
+  rb=$(release_ref) || return 2
+  remote=${rb%% *}
+  branch=${rb#* }
+  git -C "$ROOT" fetch --no-tags -- "$remote" "+refs/heads/$branch:refs/remotes/$remote/$branch" >/dev/null 2>&1 || return 1
+  printf 'refs/remotes/%s/%s\n' "$remote" "$branch"
+}
+last_fetched_ref() {
+  local rb
+  rb=$(release_ref) || return 1
+  git -C "$ROOT" rev-parse -q --verify "refs/remotes/${rb%% *}/${rb#* }" >/dev/null || return 1
+  printf 'refs/remotes/%s/%s\n' "${rb%% *}" "${rb#* }"
+}
+# The SHA-256 of the approved list at a ref (the gateway reports the same digest of its bytes).
+list_sha_at() { git -C "$ROOT" show "$1:$APPROVED_LIST" 2>/dev/null | sha256sum | cut -d' ' -f1; }
+# The gateway's /readyz field, by name (a JSON string), or nothing.
+gateway_ready_field() { # field
+  local body
+  body=$(curl -sS --noproxy '*' -m 5 "http://127.0.0.1:${PMOS_GATEWAY_PORT:-8740}/readyz" 2>/dev/null) || return 1
+  python3 -I -c 'import json,sys
+d=json.loads(sys.stdin.readline()); v=d.get(sys.argv[1])
+print(v if isinstance(v,str) else "")' "$1" <<<"$body" 2>/dev/null
+}
+hosted_checks() {
+  local bad=0 url key_file host p
+  if ! approved_list_has_entry; then
+    say "PMOS_MODEL_SOURCE=hosted: there is no approved entry on the gateway's list ($APPROVED_LIST ships empty; the first entry is the owner's slice H13), so the gateway refuses it. Use local, or hosted-test with fake data only" >&2
+    return 1
+  fi
+  url=${PMOS_GATEWAY_HOSTED_URL:-}
+  if ! [[ "$url" =~ ^https://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$ ]]; then
+    say "PMOS_MODEL_SOURCE=hosted needs PMOS_GATEWAY_HOSTED_URL, the approved provider's base URL (https://<host>/<path>, plain characters; the gateway checks its digest)" >&2
+    bad=1
+  fi
+  if ! [[ "${PMOS_GATEWAY_HOSTED_MODELS:-}" =~ ^[a-z0-9-]{1,32}=[A-Za-z0-9._:/-]{1,128}(,[a-z0-9-]{1,32}=[A-Za-z0-9._:/-]{1,128})*$ ]]; then
+    say "PMOS_MODEL_SOURCE=hosted needs PMOS_GATEWAY_HOSTED_MODELS: <ref>=<model id> pairs separated by commas (each role's host:<ref>)" >&2
+    bad=1
+  fi
+  key_file="$DEPLOY/$HOSTED_KEY_REL"
+  if ! [ -s "$key_file" ]; then
+    say "PMOS_MODEL_SOURCE=hosted needs the provider's key: deploy/pmos-admin hosted-key set (standard input)" >&2
+    bad=1
+  elif [ -n "$(find "$key_file" -perm /077 2>/dev/null)" ] || [ -n "$(find "$DEPLOY/secrets" -maxdepth 0 -perm /077 2>/dev/null)" ]; then
+    say "deploy/$HOSTED_KEY_REL (mode 600) and deploy/secrets (mode 700) must not be readable by group or others" >&2
+    bad=1
+  fi
+  if [ -n "${PMOS_GATEWAY_CA_FILE:-}" ] && ! grep -q 'tls_interception: allowed' "$ROOT/$APPROVED_LIST" 2>/dev/null; then
+    say "PMOS_GATEWAY_CA_FILE is set, but the approved entry says tls_interception: refused: the gateway takes no run-time CA" >&2
+    bad=1
+  fi
+  if [ -e "$(hosted_stop_file)" ]; then
+    say "the hosted model is stopped ($(head -c 200 "$(hosted_stop_file)" 2>/dev/null | tr -d '\n')): sudo deploy/pmos-admin hosted start --reason <text>" >&2
+    bad=1
+  elif ! [ -d "$HOST_PREFIX$HOSTED_CONTROL" ]; then
+    say "the stop file's directory $HOSTED_CONTROL doesn't exist: sudo deploy/pmos-admin hosted init" >&2
+    bad=1
+  fi
+  # The hosted host must not match NO_PROXY, or its calls would bypass the egress proxy.
+  host=${url#https://}
+  host=${host%%[:/]*}
+  host=${host,,}
+  if [ -n "$host" ] && [ -n "${HTTPS_PROXY:-}" ]; then
+    IFS=, read -ra p <<<"${NO_PROXY:-}"
+    for e in "${p[@]}"; do
+      e=${e// /}
+      e=${e,,}
+      [ -n "$e" ] || continue
+      if [ "$e" = '*' ] || [ "$host" = "${e#.}" ] || [[ "$host" == *".${e#.}" ]]; then
+        say "the hosted model's host matches NO_PROXY in deploy/.env, so its calls would bypass the egress proxy: remove that entry" >&2
+        bad=1
+        break
+      fi
+    done
+  fi
+  [ "$bad" = 0 ] || return 1
+  say "model source: hosted (the approved entry on the gateway's list; real data once the owner's conditions are recorded, spec §3.9)"
+}
+# `build`'s check under hosted (X5): the list and the gateway's code are the merged branch's.
+build_release_checks() { # use-last-fetch(0|1); prints "merged_commit checked_at"
+  local ref at=""
+  if ! ref=$(fetch_release_ref); then
+    if [ "$1" = 1 ] && ref=$(last_fetched_ref); then
+      at=$(git -C "$ROOT" reflog -1 --format=%cI "$ref" 2>/dev/null || true)
+      say "offline: checking against $ref as last fetched (${at:-unknown}), commit $(git -C "$ROOT" rev-parse --short "$ref")" >&2
+    else
+      say "build: couldn't fetch the merged branch ($(release_ref | tr ' ' /)); under hosted the image is built only from it. Retry online, or add --use-last-fetch to check against the last fetch" >&2
+      return 2
+    fi
+  fi
+  if [ -n "$(git -C "$ROOT" status --porcelain -- crates/gateway/)" ]; then
+    say "build: crates/gateway/ has uncommitted or untracked changes; under hosted the gateway is built only from the merged branch" >&2
+    return 2
+  fi
+  if [ "$(git -C "$ROOT" hash-object -- "$APPROVED_LIST")" != "$(git -C "$ROOT" rev-parse "$ref:$APPROVED_LIST" 2>/dev/null)" ]; then
+    say "build: $APPROVED_LIST differs from the merged branch's ($ref)" >&2
+    return 2
+  fi
+  if ! git -C "$ROOT" diff --quiet "$ref" -- crates/gateway/; then
+    say "build: the gateway's code differs from the merged branch's ($ref), a local commit included" >&2
+    return 2
+  fi
+  printf '%s %s\n' "$(git -C "$ROOT" rev-parse "$ref")" "$at"
+}
+# The running gateway's list digest against the merged branch's (status and up, X5).
+list_comparison() { # prints one line; exit 1 on a difference
+  local ref running merged at=""
+  if ! ref=$(fetch_release_ref); then
+    ref=$(last_fetched_ref) || { echo "can't compare: the merged branch was never fetched"; return 1; }
+    at=" (offline: last fetched $(git -C "$ROOT" reflog -1 --format=%cI "$ref" 2>/dev/null || echo unknown))"
+  fi
+  merged=$(list_sha_at "$ref")
+  running=$(gateway_ready_field approved_list_sha256 || true)
+  if [ -z "$running" ]; then
+    echo "the gateway doesn't report its approved list's digest$at"
+    return 1
+  fi
+  if [ "$running" != "$merged" ]; then
+    echo "approved list differs from $(release_ref | tr ' ' /) at $(git -C "$ROOT" rev-parse --short "$ref")$at"
+    return 1
+  fi
+  echo "approved list is $(release_ref | tr ' ' /)'s at $(git -C "$ROOT" rev-parse --short "$ref")$at"
+}
+hosted_key_set() {
+  local dir="$DEPLOY/secrets" key dest
+  (umask 077 && mkdir -p "$dir") && chmod 700 "$dir"
+  if [ -t 0 ]; then
+    printf 'the hosted model provider key (not shown): ' >&2
+    IFS= read -rs key || true
+    printf '\n' >&2
+  else
+    IFS= read -r key || true
+  fi
+  key=${key%$'\r'}
+  if [ -z "$key" ] || [[ "$key" == *[[:space:]]* ]]; then
+    say "no key was read, or it has spaces in it; nothing was written" >&2
+    exit 2
+  fi
+  dest="$DEPLOY/$HOSTED_KEY_REL"
+  (umask 077 && printf '%s\n' "$key" >"$dest.new") && chmod 600 "$dest.new" && mv -f "$dest.new" "$dest" ||
+    { rm -f "$dest.new"; say "couldn't write deploy/$HOSTED_KEY_REL" >&2; exit 1; }
+  unset key
+  say "wrote deploy/$HOSTED_KEY_REL (mode 600); the gateway reads it within a second of its next hosted call, or now with: deploy/pmos-admin restart gateway --signal HUP"
+}
+hosted_cmd() {
+  local sub=${1:-} reason="" to="" record="" model=0 last=""
+  hosted_usage() {
+    say "usage: sudo deploy/pmos-admin hosted init | hosted stop --reason <text> | hosted start --reason <text>" >&2
+    say "       sudo deploy/pmos-admin hosted acknowledge-switch --to hosted:<name> --reason <text>" >&2
+    say "       deploy/pmos-admin hosted digest [--model] < (a URL or a model id on standard input) | hosted digest --record <file>" >&2
+    exit 2
+  }
+  [ $# -ge 1 ] && shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --reason) [ $# -ge 2 ] || hosted_usage; reason=$2; shift 2 ;;
+      --to) [ $# -ge 2 ] || hosted_usage; to=$2; shift 2 ;;
+      --record) [ $# -ge 2 ] || hosted_usage; record=$2; shift 2 ;;
+      --model) model=1; shift ;;
+      *) hosted_usage ;;
+    esac
+  done
+  case "$sub" in
+    init)
+      require_root "hosted init"
+      mkdir -p -- "$HOST_PREFIX$HOSTED_CONTROL"
+      chown 0:0 -- "$HOST_PREFIX$HOSTED_CONTROL" 2>/dev/null || true
+      chmod 755 -- "$HOST_PREFIX$HOSTED_CONTROL"
+      say "made $HOSTED_CONTROL (root's, mode 755): the gateway mounts it read-only and refuses hosted without it"
+      ;;
+    stop)
+      require_root "hosted stop"
+      valid_reason "$reason" || { say "hosted stop needs --reason: 1 to 200 printable characters on one line" >&2; exit 2; }
+      mkdir -p -- "$HOST_PREFIX$HOSTED_CONTROL" && chmod 755 -- "$HOST_PREFIX$HOSTED_CONTROL"
+      # The stop file first: the gateway checks it before every hosted call, and refuses to
+      # start while it is there, however the container is started again.
+      printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$reason" | install_root_file "$HOSTED_CONTROL/stopped" 644
+      ack_log hosted stop "-" "-" "$reason"
+      compose kill gateway >/dev/null 2>&1 || say "note: docker compose kill gateway failed (is it running?); the stop file holds either way" >&2
+      say "the hosted model is stopped: the stop file is in place and the gateway was killed (logged in $ACK_LOG)"
+      ;;
+    start)
+      require_root "hosted start"
+      valid_reason "$reason" || { say "hosted start needs --reason: 1 to 200 printable characters on one line" >&2; exit 2; }
+      rm -f -- "$(hosted_stop_file)"
+      ack_log hosted start "-" "-" "$reason"
+      if [ "${PMOS_MODEL_SOURCE:-}" = hosted ]; then
+        hosted_checks || exit 2
+        compose up -d gateway
+      fi
+      say "the stop file is removed (logged in $ACK_LOG)"
+      ;;
+    acknowledge-switch)
+      require_root "hosted acknowledge-switch"
+      valid_reason "$reason" || { say "hosted acknowledge-switch needs --reason: 1 to 200 printable characters on one line" >&2; exit 2; }
+      [[ "$to" =~ ^hosted:[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$ ]] && [ "$to" != hosted:stack-test ] ||
+        { say "--to must be hosted:<name>, the approved entry the gateway serves" >&2; exit 2; }
+      last=$(gateway_ready_field model_source || true)
+      [ "$last" = "$to" ] || { say "the gateway reports $(printf '%q' "${last:-nothing}"), not $to: only the source it serves now can be acknowledged" >&2; exit 2; }
+      ack_log hosted acknowledge-switch "$to" "-" "$reason"
+      internal POST /internal/system/model-source-acknowledgement \
+        "$(python3 -I -c 'import json,sys; print(json.dumps({"to": sys.argv[1], "by": sys.argv[2], "reason": sys.argv[3]}))' "$to" "$(ack_login)" "$reason")" >/dev/null ||
+        { say "the tool server refused the acknowledgement (its status: GET /internal/system/model-source-status)" >&2; exit 1; }
+      say "acknowledged the switch to $to (logged in $ACK_LOG and the audit log)"
+      ;;
+    digest)
+      if [ -n "$record" ]; then
+        [ "$model" = 0 ] || hosted_usage
+        [ -f "$record" ] || { say "--record: no such file" >&2; exit 2; }
+        sha256sum -- "$record" | cut -d' ' -f1
+        return
+      fi
+      # The gateway's own normalisation, from standard input; never an argument.
+      if [ "$model" = 1 ]; then
+        compose run --rm --no-deps -T gateway pmos-gateway --model-digest-from-stdin
+      else
+        compose run --rm --no-deps -T gateway pmos-gateway --digest-from-stdin
+      fi
+      ;;
+    *) hosted_usage ;;
+  esac
+}
+
 # Where the host's own files are, for host-firewall, host acknowledge and host attest: the root
 # directory. Empty on a real host; scripts/test-pmos-admin.sh's copy of this script (and only that
 # copy) names a temporary directory here, as for HOSTS_FILE. No setting or argument changes it.
@@ -1850,10 +2097,34 @@ case "$cmd" in pause | host-names | help | -h | --help) ;; *)
 esac
 case "$cmd" in
   build)
+    use_last=0
+    for arg in "$@"; do
+      case "$arg" in
+        --use-last-fetch) use_last=1 ;;
+        *) say "usage: deploy/pmos-admin build [--use-last-fetch]" >&2; exit 2 ;;
+      esac
+    done
+    # Slice H12 (X5): the commit and the merged branch's commit are compiled into the gateway
+    # and reported in /readyz. Under hosted the image is built only when the approved list and
+    # the gateway's code are the merged branch's; elsewhere a failed fetch is a warning.
+    PMOS_BUILD_COMMIT=$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)
+    PMOS_BUILD_MERGED_COMMIT=""
+    PMOS_BUILD_LIST_CHECKED_AT=""
+    if [ "${PMOS_MODEL_SOURCE:-}" = hosted ]; then
+      checked=$(build_release_checks "$use_last") || exit 2
+      PMOS_BUILD_MERGED_COMMIT=${checked%% *}
+      PMOS_BUILD_LIST_CHECKED_AT=${checked#* }
+    elif ref=$(fetch_release_ref); then
+      PMOS_BUILD_MERGED_COMMIT=$(git -C "$ROOT" rev-parse "$ref")
+    else
+      say "warning: couldn't fetch the merged branch; the gateway reports no merged commit (it serves no approved list under ${PMOS_MODEL_SOURCE:-this source})" >&2
+    fi
+    export PMOS_BUILD_COMMIT PMOS_BUILD_MERGED_COMMIT PMOS_BUILD_LIST_CHECKED_AT
     # The proxy settings by name only: Docker takes each value from this environment, so a proxy
     # URL with a password in it isn't on docker's command line (the security review of 6bb806f).
     export HTTPS_PROXY="${HTTPS_PROXY:-}" NO_PROXY="${NO_PROXY:-}"
-    args=(--build-arg HTTPS_PROXY --build-arg NO_PROXY)
+    args=(--build-arg HTTPS_PROXY --build-arg NO_PROXY --build-arg PMOS_BUILD_COMMIT
+      --build-arg PMOS_BUILD_MERGED_COMMIT --build-arg PMOS_BUILD_LIST_CHECKED_AT)
     if [ -n "${HTTPS_PROXY:-}" ]; then args+=(--network host); fi
     if [ -n "${PMOS_BUILD_CA:-}" ]; then args+=(--secret "id=ca,src=$PMOS_BUILD_CA"); fi
     tag=${PMOS_VERSION:-local}
@@ -1910,6 +2181,20 @@ case "$cmd" in
         { say "the gateway refuses the route config; nothing was started" >&2; exit 2; }
     fi
     compose "${prof[@]}" up -d
+    # Slice H12 (X5): under hosted, the running gateway's approved list must be the merged
+    # branch's; one that differs is stopped at once.
+    if [ "${PMOS_MODEL_SOURCE:-}" = hosted ]; then
+      for _ in $(seq 1 30); do
+        [ -n "$(gateway_ready_field approved_list_sha256 || true)" ] && break
+        sleep 2
+      done
+      if ! line=$(list_comparison); then
+        say "$line: stopping the gateway (docker compose kill gateway)" >&2
+        compose kill gateway >/dev/null 2>&1 || true
+        exit 1
+      fi
+      say "$line"
+    fi
     say "started; check with: deploy/pmos-admin status"
     ;;
 
@@ -1988,6 +2273,21 @@ for a in d["attestations"]:
     say "== readiness"
     case "${PMOS_MODEL_SOURCE:-}" in
       hosted-test) row model WARN "PMOS_MODEL_SOURCE=hosted-test: TESTING ONLY, prompts leave this host (fake data only)" ;;
+      hosted)
+        # Slice H12: the entry, the stop file, the key, the ceiling, and the list's digest
+        # against the merged branch's (X5). Labels and digests only.
+        row model ok "PMOS_MODEL_SOURCE=hosted: $(gateway_ready_field model_source || echo 'the gateway is not answering'), ceiling $(gateway_ready_field max_data_class || echo unknown)"
+        if [ -e "$(hosted_stop_file)" ]; then
+          row hosted STOPPED "$(head -c 200 "$(hosted_stop_file)" 2>/dev/null | tr -d '\n')"
+        fi
+        [ -s "$DEPLOY/$HOSTED_KEY_REL" ] || row hosted FAIL "no key: deploy/pmos-admin hosted-key set"
+        if line=$(list_comparison); then
+          row "list" ok "$line"
+        else
+          row "list" FAIL "$line"
+          status_failed=1
+        fi
+        ;;
       local) row model ok "PMOS_MODEL_SOURCE=local: model servers on this host" ;;
       *) row model FAIL "PMOS_MODEL_SOURCE=$(printf '%q' "${PMOS_MODEL_SOURCE:-}"): run deploy/setup.sh (every service refuses a blank or unknown source)" ;;
     esac
@@ -2090,8 +2390,18 @@ for role, r in sorted((d.get("upstreams") or {}).items()):
     ;;
 
   restart)
-    [ $# -eq 1 ] || { say "usage: pmos-admin restart <service>" >&2; exit 2; }
+    # `restart gateway --signal HUP` (slice H12): the gateway reads its key files afresh.
+    if [ $# -eq 3 ] && [ "$1" = gateway ] && [ "$2" = --signal ] && [ "$3" = HUP ]; then
+      compose kill -s HUP gateway
+      say "sent SIGHUP to the gateway: its key files are read afresh on the next call"
+      exit 0
+    fi
+    [ $# -eq 1 ] || { say "usage: pmos-admin restart <service> | restart gateway --signal HUP" >&2; exit 2; }
     require_service restart "$1"
+    if [ "$1" = gateway ] && [ "${PMOS_MODEL_SOURCE:-}" = hosted ] && [ -e "$(hosted_stop_file)" ]; then
+      say "the hosted model is stopped: the gateway isn't restarted (sudo deploy/pmos-admin hosted start --reason <text>)" >&2
+      exit 2
+    fi
     compose "${ALL_PROFILES[@]}" restart "$1"
     ;;
 
@@ -2382,7 +2692,25 @@ for g in s["groups"]:
     unit=$(worker_unit "$bot")
     # Uploads come from the generated spec: `from` is relative to the content root.
     uploads=()
+    # Slice H12 (spec §3.6, V11): under hosted with a data-class ceiling below restricted, master
+    # context counts as restricted unless its first line is a sensitivity marker, and a file
+    # above the ceiling isn't uploaded (named with its class, never its text).
+    ceiling=""
+    if [ "${PMOS_MODEL_SOURCE:-}" = hosted ]; then
+      ceiling=${PMOS_HOSTED_MAX_DATA_CLASS:-$(sed -n 's/^[[:space:]]*max_data_class:[[:space:]]*"\{0,1\}\([a-z]*\).*/\1/p' "$ROOT/$APPROVED_LIST" 2>/dev/null | head -1)}
+    fi
     while read -r from to; do
+      if [ -n "$ceiling" ] && [ "$ceiling" != restricted ] && [[ "$from" == master/* ]]; then
+        cls=restricted
+        case "$(head -n 1 "$PMOS_CONTENT_CHECKOUT/content/$from" 2>/dev/null)" in
+          '<!-- sensitivity: public -->') cls=public ;;
+          '<!-- sensitivity: internal -->') cls=internal ;;
+        esac
+        if [ "$cls" = restricted ] || { [ "$cls" = internal ] && [ "$ceiling" = public ]; }; then
+          say "pmos-admin sandbox: content/$from counts as $cls data, above the hosted model's data-class ceiling ($ceiling); nothing was uploaded. If it holds less, mark its first line <!-- sensitivity: public --> or <!-- sensitivity: internal -->" >&2
+          exit 2
+        fi
+      fi
       uploads+=(--upload "$PMOS_CONTENT_CHECKOUT/content/$from:$to")
     done < <(awk '/^  - from: /{f=$3} /^    to: /{print f, $2}' "$spec")
     pmos_sandbox_create_cmd "$sandbox" "${PMOS_VERSION:-local}" "$policy" \
@@ -2717,6 +3045,17 @@ for g in s["groups"]:
 
   host)
     host_cmd "$@"
+    ;;
+
+  hosted)
+    hosted_cmd "$@"
+    ;;
+
+  hosted-key)
+    # Slice H12: the hosted model's key, from standard input (never an argument, never printed),
+    # into deploy/secrets/hosted-model.key (dir 700, file 600), mounted into the gateway only.
+    [ $# -eq 1 ] && [ "$1" = set ] || { say "usage: deploy/pmos-admin hosted-key set (the key on standard input)" >&2; exit 2; }
+    hosted_key_set
     ;;
 
   lint)

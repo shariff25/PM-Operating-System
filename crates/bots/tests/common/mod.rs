@@ -279,6 +279,8 @@ pub struct MockToolServer {
     pub drop_persona: Mutex<bool>,
     /// Session tokens revoked (`DELETE /internal/session`), in order.
     pub revoked: Mutex<Vec<String>>,
+    /// What `GET /internal/system/model-source-status` answers (slice H12): `None` is `500`.
+    pub switch: Mutex<Option<Value>>,
 }
 
 impl Default for MockToolServer {
@@ -295,7 +297,29 @@ impl Default for MockToolServer {
             approval_reads: Mutex::new(0),
             approvals_down: Mutex::new(false),
             ready: Mutex::new(true),
+            switch: Mutex::new(Some(json!({"ok": true, "acknowledgement_needed": false,
+                                           "fake_data": false}))),
         }
+    }
+}
+
+/// `GET /internal/system/model-source-status` (slice H12), as the tool server answers it.
+async fn ts_switch(State(ts): State<Arc<MockToolServer>>, headers: HeaderMap) -> Response {
+    if headers.get("authorization").and_then(|v| v.to_str().ok())
+        != Some(&format!("Bearer {SERVICE}"))
+    {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match ts.switch.lock().unwrap().clone() {
+        Some(v) => {
+            let code = if v["ok"] == json!(true) {
+                StatusCode::OK
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            (code, Json(v)).into_response()
+        }
+        None => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 
@@ -467,6 +491,8 @@ pub struct MockGateway {
     pub answer_source: Mutex<Option<String>>,
     /// `/readyz` answers `500` with no body.
     pub readyz_broken: Mutex<bool>,
+    /// `max_data_class` in `/readyz` (slice H12), when set.
+    pub ceiling: Mutex<Option<String>>,
 }
 
 impl Default for MockGateway {
@@ -478,6 +504,7 @@ impl Default for MockGateway {
             source: Mutex::new("local".into()),
             answer_source: Mutex::default(),
             readyz_broken: Mutex::default(),
+            ceiling: Mutex::default(),
         }
     }
 }
@@ -488,8 +515,11 @@ async fn gw_readyz(State(gw): State<Arc<MockGateway>>) -> Response {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     let source = gw.source.lock().unwrap().clone();
-    Json(json!({"ready": true, "class": "test", "stub": false, "model_source": source}))
-        .into_response()
+    let mut body = json!({"ready": true, "class": "test", "stub": false, "model_source": source});
+    if let Some(c) = gw.ceiling.lock().unwrap().clone() {
+        body["max_data_class"] = json!(c);
+    }
+    Json(body).into_response()
 }
 
 async fn gw_chat(
@@ -619,6 +649,39 @@ impl Env {
         catalog: Catalog,
         assertions: Option<Assertions>,
     ) -> Self {
+        Self::with_source(
+            store,
+            pg,
+            catalog,
+            assertions,
+            pmos_contract::model_source::ModelSource::Local,
+        )
+        .await
+    }
+
+    /// In memory, with `PMOS_MODEL_SOURCE=hosted` and a gateway that serves
+    /// `hosted:owner-hosted` (slice H12).
+    pub async fn hosted() -> Self {
+        let env = Self::with_source(
+            Arc::new(MemoryStore::default()),
+            None,
+            catalog(),
+            None,
+            pmos_contract::model_source::ModelSource::Hosted,
+        )
+        .await;
+        *env.gw.source.lock().unwrap() = "hosted:owner-hosted".into();
+        *env.gw.ceiling.lock().unwrap() = Some("restricted".into());
+        env
+    }
+
+    async fn with_source(
+        store: Arc<dyn BotsStore>,
+        pg: Option<TestPg>,
+        catalog: Catalog,
+        assertions: Option<Assertions>,
+        source: pmos_contract::model_source::ModelSource,
+    ) -> Self {
         let stop = CancellationToken::new();
         let ts = Arc::new(MockToolServer::default());
         let gw = Arc::new(MockGateway::default());
@@ -629,6 +692,7 @@ impl Env {
                 .route("/internal/approvals/{id}", get(ts_approval))
                 .route("/internal/runs/{id}/sensitivity", get(ts_run_level))
                 .route("/readyz", get(ts_ready))
+                .route("/internal/system/model-source-status", get(ts_switch))
                 .with_state(ts.clone()),
             &stop,
         )
@@ -650,19 +714,22 @@ impl Env {
             .refresh()
             .await
             .expect("the test directory answers");
-        let rt = Arc::new(Runtime::new(
-            store.clone(),
-            Arc::new(catalog),
-            snapshots,
-            ToolServer::new(&ts_base, SERVICE),
-            Gateway::with_source_cache(
-                &format!("{gw_base}/v1"),
-                GATEWAY,
-                pmos_contract::model_source::ModelSource::Local,
-                std::time::Duration::ZERO,
-            ),
-            stop.child_token(),
-        ));
+        let rt = Arc::new(
+            Runtime::new(
+                store.clone(),
+                Arc::new(catalog),
+                snapshots,
+                ToolServer::new(&ts_base, SERVICE),
+                Gateway::with_source_cache(
+                    &format!("{gw_base}/v1"),
+                    GATEWAY,
+                    source,
+                    std::time::Duration::ZERO,
+                ),
+                stop.child_token(),
+            )
+            .with_switch_cache(std::time::Duration::ZERO),
+        );
         let app = match assertions {
             None => router(rt.clone(), clients(), evals_as()),
             Some(a) => router_with(rt.clone(), clients(), evals_as(), Arc::new(a)),

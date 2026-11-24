@@ -1,0 +1,33 @@
+# syntax=docker/dockerfile:1
+# TEST ONLY (docs/openshell-any-host-spec.md §3.6, "How H12's stack test runs `hosted`"): the
+# gateway alone, built with the `stack-test-list` feature, which compiles
+# crates/gateway/approved-hosted.stack-test.yaml (one entry, `stack-test`, naming only the
+# stack test's local mock) INSTEAD of the release list. Every PM OS service treats a gateway
+# that reports `hosted:stack-test` as fake-data mode.
+#
+# The release image (deploy/Dockerfile) is untouched and never names a feature:
+# crates/gateway/tests/stack_test_feature.rs fails if it, or any crate's normal dependency,
+# enables this one. Used only by deploy/test/compose.hosted-stack-test.yaml.
+FROM rust:1.100-bookworm AS build
+ARG HTTPS_PROXY
+ARG NO_PROXY
+ARG PMOS_BUILD_COMMIT
+ARG PMOS_BUILD_MERGED_COMMIT
+ARG PMOS_BUILD_LIST_CHECKED_AT
+WORKDIR /src
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=secret,id=ca,required=false \
+    if [ -s /run/secrets/ca ]; then \
+      cat /etc/ssl/certs/ca-certificates.crt /run/secrets/ca > /tmp/ca.crt; \
+      export CARGO_HTTP_CAINFO=/tmp/ca.crt SSL_CERT_FILE=/tmp/ca.crt; \
+    fi \
+ && cargo build --release --locked -p pmos-gateway --features stack-test-list \
+ && mkdir -p /out && cp target/release/pmos-gateway /out/
+
+FROM buildpack-deps:bookworm-scm
+RUN useradd --uid 10001 --create-home --shell /usr/sbin/nologin pmos
+COPY --from=build /out/ /usr/local/bin/
+USER pmos
+WORKDIR /home/pmos
+CMD ["pmos-gateway"]

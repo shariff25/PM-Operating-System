@@ -7,7 +7,9 @@
 //!   local ones on PM OS's host (ADM-3). The testing-only cloud upstreams, the Claude
 //!   Messages API (`anthropic.rs`) and remote OpenAI-compatible APIs (`remote.rs`), run only
 //!   as `hosted-test` (a `class: test` config, fake data) with `PMOS_GATEWAY_CLOUD_TEST=1`.
-//!   `hosted`, one owner-approved hosted model for real data, is not built and is refused.
+//!   `hosted` (slice H12, `hosted.rs`) serves one owner-approved hosted model for real data:
+//!   an entry on the approved list compiled into this binary, which ships empty, so a gateway
+//!   built from a fresh checkout refuses `hosted` at start.
 //! - One GPU is shared fairly: interactive before scheduled before personal work, with a cap
 //!   per person (MOD-4).
 //! - Every call is logged with who, which role, queue time and tokens; never the text.
@@ -17,6 +19,7 @@ pub mod app;
 pub mod config;
 pub mod fallback;
 pub mod health;
+pub mod hosted;
 pub mod keys;
 pub mod remote;
 pub mod resolve;

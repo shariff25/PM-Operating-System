@@ -6,7 +6,15 @@
 //! - `hosted-test`: any OpenAI-compatible endpoint nobody approved, behind a `class: test`
 //!   gateway. **Fake data only**: every service refuses what would put real data in a prompt
 //!   or a database ([`fake_data_refusal`]).
-//! - `hosted`: the owner's approved hosted model. Not built (spec slice H12), so refused.
+//! - `hosted`: the owner's approved hosted model (slice H12): an entry on the approved list
+//!   compiled into the gateway (`crates/gateway/approved-hosted.yaml`), which ships **empty**,
+//!   so a gateway built from a fresh checkout refuses `hosted` at start ("no approved entry").
+//!   The gateway reports it as `hosted:<name>`. Real data may be used once the entry's
+//!   conditions are recorded (spec §3.9, slice H13, the owner's).
+//!
+//!   A gateway built with the test-only `stack-test-list` feature reports
+//!   `hosted:stack-test` ([`STACK_TEST_SOURCE`]); every service treats that as fake-data mode,
+//!   exactly as `hosted-test` ([`reported_fake_data_only`]).
 //!
 //! The setting is required by every service, with no default: a blank value is refused, never
 //! read as the source that allows more.
@@ -28,11 +36,21 @@ pub const STUB: &str = "stub";
 /// checkout, stating it holds no company data.
 pub const TEST_CONTENT_MARKER: &str = "TEST-CONTENT";
 
+/// The entry name of the test-only approved list (`approved-hosted.stack-test.yaml`, the
+/// gateway's `stack-test-list` feature). No entry of the release list may take it.
+pub const STACK_TEST_NAME: &str = "stack-test";
+
+/// What a gateway built with the test-only list reports: fake-data mode wherever it is seen.
+pub const STACK_TEST_SOURCE: &str = "hosted:stack-test";
+
 /// `PMOS_MODEL_SOURCE`, as this build accepts it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelSource {
     /// A model server on this host.
     Local,
+    /// The owner's approved hosted model: one entry of the gateway's compiled list, reported
+    /// as `hosted:<name>` (slice H12).
+    Hosted,
     /// An unapproved hosted endpoint: fake data only.
     HostedTest,
 }
@@ -41,30 +59,29 @@ impl ModelSource {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Local => "local",
+            Self::Hosted => "hosted",
             Self::HostedTest => "hosted-test",
         }
     }
 
     /// `PMOS_MODEL_SOURCE` as set (`None` when unset). Required: unset or blank is refused,
-    /// never read as `local` (§3.1, "Defaults that allow less"); `hosted` is refused until
-    /// slice H12 builds it.
+    /// never read as `local` (§3.1, "Defaults that allow less"). `hosted` is accepted here;
+    /// whether it can be served is the gateway's compiled list's to decide (empty as shipped,
+    /// so the gateway refuses it).
     pub fn from_setting(value: Option<&str>) -> Result<Self, String> {
         match value.map(str::trim) {
             None | Some("") => Err(
-                "PMOS_MODEL_SOURCE is required: `local` (a model server on this host) or \
+                "PMOS_MODEL_SOURCE is required: `local` (a model server on this host), `hosted` \
+                 (the owner-approved hosted model on the gateway's compiled list) or \
                  `hosted-test` (an unapproved hosted endpoint, fake data only); run \
                  deploy/setup.sh, which writes it"
                     .into(),
             ),
             Some("local") => Ok(Self::Local),
+            Some("hosted") => Ok(Self::Hosted),
             Some("hosted-test") => Ok(Self::HostedTest),
-            Some("hosted") => Err(
-                "PMOS_MODEL_SOURCE=hosted is not built yet (spec slice H12): use `local` or \
-                 `hosted-test`"
-                    .into(),
-            ),
             Some(other) => Err(format!(
-                "PMOS_MODEL_SOURCE must be `local` or `hosted-test`, not `{other}`"
+                "PMOS_MODEL_SOURCE must be `local`, `hosted` or `hosted-test`, not `{other}`"
             )),
         }
     }
@@ -79,11 +96,40 @@ impl ModelSource {
         self == Self::HostedTest
     }
 
-    /// Whether a gateway reporting `reported` serves this source: the same one, or the stub,
-    /// which sends no prompt anywhere.
+    /// Whether a gateway reporting `reported` serves this source: the same one (for `hosted`,
+    /// `hosted:<name>` with a well-formed name), or the stub, which sends no prompt anywhere.
+    /// The test-only list's `hosted:stack-test` is never accepted here: a service takes it only
+    /// through its own fake-data check ([`reported_fake_data_only`]).
     pub fn accepts(self, reported: &str) -> bool {
-        reported == self.as_str() || reported == STUB
+        if reported == STUB {
+            return true;
+        }
+        match self {
+            Self::Hosted => hosted_name(reported).is_some() && reported != STACK_TEST_SOURCE,
+            _ => reported == self.as_str(),
+        }
     }
+}
+
+/// The entry name in a reported `hosted:<name>`, when well formed.
+pub fn hosted_name(reported: &str) -> Option<&str> {
+    let name = reported.strip_prefix("hosted:")?;
+    valid_reported(reported).then_some(name)
+}
+
+/// Whether a gateway reporting `reported` must be treated as fake-data mode wherever it is
+/// seen: `hosted-test` (an unapproved endpoint) and `hosted:stack-test` (the test-only list,
+/// spec §3.6, "How H12's stack test runs `hosted`"), so even a misplaced test image can't take
+/// real data.
+pub fn reported_fake_data_only(reported: &str) -> bool {
+    reported == "hosted-test" || reported == STACK_TEST_SOURCE
+}
+
+/// Whether `reported` is a real source for the switch acknowledgement's history (r7, X3):
+/// `local` and each `hosted:<name>` but the test-only one. `stub`, `hosted-test` and
+/// `hosted:stack-test` are recorded but never count.
+pub fn reported_is_real(reported: &str) -> bool {
+    reported == "local" || (hosted_name(reported).is_some() && reported != STACK_TEST_SOURCE)
 }
 
 /// A source as the gateway reports it: `local`, `hosted-test`, `stub`, or `hosted:<name>`
@@ -199,11 +245,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_setting_is_required_and_hosted_is_not_built() {
+    fn the_setting_is_required_and_has_three_values() {
         assert_eq!(
             ModelSource::from_setting(Some("local")),
             Ok(ModelSource::Local)
         );
+        assert_eq!(
+            ModelSource::from_setting(Some("hosted")),
+            Ok(ModelSource::Hosted)
+        );
+        assert!(!ModelSource::Hosted.fake_data_only());
         assert_eq!(
             ModelSource::from_setting(Some("hosted-test")),
             Ok(ModelSource::HostedTest)
@@ -212,9 +263,11 @@ mod tests {
             let err = ModelSource::from_setting(blank).unwrap_err();
             assert!(err.contains("is required"), "{err}");
         }
-        assert!(ModelSource::from_setting(Some("hosted"))
-            .unwrap_err()
-            .contains("not built yet"));
+        for bad in ["hosted:owner-hosted", "Hosted", "hosted-prod"] {
+            assert!(ModelSource::from_setting(Some(bad))
+                .unwrap_err()
+                .contains("must be"));
+        }
         assert!(ModelSource::from_setting(Some("Local"))
             .unwrap_err()
             .contains("must be"));
@@ -231,6 +284,33 @@ mod tests {
         assert!(ModelSource::HostedTest.accepts("hosted-test"));
         assert!(!ModelSource::HostedTest.accepts("local"));
         assert!(!ModelSource::HostedTest.accepts(""));
+        assert!(ModelSource::Hosted.accepts("hosted:owner-hosted"));
+        assert!(ModelSource::Hosted.accepts("stub"));
+        for no in [
+            "hosted",
+            "hosted:",
+            "hosted:A",
+            "local",
+            "hosted-test",
+            STACK_TEST_SOURCE,
+        ] {
+            assert!(!ModelSource::Hosted.accepts(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn the_stack_test_list_is_fake_data_and_never_real() {
+        assert!(reported_fake_data_only("hosted-test"));
+        assert!(reported_fake_data_only(STACK_TEST_SOURCE));
+        assert!(!reported_fake_data_only("hosted:owner-hosted"));
+        assert!(!reported_fake_data_only("local"));
+        assert!(reported_is_real("local"));
+        assert!(reported_is_real("hosted:owner-hosted"));
+        for no in ["stub", "hosted-test", STACK_TEST_SOURCE, "hosted:", "x"] {
+            assert!(!reported_is_real(no), "{no}");
+        }
+        assert_eq!(hosted_name("hosted:a-1"), Some("a-1"));
+        assert_eq!(hosted_name("hosted:-a"), None);
     }
 
     #[test]

@@ -25,6 +25,13 @@ RUN pnpm -C web build
 FROM rust:1.100-bookworm AS build
 ARG HTTPS_PROXY
 ARG NO_PROXY
+# Slice H12 (docs/openshell-any-host-spec.md §3.6, "Built only from committed code", X5):
+# `pmos-admin build` passes the checkout's commit, the merged branch's commit and, when built
+# offline, when that branch was last fetched; pmos-gateway compiles them in and reports them in
+# /readyz. A gateway built without them refuses PMOS_MODEL_SOURCE=hosted.
+ARG PMOS_BUILD_COMMIT
+ARG PMOS_BUILD_MERGED_COMMIT
+ARG PMOS_BUILD_LIST_CHECKED_AT
 WORKDIR /src
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

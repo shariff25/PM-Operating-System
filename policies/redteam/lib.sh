@@ -77,11 +77,20 @@ h10_built() {
   grep -q '^      PMOS_WEB_ADMIN_BIND: 0.0.0.0:8772$' "$REPO/deploy/compose.yaml" 2>/dev/null &&
     grep -q '"${PMOS_WEB_ADMIN_PUBLISH:-127.0.0.1}:8772:8772"' "$REPO/deploy/compose.yaml"
 }
+# Slice H12 is built in a checkout with the approved list and `pmos-admin hosted` (true in this
+# repository since H12). An approved entry (slice H13) is a list item (`- name: …`, as the gateway
+# parses the list, a top-level sequence) with a 64-hex url_sha256; the list ships empty.
 h12_built() {
   [ -f "$REPO/crates/gateway/approved-hosted.yaml" ] && grep -Eq '^  hosted\)' "$REPO/deploy/pmos-admin" 2>/dev/null
 }
 hosted_entry_exists() {
-  h12_built && grep -Eq 'url_sha256:[[:space:]]*"?[0-9a-f]{64}' "$REPO/crates/gateway/approved-hosted.yaml"
+  h12_built && grep -q '^- ' "$REPO/crates/gateway/approved-hosted.yaml" &&
+    grep -Eq 'url_sha256:[[:space:]]*"?[0-9a-f]{64}' "$REPO/crates/gateway/approved-hosted.yaml"
+}
+# The gateway's /readyz field (a string), or nothing.
+gateway_field() { # field
+  curl -s -m 10 --noproxy '*' "http://127.0.0.1:$(env_value PMOS_GATEWAY_PORT || echo 8740)/readyz" 2>/dev/null |
+    jq -r --arg f "$1" '.[$f] // empty' 2>/dev/null
 }
 commit_line() {
   local c

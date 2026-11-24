@@ -215,6 +215,10 @@ pub struct Config {
     /// live connectors, GitHub memory and the GitHub App are refused here, and `main` refuses
     /// content that isn't test content and a database that has held real data.
     pub model_source: pmos_contract::model_source::ModelSource,
+    /// Slice H12: whether every fake-data refusal of the settings passes (fake connectors, no
+    /// GitHub memory, no GitHub App), so that under `hosted` a gateway with the test-only list
+    /// (`hosted:stack-test`) may be taken. `main` adds the content check and `held_real_data`.
+    pub fake_settings: bool,
     /// `PMOS_GATEWAY_URL`: the model gateway, whose `/readyz` says the source it serves; every
     /// session open and tool call checks it (`crate::model_source`). Required.
     pub gateway_url: String,
@@ -630,6 +634,7 @@ impl Config {
             dev_password_setup,
             entra: entra_settings(&get)?,
             model_source,
+            fake_settings: fake_data_refusals(&get).is_ok(),
             gateway_url,
             fake_mcp,
             mcp_systems,
@@ -905,9 +910,13 @@ mod tests {
         assert!(run("", Some(("PMOS_MODEL_SOURCE", " ")))
             .unwrap_err()
             .contains("PMOS_MODEL_SOURCE is required"));
-        assert!(run("", Some(("PMOS_MODEL_SOURCE", "hosted")))
-            .unwrap_err()
-            .contains("not built yet"));
+        // Slice H12: `hosted` is taken; the gateway's compiled list decides whether it serves.
+        assert_eq!(
+            run("", Some(("PMOS_MODEL_SOURCE", "hosted")))
+                .unwrap()
+                .model_source,
+            pmos_contract::model_source::ModelSource::Hosted
+        );
         assert!(run("PMOS_GATEWAY_URL", None)
             .unwrap_err()
             .contains("PMOS_GATEWAY_URL is required"));

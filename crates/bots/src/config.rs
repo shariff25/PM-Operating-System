@@ -320,7 +320,11 @@ mod tests {
         assert!(!ok.connectors_live);
         for (key, value, want) in [
             ("PMOS_MODEL_SOURCE", "", "PMOS_MODEL_SOURCE is required"),
-            ("PMOS_MODEL_SOURCE", "hosted", "not built yet"),
+            (
+                "PMOS_MODEL_SOURCE",
+                "hosted-prod",
+                "must be `local`, `hosted` or `hosted-test`",
+            ),
             ("PMOS_CONNECTORS", "", "PMOS_CONNECTORS is required"),
             ("PMOS_CONNECTORS", "maybe", "must be `live` or `fake`"),
         ] {

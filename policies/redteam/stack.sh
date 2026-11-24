@@ -235,11 +235,24 @@ step_rt16() {
 
 # --- RT-19 (slices H12 and H13) ---------------------------------------------------------------
 
-# The kit's gateway, by hand (no pmos-admin), on an env file.
+# The kit's gateway, by hand (no pmos-admin), on an env file: under hosted with the hosted overlay
+# (deploy/compose.hosted.yaml, slice H12), as pmos-admin adds it.
 gw_compose() { # env-file compose-arguments…
-  local env=$1
+  local env=$1 hosted=()
   shift
-  docker compose --project-directory "$DEPLOY" -f "$DEPLOY/compose.yaml" ${GW_EXTRA:+-f "$GW_EXTRA"} --env-file "$env" "$@"
+  if grep -qx 'PMOS_MODEL_SOURCE=hosted' "$env" 2>/dev/null && [ -f "$DEPLOY/compose.hosted.yaml" ]; then
+    hosted=(-f "$DEPLOY/compose.hosted.yaml")
+  fi
+  docker compose --project-directory "$DEPLOY" -f "$DEPLOY/compose.yaml" "${hosted[@]}" ${GW_EXTRA:+-f "$GW_EXTRA"} --env-file "$env" "$@"
+}
+# A one-token model call as the runtime, naming the source the gateway serves (X4) and a run
+# (slice H12), so a refusal comes from the condition probed, never from a missing header.
+gw_call() { # run-id; prints the status, the body in $SCRATCH/answer
+  printf 'header = "Authorization: Bearer %s"\n' "$(env_value PMOS_GW_RUNTIME_TOKEN || true)" |
+    curl --config - -s -o "$SCRATCH/answer" -w '%{http_code}' --noproxy '*' -m 30 \
+      -H 'content-type: application/json' -H "X-Pmos-Model-Source: ${GW_SOURCE:-hosted}" -H "X-Pmos-Run: $1" \
+      -d '{"model":"pmos/default","max_tokens":1,"messages":[{"role":"user","content":"ping"}]}' \
+      "http://127.0.0.1:$(env_value PMOS_GATEWAY_PORT || echo 8740)/v1/chat/completions"
 }
 # A copy of deploy/.env with one key's value replaced; the value comes through the environment.
 env_copy_with() { # key (value in RT_VALUE) → prints the copy's path
@@ -290,13 +303,20 @@ restore_key() {
   return 1
 }
 step_rt19() {
-  local url host addr models cls max env key code
+  local url host addr models cls max env key code list="$REPO/crates/gateway/approved-hosted.yaml"
   if ! h12_built; then
     skip RT-19 "not built: skipped (the hosted source is slice H12)"
     [ "$DRY" = 1 ] || return
   elif ! hosted_entry_exists; then
-    skip RT-19 "skipped: no approved hosted entry yet (slice H13); RT-19 runs only once one exists"
-    [ "$DRY" = 1 ] || return
+    # Without an approved entry (H13), RT-19 runs as far as it can on a test stack whose gateway
+    # carries the test-only list (approved_list: stack-test), against that list's one entry.
+    if [ "$DRY" = 0 ] && [ "$(gateway_field approved_list)" = stack-test ]; then
+      list="$REPO/crates/gateway/approved-hosted.stack-test.yaml"
+      GW_EXTRA="$DEPLOY/test/compose.hosted-stack-test.yaml"
+    else
+      skip RT-19 "skipped: no approved hosted entry yet (slice H13), and the gateway isn't the stack-test-list one; RT-19 runs once one exists, or on a test stack"
+      [ "$DRY" = 1 ] || return
+    fi
   fi
   if [ "$DRY" = 1 ]; then
     for what in "PMOS_GATEWAY_HOSTED_URL=https://example.invalid/v1" "PMOS_GATEWAY_HOSTED_URL=<the right URL>?x=1" \
@@ -332,7 +352,7 @@ step_rt19() {
   fi
   printf 'services:\n  gateway:\n    environment:\n      SSL_CERT_FILE: /etc/ssl/certs/ca-certificates.crt\n' >"$SCRATCH/compose.ssl.yaml"
   GW_EXTRA=$SCRATCH/compose.ssl.yaml rt19_start "SSL_CERT_FILE set" "$ENV_FILE"
-  cls=$(sed -n 's/^[[:space:]]*max_data_class:[[:space:]]*"\{0,1\}\([a-z]*\)"\{0,1\}.*/\1/p' "$REPO/crates/gateway/approved-hosted.yaml" | head -1)
+  cls=$(sed -n 's/^[[:space:]]*max_data_class:[[:space:]]*"\{0,1\}\([a-z]*\)"\{0,1\}.*/\1/p' "$list" | head -1)
   case "$cls" in public) max=internal ;; internal) max=restricted ;; *) max="" ;; esac
   if [ -n "$max" ]; then
     rt19_start "PMOS_HOSTED_MAX_DATA_CLASS=$max, above the entry's $cls" "$(RT_VALUE=$max env_copy_with PMOS_HOSTED_MAX_DATA_CLASS)"
@@ -347,13 +367,8 @@ step_rt19() {
   (umask 077 && cp -p -- "$key" "$KEY_BACKUP") || { KEY_BACKUP=""; fail RT-19 "couldn't keep a copy of the key file: it wasn't emptied"; return; }
   : >"$key" || { restore_key; fail RT-19 "couldn't empty the key file (inconclusive)"; return; }
   sleep 2
-  env=$(env_value PMOS_GW_RUNTIME_TOKEN || true)
-  code=$(printf 'header = "Authorization: Bearer %s"\n' "$env" |
-    curl --config - -s -o "$SCRATCH/answer" -w '%{http_code}' --noproxy '*' -m 30 \
-      -H 'content-type: application/json' -H 'X-Pmos-Model-Source: hosted' -H 'X-Pmos-Run: redteam-rt19' \
-      -d '{"model":"default","max_tokens":1,"messages":[{"role":"user","content":"ping"}]}' \
-      "http://127.0.0.1:$(env_value PMOS_GATEWAY_PORT || echo 8740)/v1/chat/completions")
-  env=""
+  GW_SOURCE=$(gateway_field model_source)
+  code=$(gw_call redteam-rt19)
   if [ "$code" = 503 ] && grep -qF hosted_key_missing "$SCRATCH/answer"; then
     pass RT-19 "with the key file emptied, the next call answers 503 hosted_key_missing"
   else
@@ -374,11 +389,7 @@ gateway_refuses() { # what
     pass RT-20 "$1: the gateway refuses to start while stopped"
     return
   fi
-  code=$(printf 'header = "Authorization: Bearer %s"\n' "$(env_value PMOS_GW_RUNTIME_TOKEN || true)" |
-    curl --config - -s -o "$SCRATCH/answer" -w '%{http_code}' --noproxy '*' -m 30 \
-      -H 'content-type: application/json' -H 'X-Pmos-Model-Source: hosted' -H 'X-Pmos-Run: redteam-rt20' \
-      -d '{"model":"default","max_tokens":1,"messages":[{"role":"user","content":"ping"}]}' \
-      "http://127.0.0.1:$(env_value PMOS_GATEWAY_PORT || echo 8740)/v1/chat/completions")
+  code=$(gw_call redteam-rt20)
   if [ "$code" = 503 ] && grep -qF hosted_stopped "$SCRATCH/answer"; then
     pass RT-20 "$1: the gateway runs but answers 503 hosted_stopped"
   else
@@ -392,10 +403,12 @@ step_rt20() {
     skip RT-20 "not built: skipped (the hosted source and pmos-admin hosted stop are slice H12)"
     [ "$DRY" = 1 ] || return
   fi
-  if [ "$DRY" = 0 ] && [ "$(curl -s -m 10 --noproxy '*' "http://127.0.0.1:$(env_value PMOS_GATEWAY_PORT || echo 8740)/readyz" | jq -r '.approved_list // empty' 2>/dev/null)" != stack-test ]; then
+  if [ "$DRY" = 0 ] && [ "$(gateway_field approved_list)" != stack-test ]; then
     skip RT-20 "the gateway isn't the stack-test-list gateway (§3.6): RT-20 runs on a test stack only"
     return
   fi
+  # The source the stack-test gateway serves (hosted:stack-test), named on every probe call.
+  [ "$DRY" = 1 ] || GW_SOURCE=$(gateway_field model_source)
   may_change RT-20 "stops the hosted model, restarts the gateway three ways and Docker itself, then starts the hosted model again" || return
   GW_EXTRA=""
   [ ! -f "$DEPLOY/test/compose.hosted-stack-test.yaml" ] || GW_EXTRA="$DEPLOY/test/compose.hosted-stack-test.yaml"

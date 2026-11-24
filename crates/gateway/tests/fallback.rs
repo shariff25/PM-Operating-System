@@ -1062,6 +1062,7 @@ async fn a_one_hop_roles_disabled_label_answers_503_and_sends_nothing() {
             .post(format!("{base}/v1/chat/completions"))
             .bearer_auth(TOKEN)
             .header("x-pmos-model-source", "local")
+            .header("x-pmos-run", "run-disabled")
             .json(&hello(false))
             .send()
     };

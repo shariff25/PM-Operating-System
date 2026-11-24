@@ -1104,7 +1104,9 @@ async fn a_remote_test_upstream_needs_its_switch_and_forwards_as_is_with_its_key
         (events[0].role.as_str(), events[0].model.as_str()),
         ("default", "remote-model")
     );
-    assert_eq!(events[0].upstream, "127.0.0.1");
+    // Slice H12 (spec §3.6, "The usage log"): a remote test upstream is logged by its kind,
+    // labelled or not, never by its host.
+    assert_eq!(events[0].upstream, "remote-test");
     assert_eq!(
         (events[0].prompt_tokens, events[0].completion_tokens),
         (Some(21), Some(5))
@@ -2019,6 +2021,12 @@ fn http_as(source: &str) -> reqwest::Client {
     h.insert(
         "x-pmos-model-source",
         reqwest::header::HeaderValue::from_str(source).unwrap(),
+    );
+    // Under `local` and `hosted` every model call names its task (slice H12); a call that
+    // names its own run keeps it.
+    h.insert(
+        "x-pmos-run",
+        reqwest::header::HeaderValue::from_static("test-run"),
     );
     reqwest::Client::builder()
         .default_headers(h)

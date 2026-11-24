@@ -113,7 +113,21 @@ change"):
    /crates/gateway/                          @<org>/<team>
    /crates/bots/src/clients.rs               @<org>/<team>
    /config/gateway.yaml                      @<org>/<team>
+   # The approved hosted list and who may change it: the owner alone, and last, so no line
+   # above can win for them (docs/openshell-any-host-spec.md §3.6, "Who may change the list").
+   /.github/CODEOWNERS                       @<owner>
+   /.github/owner-handle                     @<owner>
+   /crates/gateway/approved-hosted.yaml      @<owner>
+   /docs/model-providers/                    @<owner>
    ```
+
+   `@<owner>` is the owner's own GitHub account, the one handle written in
+   `.github/owner-handle` (one line, `@` and the user name), never a team: only the owner may
+   approve a change to the approved hosted list, to the provider-record rules, or to these
+   lines and that file. The lint test `codeowners_hosted_list_is_owner_only` checks this block,
+   and, once both files exist, `.github/CODEOWNERS` against the handle in
+   `.github/owner-handle`; the approved list's own test in `crates/gateway` fails on any entry
+   until both are in place.
 
    A new persona whose role is not listed above needs its `ROLE.md` line added in the same pull
    request (the lint test `codeowners_lines_cover_every_bot_instruction_file` checks this list

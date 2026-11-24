@@ -101,6 +101,7 @@ pub fn router_with(
         .route("/bots", get(list_bots))
         .route("/bots/{name}", get(get_bot))
         .route("/personas", get(list_personas))
+        .route("/model-source", get(model_source_view))
         .route("/tasks", post(create_task).get(list_tasks))
         .route("/tasks/{id}", get(get_task))
         .route("/tasks/{id}/cancel", post(cancel_task))
@@ -159,6 +160,14 @@ impl IntoResponse for Error {
             )
                 .into_response(),
             Error::Unavailable(m) => error(StatusCode::SERVICE_UNAVAILABLE, m),
+            ref e @ Error::AcknowledgementRequired => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "code": crate::runtime::ACKNOWLEDGEMENT_REQUIRED,
+                    "error": e.to_string(),
+                })),
+            )
+                .into_response(),
             ref e @ Error::ModelSourceChanged => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({
@@ -498,6 +507,23 @@ async fn list_personas(
         };
     }
     Ok(Json(body).into_response())
+}
+
+/// `GET /v1/model-source` (slice H12, r6 V7, "The indicator"): where prompts go, as this
+/// runtime sees the gateway, for the web app's header and `/api/me` and the Slack App Home.
+/// Labels only, never a host: `{"source": "hosted", "name": "<entry>"}`, `"local"`,
+/// `"hosted-test"`, `"stub"`, or `"unknown"` when the gateway can't be read; `fake_data` for
+/// the test banner; `switch_pending` while a switch waits for its acknowledgement.
+async fn model_source_view(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+) -> Reply {
+    allow(
+        &caller,
+        &[ClientKind::Web, ClientKind::Slack, ClientKind::Console],
+        "read the model source",
+    )?;
+    Ok(Json(state.rt.model_view().await).into_response())
 }
 
 /// `Some(x)` for a field that is present, `null` included, so `{"persona": null}` (move to

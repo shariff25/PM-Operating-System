@@ -61,6 +61,8 @@ struct Upstream {
     directory: FakeDirectory,
     /// The bot marketplace's routes (the catalog, each PM's team), answered apart.
     bots: support::FakeBots,
+    /// What the runtime's `GET /v1/model-source` answers (slice H12; runtime only).
+    model: Mutex<Value>,
 }
 
 impl Upstream {
@@ -152,6 +154,16 @@ async fn runtime(
 ) -> Response {
     if uri.path() == "/healthz" {
         return "ok".into_response();
+    }
+    // Slice H12: the indicator's view, asked on every `/api/me` (not recorded, so the tests
+    // that read the calls a route made see only that route's).
+    if uri.path() == "/v1/model-source" {
+        if headers.get("authorization").and_then(|v| v.to_str().ok())
+            != Some(&format!("Bearer {BOTS_TOKEN}"))
+        {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        return Json(up.model.lock().unwrap().clone()).into_response();
     }
     up.record(&method, &uri, &headers, &body);
     if headers.get("authorization").and_then(|v| v.to_str().ok())
@@ -1290,6 +1302,37 @@ async fn a_deactivated_user_loses_access_within_ten_seconds() {
     assert_eq!(w.get(&b, "/api/me").await.code(), "signed_out");
     w.advance(Duration::seconds(10));
     w.login("ana").await;
+}
+
+/// Slice H12 (spec §3.6, "The indicator"): `/api/me` says where prompts go, from the runtime's
+/// view, rebuilt from labels only; anything else, or no answer, is `unknown`.
+#[tokio::test]
+async fn me_says_where_prompts_go_by_label_only() {
+    let w = web().await;
+    let b = w.login("ana").await;
+    let me = w.get(&b, "/api/me").await.body;
+    assert_eq!(me["model"]["source"], "unknown");
+    *w.runtime.model.lock().unwrap() = json!({"source": "hosted", "name": "owner-hosted",
+        "fake_data": false, "switch_pending": true, "host": "models.example.test"});
+    let me = w.get(&b, "/api/me").await.body;
+    assert_eq!(
+        me["model"],
+        json!({"source": "hosted", "name": "owner-hosted", "fake_data": false,
+               "switch_pending": true})
+    );
+    // A name that isn't an entry name, or a source no build knows, isn't passed on.
+    for odd in [
+        json!({"source": "hosted", "name": "models.example.test"}),
+        json!({"source": "https://models.example.test"}),
+    ] {
+        *w.runtime.model.lock().unwrap() = odd;
+        let me = w.get(&b, "/api/me").await.body;
+        assert_eq!(me["model"]["source"], "unknown");
+        assert!(!me.to_string().contains("example.test"), "{me}");
+    }
+    *w.runtime.model.lock().unwrap() = json!({"source": "local"});
+    let me = w.get(&b, "/api/me").await.body;
+    assert_eq!(me["model"]["source"], "local");
 }
 
 #[tokio::test]

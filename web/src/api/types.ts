@@ -53,6 +53,22 @@ export interface Me {
   admin_url?: string;
   /** On the admin door: the public door's address, when the server knows it. */
   public_url?: string | null;
+  /**
+   * Where prompts go (slice H12): the model source as the runtime sees the gateway. Labels
+   * only, never a host. An older server leaves it out: show nothing.
+   */
+  model?: ModelSourceView;
+}
+
+/** `model` in `GET /api/me` (docs/web-api.md, "Me"; slice H12). */
+export interface ModelSourceView {
+  source: 'local' | 'hosted' | 'hosted-test' | 'stub' | 'unknown';
+  /** The approved entry's name, for `hosted`. */
+  name?: string;
+  /** Fake-data mode: `hosted-test`, or the test-only list. */
+  fake_data?: boolean;
+  /** A switch to a hosted entry waits for an administrator's confirmation. */
+  switch_pending?: boolean;
 }
 
 export type DraftKind = 'confluence_page' | 'jira_issue' | 'slack_reply' | 'slack_message';

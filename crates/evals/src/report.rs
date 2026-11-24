@@ -197,7 +197,7 @@ pub fn sha256_hex(text: &str) -> String {
 }
 
 /// A SHA-256 in lowercase hex: 64 of `0-9a-f`.
-fn is_sha256_hex(s: &str) -> bool {
+pub fn is_sha256_hex(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
@@ -225,7 +225,7 @@ impl GatewayModels {
                 );
             };
             // A label, never an address: anything else the gateway might send is refused.
-            if !matches!(up, "local" | "claude-test" | "remote-test") {
+            if !matches!(up, "local" | "claude-test" | "remote-test" | "hosted") {
                 return Err(format!("the gateway named an unknown upstream kind `{up}`"));
             }
             // A labelled role's model hash: a SHA-256 in hex, never anything else.

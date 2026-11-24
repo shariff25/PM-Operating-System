@@ -61,8 +61,9 @@ fresh_repo() { # [h10] [h12] [entry]
   for a in "$@"; do
     case "$a" in
       h10) h10=1 ;;
-      h12) printf 'entries: []\n' >"$R/crates/gateway/approved-hosted.yaml"; hosted='  hosted)' ;;
-      entry) printf 'entries:\n  - name: test\n    url_sha256: "%064d"\n    max_data_class: internal\n' 0 >"$R/crates/gateway/approved-hosted.yaml" ;;
+      # The list's real shape (slice H12): a top-level sequence, shipped as `[]`.
+      h12) printf '[]\n' >"$R/crates/gateway/approved-hosted.yaml"; hosted='  hosted)' ;;
+      entry) printf -- '- name: test\n  url_sha256: "%064d"\n  max_data_class: internal\n' 0 >"$R/crates/gateway/approved-hosted.yaml" ;;
     esac
   done
   # Slice H10 is built in this checkout: without `h10`, the copy is made as a checkout before it
@@ -301,6 +302,13 @@ expect_code 3 "RT-19 with an entry, without --allow-host-changes"
 has "not run: it changes the host" "RT-19 without --allow-host-changes"
 no_change_calls "RT-19 without --allow-host-changes"
 no_secrets "RT-19 without --allow-host-changes"
+
+# This checkout itself is detected as H12 built (the list and `pmos-admin hosted`), with no
+# approved entry: RT-19 reports "no approved hosted entry" unless the gateway is the stack-test
+# one, and RT-20 runs only on the stack-test-list gateway.
+grep -Eq '^  hosted\)' "$SRC/deploy/pmos-admin" && [ -f "$SRC/crates/gateway/approved-hosted.yaml" ] ||
+  fail "this checkout isn't detected as H12 built"
+! grep -q '^- ' "$SRC/crates/gateway/approved-hosted.yaml" || fail "this checkout's approved list has an entry"
 
 # exposure.sh: closed ports pass; an open one fails; through 443, H10's routes are skipped until
 # H10 is built, and checked after.

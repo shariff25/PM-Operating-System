@@ -1776,6 +1776,104 @@ fn codeowners_lines_cover_every_bot_instruction_file() {
     }
 }
 
+/// The approved hosted list and who may change it (spec §3.6, "Who may change the list", r6
+/// V1, r7 X2): the CODEOWNERS block in `policies/README.md` gives the four owner-only paths to
+/// `@<owner>` alone, after every line that could also match them; and once `.github/owner-handle`
+/// and `.github/CODEOWNERS` exist, `.github/CODEOWNERS` gives them to exactly the recorded
+/// handle. Until both exist only the block is checked, and the test says so. One file without
+/// the other fails. The cases themselves (a different single handle, a team, a second owner, a
+/// later line, a missing line, a malformed handle) are `pmos_contract::codeowners`'s tests and
+/// [`codeowners_hosted_list_rule_on_fixtures`].
+#[test]
+fn codeowners_hosted_list_is_owner_only() {
+    use pmos_contract::codeowners::{self, RepoOwnership, OWNER_PLACEHOLDER};
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let readme = fs::read_to_string(repo.join("policies/README.md")).unwrap();
+    let block = readme
+        .split("## Bot instructions (second review)")
+        .nth(1)
+        .and_then(|s| s.split("```text").nth(1))
+        .and_then(|s| s.split("```").next())
+        .expect("the CODEOWNERS block in policies/README.md");
+    let problems = codeowners::owner_only_problems(block, OWNER_PLACEHOLDER);
+    assert!(
+        problems.is_empty(),
+        "policies/README.md's CODEOWNERS block: {problems:?}"
+    );
+    match codeowners::repo_ownership(&repo) {
+        RepoOwnership::NotYet => eprintln!(
+            "codeowners_hosted_list_is_owner_only: .github/owner-handle and .github/CODEOWNERS \
+             don't exist yet (they wait on the owner); checked the policies/README.md block only"
+        ),
+        RepoOwnership::OwnerOnly { handle } => eprintln!(
+            "codeowners_hosted_list_is_owner_only: .github/CODEOWNERS gives the four paths to \
+             {handle} alone"
+        ),
+        RepoOwnership::Problems(p) => panic!("the owner-only CODEOWNERS lines: {p:?}"),
+    }
+}
+
+/// The same rule on fixture repositories: one passing case and each failing one.
+#[test]
+fn codeowners_hosted_list_rule_on_fixtures() {
+    use pmos_contract::codeowners::{repo_ownership, RepoOwnership};
+    let lines = |owner: &str| {
+        format!(
+            "/crates/gateway/ @org/team\n/.github/CODEOWNERS {owner}\n\
+             /.github/owner-handle {owner}\n/crates/gateway/approved-hosted.yaml {owner}\n\
+             /docs/model-providers/ {owner}\n"
+        )
+    };
+    let repo = |handle: Option<&str>, codeowners: Option<String>| {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join(".github")).unwrap();
+        if let Some(h) = handle {
+            fs::write(dir.path().join(".github/owner-handle"), h).unwrap();
+        }
+        if let Some(c) = codeowners {
+            fs::write(dir.path().join(".github/CODEOWNERS"), c).unwrap();
+        }
+        dir
+    };
+    let ok = repo(Some("@the-owner\n"), Some(lines("@the-owner")));
+    assert!(matches!(
+        repo_ownership(ok.path()),
+        RepoOwnership::OwnerOnly { .. }
+    ));
+    let owner = Some("@the-owner\n");
+    let cases: Vec<(Option<&str>, Option<String>)> = vec![
+        // A different single handle than the recorded one.
+        (owner, Some(lines("@someone"))),
+        // A missing or malformed handle file.
+        (None, Some(lines("@the-owner"))),
+        (Some("the-owner\n"), Some(lines("the-owner"))),
+        (Some("@org/team\n"), Some(lines("@org/team"))),
+        // No CODEOWNERS beside the handle.
+        (owner, None),
+        // No line for .github/CODEOWNERS, or for .github/owner-handle.
+        (
+            owner,
+            Some(lines("@the-owner").replace("/.github/CODEOWNERS @the-owner\n", "")),
+        ),
+        (
+            owner,
+            Some(lines("@the-owner").replace("/.github/owner-handle @the-owner\n", "")),
+        ),
+        // A later line that also matches.
+        (
+            owner,
+            Some(format!("{}/.github/ @org/team\n", lines("@the-owner"))),
+        ),
+    ];
+    for (handle, codeowners) in cases {
+        let dir = repo(handle, codeowners.clone());
+        assert!(
+            matches!(repo_ownership(dir.path()), RepoOwnership::Problems(_)),
+            "{handle:?} {codeowners:?}"
+        );
+    }
+}
+
 /// The repository's marketplace content as the owner decided on 2026-11-21: the three new
 /// bots are Previews; Echo's pages carry the internal-review line, stated in its role and its
 /// own skills; the team context says it comes first for every bot.

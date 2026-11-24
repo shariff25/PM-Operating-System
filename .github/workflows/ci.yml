@@ -179,6 +179,14 @@ jobs:
           deploy/pmos-admin up --bringup
           for i in $(seq 1 30); do deploy/pmos-admin status | grep -Eq '^ +bots +ok' && break; sleep 5; done
           deploy/pmos-admin status
+          # Slice H12 (docs/openshell-any-host-spec.md §3.6): the release image's gateway carries
+          # the release list, byte for byte the committed (empty) one, never the test-only list.
+          ready=$(curl -sS --noproxy '*' http://127.0.0.1:8740/readyz)
+          want=$(sha256sum <crates/gateway/approved-hosted.yaml | cut -d' ' -f1)
+          python3 -I -c 'import json,sys
+          d = json.loads(sys.argv[1])
+          assert d["approved_list"] == "release", d
+          assert d["approved_list_sha256"] == sys.argv[2], d' "$ready" "$want"
       - name: A member and a Docs-bot task end to end
         run: |
           # Every service decides from the user database (there is no team file since slice

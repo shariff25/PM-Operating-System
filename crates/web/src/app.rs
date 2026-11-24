@@ -2044,6 +2044,9 @@ async fn me_json(state: &AppState, signed: &Signed, st: &UserState) -> Response 
         // admin door's address (the admin screens live there only); on the admin door, the
         // public door's.
         o.insert("door".into(), json!(state.door().as_str()));
+        // Slice H12 (spec §3.6, "The indicator"): where prompts go, from the runtime's view of
+        // the gateway, rebuilt from the fields the web app reads (labels only, never a host).
+        o.insert("model".into(), model_view(state, signed).await);
         match (state.door(), &state.0.admin) {
             (Door::Public, Some(a)) if admin_door_role(&signed.member.roles) => {
                 o.insert("admin_url".into(), json!(a.url));
@@ -2055,6 +2058,34 @@ async fn me_json(state: &AppState, signed: &Signed, st: &UserState) -> Response 
         }
     }
     Json(body).into_response()
+}
+
+/// `model` in `/api/me` (slice H12): `{source, name?, fake_data, switch_pending}`, or
+/// `{"source": "unknown"}` when the runtime can't say.
+async fn model_view(state: &AppState, signed: &Signed) -> serde_json::Value {
+    let unknown = json!({"source": "unknown", "fake_data": false, "switch_pending": false});
+    let Ok(v) = signed.runtime(state).model_source(signed.handle()).await else {
+        return unknown;
+    };
+    let source = match v["source"].as_str() {
+        Some(s @ ("local" | "hosted" | "hosted-test" | "stub")) => s,
+        _ => return unknown,
+    };
+    let mut out = json!({
+        "source": source,
+        "fake_data": v["fake_data"].as_bool().unwrap_or(false),
+        "switch_pending": v["switch_pending"].as_bool().unwrap_or(false),
+    });
+    if source == "hosted" {
+        match v["name"]
+            .as_str()
+            .filter(|n| pmos_contract::model_source::hosted_name(&format!("hosted:{n}")).is_some())
+        {
+            Some(n) => out["name"] = json!(n),
+            None => return unknown,
+        }
+    }
+    out
 }
 
 /// `GET /api/me`: from the user database (a fresh answer, or on the last-known-good path at

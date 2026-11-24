@@ -32,12 +32,17 @@ while [ $# -gt 0 ]; do
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac
 done
-# The host settings (§3.1). Each default is the value that allows less; `local` and `private`
-# must be chosen. `hosted` (an approved provider) isn't built yet (slice H12).
+# The host settings (§3.1). Each default is the value that allows less; `local`, `hosted` and
+# `private` must be chosen. `hosted` (slice H12) needs an entry on the gateway's approved list
+# (crates/gateway/approved-hosted.yaml), which ships empty: the first entry is the owner's H13.
 case "$MODEL_SOURCE" in
   '' | local | hosted-test) ;;
-  hosted) echo "--model-source hosted (an approved provider) isn't built yet (slice H12): use hosted-test (fake data only) or local" >&2; exit 2 ;;
-  *) echo "--model-source $(printf '%q' "$MODEL_SOURCE"): use hosted-test or local" >&2; exit 2 ;;
+  hosted)
+    grep -q '^- ' "$DEPLOY/../crates/gateway/approved-hosted.yaml" 2>/dev/null || {
+      echo "--model-source hosted: there is no approved entry on the gateway's list (crates/gateway/approved-hosted.yaml ships empty; the first entry is the owner's slice H13): use hosted-test (fake data only) or local" >&2
+      exit 2
+    } ;;
+  *) echo "--model-source $(printf '%q' "$MODEL_SOURCE"): use hosted-test, local or hosted" >&2; exit 2 ;;
 esac
 case "$EXPOSURE" in
   '' | private | public) ;;
@@ -142,6 +147,12 @@ echo "== state directories"
 mkdir -p "$STATE"/{audit,usage,slack} "$DEPLOY/backups"
 chown -R "$OWNER_UID:$OWNER_GID" "$STATE" 2>/dev/null || warn "couldn't chown $STATE to $OWNER_UID:$OWNER_GID"
 ok "$STATE (owned by $OWNER_UID:$OWNER_GID, the checkout's owner)"
+# Slice H12: the hosted model's key file, made empty on every host so Compose can mount it
+# (deploy/compose.hosted.yaml); `pmos-admin hosted-key set` writes it. Never in a backup.
+(umask 077 && mkdir -p "$DEPLOY/secrets") && chmod 700 "$DEPLOY/secrets"
+[ -e "$DEPLOY/secrets/hosted-model.key" ] || (umask 077 && : >"$DEPLOY/secrets/hosted-model.key")
+chmod 600 "$DEPLOY/secrets/hosted-model.key"
+ok "deploy/secrets/hosted-model.key (mode 600; empty until pmos-admin hosted-key set)"
 
 echo "== deploy/.env"
 # Under the same lock as pmos-admin (deploy/.env.lock with flock; where flock isn't installed,

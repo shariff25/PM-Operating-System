@@ -420,6 +420,9 @@ pub struct Role {
     /// `None` for a role in the one-hop form, whose one model is the fields above. For a
     /// routed role those fields are its primary's.
     pub route: Option<Vec<Hop>>,
+    /// A hosted role's entry name (`hosted:<name>`), kept after `hosted::bind` puts the checked
+    /// URL in `upstream`.
+    pub hosted_name: Option<String>,
 }
 
 /// What an upstream speaks.
@@ -438,6 +441,14 @@ pub enum UpstreamKind {
     /// own key: its `key-file:`, or `PMOS_GATEWAY_REMOTE_KEY` for a config with one remote
     /// upstream (`docs/model-providers-spec.md` §4.11).
     RemoteOpenAi,
+    /// The owner-approved hosted model (slice H12): written `hosted:<name>`, `<name>` an entry
+    /// on the approved list compiled into the gateway (`hosted.rs`), allowed only in a `class:
+    /// production` config under `PMOS_MODEL_SOURCE=hosted`. Its roles' models are `host:<ref>`
+    /// until `hosted::bind` checks the host's URL and model ids against the entry's digests and
+    /// puts them in. An OpenAI-compatible API, reached through the hosted client only (compiled
+    /// roots, no redirects, the hosted resolver), with the key in
+    /// `PMOS_GATEWAY_HOSTED_KEY_FILE`.
+    Hosted,
 }
 
 impl UpstreamKind {
@@ -446,13 +457,20 @@ impl UpstreamKind {
         matches!(self, Self::ClaudeTest | Self::RemoteOpenAi)
     }
 
-    /// The neutral name for the kind, never an address: `local`, `claude-test` or
-    /// `remote-test`.
+    /// An OpenAI-compatible API off this host, sent a bearer key: a remote test upstream or
+    /// the approved hosted model.
+    pub fn is_remote_openai(self) -> bool {
+        matches!(self, Self::RemoteOpenAi | Self::Hosted)
+    }
+
+    /// The neutral name for the kind, never an address: `local`, `claude-test`,
+    /// `remote-test` or `hosted`.
     pub fn label(self) -> &'static str {
         match self {
             Self::OpenAi => "local",
             Self::ClaudeTest => "claude-test",
             Self::RemoteOpenAi => "remote-test",
+            Self::Hosted => "hosted",
         }
     }
 }
@@ -522,15 +540,23 @@ impl Role {
     /// The upstream as the gateway's logs name it: its base URL, or, for a labelled role, its
     /// kind ([`Role::upstream_kind_label`]), so a log doesn't name the provider's host.
     pub fn logged_upstream(&self) -> String {
-        if self.label.is_some() {
+        if self.label.is_some() || self.kind.is_remote_openai() {
             self.upstream_kind_label().to_string()
         } else {
             self.upstream.clone()
         }
     }
 
-    /// The upstream's host for the usage log, or, for a labelled role, its kind.
+    /// The upstream's host for the usage log, or, for a labelled role, its kind. A hosted
+    /// role's is always `hosted:<name>` (spec §3.6, "The usage log"), never the provider's
+    /// host; a remote test upstream's is always `remote-test`.
     pub fn logged_upstream_host(&self) -> String {
+        if let Some(name) = &self.hosted_name {
+            return format!("hosted:{name}");
+        }
+        if self.kind == UpstreamKind::RemoteOpenAi {
+            return self.upstream_kind_label().to_string();
+        }
         if self.label.is_some() {
             self.upstream_kind_label().to_string()
         } else {
@@ -873,6 +899,18 @@ impl Models {
                 )
             })?;
             let base = entry.url();
+            if let Some(hosted) = base.strip_prefix("hosted:") {
+                let role = hosted_role(&name, &spec, hosted, &upstream, entry, class)?;
+                upstream_kinds.insert(upstream.clone(), UpstreamKind::Hosted);
+                roles.insert(name, role);
+                continue;
+            }
+            if model.starts_with("host:") {
+                return Err(format!(
+                    "gateway config: role `{name}`: a `host:<ref>` model is taken only by a \
+                     `hosted:<name>` upstream"
+                ));
+            }
             let (kind, base) = split_kind(base);
             let url = reqwest::Url::parse(base)
                 .map_err(|e| format!("gateway config: upstream `{}`: {e}", upstream))?;
@@ -1001,7 +1039,28 @@ impl Models {
                     upstream_id: upstream,
                     key_file: entry.key_file().cloned(),
                     route: None,
+                    hosted_name: None,
                 },
+            );
+        }
+        // Slice H12: a `class: production` config takes `<name>.pmos.internal` model servers or
+        // one `hosted:<name>` upstream, never both, and never two entry names.
+        let hosted_names: std::collections::BTreeSet<&str> = roles
+            .values()
+            .filter_map(|r| r.hosted_name.as_deref())
+            .collect();
+        if hosted_names.len() > 1 {
+            return Err(
+                "gateway config: two `hosted:<name>` upstreams; one gateway serves one approved \
+                 entry"
+                    .into(),
+            );
+        }
+        if !hosted_names.is_empty() && roles.values().any(|r| r.kind != UpstreamKind::Hosted) {
+            return Err(
+                "gateway config: a `hosted:<name>` upstream can't share a config with local \
+                 model servers; one gateway serves one model source"
+                    .into(),
             );
         }
         // One label, one model: a one-hop role's label may not also be a routed model's.
@@ -1190,6 +1249,72 @@ fn person_pools(
 }
 
 /// An upstream URL's kind, from its prefix, and the URL without it.
+/// A role on a `hosted:<name>` upstream (slice H12, spec §3.6, "The gateway config for
+/// `hosted`"): only in a `class: production` config, its model `host:<ref>`, with a role
+/// label, no `key-file` (the key is `PMOS_GATEWAY_HOSTED_KEY_FILE`), and none of the testing-only
+/// upstreams' fields. Its URL and model id are put in by `hosted::bind`, after the digests are
+/// checked; until then `upstream` holds `hosted:<name>` and `model` holds `host:<ref>`.
+fn hosted_role(
+    name: &str,
+    spec: &RoleSpec,
+    hosted: &str,
+    upstream_id: &str,
+    entry: &UpstreamEntry,
+    class: GatewayClass,
+) -> Result<Role, String> {
+    let fail = |why: &str| Err(format!("gateway config: role `{name}`: {why}"));
+    if !crate::hosted::valid_entry_name(hosted) {
+        return fail(
+            "a `hosted:<name>` upstream's name must be lowercase letters, digits and inner \
+             hyphens",
+        );
+    }
+    if class != GatewayClass::Production {
+        return fail("a `hosted:<name>` upstream is taken only by a `class: production` config");
+    }
+    if entry.key_file().is_some() {
+        return fail(
+            "a `hosted:<name>` upstream takes no `key-file`; its key is \
+             PMOS_GATEWAY_HOSTED_KEY_FILE",
+        );
+    }
+    let model = spec.model.clone().unwrap_or_default();
+    let Some(r) = model.strip_prefix("host:") else {
+        return fail(
+            "on a `hosted:<name>` upstream the model must be `host:<ref>`, never a model id",
+        );
+    };
+    if !crate::hosted::valid_ref(r) {
+        return fail("`host:<ref>`: the ref must be lowercase letters, digits and hyphens");
+    }
+    let Some(label) = spec.label.clone() else {
+        return fail("a hosted role needs a role label (`label:`), reported in place of its model");
+    };
+    if !valid_label(&label) {
+        return fail("label must be 1 to 64 letters, digits, `.`, `_` and `-`");
+    }
+    if spec.effort.is_some() {
+        return fail("sets `effort`, which only the Claude test upstream takes");
+    }
+    let workarounds_on = spec.workarounds.clone().unwrap_or_default();
+    if let Some(w) = workarounds_on.iter().find(|w| !workarounds::known(w)) {
+        return fail(&format!("enables unknown workaround `{w}`"));
+    }
+    Ok(Role {
+        name: name.to_string(),
+        upstream: format!("hosted:{hosted}"),
+        model,
+        workarounds: workarounds_on,
+        kind: UpstreamKind::Hosted,
+        effort: None,
+        label: Some(label),
+        upstream_id: upstream_id.to_string(),
+        key_file: None,
+        route: None,
+        hosted_name: Some(hosted.to_string()),
+    })
+}
+
 fn split_kind(base: &str) -> (UpstreamKind, &str) {
     if let Some(rest) = base.strip_prefix("anthropic+") {
         (UpstreamKind::ClaudeTest, rest)
@@ -1231,6 +1356,12 @@ fn model_hop(
     let Some(entry) = upstreams.get(&m.upstream) else {
         return fail("its `upstream` isn't listed under `upstreams:`");
     };
+    if entry.url().starts_with("hosted:") || m.model.starts_with("host:") {
+        return fail(
+            "a route across models of the approved hosted entry is slice MP9, not built; give \
+             each hosted role one model (`upstream` and `model: host:<ref>`)",
+        );
+    }
     let (kind, base) = split_kind(entry.url());
     let Ok(url) = reqwest::Url::parse(base) else {
         return fail("its upstream's URL doesn't parse");
@@ -1423,6 +1554,7 @@ fn routed_role(
         upstream_id: p.upstream_id.clone(),
         key_file: p.key_file.clone(),
         route: Some(hops),
+        hosted_name: None,
     })
 }
 
@@ -1558,9 +1690,12 @@ pub struct Config {
     pub remote_key: String,
     /// `PMOS_GATEWAY_RETRY_*`: how a `429`/`503` from the upstream is retried (`retry.rs`).
     pub retry: crate::retry::RetryPolicy,
-    /// `PMOS_MODEL_SOURCE`: where this gateway's prompts go (`local` or `hosted-test`), required
-    /// with no default ([`Config::check_source`]).
+    /// `PMOS_MODEL_SOURCE`: where this gateway's prompts go (`local`, `hosted` or
+    /// `hosted-test`), required with no default ([`Config::check_source`]).
     pub model_source: ModelSource,
+    /// What the host gives a `hosted` gateway (slice H12): read always, used only under
+    /// `hosted` (`hosted::bind`).
+    pub hosted: crate::hosted::HostedEnv,
 }
 
 impl std::fmt::Debug for Config {
@@ -1578,6 +1713,7 @@ impl std::fmt::Debug for Config {
             .field("remote_key", &redacted(&self.remote_key))
             .field("retry", &self.retry)
             .field("model_source", &self.model_source)
+            .field("hosted", &self.hosted)
             .finish()
     }
 }
@@ -1619,6 +1755,7 @@ impl Config {
             remote_key: get("PMOS_GATEWAY_REMOTE_KEY").unwrap_or_default(),
             retry: crate::retry::RetryPolicy::from_lookup(&get)?,
             model_source: ModelSource::from_lookup(&get)?,
+            hosted: crate::hosted::HostedEnv::from_lookup(&get),
         })
     }
 
@@ -1638,7 +1775,49 @@ impl Config {
     ///   stub is on, and a `label:` on every role, so no model id reaches a client, a report or
     ///   a log (r7, X1).
     pub fn check_source(&self, models: &Models) -> Result<(), String> {
+        // Slice H12: only `hosted` takes a `hosted:<name>` upstream (and so a `host:<ref>`
+        // model, which no other upstream takes).
+        if self.model_source != ModelSource::Hosted
+            && models
+                .roles
+                .values()
+                .any(|r| r.hops().iter().any(|h| h.kind == UpstreamKind::Hosted))
+        {
+            return Err(format!(
+                "PMOS_MODEL_SOURCE={}: the config has a `hosted:<name>` upstream, which only \
+                 PMOS_MODEL_SOURCE=hosted serves",
+                self.model_source.as_str()
+            ));
+        }
         match self.model_source {
+            ModelSource::Hosted => {
+                if models.class != GatewayClass::Production {
+                    return Err(
+                        "PMOS_MODEL_SOURCE=hosted needs a `class: production` gateway config \
+                         (deploy/gateway.hosted.yaml)"
+                            .into(),
+                    );
+                }
+                if self.cloud_test {
+                    return Err(
+                        "PMOS_MODEL_SOURCE=hosted can't be used with PMOS_GATEWAY_CLOUD_TEST=1, \
+                         which is for hosted-test's unapproved endpoints"
+                            .into(),
+                    );
+                }
+                if let Some(r) = models.roles.values().find(|r| {
+                    r.routed()
+                        || r.kind != UpstreamKind::Hosted
+                        || r.label.is_none()
+                        || r.hosted_name.is_none()
+                }) {
+                    return Err(format!(
+                        "PMOS_MODEL_SOURCE=hosted: role `{}` must be one model on the \
+                         `hosted:<name>` upstream with a role label (`label:`)",
+                        r.name
+                    ));
+                }
+            }
             ModelSource::Local => {
                 if models.class != GatewayClass::Production {
                     return Err(
@@ -1799,9 +1978,21 @@ pub fn check_config(
     let path = path.unwrap_or_else(|| config.models_path.clone());
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("{}: can't read the gateway config: {e}", path.display()))?;
-    let models = Models::parse(&text, config.cloud_test)?;
+    let mut models = Models::parse(&text, config.cloud_test)?;
     config.check_keys(&models)?;
     config.check_source(&models)?;
+    let mut hosted = None;
+    if config.model_source == ModelSource::Hosted {
+        let list = crate::hosted::compiled()?;
+        let binding = crate::hosted::bind(
+            &mut models,
+            &list,
+            &config.hosted,
+            std::path::Path::new(crate::hosted::CONTROL_DIR),
+            crate::hosted::BuildInfo::compiled(),
+        )?;
+        hosted = Some(binding.source());
+    }
     // §4.11: only the gateway reaches a provider, through the egress proxy; an upstream whose
     // host NO_PROXY names would bypass it.
     let no_proxy = get("NO_PROXY")
@@ -1826,7 +2017,7 @@ pub fn check_config(
     let mut out = vec![format!(
         "ok: class {}, model source {}",
         models.class.as_str(),
-        config.served_source()
+        hosted.as_deref().unwrap_or(config.served_source())
     )];
     for r in models.roles.values() {
         let hops = r.hops();
@@ -1858,7 +2049,8 @@ pub fn no_proxy_matches(list: &str, host: &str) -> bool {
             })
 }
 
-/// What a gateway reports as its source: `stub` with the stub on, else `source`.
+/// What a gateway reports as its source: `stub` with the stub on, else `source` (for
+/// `hosted`, the router reports `hosted:<name>` from its binding instead).
 pub fn served_source(source: ModelSource, stub: bool) -> &'static str {
     if stub {
         pmos_contract::model_source::STUB

@@ -637,6 +637,12 @@ impl Runtime {
         self.0.healthy().await
     }
 
+    /// `GET /v1/model-source` for `user` (slice H12): where prompts go, as the runtime sees
+    /// the gateway, for the indicator in `/api/me`. Labels only.
+    pub async fn model_source(&self, user: &str) -> UpstreamResult<Value> {
+        self.get(user, &["v1", "model-source"], &[]).await
+    }
+
     /// `POST /v1/tasks` for `user`, with `source: "web"`.
     pub async fn create_task(&self, user: &str, bot: &str, text: &str) -> UpstreamResult<Task> {
         self.create_task_at(user, bot, text, None).await

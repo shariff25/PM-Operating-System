@@ -20,12 +20,45 @@ pub fn readyz_url(gateway_url: &str) -> String {
     format!("{base}/readyz")
 }
 
+/// What the gateway's `/readyz` says about where prompts go (slice H12): its source, and the
+/// approved list's digest, the build's commit and (under `hosted`) the effective data-class
+/// ceiling. Names and digests only.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GatewayReport {
+    /// `local`, `hosted-test`, `stub` or `hosted:<name>`.
+    pub source: String,
+    /// `release`, or `stack-test` for the test-only build (fake-data mode wherever seen).
+    pub approved_list: Option<String>,
+    pub approved_list_sha256: Option<String>,
+    pub commit: Option<String>,
+    /// Under `hosted`: the effective ceiling (`public`, `internal`, `restricted`).
+    pub max_data_class: Option<String>,
+}
+
+impl GatewayReport {
+    /// The ceiling as a class, when the gateway reports one. A value no build knows reads as
+    /// the lowest class, `public` (fail closed).
+    pub fn ceiling(&self) -> Option<pmos_contract::model::Sensitivity> {
+        self.max_data_class.as_deref().map(|c| {
+            pmos_contract::model::Sensitivity::parse(c)
+                .unwrap_or(pmos_contract::model::Sensitivity::Public)
+        })
+    }
+
+    /// Fake-data mode as the gateway reports it: `hosted-test`, or the test-only list
+    /// (`hosted:stack-test`, or `approved_list: stack-test` whatever the source says).
+    pub fn fake_data_only(&self) -> bool {
+        pmos_contract::model_source::reported_fake_data_only(&self.source)
+            || self.approved_list.as_deref() == Some("stack-test")
+    }
+}
+
 /// Reads and caches the gateway's reported source.
 pub struct GatewaySource {
     readyz: String,
     http: reqwest::Client,
     ttl: Duration,
-    cache: tokio::sync::Mutex<Option<(Instant, String)>>,
+    cache: tokio::sync::Mutex<Option<(Instant, GatewayReport)>>,
 }
 
 impl std::fmt::Debug for GatewaySource {
@@ -63,16 +96,21 @@ impl GatewaySource {
     /// be reached, answers with no readable `model_source`, or reports a form no service
     /// knows; the cached reading is dropped then, so the next call reads again.
     pub async fn current(&self) -> Result<String, String> {
+        self.report().await.map(|r| r.source)
+    }
+
+    /// The whole report ([`GatewayReport`]), from the same cache as [`GatewaySource::current`].
+    pub async fn report(&self) -> Result<GatewayReport, String> {
         let mut cached = self.cache.lock().await;
-        if let Some((at, source)) = cached.as_ref() {
+        if let Some((at, report)) = cached.as_ref() {
             if at.elapsed() < self.ttl {
-                return Ok(source.clone());
+                return Ok(report.clone());
             }
         }
         *cached = None;
-        let source = self.read().await?;
-        *cached = Some((Instant::now(), source.clone()));
-        Ok(source)
+        let report = self.read().await?;
+        *cached = Some((Instant::now(), report.clone()));
+        Ok(report)
     }
 
     /// Drops the cached reading, so the next [`GatewaySource::current`] reads afresh.
@@ -80,7 +118,7 @@ impl GatewaySource {
         *self.cache.lock().await = None;
     }
 
-    async fn read(&self) -> Result<String, String> {
+    async fn read(&self) -> Result<GatewayReport, String> {
         let res = self
             .http
             .get(&self.readyz)
@@ -96,8 +134,20 @@ impl GatewaySource {
             .json()
             .await
             .map_err(|_| "the model gateway's /readyz isn't JSON".to_string())?;
+        let text = |k: &str| {
+            body.get(k)
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty() && s.len() <= 128)
+                .map(String::from)
+        };
         match body.get("model_source").and_then(|v| v.as_str()) {
-            Some(s) if valid_reported(s) => Ok(s.to_string()),
+            Some(s) if valid_reported(s) => Ok(GatewayReport {
+                source: s.to_string(),
+                approved_list: text("approved_list"),
+                approved_list_sha256: text("approved_list_sha256"),
+                commit: text("commit"),
+                max_data_class: text("max_data_class"),
+            }),
             Some(_) => {
                 Err("the model gateway reports a model source this build doesn't know".into())
             }

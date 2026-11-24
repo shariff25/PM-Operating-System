@@ -17,6 +17,7 @@ import type {
   Draft,
   DraftSummary,
   FollowUp,
+  ModelSourceView,
   SeenName,
   Me,
   RejectReason,
@@ -30,6 +31,8 @@ export interface MockOptions extends MockAdminOptions, MockPolicyOptions, MockPa
   role?: MockRole;
   /** Pretend network delay in ms. Tests use 0. */
   latency?: number;
+  /** `model` in `/api/me` (slice H12); local by default. */
+  model?: ModelSourceView;
   /** How long each task step and each suggestion takes, in ms. */
   stepMs?: number;
   /** false makes GET /api/brief answer 501 not_built. */
@@ -213,6 +216,7 @@ export function createMockClient(options: MockOptions = {}): Api {
     nudges: options.nudges ?? true,
     mascot: options.mascot ?? true,
     reviewer: profile.roles.includes('reviewer'),
+    model: options.model ?? { source: 'local', fake_data: false, switch_pending: false },
   };
   /** The settings the real server keeps per person, kept across a reload when `keepSettings` is on. */
   const keyFor = (handle: string) => `pmos-mock-settings:${handle}`;

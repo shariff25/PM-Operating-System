@@ -261,6 +261,13 @@ pub fn router_full(
         .route("/ledger/summary", get(ledger_summary))
         .route("/credentials", get(list_credentials))
         .route("/runs/{run_id}/sensitivity", get(run_sensitivity))
+        // Slice H12 (r7, X3): the switch status the runtime gates on, and the acknowledgement
+        // `sudo pmos-admin hosted acknowledge-switch` records.
+        .route("/system/model-source-status", get(model_source_status))
+        .route(
+            "/system/model-source-acknowledgement",
+            post(model_source_acknowledgement),
+        )
         .layer(middleware::from_fn(orchestrator_only));
 
     // Any internal client; the bot is limited to its own skills inside each handler. Both
@@ -1436,6 +1443,118 @@ async fn ledger_summary(State(state): State<AppState>, Query(q): Query<SummaryPa
         Ok(summary) => Json(summary).into_response(),
         Err(e) => unavailable(e),
     }
+}
+
+/// `GET /internal/system/model-source-status` (slice H12, r7 X3): the gateway's source as the
+/// tool server reads it now, whether a switch to a hosted entry waits for its acknowledgement,
+/// and whether sessions may open (`ok`). `503` with `ok: false` whenever it isn't so, the
+/// gateway unreadable included, so a caller that can't tell refuses.
+async fn model_source_status(State(state): State<AppState>) -> Response {
+    let Some(guard) = state.svc.model_source_guard() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(
+                json!({"ok": false, "refused": "this tool server doesn't check the model source"}),
+            ),
+        )
+            .into_response();
+    };
+    let status = guard.status().await;
+    let code = if status.ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (code, Json(status)).into_response()
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AcknowledgeBody {
+    to: String,
+    by: String,
+    reason: String,
+}
+
+/// Plain text for the audit log: printable characters, no line breaks.
+fn plain(s: &str, max: usize) -> Option<String> {
+    let t = s.trim();
+    (!t.is_empty() && t.chars().count() <= max && !t.chars().any(char::is_control))
+        .then(|| t.to_string())
+}
+
+/// `POST /internal/system/model-source-acknowledgement` (slice H12, r7 X3), the service token
+/// only: records that `by` (the `SUDO_USER` of `pmos-admin hosted acknowledge-switch`)
+/// confirmed the switch to `to`, which must be what the gateway reports now, for `reason`; and
+/// writes `system.model_source_acknowledged` with the real sources the database has served.
+async fn model_source_acknowledgement(
+    State(state): State<AppState>,
+    Json(body): Json<AcknowledgeBody>,
+) -> Response {
+    let Some(guard) = state.svc.model_source_guard() else {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this tool server doesn't check the model source",
+        );
+    };
+    let (Some(by), Some(reason)) = (plain(&body.by, 64), plain(&body.reason, 500)) else {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "`by` (1 to 64 characters) and `reason` (1 to 500) are required, with no line breaks",
+        );
+    };
+    if !pmos_contract::model_source::valid_reported(&body.to) {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "`to` is not a model source",
+        );
+    }
+    let now = Utc::now();
+    let history = match guard.acknowledge(&body.to, &by, &reason, now).await {
+        Ok(h) => h,
+        Err(why) => return error(StatusCode::CONFLICT, why),
+    };
+    let served: Vec<String> = history
+        .iter()
+        .filter(|r| r.real)
+        .map(|r| {
+            format!(
+                "{} (first {}, last {})",
+                r.source,
+                r.first_at.format("%Y-%m-%d"),
+                r.last_at.format("%Y-%m-%d")
+            )
+        })
+        .collect();
+    state
+        .svc
+        .audit(crate::audit::AuditEvent {
+            client: Client::System,
+            at: now,
+            run_id: "system".into(),
+            user: by.clone(),
+            skill: None,
+            bot: None,
+            tool: crate::model_source::SYSTEM_MODEL_SOURCE_ACKNOWLEDGED.into(),
+            outcome: crate::audit::Outcome::Ok,
+            sources: Vec::new(),
+            source_titles: Default::default(),
+            args_hash: None,
+            output_ref: None,
+            detail: Some(format!(
+                "to: {}; by: {by}; reason: {reason}; real sources served: {}",
+                body.to,
+                if served.is_empty() {
+                    "none".to_string()
+                } else {
+                    served.join(", ")
+                }
+            )),
+            persona: None,
+        })
+        .await;
+    tracing::warn!(to = %body.to, by = %by, "model source switch acknowledged");
+    Json(json!({"acknowledged": body.to, "history": history})).into_response()
 }
 
 /// Rebuild the context index after a merge to the content repo.
