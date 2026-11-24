@@ -629,3 +629,156 @@ async fn one_upstreams_tool_call_extras_never_reach_another() {
     // provider accepts another's ids is checked against real test upstreams in MP8).
     assert!(to_b.contains("call-1"));
 }
+
+// Slice MP4 (§4.6, §4.12): circuits per model and per upstream, `/readyz` by counts only,
+// `GET /v1/pmos/routes` for the admin client alone.
+
+fn routes(gw: &Gw, token: &str) -> reqwest::RequestBuilder {
+    reqwest::Client::new()
+        .get(format!("{}/v1/pmos/routes", gw.base))
+        .bearer_auth(token)
+}
+
+#[tokio::test]
+async fn a_circuit_opens_skips_its_model_and_lets_one_real_call_through_after_its_cool_down() {
+    let gw = gateway(
+        &[FULL, FULL],
+        "routing: {circuit: {failures: 1, cool-down-secs: 1, max-cool-down-secs: 2}}\n",
+    )
+    .await;
+    gw.mocks[0].script(vec![Step::Status(500, None, "oops")]);
+    let res = ask(&gw, hello(false)).send().await.unwrap();
+    assert_eq!(header(res.headers(), "x-pmos-model"), "hosted-model-b");
+    assert_eq!(gw.mocks[0].calls(), 1);
+    // Open: the primary is skipped, and the line says why.
+    let res = ask(&gw, hello(false)).send().await.unwrap();
+    assert_eq!(header(res.headers(), "x-pmos-model"), "hosted-model-b");
+    assert_eq!(gw.mocks[0].calls(), 1, "an open circuit sends nothing");
+    let line = gw.usage.recent().last().unwrap().clone();
+    assert_eq!(line.skipped[0].why, "circuit");
+    let v: Value = routes(&gw, ADMIN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["roles"][0]["hops"][0]["circuit"], "open", "{v}");
+    assert_eq!(v["roles"][0]["hops"][1]["circuit"], "closed");
+    // No synthetic traffic: while it cools down, the gateway sends the model nothing.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(gw.mocks[0].calls(), 1);
+    // Half-open: the next real call tries it, succeeds, and closes it.
+    let res = ask(&gw, hello(false)).send().await.unwrap();
+    assert_eq!(header(res.headers(), "x-pmos-model"), "hosted-model-a");
+    assert_eq!(header(res.headers(), "x-pmos-fallback"), "0");
+    let v: Value = routes(&gw, ADMIN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["roles"][0]["hops"][0]["circuit"], "closed");
+}
+
+#[tokio::test]
+async fn a_callers_own_errors_never_trip_a_circuit() {
+    let gw = gateway(&[FULL, FULL], "routing: {circuit: {failures: 1}}\n").await;
+    gw.mocks[0].script(vec![Step::Status(400, None, "bad request"); 100]);
+    for _ in 0..100 {
+        let res = ask(&gw, hello(false)).send().await.unwrap();
+        assert_eq!(res.status(), 400);
+    }
+    assert_eq!(gw.mocks[1].calls(), 0);
+    let res = ask(&gw, hello(false)).send().await.unwrap();
+    assert_eq!(header(res.headers(), "x-pmos-model"), "hosted-model-a");
+    let v: Value = routes(&gw, ADMIN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    for hop in v["roles"][0]["hops"].as_array().unwrap() {
+        assert_eq!(hop["circuit"], "closed", "{v}");
+    }
+}
+
+#[tokio::test]
+async fn readiness_counts_usable_hops_and_names_no_label() {
+    let gw = gateway(
+        &[FULL, FULL],
+        "routing: {circuit: {failures: 1, cool-down-secs: 60}}\n",
+    )
+    .await;
+    let ready = || async {
+        let res = reqwest::get(format!("{}/readyz", gw.base)).await.unwrap();
+        let status = res.status().as_u16();
+        let text = res.text().await.unwrap();
+        for f in ["hosted-model", "id-a", "id-b", "127.0.0.1", "up-a", "key-"] {
+            assert!(!text.contains(f), "/readyz carries `{f}`: {text}");
+        }
+        (status, serde_json::from_str::<Value>(&text).unwrap())
+    };
+    let (status, v) = ready().await;
+    assert_eq!(status, 200, "{v}");
+    assert_eq!(v["upstreams"]["default"]["hops"], 2);
+    assert_eq!(v["upstreams"]["default"]["hops_usable"], 2);
+    // The primary's circuit opens: still ready, on the fallback.
+    gw.mocks[0].script(vec![Step::Status(500, None, "x")]);
+    ask(&gw, hello(false)).send().await.unwrap();
+    let (status, v) = ready().await;
+    assert_eq!(
+        (status, &v["upstreams"]["default"]["hops_usable"]),
+        (200, &json!(1))
+    );
+    assert_eq!(v["upstreams"]["default"]["status"], "ok");
+    // Hop 1 is skipped (open), hop 2 fails and opens: down.
+    gw.mocks[1].script(vec![Step::Status(500, None, "x")]);
+    assert_eq!(ask(&gw, hello(false)).send().await.unwrap().status(), 503);
+    let (status, v) = ready().await;
+    assert_eq!(status, 503);
+    assert_eq!(v["upstreams"]["default"]["status"], "down");
+    // The 503 says when to come back: the soonest cool-down's end.
+    let res = ask(&gw, hello(false)).send().await.unwrap();
+    assert_eq!(res.status(), 503);
+    let ra: u64 = header(res.headers(), "retry-after").parse().unwrap();
+    assert!((50..=60).contains(&ra), "{ra}");
+}
+
+#[tokio::test]
+async fn only_the_admin_client_reads_the_routes_and_it_makes_no_model_call() {
+    let gw = gateway(&[FULL, FULL], "").await;
+    assert_eq!(routes(&gw, TOKEN).send().await.unwrap().status(), 403);
+    assert_eq!(routes(&gw, EVALS).send().await.unwrap().status(), 403);
+    let v: Value = routes(&gw, ADMIN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["roles"][0]["hops"][1]["label"], "hosted-model-b");
+    assert_eq!(v["roles"][0]["hops"][1]["model_sha256"], sha256_hex("id-b"));
+    let text = v.to_string();
+    for f in ["id-a", "127.0.0.1", "up-a", "key-"] {
+        assert!(!text.contains(f), "{text}");
+    }
+    let res = ask_as(&gw, ADMIN, hello(false)).send().await.unwrap();
+    assert_eq!(res.status(), 403);
+    assert_eq!(gw.mocks[0].calls() + gw.mocks[1].calls(), 0);
+    // The roles answer lists the route by label, the primary as the role's model.
+    let v: Value = reqwest::Client::new()
+        .get(format!("{}/v1/pmos/roles", gw.base))
+        .bearer_auth(EVALS)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["roles"][0]["model"], "hosted-model-a");
+    assert_eq!(v["roles"][0]["route"][1]["label"], "hosted-model-b");
+    assert!(!v.to_string().contains("id-b"));
+}
