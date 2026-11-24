@@ -44,8 +44,9 @@ deploy/setup.sh --content /srv/pmos/content-repo --clone <the content repo> --st
 
 `--model-source` defaults to `hosted-test` (fake data only) and `--exposure` to `public`, the
 values that allow less; `setup.sh` never replaces a value already in `deploy/.env`. With
-`PMOS_EXPOSURE=public` the web app refuses to start until slice H10 (the admin listener) is
-built; `private` means the host is reached only from a network the company controls, which the
+`PMOS_EXPOSURE=public` the web app takes Microsoft sign-in from anywhere and password sign-in
+only from `PMOS_WEB_PASSWORD_CLIENTS` (decision D2 (a), "The web app on a public host" below);
+`private` means the host is reached only from a network the company controls, which the
 preflight's H-PRIVATE checks.
 
 1. **Read `setup.sh`'s output.** Warnings about OpenShell or the NVIDIA runtime must be gone
@@ -386,11 +387,13 @@ compromised console can't decide one or call a tool.
 
 ## Optional: the web app
 
-The web app is **off by default**. Turn it on only for a closed test network: development
-sign-in lets anyone who can reach its port sign in as any member. Until slice H10 (the
-admin-only listener and the public sign-in rules) is built, `pmos-web` refuses to start with
-`PMOS_EXPOSURE=public`, so the web app, and password sign-in with it, runs only on a host
-reached from networks the company controls. See
+The web app is **off by default**. It has two front doors (slice H10,
+[docs/openshell-any-host-spec.md](../openshell-any-host-spec.md) §3.8): the browser-facing one
+on `8770`, behind the reverse proxy, and the **admin door** on `8772`, where every
+`/api/admin/*` route and the admin and audit screens live, for Admins and Auditors only ("The
+admin door", below). `pmos-web` refuses to start without the admin door, on every host.
+Development sign-in lets anyone who can reach the port sign in as any member: only on a closed
+test network, never on `PMOS_EXPOSURE=public` (the web app refuses it there). See
 [docs/web-app-running.md](../web-app-running.md) before you start it.
 
 With **password sign-in** (`PMOS_WEB_PASSWORD_LOGIN=1`, [docs/password-sign-in.md](../password-sign-in.md))
@@ -410,7 +413,13 @@ your site already routes that range. The proxy must send `X-Forwarded-For` (ngin
 | `The pmos network's gateway is <a>, but deploy/.env pins PMOS_NETWORK_GATEWAY=<b>` | The network was made before the kit pinned it (or with other settings). Run `deploy/pmos-admin down && deploy/pmos-admin up --web`: `down` removes the network and `up` makes it at the pinned address. Every service restarts. |
 | `PMOS_WEB_TRUSTED_PROXIES names <x>, but ... the gateway, <g>` | The setting is stale (an old, unpinned gateway such as `172.18.0.1`). Set the printed line. A proxy in a container on the `pmos` network may be listed by its own address inside the subnet. |
 | `PMOS_WEB_PUBLIC_URL must be the web app's https:// address` | Set it. |
-| `PMOS_EXPOSURE=public in deploy/.env, and the web app (pmos-web) does not run on a public host` | `public` is `setup.sh`'s default, and `pmos-web` refuses it until the admin listener (slice H10) is built. On a host reached only from a network the company controls (a VPN, an SSH tunnel), set `PMOS_EXPOSURE=private` in `deploy/.env`; if the preflight's H-PRIVATE then fails on a closed test host (a public address, or a metadata service that answers), record it with `sudo deploy/pmos-admin host acknowledge H-PRIVATE --reason "<why>"`. Otherwise leave the web app off. |
+| `PMOS_WEB_ADMIN_URL is blank` | Set the admin door's address ("The admin door", below). |
+| `PMOS_WEB_ADMIN_PUBLISH=… : the admin door is published only on loopback, …` | Publish `8772` on `127.0.0.1` (a tunnel) or this host's VPN or private address, never a public one. IPv4 only. |
+| `PMOS_WEB_ADMIN_URL is http (the tunnel mode) and …` | An `http` admin URL is a loopback name with a port, published on `127.0.0.1`, with no `PMOS_WEB_ADMIN_TRUSTED_PROXIES`. Otherwise use `https` through a TLS terminator. |
+| `PMOS_WEB_ADMIN_URL is https (the proxy mode): set PMOS_WEB_ADMIN_TRUSTED_PROXIES` | The terminator's address as the web app sees it: on this host, the `pmos` network's gateway. |
+| `PMOS_EXPOSURE=public with development sign-in` | Set `PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=0`. |
+| `PMOS_EXPOSURE=public with password sign-in: set PMOS_WEB_PASSWORD_CLIENTS` | Name the VPN's or office's ranges (each no wider than a `/16` or `/48`), or turn password sign-in off and use Microsoft sign-in (decision D2). On a host reached only from a network the company controls, `PMOS_EXPOSURE=private` instead; if H-PRIVATE then fails on a closed test host, `sudo deploy/pmos-admin host acknowledge H-PRIVATE --reason "<why>"`. |
+| `PMOS_WEB_PASSWORD_CLIENTS: … is wider than decision D2 (a) allows` | `0.0.0.0/0`, `::/0`, `::ffff:0:0/96` or any prefix shorter than `/16` (IPv4) or `/48` (IPv6) holds the internet. A site whose VPN really hands out a wider range needs a reviewed code change. |
 | `PMOS_WEB_BRIEF_URL=… is the web app's browser-facing port` (any `up`) | A value from before slice H9. Set `PMOS_WEB_BRIEF_URL=http://web.pmos.internal:8771`, or leave it blank to send no brief. |
 
 **What a reverse proxy in front of the web app must not forward, and how big a body it takes.**
@@ -437,7 +446,85 @@ location = /readyz     { return 404; }
 location ^~ /internal/ { return 404; }
 ```
 
-The full public example (rate limits, TLS, the admin listener) comes with slice H10.
+### The web app on a public host
+
+With `PMOS_EXPOSURE=public` (decision D2 (a)): Microsoft (Entra) sign-in from anywhere; password
+sign-in only from `PMOS_WEB_PASSWORD_CLIENTS` (required with password sign-in on: the VPN's or
+office's ranges, each no wider than a `/16` or a `/48`; a password request from anywhere else
+answers `403 password_sign_in_not_from_here` before the tool server is asked); development
+sign-in refused. Until the Entra app registration exists, a public host signs in nobody outside
+the allow-list.
+
+The full nginx example is in the kit: [`deploy/nginx/pmos-public.conf.example`](../../deploy/nginx/pmos-public.conf.example)
+(rate limits on sign-in and the API, TLS, HTTP only to redirect, the health, internal and admin
+routes answering `404`) and [`deploy/nginx/pmos-proxy.conf`](../../deploy/nginx/pmos-proxy.conf)
+(the upstream, `Host`, `X-Forwarded-For`, and the headers no browser may set). Copy them to
+`/etc/nginx/`, set the name, addresses and certificate paths, then `sudo nginx -t && sudo
+systemctl reload nginx`. CI checks both parse (`scripts/check-nginx-examples.sh`, `nginx -t`).
+`listen … ssl http2` rather than `http2 on;`: Ubuntu 24.04's nginx (1.24) predates it. For IPv6,
+nginx's limits key on each address, not each `/64` (the file says so): they are a coarse first
+layer, not the sign-in defence, which is the tool server's per-account and per-address counters.
+The tool server's `/oauth/` block (Stage 6) takes the same `limit_req zone=pmos_signin` and
+`client_max_body_size 64k`.
+
+### The admin door
+
+Every `/api/admin/*` route (people and roles, setup and reset codes, content and policy
+proposals, the harness view, the audit log and export, the Auditor's views, a held draft's
+release) is served only here, on `8772` (`PMOS_WEB_ADMIN_BIND`, fixed in `deploy/compose.yaml`),
+at its own address, `PMOS_WEB_ADMIN_URL`, with its own cookie and sessions, and only to Admins
+and Auditors. A PM or a Reviewer is refused before any session exists (`403
+admin_door_not_allowed`). The admin door's sessions last at most 30 idle and 480 minutes in all
+(`PMOS_WEB_ADMIN_SESSION_IDLE_MINUTES`, at most 60; `PMOS_WEB_ADMIN_SESSION_MAX_MINUTES`, at
+most 720), a role change, an invitation, a deactivation, an unlinked identity, a setup or reset
+code, a policy or content proposal and the audit export need a sign-in from the last 5 minutes,
+and the browser-facing door answers `404` for all of it. Pick one of two modes:
+
+- **Tunnel mode (no TLS to set up).** `PMOS_WEB_ADMIN_URL=http://<deployment>.localhost:8772`
+  (a name unique to this deployment, such as `pmos-prod.localhost`: every tunnel to a bare
+  `localhost` shares its cookies with any other local page), `PMOS_WEB_ADMIN_PUBLISH=127.0.0.1`
+  (the default), `PMOS_WEB_ADMIN_TRUSTED_PROXIES` blank. From your machine:
+  `ssh -L 8772:127.0.0.1:8772 <host>`, then open the admin URL in Chromium or Firefox, which
+  resolve `*.localhost` to your machine and keep the admin door's `Secure` cookie on it. The web
+  app takes connections only from the `pmos` network's gateway (`PMOS_WEB_ADMIN_TUNNEL_PEER`,
+  which compose sets) and never reads `X-Forwarded-For` there. If you sign in and the page still
+  asks you to, your browser dropped the cookie: use Chromium or Firefox, or the proxy mode.
+- **Proxy mode (over the VPN).** A TLS terminator on this host's VPN or private address only:
+  [`deploy/nginx/pmos-admin.conf.example`](../../deploy/nginx/pmos-admin.conf.example), with
+  `PMOS_WEB_ADMIN_URL=https://<a private name>` (not the public URL's host),
+  `PMOS_WEB_ADMIN_PUBLISH=<that private address>` and `PMOS_WEB_ADMIN_TRUSTED_PROXIES=10.201.77.1`
+  (the gateway). The web app answers `404` to any other peer, to a forwarded client outside
+  loopback, RFC 1918, `100.64.0.0/10` and unique-local, and to any `Host` but the admin URL's;
+  `PMOS_WEB_PASSWORD_CLIENTS` applies to the forwarded client. Never `listen 443` without an
+  address there: the preflight's H-ADMIN reads `nginx -T` (and `caddy adapt`) and fails a server
+  that forwards to the admin door while listening on a public address, or on every address of a
+  host that has a public one.
+
+Sign-in on the admin door is password sign-in by default. Microsoft sign-in there needs
+`<PMOS_WEB_ADMIN_URL>/api/auth/callback` added as a second redirect URI of the Entra app
+registration, then `PMOS_WEB_ADMIN_ENTRA=1` (an open question for the owner, spec §8.2 item 9).
+Passwords and authenticators are changed on the public door and used on either.
+
+**The first Admin on a fresh host with no Entra registration:**
+
+1. On the host: `deploy/pmos-admin users bootstrap-admin --handle <handle> … --no-entra`
+   ([users.md](users.md), "Once, on a fresh install"), then `deploy/pmos-admin users
+   password-setup <handle>`, which prints a setup code once.
+2. From your machine: the SSH tunnel above.
+3. In the browser, open the admin URL's `#/setup` page, set the password and the authenticator
+   with the code, then sign in. Further Admins and Auditors are made from the Team page; their
+   setup codes still come from the host.
+
+### Firewall
+
+- **Inbound:** 443 (and 80 for certificate issuance, if used) from where PMs are, and 22 from the
+  operators' addresses. Deny everything else, at the cloud's network firewall as well as on the
+  host. `8772` is never opened to the internet: in tunnel mode it is on `127.0.0.1`; in proxy mode
+  only the VPN reaches the terminator.
+- **Docker bypasses `ufw`** for the ports it publishes, which is why every PM OS port is
+  published on `127.0.0.1` (and the admin door on `PMOS_WEB_ADMIN_PUBLISH`) and H-EXPOSURE fails
+  any other listener. Never change a publish to `0.0.0.0`.
+- **Outbound:** as Stage 1 lists. Sandboxes are default-deny already.
 
 **After it starts, if password sign-in answers "PM OS can't sign you in through this
 address"** (`403 proxy_not_trusted`): the requests arrive from somewhere

@@ -115,8 +115,12 @@ The deploy kit (`deploy/`) knows the web app, **off by default**:
   `PMOS_WEB_PUBLIC_URL` in `deploy/.env`; Compose passes it to `pmos-web` (for its origin check)
   and to the Slack service (for the cards' links), and blank means unset for both. The proxy
   must pass the request's `Host`, `Origin` and `Cookie` headers unchanged.
-- **Private hosts only, for now.** `pmos-web` refuses to start with `PMOS_EXPOSURE=public`
-  until slice H10 (the admin-only listener and the public sign-in rules) is built.
+- **Two doors (slice H10).** The admin screens and every `/api/admin/*` route are on the admin
+  door, `8772`, at `PMOS_WEB_ADMIN_URL` (an SSH tunnel to `127.0.0.1`, or a TLS terminator on the
+  VPN), for Admins and Auditors only; `pmos-web` refuses to start without it, on every host
+  ([docs/runbooks/install.md](runbooks/install.md), "The admin door"). On `PMOS_EXPOSURE=public`
+  it takes Microsoft sign-in, password sign-in only from `PMOS_WEB_PASSWORD_CLIENTS`, and never
+  development sign-in.
 - **Health.** The container's health check is `GET /healthz`; `deploy/pmos-admin status` shows
   it while the service runs.
 

@@ -58,6 +58,12 @@ For Entra ID sign-in instead of `PMOS_WEB_DEV_LOGIN=1`, set `PMOS_WEB_ENTRA_TENA
 | `PMOS_WEB_POLICIES_ROOT` | `policies` beside the content root, if there | The checked-in policy files the Policy Admin compares with (drift) |
 | `PMOS_WEB_GATEWAY_CONFIG` | none | The gateway's model config (`deploy/gateway.yaml`), read for model and upstream names only, for `GET /api/admin/harness` |
 | `PMOS_WEB_CONTENT_REVISION` | none | The deployed content's commit, when the content root has no `.git` to read it from |
+| `PMOS_WEB_ADMIN_BIND` | required (slice H10) | The admin door: `/api/admin/*` and the admin screens, never on `PMOS_WEB_BIND` (decision D3 (b)). Unspecified, loopback, RFC 1918, `100.64.0.0/10` or unique-local only |
+| `PMOS_WEB_ADMIN_URL` | required with it | Its own origin: `http://<loopback name>:<port>` (the tunnel mode, with `PMOS_WEB_ADMIN_TUNNEL_PEER`) or `https://<name>` (the proxy mode, with `PMOS_WEB_ADMIN_TRUSTED_PROXIES`), on a host other than `PMOS_WEB_PUBLIC_URL`'s |
+| `PMOS_WEB_ADMIN_TUNNEL_PEER`, `PMOS_WEB_ADMIN_TRUSTED_PROXIES` | by mode | The one peer a tunnel arrives from; the terminators an `https` admin door takes, whose forwarded client must be private |
+| `PMOS_WEB_ADMIN_SESSION_IDLE_MINUTES`, `PMOS_WEB_ADMIN_SESSION_MAX_MINUTES` | 30, 480 | The admin door's session bounds, at most 60 and 720 |
+| `PMOS_WEB_ADMIN_ENTRA` | 0 | 1: Microsoft sign-in on the admin door, its callback registered as a second redirect URI. 0: password-only there |
+| `PMOS_WEB_PASSWORD_CLIENTS` | none | Decision D2 (a): the networks password sign-in is served to (each no wider than `/16` or `/48`); required on `PMOS_EXPOSURE=public` with password sign-in |
 
 **Removed:** `PMOS_WEB_GITHUB_TOKEN`, `PMOS_WEB_GITHUB_REPO`, `PMOS_WEB_GITHUB_API`,
 `PMOS_WEB_GITHUB_BASE`, `PMOS_WEB_PROPOSALS_PER_HOUR`, `PMOS_WEB_GITHUB_CONTENT_DIR` and

@@ -957,6 +957,39 @@ task, whatever its answer contains), it sends the items of the brief's machine-r
 routine has empty lists and `status: "never"`. A brief that found nothing still calls it, with
 empty lists, so the home page can tell "nothing found" (`today`) from "never ran" (`never`).
 
+## The admin door
+
+Slice H10 (`docs/openshell-any-host-spec.md` §3.8; decision D3 (b)). `pmos-web` has two front
+doors and refuses to start without the second:
+
+- **The public door** (`PMOS_WEB_BIND`, 8770): every route above but `/api/admin/*`, which
+  answers `404` here on every host. Its cookie is `__Host-pmos` (`SameSite=Lax`).
+- **The admin door** (`PMOS_WEB_ADMIN_BIND`, 8772, at `PMOS_WEB_ADMIN_URL`): `/api/admin/*` (the
+  Auditor's views and `POST /api/admin/bots/drafts/{id}/release` included), `GET
+  /api/auth/providers`, `GET /api/auth/login` and `/api/auth/callback` (only with
+  `PMOS_WEB_ADMIN_ENTRA=1`), `POST /api/auth/password/sign-in`, `second-step` and `setup/*`,
+  `POST /api/auth/logout`, `GET /api/me`, and the app's files. Everything else answers `404`
+  (development sign-in, a password change, recovery codes, `/healthz`, `/readyz`, every PM
+  route). Its cookie is `__Host-pmos-admin` (`SameSite=Strict`), its Entra flow cookie
+  `__Host-pmos-admin-entra` (`Lax`), its password steps' `__Host-pmos-admin-pending` and
+  `__Host-pmos-admin-setup`. Writes must come from `PMOS_WEB_ADMIN_URL`'s origin.
+- **Before any route there:** a `Host` other than the admin URL's authority, a missing one, a
+  peer other than the tunnel peer (`http` admin URL) or a trusted terminator naming a private
+  client (`https` admin URL) answers `404` (counted on `/readyz` as `admin_bad_host` and
+  `admin_refused_peer`). No answer carries an `Access-Control-*` header.
+- **Who:** an Admin or an Auditor only, checked after the credentials and before any session or
+  cookie (`403 admin_door_not_allowed`, audited as `web.sign_in_refused` with that reason), and
+  again on every request (the session ends). Set-up there serves an Admin or an Auditor only
+  (`404` otherwise). Sessions are bounded (idle 30, at most 60; absolute 480, at most 720
+  minutes). The admin door's Entra callback answers a page that moves the browser to the app (a
+  same-site navigation carries the `Strict` cookie), not a `303`.
+- **Step-up:** `POST /api/admin/users`, `PUT …/roles`, `POST …/deactivate`, `DELETE
+  …/identities/{kind}`, `POST …/password-setup-code`, `POST /api/admin/policy/proposals`, `POST
+  /api/admin/content/proposals` and `GET /api/admin/audit/export` need a sign-in from the last 5
+  minutes (`401 reauth_required`).
+- **`GET /api/me`** adds `door` (`public` or `admin`); on the public door, for an Admin or an
+  Auditor, `admin_url`; on the admin door, `public_url`.
+
 ## Error codes
 
 Every error is `{"code", "error"}`: `code` is one of these, and `error` a plain sentence for
