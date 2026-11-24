@@ -346,7 +346,7 @@ async fn list_workarounds(State(state): State<AppState>) -> Response {
                 .models
                 .roles
                 .values()
-                .filter(|r| r.workarounds.iter().any(|id| id == w.id))
+                .filter(|r| r.uses_workaround(w.id))
                 .map(Role::alias)
                 .collect();
             json!({"id": w.id, "what": w.what, "delete_when": w.delete_when, "roles": roles})

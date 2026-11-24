@@ -18,6 +18,7 @@ pub mod config;
 pub mod remote;
 pub mod resolve;
 pub mod retry;
+pub mod route;
 pub mod scheduler;
 pub mod stub;
 pub mod usage;

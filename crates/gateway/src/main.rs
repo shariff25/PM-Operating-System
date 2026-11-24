@@ -15,6 +15,25 @@ async fn main() -> Result<()> {
     for quiet in ["reqwest", "hyper", "hyper_util", "h2", "rustls"] {
         filter = filter.add_directive(format!("{quiet}=warn").parse().expect("a valid directive"));
     }
+    // `pmos-gateway --check-config [path]` (docs/model-providers-spec.md §4.12): every start-up
+    // check of the config against this environment, then exit, serving nothing. Prints the
+    // roles and their routes by label only, never a URL, host, key or model id.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--check-config") {
+        return match pmos_gateway::config::check_config(
+            |k| std::env::var(k).ok(),
+            args.get(1).map(std::path::PathBuf::from),
+        ) {
+            Ok(summary) => {
+                println!("{summary}");
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        };
+    }
     tracing_subscriber::fmt()
         .json()
         .with_env_filter(filter)
