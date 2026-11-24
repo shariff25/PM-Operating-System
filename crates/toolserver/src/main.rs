@@ -269,6 +269,14 @@ async fn main() -> Result<()> {
     if let Some(pg) = openshell_pg {
         svc = svc.with_openshell(Arc::new(pg));
     }
+    // The sandbox-audit collector (docs/openshell-prover-and-sandbox-audit-spec.md §B.2): off
+    // unless PMOS_SANDBOX_AUDIT_TOKEN is set; then its two routes answer and the silence check
+    // runs every minute.
+    let sandbox_audit = config.sandbox_audit_token.is_some();
+    if let Some(t) = &config.sandbox_audit_token {
+        svc = svc.with_sandbox_audit_token(t.expose());
+        tracing::info!("sandbox-audit collector accepted (PMOS_SANDBOX_AUDIT_TOKEN)");
+    }
     // Password sign-in (docs/password-sign-in.md): on when the vault has a key to seal
     // authenticator secrets with; its routes also need assertion `require`.
     match &config.password_keys {
@@ -314,6 +322,9 @@ async fn main() -> Result<()> {
         Err(e) => tracing::error!(error = %e, "reconciling interrupted writes failed"),
     }
     spawn_reconciler(svc.clone(), cancel.clone());
+    if sandbox_audit {
+        pmos_toolserver::openshell::spawn_watchdog(svc.clone(), cancel.clone());
+    }
     spawn_draft_sweeper(svc.clone(), cancel.clone());
     spawn_deactivation_sweeper(svc.clone(), cancel.clone());
     let mut onboarding = Onboarding::new(svc.clone(), oauth.clone(), github_setup);

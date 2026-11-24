@@ -1,20 +1,30 @@
 //! What the tool server keeps about NVIDIA OpenShell (`docs/openshell-prover-and-sandbox-audit-
-//! spec.md`): the host's policy proofs (Part A, [`proofs`]). The tool server runs no prover and
-//! reads nothing from OpenShell itself: proofs arrive from a host command.
+//! spec.md`): the host's policy proofs (Part A, [`proofs`]) and the sandboxes' own allow and deny
+//! decisions (Part B, [`sandbox`]). The tool server runs no prover and reads nothing from
+//! OpenShell itself: proofs arrive from a host command, decisions from the `pmos-sandbox-audit`
+//! collector through its own append-only token ([`ingest`]).
 //!
 //! One store seam, [`OpenShellStore`], with an in-memory implementation (tests and
-//! `PMOS_DEV=1`) and a Postgres one (`pg.rs`), where proofs are `policy_proofs` rows.
+//! `PMOS_DEV=1`) and a Postgres one (`pg.rs`), where proofs are `policy_proofs` rows and
+//! decisions are `audit_events` rows, under the one 90-day purge.
 
 pub mod pg;
 pub mod proofs;
+pub mod sandbox;
 
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 
 use crate::audit::AuditSink;
-use crate::store::StoreResult;
+use crate::service::ToolService;
+use crate::store::{StoreError, StoreResult};
 use proofs::ProofRow;
+use sandbox::{
+    Batch, CollectorState, Fields, Heartbeat, Ingested, KnownBot, Prepared, SandboxQuery,
+    SandboxRow, WatchdogReport,
+};
 
 #[async_trait]
 pub trait OpenShellStore: Send + Sync {
@@ -23,12 +33,41 @@ pub trait OpenShellStore: Send + Sync {
 
     /// The newest proof of each bot, by bot.
     async fn latest_proofs(&self) -> StoreResult<Vec<ProofRow>>;
+
+    /// Store one checked, attributed batch of run `run` (`events` in `seq` order): the
+    /// sequence check, deduplication and gap events, in one transaction (`sandbox::plan`).
+    async fn ingest(
+        &self,
+        run: &str,
+        events: Vec<Prepared>,
+        now: DateTime<Utc>,
+    ) -> StoreResult<Ingested>;
+
+    /// A heartbeat: the run is alive. A new run, or one heard from after an open
+    /// `collector_down`, records the down period it ends; an `acked_seq` past what was stored
+    /// is a gap.
+    async fn heartbeat(&self, hb: &Heartbeat, now: DateTime<Utc>) -> StoreResult<Ingested>;
+
+    /// The silence check: no heartbeat or batch for [`sandbox::silence`] opens a
+    /// `collector_down` with an open end, once.
+    async fn watchdog(&self, now: DateTime<Utc>) -> StoreResult<WatchdogReport>;
+
+    /// Sandbox rows matching `q`, newest first.
+    async fn sandbox_rows(&self, q: &SandboxQuery) -> StoreResult<Vec<SandboxRow>>;
+
+    /// The sandbox columns of the audit events `ids`, for the admin audit list. In memory: none
+    /// (its rows have their own ids).
+    async fn sandbox_fields(&self, ids: &[i64]) -> StoreResult<Vec<(i64, Fields)>>;
+
+    /// The collector's state for the overview.
+    async fn collector_state(&self, now: DateTime<Utc>) -> StoreResult<CollectorState>;
 }
 
 /// In memory, for tests and `PMOS_DEV=1`.
 pub struct MemoryOpenShell {
     audit: Option<Arc<dyn AuditSink>>,
     proofs: Mutex<Vec<ProofRow>>,
+    sandbox: Mutex<sandbox::MemoryState>,
 }
 
 impl Default for MemoryOpenShell {
@@ -43,6 +82,7 @@ impl MemoryOpenShell {
         Self {
             audit,
             proofs: Mutex::new(Vec::new()),
+            sandbox: Mutex::new(sandbox::MemoryState::default()),
         }
     }
 }
@@ -67,4 +107,192 @@ impl OpenShellStore for MemoryOpenShell {
             &self.proofs.lock().expect("proofs lock"),
         ))
     }
+
+    async fn ingest(
+        &self,
+        run: &str,
+        events: Vec<Prepared>,
+        now: DateTime<Utc>,
+    ) -> StoreResult<Ingested> {
+        Ok(self
+            .sandbox
+            .lock()
+            .expect("sandbox lock")
+            .ingest(run, events, now))
+    }
+
+    async fn heartbeat(&self, hb: &Heartbeat, now: DateTime<Utc>) -> StoreResult<Ingested> {
+        Ok(self
+            .sandbox
+            .lock()
+            .expect("sandbox lock")
+            .heartbeat(hb, now))
+    }
+
+    async fn watchdog(&self, now: DateTime<Utc>) -> StoreResult<WatchdogReport> {
+        Ok(self.sandbox.lock().expect("sandbox lock").watchdog(now))
+    }
+
+    async fn sandbox_rows(&self, q: &SandboxQuery) -> StoreResult<Vec<SandboxRow>> {
+        Ok(self.sandbox.lock().expect("sandbox lock").rows(q))
+    }
+
+    async fn sandbox_fields(&self, _ids: &[i64]) -> StoreResult<Vec<(i64, Fields)>> {
+        Ok(Vec::new())
+    }
+
+    async fn collector_state(&self, now: DateTime<Utc>) -> StoreResult<CollectorState> {
+        Ok(self.sandbox.lock().expect("sandbox lock").state(now))
+    }
+}
+
+/// Why a batch was refused.
+#[derive(Debug)]
+pub enum IngestError {
+    /// The batch isn't the shape the collector writes (`400`).
+    Invalid(String),
+    /// Storage is down (`503`): the collector keeps the batch in its spool and retries.
+    Store(StoreError),
+}
+
+impl From<StoreError> for IngestError {
+    fn from(e: StoreError) -> Self {
+        IngestError::Store(e)
+    }
+}
+
+/// Copy what was stored to every other audit sink (the JSON-lines file). A copy that fails is
+/// logged loudly; the row is in the database already.
+async fn mirror(svc: &ToolService, stored: &[(crate::audit::AuditEvent, Fields)]) {
+    for (event, fields) in stored {
+        if let Err(e) = svc
+            .stores()
+            .audit
+            .mirror_sandbox(event.clone(), sandbox::fields_json(fields))
+            .await
+        {
+            tracing::error!(error = %e, "a sandbox event couldn't be copied to every audit sink");
+        }
+    }
+}
+
+/// `POST /internal/sandbox-audit/batch`: check the batch, attribute each event to its bot and,
+/// when it can tell, its PM and task (from the roster and the bot sessions open at the event's
+/// time), store it, and copy what was stored to the other sinks.
+pub async fn ingest(
+    svc: &ToolService,
+    batch: Batch,
+    now: DateTime<Utc>,
+) -> Result<Ingested, IngestError> {
+    sandbox::check_batch(&batch, now).map_err(IngestError::Invalid)?;
+    let roster = svc.roster();
+    let mut prepared = Vec::with_capacity(batch.events.len());
+    for e in &batch.events {
+        let bot = e.sandbox.as_deref().and_then(sandbox::bot_of_sandbox);
+        let known = bot.and_then(|b| roster.bot(b)).map(|(found, _)| {
+            if found.scope == pmos_contract::bots::BotScope::Personal {
+                KnownBot::Personal {
+                    owner: found.owner.clone(),
+                }
+            } else {
+                KnownBot::Team
+            }
+        });
+        let sessions = match (bot, &known, e.at) {
+            (Some(b), Some(_), Some(at)) => svc.stores().sessions.open_bot_sessions(b, at).await?,
+            _ => Vec::new(),
+        };
+        let who = sandbox::attribute(e.sandbox.as_deref(), known.as_ref(), &sessions);
+        prepared.push(sandbox::prepare(e, &batch.collector_run, Some(&who)));
+    }
+    let done = svc
+        .openshell()
+        .ingest(&batch.collector_run, prepared, now)
+        .await?;
+    mirror(svc, &done.stored).await;
+    Ok(done)
+}
+
+/// `POST /internal/sandbox-audit/heartbeat`.
+pub async fn heartbeat(
+    svc: &ToolService,
+    hb: Heartbeat,
+    now: DateTime<Utc>,
+) -> Result<Ingested, IngestError> {
+    sandbox::check_heartbeat(&hb).map_err(IngestError::Invalid)?;
+    let done = svc.openshell().heartbeat(&hb, now).await?;
+    mirror(svc, &done.stored).await;
+    Ok(done)
+}
+
+/// One silence check, with what it recorded copied to the other sinks.
+pub async fn watchdog(svc: &ToolService, now: DateTime<Utc>) -> StoreResult<WatchdogReport> {
+    let done = svc.openshell().watchdog(now).await?;
+    mirror(svc, &done.stored).await;
+    Ok(done)
+}
+
+/// The tripwire (spec §B.5, SBA-14): `bot`'s denials and findings at or after `since`, newest
+/// first (at most 1,000). The phase 2 halt (IL2-16) reads this; any row halts.
+pub async fn denials_since(
+    svc: &ToolService,
+    bot: &str,
+    since: DateTime<Utc>,
+) -> StoreResult<Vec<SandboxRow>> {
+    svc.openshell()
+        .sandbox_rows(&SandboxQuery {
+            bot: Some(bot.to_string()),
+            since: Some(since),
+            tools: vec![
+                "sandbox.deny".into(),
+                "sandbox.deny_summary".into(),
+                "sandbox.finding".into(),
+            ],
+            limit: 1000,
+        })
+        .await
+}
+
+/// The tripwire's other half: every gap, down period and unparsed record at or after `since`.
+/// No record of a denial is not proof of none, so any row here halts too.
+pub async fn sandbox_gaps_since(
+    svc: &ToolService,
+    since: DateTime<Utc>,
+) -> StoreResult<Vec<SandboxRow>> {
+    svc.openshell()
+        .sandbox_rows(&SandboxQuery {
+            bot: None,
+            since: Some(since),
+            tools: vec![
+                "sandbox.collector_gap".into(),
+                "sandbox.collector_down".into(),
+                "sandbox.source_gap".into(),
+                "sandbox.unparsed".into(),
+            ],
+            limit: 1000,
+        })
+        .await
+}
+
+/// Run the silence check every minute while the collector is configured.
+pub fn spawn_watchdog(
+    svc: Arc<ToolService>,
+    cancel: tokio_util::sync::CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tick.tick() => {}
+            }
+            match watchdog(&svc, Utc::now()).await {
+                Ok(r) if !r.stored.is_empty() => {
+                    tracing::warn!("the sandbox-audit collector has been silent for 5 minutes: collector_down recorded")
+                }
+                Ok(_) => {}
+                Err(e) => tracing::error!(error = %e, "the sandbox-audit silence check failed"),
+            }
+        }
+    })
 }

@@ -45,6 +45,10 @@
 //!   own team (`/internal/team/{handle}`) and the admin's read (`GET /internal/admin/personas`)
 //!   for `pmos-web` only, the team with its signed assertion for that person in every mode.
 //!
+//!   `PMOS_SANDBOX_AUDIT_TOKEN`: the `pmos-sandbox-audit` collector (`app/sandbox_audit.rs`).
+//!   `POST /internal/sandbox-audit/{batch,heartbeat}` only; it is no client of any other route
+//!   (`client_for` doesn't know it), so it can't read, edit or delete audit events.
+//!
 //!   The sandbox network policy never routes to `/internal`.
 //! - Session tokens travel in headers (`Authorization` on `/mcp`, `X-Pmos-Session` on
 //!   `/internal`), never in URLs, so access logs and proxies don't record them.
@@ -87,6 +91,7 @@ mod admin;
 pub mod directory;
 mod password;
 mod reviews;
+mod sandbox_audit;
 mod team;
 mod users;
 
@@ -322,7 +327,10 @@ pub fn router_full(
         .merge(password::routes(state.clone()))
         // The bot marketplace (`team.rs`): the catalog for pmos-web, the runtime and the
         // Slack bot; a PM's own team and the admin's read for pmos-web only.
-        .merge(team::routes(state.clone()));
+        .merge(team::routes(state.clone()))
+        // The sandbox-audit collector (`sandbox_audit.rs`): its own token, two routes, append
+        // only; that token reaches nothing else.
+        .merge(sandbox_audit::routes(state.clone()));
 
     Router::new()
         // Liveness: the process answers. Readiness: its dependencies do too.
@@ -619,7 +627,15 @@ fn client_may_use(state: &AppState, client: Client, skill: Option<&str>) -> bool
             .as_ref()
             .is_some_and(|b| b.skills.iter().any(|s| s == skill)),
         (Client::Bot, None)
-        | (Client::Mcp | Client::Web | Client::Console | Client::System | Client::Host, _) => false,
+        | (
+            Client::Mcp
+            | Client::Web
+            | Client::Console
+            | Client::System
+            | Client::Host
+            | Client::SandboxAudit,
+            _,
+        ) => false,
     }
 }
 

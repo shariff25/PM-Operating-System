@@ -521,7 +521,10 @@ pub struct ToolService {
     model_source: Option<Arc<crate::model_source::SourceGuard>>,
     /// The host's policy proofs and the sandboxes' own decisions (`crate::openshell`). In
     /// memory unless `main` gives it the database ([`ToolService::with_openshell`]).
-    openshell: Arc<dyn crate::openshell::OpenShellStore>,
+    openshell: RwLock<Arc<dyn crate::openshell::OpenShellStore>>,
+    /// `PMOS_SANDBOX_AUDIT_TOKEN`: the collector's own token, which reaches the two
+    /// `/internal/sandbox-audit` routes only. `None`: those routes answer `404`.
+    sandbox_audit_token: RwLock<Option<Arc<str>>>,
 }
 
 /// The most (kind, person) marks [`ToolService::first_in_window`] keeps.
@@ -567,7 +570,8 @@ impl ToolService {
             crate::openshell::MemoryOpenShell::new(Some(stores.audit.clone())),
         );
         Ok(Self {
-            openshell,
+            openshell: RwLock::new(openshell),
+            sandbox_audit_token: RwLock::new(None),
             roster: RwLock::new(Arc::new(catalog.roster().clone())),
             content_sha: RwLock::new(catalog.content_sha().map(String::from)),
             catalog,
@@ -589,14 +593,41 @@ impl ToolService {
     }
 
     /// Keep proofs and sandbox decisions in `store` (Postgres in a deployment).
-    pub fn with_openshell(mut self, store: Arc<dyn crate::openshell::OpenShellStore>) -> Self {
-        self.openshell = store;
+    pub fn with_openshell(self, store: Arc<dyn crate::openshell::OpenShellStore>) -> Self {
+        self.set_openshell(store);
         self
     }
 
+    /// [`ToolService::with_openshell`] on a running service (tests, and `main` before serving).
+    pub fn set_openshell(&self, store: Arc<dyn crate::openshell::OpenShellStore>) {
+        *self.openshell.write().expect("openshell lock") = store;
+    }
+
     /// The host's policy proofs and the sandboxes' own decisions.
-    pub fn openshell(&self) -> &Arc<dyn crate::openshell::OpenShellStore> {
-        &self.openshell
+    pub fn openshell(&self) -> Arc<dyn crate::openshell::OpenShellStore> {
+        self.openshell.read().expect("openshell lock").clone()
+    }
+
+    /// Accept the sandbox-audit collector with `token` (`PMOS_SANDBOX_AUDIT_TOKEN`).
+    pub fn with_sandbox_audit_token(self, token: &str) -> Self {
+        self.set_sandbox_audit_token(token);
+        self
+    }
+
+    /// [`ToolService::with_sandbox_audit_token`] on a running service.
+    pub fn set_sandbox_audit_token(&self, token: &str) {
+        *self
+            .sandbox_audit_token
+            .write()
+            .expect("sandbox audit token lock") = Some(token.into());
+    }
+
+    /// The collector's token, when it is configured.
+    pub fn sandbox_audit_token(&self) -> Option<Arc<str>> {
+        self.sandbox_audit_token
+            .read()
+            .expect("sandbox audit token lock")
+            .clone()
     }
 
     /// Check the model gateway's source at every session open and tool call (slice H4).

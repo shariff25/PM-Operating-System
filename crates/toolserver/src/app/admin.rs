@@ -430,6 +430,7 @@ pub fn safe_detail(detail: &str) -> Option<String> {
         || crate::users::detail::is_purge_detail(detail)
         || crate::password::is_safe_detail(detail)
         || crate::team::is_safe_detail(detail)
+        || crate::openshell::sandbox::is_safe_detail(detail)
         || is_sign_in_detail(detail)
         || detail
             .strip_prefix("reason: ")
