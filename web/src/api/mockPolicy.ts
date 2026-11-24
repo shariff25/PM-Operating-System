@@ -22,6 +22,8 @@ import type {
   ProposalList,
   ProposalResult,
   Protection,
+  ProverNotes,
+  ProverRow,
   SpecPatch,
   Validation,
 } from './policyTypes';
@@ -41,6 +43,32 @@ const MIN = 60_000;
 const COMMIT = '5bb6de4c9a0f7d21c3e8b4a6f1d09e7c2b5a8f30';
 const BASE_COMMIT = '1111111111111111111111111111111111111111';
 const AUDITOR_REDACTED = "A finding on a file your role can't open.";
+
+// ---------- OpenShell's prover, as the host recorded it (spec §A.5) ----------
+
+const ALL_DOMAINS = ['filesystem', 'landlock', 'network_l4', 'network_rest', 'process'];
+
+/** One bot of each kind the screen must tell apart: a current proof, a stale one, a failure. */
+const MOCK_PROVER: Record<string, ProverRow> = {
+  docs: { state: 'proved', passed: true, status: 'proved', stale: false, stale_reason: null, at: '2026-11-24T09:00:00Z', coverage: ALL_DOMAINS, prover_version: '0.1.9', host_user: 'pmosop' },
+  'pm-ana': { state: 'stale', passed: false, status: 'proved', stale: true, stale_reason: 'policy_changed', at: '2026-11-20T09:00:00Z', coverage: ALL_DOMAINS, prover_version: '0.1.9' },
+  'pm-ben': { state: 'exceeds', passed: false, status: 'exceeds', stale: false, at: '2026-11-24T09:00:00Z', counterexample: 'network_l4 api.example.com:443', coverage: ALL_DOMAINS, prover_version: '0.1.9' },
+  triage: { state: 'not_available', passed: false, status: 'not_available', stale: false, at: '2026-11-24T09:00:00Z', reason_code: 'no_binary', reason: 'no prover binary at the given path' },
+};
+
+const MOCK_PROVER_NOTES: ProverNotes = {
+  not_proved: [
+    'which paths are readable (the boundary allows reading /; `fs-readable` covers it)',
+    'the MCP methods and tool allowlist (`net-tools`)',
+    'credential bindings (`cred-binding`, `cred-providers`)',
+    'uploads and the launch spec (`fs-uploads`, `spec-*`)',
+    'name resolution (the prover does not resolve hostnames)',
+    'what a running sandbox enforces',
+  ],
+  domains: ['filesystem', 'network_l4', 'network_rest', 'process', 'landlock'],
+  view: 'proved on the network view (MCP rules removed, which only widens)',
+  not_run_here: 'The prover runs on the pull request (CI check `policy-prover`). Not run here.',
+};
 
 // ---------- The spec and the metadata the files carry ----------
 
@@ -744,6 +772,7 @@ export function createMockPolicy(now: number, options: MockPolicyOptions): MockP
         tools: toolsOf(spec, bot).map(mcpName), master: mastersOf(spec, bot),
         policy_file: `policies/bots/${bot}.yaml`, launch_spec_file: `policies/bots/${bot}.sandbox.yaml`,
         allowances_from: 'checked_in', allowances: bot === 'pm-ben' ? handEdited(allowances) : allowances,
+        prover: MOCK_PROVER[bot] ?? { state: 'missing', passed: false },
       };
     });
 
@@ -785,6 +814,7 @@ export function createMockPolicy(now: number, options: MockPolicyOptions): MockP
         generate_errors: [],
         proposals_configured: configured,
         protection: protection(),
+        prover_notes: MOCK_PROVER_NOTES,
       };
     },
 

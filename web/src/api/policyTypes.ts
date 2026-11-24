@@ -121,6 +121,48 @@ export interface PolicyBot {
   launch_spec_file: string;
   allowances_from: 'checked_in' | 'generated';
   allowances: Allowances | null;
+  /** The hash a host proof must have proved to be current. */
+  policy_sha256?: string | null;
+  /** OpenShell's prover on this bot's running sandbox (docs/openshell-prover-and-sandbox-audit-spec.md §A.5). */
+  prover?: ProverRow;
+}
+
+/**
+ * What the screen shows for one bot's host proof. Only `proved` passes; `stale`, `missing` and
+ * `unknown` are never shown as proved.
+ */
+export type ProverState =
+  | 'proved'
+  | 'stale'
+  | 'exceeds'
+  | 'unsupported'
+  | 'inconclusive'
+  | 'error'
+  | 'not_available'
+  | 'version_mismatch'
+  | 'missing'
+  | 'unknown';
+
+export interface ProverRow {
+  state: ProverState;
+  passed: boolean;
+  status?: string;
+  stale?: boolean;
+  stale_reason?: 'policy_changed' | 'policy_loaded_after' | null;
+  at?: string | null;
+  reason_code?: string | null;
+  reason?: string | null;
+  counterexample?: string | null;
+  coverage?: string[] | null;
+  prover_version?: string | null;
+  host_user?: string | null;
+}
+
+export interface ProverNotes {
+  not_proved: string[];
+  domains: string[];
+  view: string;
+  not_run_here: string;
 }
 
 export interface PolicyFile {
@@ -141,6 +183,8 @@ export interface PolicyView {
   generate_errors: Issue[];
   proposals_configured: boolean;
   protection: Protection;
+  /** The prover's fixed notes: what a proof never covers, and that it doesn't run here. */
+  prover_notes?: ProverNotes;
 }
 
 export interface FileDiff {

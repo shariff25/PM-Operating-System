@@ -1917,6 +1917,10 @@ a.pr-title:hover { color: var(--accent-text); text-decoration: underline; }
 .bot-sentences > summary:hover { color: var(--ink); }
 .bot-sentences ul { margin: 4px 0 6px 20px; display: flex; flex-direction: column; gap: 3px; color: var(--ink-2); line-height: 1.45; }
 .bot-file { font-size: 11px; color: var(--muted); }
+/* OpenShell's prover, per bot (docs/openshell-prover-and-sandbox-audit-spec.md §A.5). */
+.bot-prover dd { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; }
+.bot-prover .pill { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+.bot-prover-sub { display: block; }
 
 /* Policy files */
 .file-row { flex-wrap: nowrap; padding: 10px 18px; min-height: 44px; }
