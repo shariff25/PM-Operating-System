@@ -159,6 +159,16 @@ follow-up tracking.
   tool; removing each built-in connector needs the owner's explicit go-ahead. The side-by-side
   comparison of old and new runs on fake data only.
 
+- **Build before review, for two days (owner, 2026-11-24):** "ignore the security reviewer for
+  next 2 days and start building feature". Until the end of 2026-11-26 the conductor builds from
+  the specs without waiting for the reviewer's read: provider switching, MCP servers, the
+  prover and sandbox audit, H10 and H12. This suspends the "reviewed before it is built" rule
+  for that time only; it does not suspend the others (real data still needs the owner's
+  provider approval, each connector's removal needs the owner's go-ahead, no test or check is
+  weakened, no pull request is merged). Everything built this way is marked "built before
+  review" in its spec's status note, and all of it goes to the reviewer afterwards; the gate
+  (no open High or Critical) still applies before real data or a pilot.
+
 ## Where the build stands (2026-11-23)
 
 - Pushed and checked: `claude/web-app` (draft pull request #10).
