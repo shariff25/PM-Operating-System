@@ -9,8 +9,7 @@ async fn main() -> Result<()> {
         .json()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
-    // Slice H4, first: PMOS_EXPOSURE (`public` refused until H10), PMOS_MODEL_SOURCE and
-    // PMOS_CONNECTORS, each required.
+    // Slice H4, first: PMOS_EXPOSURE, PMOS_MODEL_SOURCE and PMOS_CONNECTORS, each required.
     let host = pmos_web::host::HostSettings::from_env().map_err(anyhow::Error::msg)?;
     let fake_only = host.model_source.fake_data_only();
     tracing::info!(
@@ -21,6 +20,31 @@ async fn main() -> Result<()> {
     );
     // Refuses to start without a sign-in provider, weak tokens or bad URLs.
     let config = Config::from_env().map_err(anyhow::Error::msg)?;
+    // Slice H10: the admin door on every host (D3 (b)); on `public`, no development sign-in and
+    // password sign-in only with PMOS_WEB_PASSWORD_CLIENTS (D2 (a)).
+    pmos_web::host::check_deployment(&host, &config).map_err(anyhow::Error::msg)?;
+    // Under `private`, the public URL must not resolve to a public address (r6): at start
+    // here, and every 10 minutes below.
+    let private_url = match (host.exposure, &config.public_url) {
+        (pmos_web::host::Exposure::Private, Some(u)) => Some(u.clone()),
+        _ => None,
+    };
+    if let Some(url) = &private_url {
+        pmos_web::host::check_private_url(url)
+            .await
+            .map_err(anyhow::Error::msg)?;
+    }
+    if let Some(admin) = &config.admin {
+        tracing::info!(
+            admin_url = %admin.url,
+            mode = match admin.mode {
+                pmos_web::config::AdminMode::Tunnel { .. } => "tunnel",
+                pmos_web::config::AdminMode::Proxy { .. } => "proxy",
+            },
+            entra = admin.entra,
+            "the admin door: /api/admin/* only there"
+        );
+    }
     // Fake-data mode: the content checkout the admin screens read must be test content.
     if fake_only {
         pmos_contract::model_source::check_test_content(&config.content_root).map_err(|c| {
@@ -90,6 +114,7 @@ async fn main() -> Result<()> {
         tracing::info!("no PMOS_WEB_STATIC_DIR: serving /api only");
     }
     let (bind, internal_bind) = (config.bind, config.internal_bind);
+    let admin_bind = config.admin.as_ref().map(|a| a.bind);
     let stores = pmos_web::store_config::StoreConfig::from_env().map_err(anyhow::Error::msg)?;
     let mut deps = stores.deps().await.map_err(anyhow::Error::msg)?;
     // The permanent marker (slice H4): written at a start with live connectors; a fake-data
@@ -112,8 +137,9 @@ async fn main() -> Result<()> {
     }
     let mut server = app::build_server(config, deps).map_err(anyhow::Error::msg)?;
     if fake_only {
-        // What people type can't be checked by code: every page says so.
+        // What people type can't be checked by code: every page says so, on both doors.
         server.public = pmos_web::host::with_test_stack_banner(server.public);
+        server.admin = server.admin.map(pmos_web::host::with_test_stack_banner);
         tracing::warn!("PMOS_MODEL_SOURCE=hosted-test: every page shows the test-stack banner");
     }
     let listener = tokio::net::TcpListener::bind(bind)
@@ -129,6 +155,50 @@ async fn main() -> Result<()> {
             .clone()
             .run(app::HOUSEKEEPING_EVERY, shutdown.clone()),
     );
+    // The private-exposure check every 10 minutes: a public answer stops sign-in on both doors
+    // (and says so at error level) until the name resolves privately again.
+    if let Some(url) = private_url {
+        let stopped = server.sign_in_stopped.clone();
+        let stop = shutdown.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(10 * 60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await;
+            loop {
+                tokio::select! {
+                    _ = stop.cancelled() => return,
+                    _ = tick.tick() => {}
+                }
+                match pmos_web::host::check_private_url(&url).await {
+                    Ok(()) => stopped.store(false, std::sync::atomic::Ordering::Relaxed),
+                    Err(e) => {
+                        tracing::error!(error = %e, "sign-in stopped on both doors");
+                        stopped.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        });
+    }
+    // The admin door (slice H10), with each connection's peer address: its gate answers 404 to
+    // any peer it doesn't take.
+    let admin = match (admin_bind, server.admin) {
+        (Some(at), Some(router)) => {
+            let listener = tokio::net::TcpListener::bind(at)
+                .await
+                .with_context(|| format!("binding {at}"))?;
+            tracing::info!(bind = %at, "pmos-web admin door listening");
+            let stop = shutdown.clone();
+            Some(tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .with_graceful_shutdown(async move { stop.cancelled_owned().await })
+                .await
+            }))
+        }
+        _ => None,
+    };
     // The server-to-server route on its own listener, when PMOS_WEB_INTERNAL_BIND is set.
     let internal = match (internal_bind, server.internal) {
         (Some(at), Some(router)) => {
@@ -164,6 +234,9 @@ async fn main() -> Result<()> {
     shutdown.cancel();
     if let Some(internal) = internal {
         internal.await??;
+    }
+    if let Some(admin) = admin {
+        admin.await??;
     }
     purge.await?;
     Ok(())

@@ -957,6 +957,39 @@ task, whatever its answer contains), it sends the items of the brief's machine-r
 routine has empty lists and `status: "never"`. A brief that found nothing still calls it, with
 empty lists, so the home page can tell "nothing found" (`today`) from "never ran" (`never`).
 
+## The admin door
+
+Slice H10 (`docs/openshell-any-host-spec.md` §3.8; decision D3 (b)). `pmos-web` has two front
+doors and refuses to start without the second:
+
+- **The public door** (`PMOS_WEB_BIND`, 8770): every route above but `/api/admin/*`, which
+  answers `404` here on every host. Its cookie is `__Host-pmos` (`SameSite=Lax`).
+- **The admin door** (`PMOS_WEB_ADMIN_BIND`, 8772, at `PMOS_WEB_ADMIN_URL`): `/api/admin/*` (the
+  Auditor's views and `POST /api/admin/bots/drafts/{id}/release` included), `GET
+  /api/auth/providers`, `GET /api/auth/login` and `/api/auth/callback` (only with
+  `PMOS_WEB_ADMIN_ENTRA=1`), `POST /api/auth/password/sign-in`, `second-step` and `setup/*`,
+  `POST /api/auth/logout`, `GET /api/me`, and the app's files. Everything else answers `404`
+  (development sign-in, a password change, recovery codes, `/healthz`, `/readyz`, every PM
+  route). Its cookie is `__Host-pmos-admin` (`SameSite=Strict`), its Entra flow cookie
+  `__Host-pmos-admin-entra` (`Lax`), its password steps' `__Host-pmos-admin-pending` and
+  `__Host-pmos-admin-setup`. Writes must come from `PMOS_WEB_ADMIN_URL`'s origin.
+- **Before any route there:** a `Host` other than the admin URL's authority, a missing one, a
+  peer other than the tunnel peer (`http` admin URL) or a trusted terminator naming a private
+  client (`https` admin URL) answers `404` (counted on `/readyz` as `admin_bad_host` and
+  `admin_refused_peer`). No answer carries an `Access-Control-*` header.
+- **Who:** an Admin or an Auditor only, checked after the credentials and before any session or
+  cookie (`403 admin_door_not_allowed`, audited as `web.sign_in_refused` with that reason), and
+  again on every request (the session ends). Set-up there serves an Admin or an Auditor only
+  (`404` otherwise). Sessions are bounded (idle 30, at most 60; absolute 480, at most 720
+  minutes). The admin door's Entra callback answers a page that moves the browser to the app (a
+  same-site navigation carries the `Strict` cookie), not a `303`.
+- **Step-up:** `POST /api/admin/users`, `PUT …/roles`, `POST …/deactivate`, `DELETE
+  …/identities/{kind}`, `POST …/password-setup-code`, `POST /api/admin/policy/proposals`, `POST
+  /api/admin/content/proposals` and `GET /api/admin/audit/export` need a sign-in from the last 5
+  minutes (`401 reauth_required`).
+- **`GET /api/me`** adds `door` (`public` or `admin`); on the public door, for an Admin or an
+  Auditor, `admin_url`; on the admin door, `public_url`.
+
 ## Error codes
 
 Every error is `{"code", "error"}`: `code` is one of these, and `error` a plain sentence for
@@ -973,6 +1006,10 @@ say nothing was sent, and should reload the draft to see where it stands.
 | `403` | `bad_origin` | A write from another origin, or with neither `Origin` nor `Referer`. | Yes |
 | `403` | `bad_csrf` | A write without the session's CSRF token. | Yes |
 | `403` | `proxy_not_trusted` | Password sign-in: a request that carries a forwarded header (`X-Forwarded-For`, `Forwarded`, `X-Real-IP`) while `pmos-web` trusts no proxy (`PMOS_WEB_DIRECT=1`), or from a peer not in `PMOS_WEB_TRUSTED_PROXIES`, or from a trusted proxy that names no client: the proxy setting doesn't match the deployment. | Yes |
+| `403` | `password_sign_in_not_from_here` | Password sign-in (`/api/auth/password/*`) from a client address outside `PMOS_WEB_PASSWORD_CLIENTS` (decision D2 (a); required on `PMOS_EXPOSURE=public`), checked before the tool server is asked. Microsoft sign-in is unaffected. | Yes |
+| `403` | `admin_door_not_allowed` | The admin door (slice H10, **The admin door**): someone who is neither an Admin nor an Auditor, at sign-in (no session or cookie is made) or on any later request (the session ends). | Yes |
+| `401` | `reauth_required` | A sensitive admin action (a role change, an invitation, a deactivation, an unlinked identity, a setup or reset code, a policy or content proposal, the audit export) on an admin-door sign-in older than 5 minutes. Sign in again and retry. | Yes |
+| `503` | `sign_in_stopped` | `PMOS_EXPOSURE=private` and the public URL has started resolving to a public address: every sign-in route on both doors is stopped until it resolves privately again. | Yes |
 | `403` | `not_a_member` | Not (or no longer) an active user in the user database; every session of theirs ends. Also when the tool server doesn't count them a member on a decision. | Yes |
 | `403` | `not_allowed` | Their role doesn't allow drafts, tasks or asking (also the Bots page and team changes: **Bots**). | Yes |
 | `403` | `forbidden` | Admin and auditor routes their role doesn't allow; the reviewer routes for someone who isn't an active reviewer; the producer route called like a browser. | Yes |

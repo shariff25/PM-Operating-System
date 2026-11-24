@@ -272,6 +272,11 @@ export const copy = {
       not_configured: "Password sign-in isn't fully set up on this PM OS yet. Tell a platform owner.",
       assertion_required: "Password sign-in can't run on this PM OS as it is set up. Tell a platform owner.",
       proxy_not_trusted: "Password sign-in can't run through this address as PM OS is set up. Tell a platform owner.",
+      password_sign_in_not_from_here:
+        "Password sign-in isn't offered from this network. Use Microsoft sign-in, or connect to the VPN and try again.",
+      admin_door_not_allowed:
+        'This address is for Admins and Auditors only. Sign in at the address you normally use for PM OS.',
+      sign_in_stopped: 'Sign-in is stopped on this PM OS for now. Tell a platform owner.',
       not_found: "Password sign-in isn't switched on here.",
       failed: "That didn't work. Try again.",
     },
@@ -443,6 +448,8 @@ export const copy = {
       entra_misconfigured:
         "Microsoft sign-in isn't set up quite right for PM OS yet (the app registration needs the acct claim). Tell a platform owner.",
       users_unavailable: "I can't check who you are right now, so I'm not letting anyone in. Try again in a minute.",
+      admin_door_not_allowed:
+        'This address is for Admins and Auditors only. Sign in at the address you normally use for PM OS.',
     } as Record<string, string>,
     failed: "Sign-in didn't work. Try again.",
   },
@@ -718,6 +725,19 @@ export const copy = {
   },
 
   // ---- App shell and navigation ----
+  /** Slice H10: the admin screens live on the admin door, their own address. */
+  door: {
+    elsewhereTitle: 'The admin screens have their own address',
+    elsewhereBody:
+      'For safety, Admin and Audit open only at the admin address, over the VPN or an SSH tunnel. Sign in there with your password or Microsoft account.',
+    elsewhereLink: 'Open the admin address',
+    adminOnly: 'Admin address',
+    backToApp: 'Back to PM OS',
+    /** Shown on the admin door's sign-in page. */
+    signInNote:
+      'Admins and Auditors only. If you sign in and the page still asks you to, this browser refused the secure cookie: use Chromium or Firefox, or the https admin address.',
+  },
+
   nav: {
     label: 'Main',
     home: 'Today',
@@ -2496,6 +2516,13 @@ export const copy = {
       too_many_attempts: 'Too many tries. Wait a few minutes, then try again.',
       sign_in_busy: 'Sign-in is busy right now. Try again in a moment.',
       proxy_not_trusted: "Password sign-in can't run through this address as PM OS is set up. Nothing changed. Tell a platform owner.",
+      password_sign_in_not_from_here:
+        "Password sign-in isn't offered from this network. Nothing changed. Use Microsoft sign-in, or connect to the VPN.",
+      admin_door_not_allowed:
+        'This address is for Admins and Auditors only. Nothing changed. Use the address you normally use for PM OS.',
+      reauth_required:
+        'That change needs a sign-in from the last 5 minutes. Nothing changed. Sign in again, then make the change again.',
+      sign_in_stopped: 'Sign-in is stopped on this PM OS for now. Nothing changed. Tell a platform owner.',
     } satisfies Record<ServerErrorCode, string>,
     loadDraftFailed: 'I could not open that draft.',
     notFound: 'That draft does not exist, or it is not yours.',

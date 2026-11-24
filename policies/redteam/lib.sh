@@ -68,10 +68,15 @@ may_change() { # id what
 
 # The features H7 probes but that other slices build. Read from this checkout's files, which
 # must be the commit the host runs (the scripts print it).
-#   H10, the admin listener: deploy/compose.yaml publishes 8772 on PMOS_WEB_ADMIN_PUBLISH.
+#   H10, the admin listener: deploy/compose.yaml sets the web app's admin listener
+#   (PMOS_WEB_ADMIN_BIND: 0.0.0.0:8772) and publishes it on PMOS_WEB_ADMIN_PUBLISH. Both lines,
+#   not a mention of the setting: H10 is built from the commit that has them.
 #   H12, the hosted source: crates/gateway/approved-hosted.yaml and `pmos-admin hosted`.
 #   An approved entry (H13): a url_sha256 digest in that list.
-h10_built() { grep -q 'PMOS_WEB_ADMIN_PUBLISH' "$REPO/deploy/compose.yaml" 2>/dev/null; }
+h10_built() {
+  grep -q '^      PMOS_WEB_ADMIN_BIND: 0.0.0.0:8772$' "$REPO/deploy/compose.yaml" 2>/dev/null &&
+    grep -q '"${PMOS_WEB_ADMIN_PUBLISH:-127.0.0.1}:8772:8772"' "$REPO/deploy/compose.yaml"
+}
 h12_built() {
   [ -f "$REPO/crates/gateway/approved-hosted.yaml" ] && grep -Eq '^  hosted\)' "$REPO/deploy/pmos-admin" 2>/dev/null
 }

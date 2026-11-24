@@ -57,14 +57,19 @@ fresh_repo() { # [h10] [h12] [entry]
   printf '%s\n' "PMOS_MODEL_SOURCE=hosted-test" "PMOS_HOSTED_TEST_URL=https://$PROVIDER/v1" \
     "PMOS_GATEWAY_REMOTE_KEY=$KEY" "PMOS_GW_RUNTIME_TOKEN=runtime-token-fake" >"$R/deploy/.env"
   chmod 600 "$R/deploy/.env"
-  local a hosted=""
+  local a hosted="" h10=0
   for a in "$@"; do
     case "$a" in
-      h10) printf '# test: PMOS_WEB_ADMIN_PUBLISH\n' >>"$R/deploy/compose.yaml" ;;
+      h10) h10=1 ;;
       h12) printf 'entries: []\n' >"$R/crates/gateway/approved-hosted.yaml"; hosted='  hosted)' ;;
       entry) printf 'entries:\n  - name: test\n    url_sha256: "%064d"\n    max_data_class: internal\n' 0 >"$R/crates/gateway/approved-hosted.yaml" ;;
     esac
   done
+  # Slice H10 is built in this checkout: without `h10`, the copy is made as a checkout before it
+  # (no admin listener in compose.yaml), so the scripts' "not built" path stays tested.
+  if [ "$h10" = 0 ]; then
+    grep -v 'PMOS_WEB_ADMIN' "$SRC/deploy/compose.yaml" | grep -v ':8772:8772' >"$R/deploy/compose.yaml"
+  fi
   # The stand-in pmos-admin: host-names check and apply on the test's hosts file,
   # host-firewall check (BLOCK_APPLIED) and apply, hosted stop and start; every call logged.
   cat >"$R/deploy/pmos-admin" <<EOF
@@ -317,6 +322,16 @@ expect_code 0 "exposure, web on, H10 built"
 has "PASS RT-14   POST /api/auth/password/sign-in" "exposure, web on, H10 built"
 OPEN_PORTS="443" CURL_SIGNIN=200 run exposure.sh --web on 198.51.100.9
 expect_code 1 "exposure, the password sign-in open to outside"
+# 8772 published on the public address on purpose (a test host): every request from outside
+# answers 404 (the admin door's peer check), and anything else fails.
+OPEN_PORTS="443 8772" run exposure.sh --web on --admin-published 198.51.100.9
+has "PASS RT-14   GET /api/admin/users on the admin listener published on purpose" "exposure, 8772 published, H10 built"
+has "HAND RT-14   on the host: deploy/preflight.sh fails H-ADMIN" "exposure, 8772 published, H10 built"
+[[ "$OUT" != *"not built"* ]] || fail "exposure, 8772 published, H10 built: still says not built"
+OPEN_PORTS="443 8772" CURL_CODE=200 run exposure.sh --web on --admin-published 198.51.100.9
+expect_code 1 "exposure, the admin listener answering from outside"
+# This checkout itself is detected as built (the real compose.yaml).
+grep -q '^      PMOS_WEB_ADMIN_BIND: 0.0.0.0:8772$' "$SRC/deploy/compose.yaml" || fail "this checkout's compose.yaml has no admin listener"
 
 # --- RT-13b: the temporary hosts line, put back on every exit ----------------------------------
 

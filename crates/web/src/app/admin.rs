@@ -366,6 +366,8 @@ fn row_cells(r: &AuditRow) -> Vec<String> {
 /// [`MAX_EXPORT_ROWS`].
 async fn export(State(state): State<AppState>, signed: Signed, q: Params) -> ApiResult {
     need_any(&signed, &[Permission::ExportAudit])?;
+    // A sensitive admin action: a sign-in no older than 5 minutes (r7, X6 item 5).
+    signed.step_up(&state)?;
     let Ok(Query(q)) = q else {
         return Err(bad_params());
     };

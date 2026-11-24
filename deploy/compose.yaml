@@ -343,18 +343,44 @@ services:
     command: ["pmos-web"]
     networks:
       pmos: { aliases: [web.pmos.internal] }
-    ports: ["127.0.0.1:${PMOS_WEB_PORT:-8770}:8770"]
+    ports:
+      - "127.0.0.1:${PMOS_WEB_PORT:-8770}:8770"
+      # The admin door (slice H10, decision D3 (b)): /api/admin/* and the admin screens, on
+      # loopback (an SSH tunnel) or a private address (a TLS terminator on the VPN), never a
+      # public one: `pmos-admin up --web` and the host preflight (H-ADMIN, H-EXPOSURE) refuse
+      # anything else, and pmos-web answers 404 to any peer but the tunnel's or the trusted
+      # terminator's.
+      - "${PMOS_WEB_ADMIN_PUBLISH:-127.0.0.1}:8772:8772"
     environment:
       # Entra sign-in reaches login.microsoftonline.com through this host's proxy, if it has one.
       <<: *proxy
       PMOS_WEB_BIND: 0.0.0.0:8770
+      # The admin door's listener: fixed here, not a setting (pmos-web refuses to start without
+      # it, on every host). Its address and who may reach it are the settings below.
+      PMOS_WEB_ADMIN_BIND: 0.0.0.0:8772
+      # Its own origin: http://<deployment>.localhost:8772 (the tunnel mode) or https://<a
+      # private name> (the proxy mode, with PMOS_WEB_ADMIN_TRUSTED_PROXIES). Required.
+      PMOS_WEB_ADMIN_URL: ${PMOS_WEB_ADMIN_URL:-}
+      PMOS_WEB_ADMIN_TRUSTED_PROXIES: ${PMOS_WEB_ADMIN_TRUSTED_PROXIES:-}
+      # The tunnel mode's one peer: what a connection to the loopback publish arrives from, the
+      # pmos network's pinned gateway (below). Not read in the proxy mode.
+      PMOS_WEB_ADMIN_TUNNEL_PEER: ${PMOS_NETWORK_GATEWAY:-10.201.77.1}
+      PMOS_WEB_ADMIN_SESSION_IDLE_MINUTES: ${PMOS_WEB_ADMIN_SESSION_IDLE_MINUTES:-}
+      PMOS_WEB_ADMIN_SESSION_MAX_MINUTES: ${PMOS_WEB_ADMIN_SESSION_MAX_MINUTES:-}
+      # 1 only once <PMOS_WEB_ADMIN_URL>/api/auth/callback is a redirect URI of the Entra app
+      # registration; otherwise the admin door is password-only.
+      PMOS_WEB_ADMIN_ENTRA: ${PMOS_WEB_ADMIN_ENTRA:-0}
+      # Decision D2 (a): the networks password sign-in is served to (required on a public host
+      # with password sign-in; each no wider than a /16 or a /48).
+      PMOS_WEB_PASSWORD_CLIENTS: ${PMOS_WEB_PASSWORD_CLIENTS:-}
       # The server-to-server route (PUT /internal/brief/{handle}, the daily brief from the Slack
       # service) on its own listener, reached as http://web.pmos.internal:8771 on the `pmos`
       # network only: no `ports:` entry publishes it, and the browser-facing listener above
       # answers 404 for it. Fixed here, not a setting: blank would put the route back on 8770.
       PMOS_WEB_INTERNAL_BIND: 0.0.0.0:8771
-      # Slice H4: required, no default. pmos-web refuses PMOS_EXPOSURE=public until slice H10,
-      # and under hosted-test shows the test-stack banner on every page.
+      # Slice H4: required, no default. Since slice H10 pmos-web serves PMOS_EXPOSURE=public only
+      # as decisions D2 (a) and D3 (b) say, and under hosted-test shows the test-stack banner on
+      # every page.
       PMOS_EXPOSURE: ${PMOS_EXPOSURE:?run deploy/setup.sh first}
       PMOS_MODEL_SOURCE: ${PMOS_MODEL_SOURCE:?run deploy/setup.sh first}
       PMOS_CONNECTORS: ${PMOS_CONNECTORS:-fake}

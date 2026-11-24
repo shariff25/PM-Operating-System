@@ -278,6 +278,8 @@ stack_env() { # mode [extra lines...]
     # of test content, which the bring-up workers and fake-data mode need.
     echo "PMOS_MODEL_SOURCE=local"
     echo "PMOS_CONTENT_CHECKOUT=$WORK/testcontent"
+    # Slice H10: the admin door's address, required with the web app on (the tunnel mode).
+    echo "PMOS_WEB_ADMIN_URL=http://pmos-test.localhost:8772"
     printf '%s\n' "$@"
   } >"$WORK/stack/deploy/.env"
   chmod 600 "$WORK/stack/deploy/.env"
@@ -505,19 +507,67 @@ for bad in "PMOS_MODEL_SOURCE=" "PMOS_EXPOSURE=" "PMOS_EXPOSURE=intranet" "PMOS_
   [[ "$out" == *"${bad%%=*}"* ]] || fail "up with $bad doesn't say why: $out"
   ! grep -q ' up -d' "$DOCKER_LOG" || fail "up with $bad started something"
 done
-# PMOS_EXPOSURE=public (setup.sh's default, §3.1): pmos-web refuses it until slice H10, so
-# `up --web` refuses first, before any other check or a docker call, saying what an operator of a
-# private host does (PMOS_EXPOSURE=private, and the H-PRIVATE acknowledgement); `up` without the
-# web app is unaffected.
-stack_env require PMOS_EXPOSURE=public
-code=0
-out=$(run_stack up --web 2>&1) || code=$?
-[ "$code" = 2 ] || fail "up --web on public exits $code, not 2: $out"
-[[ "$out" == *"does not"*"run on a public host until the admin listener is built (spec slice H10)"* ]] || fail "up --web on public doesn't say why: $out"
-[[ "$out" == *"set PMOS_EXPOSURE=private in deploy/.env"* && "$out" == *"sudo deploy/pmos-admin host acknowledge H-PRIVATE --reason"* ]] ||
-  fail "up --web on public doesn't say what a private host's operator does: $out"
-[ ! -s "$DOCKER_LOG" ] || fail "up --web on public called docker: $(cat "$DOCKER_LOG")"
-[ ! -s "$PF_LOG" ] || fail "up --web on public got as far as the preflight"
+# Slice H10: `up --web` checks the web app's two doors first, before any other check or a docker
+# call, as pmos-web itself refuses them (decisions D2 (a) and D3 (b)): each refusal exits 2,
+# names the setting and starts nothing.
+web_refused() { # label, expected text, env lines...
+  local label=$1 want=$2
+  shift 2
+  stack_env require "$@"
+  code=0
+  out=$(run_stack up --web 2>&1) || code=$?
+  [ "$code" = 2 ] || fail "up --web with $label exits $code, not 2: $out"
+  [[ "$out" == *"$want"* ]] || fail "up --web with $label doesn't say why ($want): $out"
+  [ ! -s "$DOCKER_LOG" ] || fail "up --web with $label called docker: $(cat "$DOCKER_LOG")"
+  [ ! -s "$PF_LOG" ] || fail "up --web with $label got as far as the preflight"
+}
+web_started() { # label, env lines...
+  local label=$1
+  shift
+  stack_env require "$@"
+  out=$(run_stack up --web 2>&1) || fail "up --web with $label was refused: $out"
+  grep -q ' up -d' "$DOCKER_LOG" || fail "up --web with $label didn't start"
+}
+# The admin door, on every host.
+web_refused "no admin URL" "PMOS_WEB_ADMIN_URL is blank" PMOS_WEB_ADMIN_URL=
+for pub in 203.0.113.7 8.8.8.8 0.0.0.0 172.32.0.1; do
+  web_refused "a public admin publish $pub" "PMOS_WEB_ADMIN_PUBLISH=$pub" "PMOS_WEB_ADMIN_PUBLISH=$pub"
+done
+web_refused "an IPv6 admin publish" "use an IPv4 address" "PMOS_WEB_ADMIN_PUBLISH=::1"
+web_refused "an http admin URL on a private publish" "isn't loopback" PMOS_WEB_ADMIN_PUBLISH=10.0.0.5
+web_refused "an http admin URL with trusted proxies" "a tunnel has no proxy" PMOS_WEB_ADMIN_TRUSTED_PROXIES=10.201.77.1
+web_refused "an http admin URL on a private name" "must be a loopback name" PMOS_WEB_ADMIN_URL=http://pmos-admin.corp.example:8772
+web_refused "an http admin URL without a port" "write the tunnel's port" PMOS_WEB_ADMIN_URL=http://pmos-test.localhost
+web_refused "an https admin URL without trusted proxies" "set PMOS_WEB_ADMIN_TRUSTED_PROXIES" \
+  PMOS_WEB_ADMIN_URL=https://pmos-admin.corp.example PMOS_WEB_ADMIN_PUBLISH=10.0.0.5
+web_refused "an https admin URL on the public URL's host" "a name of its own" \
+  PMOS_WEB_ADMIN_URL=https://pmos.example.com:8443 PMOS_WEB_PUBLIC_URL=https://pmos.example.com \
+  PMOS_WEB_ADMIN_TRUSTED_PROXIES=10.201.77.1 PMOS_WEB_ADMIN_PUBLISH=10.0.0.5
+web_started "the proxy mode on a private publish" \
+  PMOS_WEB_ADMIN_URL=https://pmos-admin.corp.example PMOS_WEB_ADMIN_TRUSTED_PROXIES=10.201.77.1 \
+  PMOS_WEB_ADMIN_PUBLISH=10.0.0.5
+web_started "the tunnel mode" PMOS_WEB_ADMIN_PUBLISH=127.0.0.1
+[[ "$out" != *"WARNING: PMOS_WEB_ADMIN_URL"* ]] || fail "a deployment-unique name was warned about"
+web_started "a bare localhost admin URL" PMOS_WEB_ADMIN_URL=http://localhost:8772
+[[ "$out" == *"WARNING: PMOS_WEB_ADMIN_URL=http://localhost:8772"*"pmos-prod.localhost:8772"* ]] ||
+  fail "a bare localhost admin URL isn't warned about: $out"
+# PMOS_EXPOSURE=public (setup.sh's default, §3.1): no development sign-in, and password sign-in
+# only with an allow-list within D2 (a)'s bounds.
+web_refused "dev sign-in on public" "with development sign-in" PMOS_EXPOSURE=public
+for bad in "" "0.0.0.0/0" "10.0.0.0/8" "10.0.0.0/15" "::/0" "::ffff:0:0/96" "2001:db8::/47" "10.1.0.1/16" "10.1.0.0"; do
+  want="PMOS_WEB_PASSWORD_CLIENTS"
+  web_refused "public with password sign-in and PMOS_WEB_PASSWORD_CLIENTS=$bad" "$want" PMOS_EXPOSURE=public \
+    PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=0 PMOS_WEB_PASSWORD_LOGIN=1 "PMOS_WEB_PASSWORD_CLIENTS=$bad"
+done
+web_refused "a too-wide allow-list on private too" "wider than decision D2 (a) allows" "PMOS_WEB_PASSWORD_CLIENTS=0.0.0.0/0"
+# Within the bounds, the password checks are the next to answer (they aren't the door's).
+stack_env require PMOS_EXPOSURE=public PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=0 \
+  PMOS_WEB_PASSWORD_LOGIN=1 "PMOS_WEB_PASSWORD_CLIENTS=10.8.0.0/16, 2001:db8:1::/48"
+out=$(run_stack up --web 2>&1) || true
+[[ "$out" != *"PMOS_WEB_PASSWORD_CLIENTS"* && "$out" != *"doors aren't"* ]] || fail "a good allow-list was refused: $out"
+web_started "public with Microsoft sign-in only" PMOS_EXPOSURE=public PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=0 \
+  PMOS_WEB_ENTRA_TENANT_ID=11111111-2222-3333-4444-555555555555 PMOS_WEB_ENTRA_CLIENT_ID=aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee \
+  PMOS_WEB_ENTRA_CLIENT_SECRET=test-entra-secret PMOS_WEB_PUBLIC_URL=https://pmos.example.com
 # (Development sign-in off: H-DEVLOGIN refuses it on public, as it should.)
 stack_env require PMOS_EXPOSURE=public PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=0
 out=$(run_stack up 2>&1) || fail "up (no web app) on public was refused: $out"
@@ -892,11 +942,11 @@ cmp -s "$WORK/setup-env.old" "$WORK/setup-env.copy" && [ "$(stat -c %h "$senv")"
   fail "setup.sh rewrote deploy/.env in place, not by a rename"
 grep -qE '^PMOS_SERVICE_TOKEN=[0-9a-f]{48}$' "$senv" || fail "setup.sh didn't fill a generated value again"
 grep -qx PMOS_MODEL_SOURCE=hosted-test "$senv" || fail "setup.sh changed the model source on a second run"
-# With PMOS_EXPOSURE=public (the default), the closing list says the web app can't run yet and
-# what a private host's operator does.
+# The closing list says what `up --web` needs (slice H10): the admin door's address, and with
+# PMOS_EXPOSURE=public (the default) the sign-in rules and what a private host's operator does.
 out=$(setup_run 2>&1) || fail "setup.sh failed a third time"
-[[ "$out" == *"up --web) can't run here yet"*"spec slice H10"*"PMOS_EXPOSURE=private in deploy/.env"*"host acknowledge H-PRIVATE"* ]] ||
-  fail "setup.sh's Next list doesn't explain the web app on public: $out"
+[[ "$out" == *"PMOS_WEB_ADMIN_URL"*"PMOS_WEB_PASSWORD_CLIENTS"*"PMOS_EXPOSURE=private in deploy/.env"*"host acknowledge H-PRIVATE"* ]] ||
+  fail "setup.sh's Next list doesn't explain the web app's doors: $out"
 [ "$(grep '^PMOS_VAULT_KEY=' "$senv")" = "$kept" ] || fail "setup.sh replaced a real value"
 [ "$(stat -c %a "$senv")" = 600 ] || fail "setup.sh's deploy/.env isn't 0600 after a fill"
 [ -z "$(find "$WORK/setup/deploy" -maxdepth 1 -name '.env.??????')" ] || fail "setup.sh left a temporary file"
@@ -2413,7 +2463,8 @@ if docker compose version >/dev/null 2>&1; then
     --env-file "$WORK/full.env" --profile web --profile console --profile slack config -q ||
     fail "compose config -q refused up --web"
   for want in 'PMOS_ASSERTION_MODE: require' 'web:bots:' 'console:bots:' 'web:toolserver:' \
-    'console:toolserver:' 'PMOS_ONBOARDING_V2: "1"' 'PMOS_NUDGES: "1"'; do
+    'console:toolserver:' 'PMOS_ONBOARDING_V2: "1"' 'PMOS_NUDGES: "1"' \
+    'PMOS_WEB_ADMIN_BIND: 0.0.0.0:8772' 'PMOS_WEB_ADMIN_TUNNEL_PEER: 10.201.77.1'; do
     [[ "$full" == *"$want"* ]] || fail "the rendered up --web has no $want"
   done
   [[ "$full" == *'console=test-'* && "$full" == *'web=test-'* ]] ||
@@ -2434,6 +2485,14 @@ if docker compose version >/dev/null 2>&1; then
   docker compose --project-directory "$DEPLOY_SRC" -f "$DEPLOY_SRC/compose.yaml" --env-file "$WORK/full.env" \
     --profile web --profile console --profile slack --profile models --profile bringup --profile bringup-personal --profile cli \
     config --format json >"$WORK/pinned.json" || fail "compose doesn't render every profile"
+  # Slice H10: the admin door published on loopback by default, and on PMOS_WEB_ADMIN_PUBLISH.
+  python3 -I -c 'import json, sys; d = json.load(open(sys.argv[1])); p = [x for x in d["services"]["web"]["ports"] if x["target"] == 8772]; assert len(p) == 1 and p[0]["host_ip"] == "127.0.0.1" and str(p[0]["published"]) == "8772", p' "$WORK/pinned.json" ||
+    fail "the admin door is not published on 127.0.0.1:8772 by default"
+  sed -e 's|^PMOS_WEB_ADMIN_PUBLISH=.*|PMOS_WEB_ADMIN_PUBLISH=10.0.0.5|' "$WORK/full.env" >"$WORK/admin.env"
+  docker compose --project-directory "$DEPLOY_SRC" -f "$DEPLOY_SRC/compose.yaml" --env-file "$WORK/admin.env" \
+    --profile web config --format json >"$WORK/admin.json" || fail "compose doesn't render a private admin publish"
+  python3 -I -c 'import json, sys; d = json.load(open(sys.argv[1])); p = [x for x in d["services"]["web"]["ports"] if x["target"] == 8772]; assert p[0]["host_ip"] == "10.0.0.5", p' "$WORK/admin.json" ||
+    fail "PMOS_WEB_ADMIN_PUBLISH does not move the admin door's publish"
   docker compose --project-directory "$DEPLOY_SRC" -f "$DEPLOY_SRC/compose.yaml" --env-file "$WORK/full.env" \
     --profile models config -q || fail "compose config -q refused the pinned addresses"
   python3 -I - "$WORK/pinned.json" <<'PY' || fail "the pinned addresses, ip_range or bridge render wrong"
@@ -2584,7 +2643,9 @@ c = json.load(open(sys.argv[1]))["services"]
 web = c["web"]
 assert web["environment"]["PMOS_WEB_BIND"] == "0.0.0.0:8770", web["environment"]
 assert web["environment"]["PMOS_WEB_INTERNAL_BIND"] == "0.0.0.0:8771", web["environment"]
-assert len(web["ports"]) == 1 and web["ports"][0]["target"] == 8770 and web["ports"][0]["host_ip"] == "127.0.0.1", web["ports"]
+# Slice H10: 8770 and the admin door, 8772, each on loopback by default, and nothing else.
+assert [(p["target"], p["host_ip"]) for p in web["ports"]] == [(8770, "127.0.0.1"), (8772, "127.0.0.1")], web["ports"]
+assert web["environment"]["PMOS_WEB_ADMIN_BIND"] == "0.0.0.0:8772", web["environment"]
 for name, svc in c.items():
     for p in svc.get("ports", []):
         assert p["target"] != 8771 and str(p.get("published")) != "8771", (name, p)

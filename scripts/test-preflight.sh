@@ -281,7 +281,22 @@ env_lines
 host
 printf 'LISTEN 0 4096 *:8772 *:*\n' >>"$R/cmd/ss"
 pf
-expect H-EXPOSURE fail 1 "8772 on every address before H10"
+expect H-EXPOSURE fail 1 "8772 on every address"
+# Slice H10: 8772 only on PMOS_WEB_ADMIN_PUBLISH (default 127.0.0.1).
+host
+printf 'LISTEN 0 4096 127.0.0.1:8772 0.0.0.0:*\n' >>"$R/cmd/ss"
+pf
+expect H-EXPOSURE pass 0 "8772 on the default loopback publish"
+env_lines PMOS_WEB_ADMIN_PUBLISH=10.0.0.5
+pf
+expect H-EXPOSURE fail 1 "8772 on loopback while the publish is 10.0.0.5"
+host
+printf 'LISTEN 0 4096 10.0.0.5:8772 0.0.0.0:*\n' >>"$R/cmd/ss"
+pf
+expect H-EXPOSURE pass 0 "8772 on its private publish"
+env_lines
+pf
+expect H-EXPOSURE fail 1 "8772 on a private address that isn't the publish"
 # 8771 (the web app's internal listener, H9) is never published: a host listener on it fails on
 # every address, loopback included, and on every host (the rule is the same everywhere).
 for exposure in public private; do
@@ -476,17 +491,130 @@ pf
 expect H-DEVLOGIN fail 1 "dev sign-in on public"
 pf --exposure private
 expect H-DEVLOGIN pass 0 "dev sign-in on a host that measures private"
-env_lines
+# Slice H10: H-SIGNIN as decision D2 (a) says, from the settings.
+ADMIN_OK=PMOS_WEB_ADMIN_URL=http://pmos-test.localhost:8772
+env_lines "$ADMIN_OK"
 pf --web
-expect H-SIGNIN fail 1 "the web app on public before H10"
-[[ "$(field H-SIGNIN hint)" == *"does not serve a public host yet (spec slice H10)"* ]] || fail "H-SIGNIN's message"
-[[ "$(field H-SIGNIN hint)" == *"set PMOS_EXPOSURE=private in deploy/.env"*"host acknowledge H-PRIVATE"* ]] || fail "H-SIGNIN doesn't say what a private host's operator does: $(field H-SIGNIN hint)"
-expect H-ADMIN warn 1 "the web app on: H-ADMIN not built"
+expect H-SIGNIN pass 0 "the web app on public, Microsoft sign-in only"
+expect H-ADMIN pass 0 "the tunnel mode on the loopback publish"
+env_lines "$ADMIN_OK" PMOS_WEB_PASSWORD_LOGIN=1
+pf --web
+expect H-SIGNIN fail 1 "public with password sign-in and no allow-list"
+[[ "$(field H-SIGNIN hint)" == *"set PMOS_WEB_PASSWORD_CLIENTS"*"decision D2"* ]] || fail "H-SIGNIN's message: $(field H-SIGNIN hint)"
+for bad in 0.0.0.0/0 ::/0 ::ffff:0:0/96 10.0.0.0/15 2001:db8::/47 10.1.0.1/16 10.1.0.0 "10.1.0.0/16, 0.0.0.0/0"; do
+  env_lines "$ADMIN_OK" PMOS_WEB_PASSWORD_LOGIN=1 "PMOS_WEB_PASSWORD_CLIENTS=$bad"
+  pf --web
+  expect H-SIGNIN fail 1 "PMOS_WEB_PASSWORD_CLIENTS=$bad on public"
+  pf --web --exposure private
+  expect H-SIGNIN fail 1 "PMOS_WEB_PASSWORD_CLIENTS=$bad on private"
+done
+for good in 10.1.0.0/16 2001:db8:1::/48 "10.1.0.0/16, 192.168.7.0/24, 2001:db8:1:2::/64"; do
+  env_lines "$ADMIN_OK" PMOS_WEB_PASSWORD_LOGIN=1 "PMOS_WEB_PASSWORD_CLIENTS=$good"
+  pf --web
+  expect H-SIGNIN pass 0 "PMOS_WEB_PASSWORD_CLIENTS=$good on public"
+done
+env_lines "$ADMIN_OK" PMOS_WEB_PASSWORD_LOGIN=1
 pf --web --exposure private
-expect H-SIGNIN pass 0 "the web app on private"
+expect H-SIGNIN pass 0 "the web app on private: the allow-list optional"
 setcmd docker-ps-services $'postgres\nweb\ntoolserver'
 pf
-expect H-SIGNIN fail 1 "a running web container on public"
+expect H-SIGNIN fail 1 "a running web container on public with password sign-in and no allow-list"
+host
+# H-ADMIN, every host (decision D3 (b); r7, X6).
+for case in "PMOS_WEB_ADMIN_URL=|PMOS_WEB_ADMIN_URL is blank" \
+  "PMOS_WEB_ADMIN_PUBLISH=203.0.113.7|outside loopback" \
+  "PMOS_WEB_ADMIN_PUBLISH=0.0.0.0|outside loopback" \
+  "PMOS_WEB_ADMIN_PUBLISH=169.254.1.1|outside loopback" \
+  "PMOS_WEB_ADMIN_PUBLISH=10.0.0.5|which isn't loopback" \
+  "PMOS_WEB_ADMIN_TRUSTED_PROXIES=10.201.77.1|http admin URL with PMOS_WEB_ADMIN_TRUSTED_PROXIES" \
+  "PMOS_WEB_ADMIN_URL=http://pmos-admin.corp.example:8772|isn't a loopback name" \
+  "PMOS_WEB_ADMIN_URL=https://pmos-admin.corp.example|without PMOS_WEB_ADMIN_TRUSTED_PROXIES"; do
+  env_lines "$ADMIN_OK" "${case%%|*}"
+  pf --web
+  expect H-ADMIN fail 1 "H-ADMIN: ${case%%|*}"
+  [[ "$(field H-ADMIN measured)" == *"${case#*|}"* ]] || fail "H-ADMIN with ${case%%|*} says: $(field H-ADMIN measured)"
+done
+env_lines PMOS_WEB_ADMIN_URL=https://pmos-admin.corp.example PMOS_WEB_ADMIN_TRUSTED_PROXIES=10.201.77.1 PMOS_WEB_ADMIN_PUBLISH=10.0.0.5
+pf --web
+expect H-ADMIN pass 0 "the proxy mode on a private publish"
+for bare in http://localhost:8772 http://127.0.0.1:8772; do
+  env_lines "PMOS_WEB_ADMIN_URL=$bare"
+  pf --web
+  expect H-ADMIN warn 0 "a bare $bare"
+done
+pf
+expect H-ADMIN skip 0 "the web app off"
+# A reverse proxy on this host that forwards a public listener to the admin door (r7): nginx -T
+# and caddy adapt, as each prints its running configuration.
+nginx_conf() { # listen-line… → an nginx -T output whose server includes the proxy file
+  {
+    echo "nginx: the configuration file /etc/nginx/nginx.conf syntax is ok"
+    echo "# configuration file /etc/nginx/nginx.conf:"
+    echo "http {"
+    echo "  server {"
+    local l
+    for l in "$@"; do echo "    listen $l;"; done
+    echo "    server_name pmos-admin.corp.example;"
+    echo "    location / { include /etc/nginx/pmos-admin-proxy.conf; }"
+    echo "  }"
+    echo "  server { listen 443 ssl; location / { proxy_pass http://127.0.0.1:8770; } }"
+    echo "}"
+    echo "# configuration file /etc/nginx/pmos-admin-proxy.conf:"
+    echo "proxy_pass http://10.0.0.5:8772;"
+    echo "proxy_set_header Host \$host;"
+  } >"$R/cmd/nginx-T"
+}
+PROXY_ENV=(PMOS_WEB_ADMIN_URL=https://pmos-admin.corp.example PMOS_WEB_ADMIN_TRUSTED_PROXIES=10.201.77.1 PMOS_WEB_ADMIN_PUBLISH=10.0.0.5)
+# On a host with a public address, every unspecified listen counts as public.
+for listen in "443 ssl" "0.0.0.0:443 ssl" "203.0.113.7:443 ssl" "[::]:443 ssl" "pmos.example.com:443"; do
+  host
+  setcmd ip-addr '[{"ifname":"eth0","addr_info":[{"local":"203.0.113.7"},{"local":"10.0.0.5"}]}]'
+  nginx_conf "10.0.0.5:443 ssl" "$listen"
+  env_lines "${PROXY_ENV[@]}"
+  pf --web
+  expect H-ADMIN fail 1 "nginx forwarding to the admin door on $listen"
+  [[ "$(field H-ADMIN measured)" == *"an nginx server forwarding to 10.0.0.5:8772 listens on"* ]] || fail "H-ADMIN doesn't name the nginx server: $(field H-ADMIN measured)"
+done
+host
+nginx_conf "10.0.0.5:443 ssl" "127.0.0.1:8443"
+env_lines "${PROXY_ENV[@]}"
+pf --web
+expect H-ADMIN pass 0 "nginx forwarding to the admin door on private addresses only"
+# The unspecified address fails only on a host with a public address; the fixture host has none.
+host
+nginx_conf "443 ssl"
+setcmd ip-addr '[{"ifname":"lo","addr_info":[{"local":"127.0.0.1"}]},{"ifname":"eth0","addr_info":[{"local":"10.0.0.5"}]}]'
+env_lines "${PROXY_ENV[@]}"
+pf --web
+expect H-ADMIN pass 0 "nginx on the unspecified address of a host with no public address"
+setcmd ip-addr '[{"ifname":"eth0","addr_info":[{"local":"203.0.113.7"},{"local":"10.0.0.5"}]}]'
+pf --web
+expect H-ADMIN fail 1 "nginx on the unspecified address of a host with a public address"
+host
+setcmd caddy-adapt '{"apps":{"http":{"servers":{"srv0":{"listen":[":443"],"routes":[{"handle":[{"handler":"reverse_proxy","upstreams":[{"dial": "10.0.0.5:8772"}]}]}]}}}}}'
+setcmd ip-addr '[{"ifname":"eth0","addr_info":[{"local":"203.0.113.7"}]}]'
+env_lines "${PROXY_ENV[@]}"
+pf --web
+expect H-ADMIN fail 1 "a Caddy site forwarding to the admin door on :443 of a public host"
+[[ "$(field H-ADMIN measured)" == *"a Caddy site (srv0)"* ]] || fail "H-ADMIN doesn't name the Caddy site"
+setcmd caddy-adapt '{"apps":{"http":{"servers":{"srv0":{"listen":["10.0.0.5:443"],"routes":[{"handle":[{"handler":"reverse_proxy","upstreams":[{"dial": "10.0.0.5:8772"}]}]}]}}}}}'
+pf --web
+expect H-ADMIN pass 0 "a Caddy site forwarding to the admin door on a private address"
+# The kit's own examples (deploy/nginx/) as nginx -T prints them, on a host with a public
+# address: the admin door's terminator listens on its private address only, so H-ADMIN passes;
+# the same server on `listen 443` fails.
+host
+setcmd ip-addr '[{"ifname":"eth0","addr_info":[{"local":"203.0.113.7"},{"local":"10.0.0.5"}]}]'
+for f in pmos-public.conf.example pmos-admin.conf.example pmos-proxy.conf; do
+  printf '# configuration file /etc/nginx/%s:\n' "$f"
+  cat "$REPO/deploy/nginx/$f"
+done >"$R/cmd/nginx-T"
+env_lines "${PROXY_ENV[@]}"
+pf --web
+expect H-ADMIN pass 0 "the kit's nginx examples"
+sed -i 's|listen 10.0.0.5:443 ssl;|listen 443 ssl;|' "$R/cmd/nginx-T"
+pf --web
+expect H-ADMIN fail 1 "the kit's admin example on listen 443"
 host
 for line in "PMOS_ASSERTION_MODE=verify" "PMOS_ASSERTION_MODE=off"; do
   env_lines "$line" PMOS_RT_WEB_TOKEN=rt-web-0123456789abcdef
@@ -678,8 +806,9 @@ printf 'PMOS_VLLM_IMAGE=example.test/vllm:1\nPMOS_MODEL_SOURCE=local\n' >"$ENVF"
 pf
 expect H-SETTINGS fail 1 "a blank exposure at run"
 [[ "$(field H-SETTINGS measured)" == *"PMOS_EXPOSURE is blank (use public or private)"* ]] || fail "H-SETTINGS doesn't name the exposure"
+printf 'PMOS_VLLM_IMAGE=example.test/vllm:1\nPMOS_MODEL_SOURCE=local\nPMOS_WEB_PASSWORD_LOGIN=1\n' >"$ENVF"
 pf --web
-expect H-SIGNIN fail 1 "a blank exposure is checked as public"
+expect H-SIGNIN fail 1 "a blank exposure is checked as public (password sign-in, no allow-list)"
 printf 'PMOS_VLLM_IMAGE=example.test/vllm:1\n' >"$ENVF"
 pf
 expect H-SETTINGS fail 1 "both blank at run"

@@ -61,7 +61,9 @@ export function useData(): DataValue {
 /** The lists the navigation counts and several pages share, loaded once and refreshed on demand. */
 export function DataProvider({ children }: { children: ReactNode }) {
   const { api, me } = useApp();
-  const reviewer = me.reviewer === true;
+  // The admin door (slice H10) serves no PM route: nothing of a PM's own is loaded there.
+  const pmDoor = me.door !== 'admin';
+  const reviewer = pmDoor && me.reviewer === true;
   const [reviews, setReviews] = useState<ReviewList | null>(null);
   const [reviewsError, setReviewsError] = useState<unknown>(null);
   const [drafts, setDrafts] = useState<DraftSummary[] | null>(null);
@@ -70,7 +72,7 @@ export function DataProvider({ children }: { children: ReactNode }) {
   const [brief, setBriefState] = useState<Brief | null>(null);
   const [briefState, setBriefStatus] = useState<BriefState>('loading');
   const [tasks, setTasks] = useState<Task[] | null>(null);
-  const asks = canAsk(me);
+  const asks = pmDoor && canAsk(me);
   const [bots, setBotsState] = useState<Bots | null>(null);
   const [botsError, setBotsError] = useState<unknown>(null);
   const teamStepTaken = useRef(false);
@@ -147,10 +149,17 @@ export function DataProvider({ children }: { children: ReactNode }) {
   }, []);
 
   useEffect(() => {
+    if (!pmDoor) {
+      setDrafts([]);
+      setTasks([]);
+      setBriefState(null);
+      setBriefStatus('off');
+      return;
+    }
     void reloadDrafts();
     void reloadBrief();
     void reloadTasks();
-  }, [reloadDrafts, reloadBrief, reloadTasks]);
+  }, [pmDoor, reloadDrafts, reloadBrief, reloadTasks]);
 
   useEffect(() => {
     if (reviewer) void reloadReviews();

@@ -19,7 +19,8 @@
 #                       answer (default outside: 22 must not answer)
 #   --admin-published   you published 8772 on the public address ON PURPOSE, on a test host
 #                       (RT-14's second part): pmos-web must answer 404 to every request from here.
-#                       Until slice H10 nothing of PM OS listens on 8772, so this part is skipped.
+#                       On a checkout before slice H10 nothing of PM OS listens on 8772, so this
+#                       part is skipped there.
 #   --name <name>       the web app's public name, for the requests through 443 (default: the
 #                       address); the web app checks the Host it is asked for
 #   --private <addr>    RT-15 instead: from a machine on the same private network, the pinned
@@ -35,7 +36,8 @@
 # /healthz, /readyz, /internal/brief/x and /api/admin/users answer 404 (D3 (b)), and
 # POST /api/auth/password/sign-in from an address outside PMOS_WEB_PASSWORD_CLIENTS answers
 # 403 password_sign_in_not_from_here (D2 (a)). Before H10 those are skipped, not passed.
-# Whether H10 is built is read from this checkout (deploy/compose.yaml): use the commit the host
+# Whether H10 is built is read from this checkout (deploy/compose.yaml sets the admin listener,
+# PMOS_WEB_ADMIN_BIND, and publishes it on PMOS_WEB_ADMIN_PUBLISH; lib.sh): use the commit the host
 # runs. The H-ADMIN half of the --admin-published case runs on the host: checklist.md, RT-14.
 #
 # Exit status (lib.sh): 0 all checks passed, 1 a check failed, 2 the script couldn't run,

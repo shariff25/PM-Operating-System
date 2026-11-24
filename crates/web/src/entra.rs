@@ -46,6 +46,10 @@ pub use pmos_entra::{Failure, Identity, Tenant, DEFAULT_AUTHORITY, SKEW_SECONDS}
 
 /// The cookie that carries a sign-in in progress.
 pub const FLOW_COOKIE: &str = "__Host-pmos-entra";
+/// The admin door's (slice H10): its own name. `SameSite=Lax` like the public door's, because
+/// Entra's return to the callback is a navigation from another site, which a `Strict` cookie
+/// wouldn't join.
+pub const ADMIN_FLOW_COOKIE: &str = "__Host-pmos-admin-entra";
 /// How long a sign-in may take, from `/api/auth/login` to the callback.
 pub const FLOW_SECONDS: i64 = 600;
 /// The scopes asked for: an ID token with the person's `oid` and `preferred_username`
@@ -221,13 +225,18 @@ impl std::fmt::Debug for SignedIn {
 }
 
 /// `Set-Cookie` for a sign-in in progress.
-fn flow_cookie(value: &str) -> String {
-    format!("{FLOW_COOKIE}={value}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age={FLOW_SECONDS}")
+fn flow_cookie(name: &str, value: &str) -> String {
+    format!("{name}={value}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age={FLOW_SECONDS}")
 }
 
-/// `Set-Cookie` that removes the flow cookie.
+/// `Set-Cookie` that removes the public door's flow cookie.
 pub fn clear_flow_cookie() -> String {
-    format!("{FLOW_COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0")
+    clear_flow_cookie_named(FLOW_COOKIE)
+}
+
+/// `Set-Cookie` that removes the flow cookie called `name`.
+pub fn clear_flow_cookie_named(name: &str) -> String {
+    format!("{name}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0")
 }
 
 fn read_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -271,10 +280,33 @@ pub struct Entra {
     flow_key: [u8; 32],
     /// The hashes of `state`s already used, with their expiry: a state works once.
     used: Mutex<HashMap<[u8; 32], i64>>,
+    /// The flow cookie's name: [`FLOW_COOKIE`], or [`ADMIN_FLOW_COOKIE`] on the admin door.
+    flow_cookie: &'static str,
 }
 
 impl Entra {
     pub fn new(config: EntraConfig) -> Result<Self, String> {
+        Self::with_label(config, FLOW_COOKIE, b"pmos-web entra flow cookie v1")
+    }
+
+    /// The admin door's Entra sign-in (slice H10): the same app registration with the admin
+    /// door's redirect URI (`<PMOS_WEB_ADMIN_URL>/api/auth/callback`, registered as a second
+    /// one), its own flow cookie, and a flow key of its own, so a flow begun on one door can't
+    /// finish on the other.
+    pub fn for_admin_door(mut config: EntraConfig, admin_url: &str) -> Result<Self, String> {
+        config.redirect_uri = format!("{}/api/auth/callback", admin_url.trim_end_matches('/'));
+        Self::with_label(
+            config,
+            ADMIN_FLOW_COOKIE,
+            b"pmos-web entra flow cookie v1 admin door",
+        )
+    }
+
+    fn with_label(
+        config: EntraConfig,
+        flow_cookie: &'static str,
+        label: &[u8],
+    ) -> Result<Self, String> {
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(StdDuration::from_secs(10))
@@ -283,7 +315,7 @@ impl Entra {
         let verifier = pmos_entra::Verifier::new(config.tenant())?;
         let mut mac = HmacSha256::new_from_slice(config.client_secret.as_bytes())
             .expect("HMAC takes any key length");
-        mac.update(b"pmos-web entra flow cookie v1");
+        mac.update(label);
         let flow_key = mac.finalize().into_bytes().into();
         Ok(Self {
             config,
@@ -291,7 +323,13 @@ impl Entra {
             verifier,
             flow_key,
             used: Mutex::new(HashMap::new()),
+            flow_cookie,
         })
+    }
+
+    /// `Set-Cookie` that removes this provider's flow cookie.
+    pub fn clear_cookie(&self) -> String {
+        clear_flow_cookie_named(self.flow_cookie)
     }
 
     pub fn config(&self) -> &EntraConfig {
@@ -332,7 +370,10 @@ impl Entra {
             .append_pair("code_challenge_method", "S256");
         let payload = b64(&serde_json::to_vec(&flow).expect("a flow serializes"));
         let tag = b64(&self.mac(&payload).finalize().into_bytes());
-        Ok((url.into(), flow_cookie(&format!("{payload}.{tag}"))))
+        Ok((
+            url.into(),
+            flow_cookie(self.flow_cookie, &format!("{payload}.{tag}")),
+        ))
     }
 
     /// Check the callback's `state` against the browser's flow cookie, once.
@@ -342,7 +383,7 @@ impl Entra {
         state: &str,
         now: DateTime<Utc>,
     ) -> Result<Started, Failure> {
-        let Some(cookie) = read_cookie(headers, FLOW_COOKIE) else {
+        let Some(cookie) = read_cookie(headers, self.flow_cookie) else {
             return Err(Failure::Expired);
         };
         let (payload, tag) = cookie

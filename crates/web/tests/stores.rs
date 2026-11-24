@@ -10,7 +10,7 @@ use pmos_web::followups::{
     followup_id, Changed, FollowUpStore, Kind, MemoryFollowUpStore, NewFollowUp,
 };
 use pmos_web::pg::PgStore;
-use pmos_web::session::{hash_id, random_token, MemorySessionStore, Session, SessionStore};
+use pmos_web::session::{hash_id, random_token, Door, MemorySessionStore, Session, SessionStore};
 use pmos_web::settings::{
     DraftEdit, MemorySettingsStore, PracticeDraft, SettingsStore, StoredSuggestion, UserState,
 };
@@ -129,6 +129,7 @@ fn session(handle: &str, minutes: i64) -> Session {
         entra_oid: None,
         entra_tid: None,
         password_epoch: None,
+        door: Door::Public,
     }
 }
 
@@ -143,7 +144,7 @@ async fn sessions_expire_idle_and_absolutely(s: &Stores) {
     for step in 1..=3 {
         let got = s
             .sessions
-            .touch(&id, at(step * 7 * 60), idle, max)
+            .touch(&id, at(step * 7 * 60), idle, max, Door::Public)
             .await
             .unwrap()
             .expect("live");
@@ -155,14 +156,14 @@ async fn sessions_expire_idle_and_absolutely(s: &Stores) {
     // Never past 24 hours from sign-in, even though it was used 3 hours ago.
     assert!(s
         .sessions
-        .touch(&id, at(24 * 60), idle, max)
+        .touch(&id, at(24 * 60), idle, max, Door::Public)
         .await
         .unwrap()
         .is_none());
     // And it stays gone.
     assert!(s
         .sessions
-        .touch(&id, at(24 * 60 + 1), idle, max)
+        .touch(&id, at(24 * 60 + 1), idle, max, Door::Public)
         .await
         .unwrap()
         .is_none());
@@ -172,7 +173,7 @@ async fn sessions_expire_idle_and_absolutely(s: &Stores) {
     s.sessions.insert(id, session("ana", 0)).await.unwrap();
     assert!(s
         .sessions
-        .touch(&id, at(8 * 60 - 1), idle, max)
+        .touch(&id, at(8 * 60 - 1), idle, max, Door::Public)
         .await
         .unwrap()
         .is_some());
@@ -180,14 +181,14 @@ async fn sessions_expire_idle_and_absolutely(s: &Stores) {
     s.sessions.insert(id, session("ana", 0)).await.unwrap();
     assert!(s
         .sessions
-        .touch(&id, at(8 * 60), idle, max)
+        .touch(&id, at(8 * 60), idle, max, Door::Public)
         .await
         .unwrap()
         .is_none());
     // An id never inserted.
     assert!(s
         .sessions
-        .touch(&hash_id("nope"), at(1), idle, max)
+        .touch(&hash_id("nope"), at(1), idle, max, Door::Public)
         .await
         .unwrap()
         .is_none());
@@ -205,21 +206,21 @@ async fn sessions_end_by_id_and_by_user_and_purge(s: &Stores) {
     s.sessions.remove(&hash_id("a1")).await.unwrap();
     assert!(s
         .sessions
-        .touch(&hash_id("a1"), at(1), idle, max)
+        .touch(&hash_id("a1"), at(1), idle, max, Door::Public)
         .await
         .unwrap()
         .is_none());
     s.sessions.remove_user("ana").await.unwrap();
     assert!(s
         .sessions
-        .touch(&hash_id("a2"), at(1), idle, max)
+        .touch(&hash_id("a2"), at(1), idle, max, Door::Public)
         .await
         .unwrap()
         .is_none());
     // Ben's is untouched by any of it.
     assert!(s
         .sessions
-        .touch(&hash_id("b1"), at(2), idle, max)
+        .touch(&hash_id("b1"), at(2), idle, max, Door::Public)
         .await
         .unwrap()
         .is_some());
@@ -236,13 +237,13 @@ async fn sessions_end_by_id_and_by_user_and_purge(s: &Stores) {
     s.sessions.purge(at(9 * 60), idle, max).await.unwrap();
     assert!(s
         .sessions
-        .touch(&hash_id("old"), at(9 * 60), idle, max)
+        .touch(&hash_id("old"), at(9 * 60), idle, max, Door::Public)
         .await
         .unwrap()
         .is_none());
     assert!(s
         .sessions
-        .touch(&hash_id("new"), at(9 * 60), idle, max)
+        .touch(&hash_id("new"), at(9 * 60), idle, max, Door::Public)
         .await
         .unwrap()
         .is_some());
@@ -571,7 +572,7 @@ async fn sessions_keep_the_entra_account(s: &Stores) {
     s.sessions.insert(id, entra.clone()).await.unwrap();
     let back = s
         .sessions
-        .touch(&id, at(1), idle, max)
+        .touch(&id, at(1), idle, max, Door::Public)
         .await
         .unwrap()
         .unwrap();
@@ -581,7 +582,7 @@ async fn sessions_keep_the_entra_account(s: &Stores) {
     s.sessions.insert(dev, session("ben", 0)).await.unwrap();
     let back = s
         .sessions
-        .touch(&dev, at(1), idle, max)
+        .touch(&dev, at(1), idle, max, Door::Public)
         .await
         .unwrap()
         .unwrap();
@@ -594,7 +595,7 @@ async fn sessions_keep_the_entra_account(s: &Stores) {
     s.sessions.insert(pw, with_epoch).await.unwrap();
     let back = s
         .sessions
-        .touch(&pw, at(1), idle, max)
+        .touch(&pw, at(1), idle, max, Door::Public)
         .await
         .unwrap()
         .unwrap();
@@ -720,7 +721,7 @@ async fn postgres_data_survives_a_restart() {
     let again = pg.reconnect().await;
     let back = again
         .sessions
-        .touch(&id, at(60), idle, max)
+        .touch(&id, at(60), idle, max, Door::Public)
         .await
         .unwrap()
         .expect("the session survived");
@@ -795,5 +796,67 @@ async fn postgres_keeps_the_held_real_data_marker_for_good() {
     let again = TestPg::open(&pg.base, &pg.schema).await;
     assert!(again.held_real_data().await.unwrap());
     again.pool().close().await;
+    pg.drop_schema().await;
+}
+
+/// Slice H10: a row made before the `door` column (written without it, as an older pmos-web
+/// did) reads back as a public-door session and is refused on the admin door; an admin-door
+/// session is served on the admin door only; the column takes only the two doors.
+#[tokio::test]
+async fn postgres_sessions_keep_their_door_and_old_rows_are_public() {
+    let Some(pg) = TestPg::new().await else {
+        return;
+    };
+    let (idle, max) = (Duration::hours(8), Duration::hours(24));
+    let old = hash_id("old");
+    sqlx::query(
+        "INSERT INTO web_sessions (id_hash, handle, csrf_token, created_at, last_seen)
+         VALUES ($1, 'ada', 'c', $2, $2)",
+    )
+    .bind(&old[..])
+    .bind(at(0))
+    .execute(pg.pg.pool())
+    .await
+    .unwrap();
+    let s = pg
+        .stores
+        .sessions
+        .touch(&old, at(1), idle, max, Door::Public)
+        .await
+        .unwrap();
+    assert_eq!(s.unwrap().door, Door::Public);
+    assert!(pg
+        .stores
+        .sessions
+        .touch(&old, at(2), idle, max, Door::Admin)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(
+        pg.stores
+            .sessions
+            .touch(&old, at(3), idle, max, Door::Public)
+            .await
+            .unwrap()
+            .is_none(),
+        "presented on the other door, it ended"
+    );
+    let admin = hash_id("admin");
+    let mut a = session("ada", 0);
+    a.door = Door::Admin;
+    pg.stores.sessions.insert(admin, a).await.unwrap();
+    let got = pg
+        .stores
+        .sessions
+        .touch(&admin, at(1), idle, max, Door::Admin)
+        .await
+        .unwrap();
+    assert_eq!(got.unwrap().door, Door::Admin);
+    // The column refuses anything but the two doors.
+    let bad = sqlx::query("UPDATE web_sessions SET door = 'side' WHERE id_hash = $1")
+        .bind(&admin[..])
+        .execute(pg.pg.pool())
+        .await;
+    assert!(bad.is_err());
     pg.drop_schema().await;
 }

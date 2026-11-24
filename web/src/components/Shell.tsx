@@ -2,6 +2,7 @@ import { createContext, useContext, useState } from 'react';
 import type { ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { ADMIN_SECTIONS, canAdminister, canSee, sectionHref } from '../admin/access';
+import { adminDoorHref, onAdminDoor } from '../door';
 import { useApp } from '../app-context';
 import { canAsk } from '../bots';
 import { copy } from '../copy';
@@ -123,7 +124,11 @@ export function Shell({ route, children, onSignOut }: { route: Route; children: 
   // The draft workspace (and a reviewer's read of a draft) needs the width: there the rail is icons only.
   const compact = !isPhone && (route.name === 'draft' || route.name === 'review');
 
-  const items: NavItem[] = [
+  // Slice H10: on the public door, an Admin's or an Auditor's Admin entry opens the admin door's
+  // own address; on the admin door, the admin and audit screens are all there is.
+  const adminLink = adminDoorHref(me) ?? '#/admin';
+  const adminItem: NavItem = { key: 'admin', href: adminLink, label: copy.nav.admin, icon: 'shield', count: 0, countLabel: () => '' };
+  const items: NavItem[] = onAdminDoor(me) ? [adminItem] : [
     { key: 'home', href: '#/', label: copy.nav.home, icon: 'home', count: 0, countLabel: () => '' },
     { key: 'drafts', href: '#/drafts', label: copy.nav.drafts, icon: 'drafts', count: pendingCount, countLabel: copy.nav.draftsCount, accent: true },
     // Only for someone holding the reviewer role (not for an admin who merely may recommend).
@@ -143,9 +148,7 @@ export function Shell({ route, children, onSignOut }: { route: Route; children: 
     { key: 'activity', href: '#/activity', label: copy.nav.activity, icon: 'activity', count: runningCount, countLabel: copy.nav.activityCount },
     // The person's own team: for anyone who may ask (never an Auditor-only person).
     ...(canAsk(me) ? [{ key: 'bots' as const, href: '#/bots', label: copy.nav.bots, icon: 'mascot' as const, count: 0, countLabel: () => '' }] : []),
-    ...(canAdminister(me)
-      ? [{ key: 'admin' as const, href: '#/admin', label: copy.nav.admin, icon: 'shield' as const, count: 0, countLabel: () => '' }]
-      : []),
+    ...(canAdminister(me) ? [adminItem] : []),
   ];
 
   const detail = route.name === 'draft' || route.name === 'task' || route.name === 'review';

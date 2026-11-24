@@ -22,6 +22,79 @@ use sha2::{Digest, Sha256};
 /// `Domain`, so a sibling subdomain can't set or read it.
 pub const COOKIE: &str = "__Host-pmos";
 
+/// The admin door's session cookie (slice H10, `docs/openshell-any-host-spec.md` §3.8): its
+/// own name, `SameSite=Strict`, never `__Host-pmos`.
+pub const ADMIN_COOKIE: &str = "__Host-pmos-admin";
+
+/// Which front door of `pmos-web` a request came in by, and a session was made on (slice H10):
+/// the browser-facing listener (`PMOS_WEB_BIND`, 8770) or the admin-only listener
+/// (`PMOS_WEB_ADMIN_BIND`, 8772). Nothing made on one door works on the other: each has its own
+/// cookie, and each accepts only its own sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Door {
+    Public,
+    Admin,
+}
+
+impl Door {
+    /// As the `web_sessions.door` column stores it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Door::Public => "public",
+            Door::Admin => "admin",
+        }
+    }
+
+    /// The column's value; anything else is `None` (the column's check allows only the two).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "public" => Some(Door::Public),
+            "admin" => Some(Door::Admin),
+            _ => None,
+        }
+    }
+
+    /// This door's session cookie name.
+    pub fn cookie_name(self) -> &'static str {
+        match self {
+            Door::Public => COOKIE,
+            Door::Admin => ADMIN_COOKIE,
+        }
+    }
+
+    /// The session id the browser sent in this door's cookie, if any.
+    pub fn cookie_value(self, headers: &HeaderMap) -> Option<String> {
+        named_cookie(headers, self.cookie_name())
+    }
+
+    /// `Set-Cookie` for a new session on this door: the public door's is `SameSite=Lax`
+    /// (links from Slack and email open a signed-in page), the admin door's `SameSite=Strict`
+    /// (r7, X6): no other site's link or form carries it.
+    pub fn set_cookie(self, value: &str) -> String {
+        format!(
+            "{}={value}; Path=/; Secure; HttpOnly; SameSite={}",
+            self.cookie_name(),
+            self.same_site()
+        )
+    }
+
+    /// `Set-Cookie` that removes this door's cookie.
+    pub fn clear_cookie(self) -> String {
+        format!(
+            "{}=; Path=/; Secure; HttpOnly; SameSite={}; Max-Age=0",
+            self.cookie_name(),
+            self.same_site()
+        )
+    }
+
+    fn same_site(self) -> &'static str {
+        match self {
+            Door::Public => "Lax",
+            Door::Admin => "Strict",
+        }
+    }
+}
+
 /// The header writes carry the CSRF token in.
 pub const CSRF_HEADER: &str = "x-pmos-csrf";
 
@@ -43,6 +116,9 @@ pub struct Session {
     /// signed in with: checked against the user database on every request, so a reset or a
     /// password change ends it. `None` for every other sign-in.
     pub password_epoch: Option<i64>,
+    /// The door the session was made on (slice H10). A row from before H10 reads as
+    /// [`Door::Public`] (the column's default), so none can be used on the admin door.
+    pub door: Door,
 }
 
 impl Session {
@@ -68,14 +144,16 @@ impl std::fmt::Display for StoreError {
 pub trait SessionStore: Send + Sync {
     async fn insert(&self, id: IdHash, session: Session) -> Result<(), StoreError>;
 
-    /// The live session for `id`, with `last_seen` moved to `now`. An expired one is removed
-    /// and reads as `None`.
+    /// The live session for `id` made on `door`, with `last_seen` moved to `now`. An expired
+    /// one, or one made on the other door, is removed and reads as `None`: `idle` and `max` are
+    /// that door's own bounds.
     async fn touch(
         &self,
         id: &IdHash,
         now: DateTime<Utc>,
         idle: Duration,
         max: Duration,
+        door: Door,
     ) -> Result<Option<Session>, StoreError>;
 
     async fn remove(&self, id: &IdHash) -> Result<(), StoreError>;
@@ -135,10 +213,17 @@ impl SessionStore for MemorySessionStore {
         now: DateTime<Utc>,
         idle: Duration,
         max: Duration,
+        door: Door,
     ) -> Result<Option<Session>, StoreError> {
         let mut sessions = self.sessions.lock().expect("sessions lock");
-        // Sweep while here, so the map doesn't grow with abandoned sessions.
-        sessions.retain(|_, s| s.live(now, idle, max));
+        // Sweep this door's sessions while here, so the map doesn't grow with abandoned ones
+        // (the other door's have bounds of their own).
+        sessions.retain(|_, s| s.door != door || s.live(now, idle, max));
+        if sessions.get(id).is_some_and(|s| s.door != door) {
+            // Presented on the other door: never served there, and ended.
+            sessions.remove(id);
+            return Ok(None);
+        }
         Ok(sessions.get_mut(id).map(|s| {
             s.last_seen = now;
             s.clone()
@@ -182,28 +267,33 @@ pub fn assertion_ref(id: &IdHash) -> String {
     digest[..8].iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// The session id the browser sent in `Cookie`, if any.
+/// The public door's session id the browser sent in `Cookie`, if any.
 pub fn cookie_value(headers: &HeaderMap) -> Option<String> {
+    named_cookie(headers, COOKIE)
+}
+
+fn named_cookie(headers: &HeaderMap, wanted: &str) -> Option<String> {
     headers
         .get_all(axum::http::header::COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(';'))
         .filter_map(|pair| pair.trim().split_once('='))
-        .find(|(name, _)| *name == COOKIE)
+        .find(|(name, _)| *name == wanted)
         .map(|(_, value)| value.trim().to_string())
         .filter(|v| v.len() == 43)
 }
 
-/// `Set-Cookie` for a new session: `Secure`, `HttpOnly`, `SameSite=Lax`, `Path=/`, no
-/// `Domain`, and no `Max-Age` (the server ends it).
+/// `Set-Cookie` for a new public-door session: `Secure`, `HttpOnly`, `SameSite=Lax`,
+/// `Path=/`, no `Domain`, and no `Max-Age` (the server ends it). [`Door::set_cookie`] for the
+/// admin door's.
 pub fn set_cookie(value: &str) -> String {
-    format!("{COOKIE}={value}; Path=/; Secure; HttpOnly; SameSite=Lax")
+    Door::Public.set_cookie(value)
 }
 
-/// `Set-Cookie` that removes the cookie.
+/// `Set-Cookie` that removes the public door's cookie.
 pub fn clear_cookie() -> String {
-    format!("{COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0")
+    Door::Public.clear_cookie()
 }
 
 #[cfg(test)]
@@ -227,6 +317,7 @@ mod tests {
             entra_oid: None,
             entra_tid: None,
             password_epoch: None,
+            door: Door::Public,
         }
     }
 
@@ -268,14 +359,14 @@ mod tests {
         // Kept alive by use, every 7 hours...
         for step in 1..=3 {
             assert!(store
-                .touch(&id, at(step * 7 * 60), idle, max)
+                .touch(&id, at(step * 7 * 60), idle, max, Door::Public)
                 .await
                 .unwrap()
                 .is_some());
         }
         // ...but never past 24 hours from sign-in.
         assert!(store
-            .touch(&id, at(24 * 60), idle, max)
+            .touch(&id, at(24 * 60), idle, max, Door::Public)
             .await
             .unwrap()
             .is_none());
@@ -284,7 +375,7 @@ mod tests {
         let id = hash_id("two");
         store.insert(id, session("ana")).await.unwrap();
         assert!(store
-            .touch(&id, at(8 * 60), idle, max)
+            .touch(&id, at(8 * 60), idle, max, Door::Public)
             .await
             .unwrap()
             .is_none());
@@ -319,5 +410,73 @@ mod tests {
             set_cookie("x"),
             "__Host-pmos=x; Path=/; Secure; HttpOnly; SameSite=Lax"
         );
+    }
+
+    /// Slice H10 (X6): the admin door's cookie is its own, `SameSite=Strict`, and each door
+    /// reads only its own cookie.
+    #[test]
+    fn each_door_has_its_own_cookie() {
+        assert_eq!(
+            Door::Admin.set_cookie("x"),
+            "__Host-pmos-admin=x; Path=/; Secure; HttpOnly; SameSite=Strict"
+        );
+        assert!(Door::Admin
+            .clear_cookie()
+            .ends_with("SameSite=Strict; Max-Age=0"));
+        let (public, admin) = (random_token(), random_token());
+        let mut h = HeaderMap::new();
+        h.insert(
+            "cookie",
+            HeaderValue::from_str(&format!("__Host-pmos={public}; __Host-pmos-admin={admin}"))
+                .unwrap(),
+        );
+        assert_eq!(Door::Public.cookie_value(&h), Some(public));
+        assert_eq!(Door::Admin.cookie_value(&h), Some(admin.clone()));
+        let mut only_public = HeaderMap::new();
+        only_public.insert(
+            "cookie",
+            HeaderValue::from_str(&format!("__Host-pmos={admin}")).unwrap(),
+        );
+        assert_eq!(Door::Admin.cookie_value(&only_public), None);
+        assert_eq!(Door::parse("admin"), Some(Door::Admin));
+        assert_eq!(Door::parse("Admin"), None);
+    }
+
+    /// A session made on one door reads as `None` on the other, and is ended; sweeping one
+    /// door's expired sessions leaves the other door's alone.
+    #[tokio::test]
+    async fn a_session_works_only_on_its_own_door() {
+        let store = MemorySessionStore::new();
+        let (idle, max) = (Duration::hours(8), Duration::hours(24));
+        let public = hash_id("public");
+        store.insert(public, session("ana")).await.unwrap();
+        let admin = hash_id("admin");
+        let mut s = session("ada");
+        s.door = Door::Admin;
+        store.insert(admin, s).await.unwrap();
+        assert!(store
+            .touch(&public, at(1), idle, max, Door::Admin)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store.len(),
+            1,
+            "the public session presented on the admin door ends"
+        );
+        // The admin door's shorter bounds sweep only admin sessions.
+        let other = hash_id("other");
+        store.insert(other, session("ben")).await.unwrap();
+        let (a_idle, a_max) = (Duration::minutes(30), Duration::minutes(480));
+        assert!(store
+            .touch(&admin, at(60), a_idle, a_max, Door::Admin)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .touch(&other, at(60), idle, max, Door::Public)
+            .await
+            .unwrap()
+            .is_some());
     }
 }

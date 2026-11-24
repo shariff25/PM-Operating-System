@@ -245,10 +245,14 @@ fn ring() -> pmos_assertion::KeyRing {
     pmos_assertion::KeyRing::new(pmos_assertion::Key::from_base64("wt1", WEB_TOOLS_KEY).unwrap())
 }
 
+/// The admin routes live on the admin door only (slice H10): `base` and `http` reach it (its
+/// `*.localhost` name, as a tunnel's browser would); `public` is the browser-facing door.
 struct Web {
     base: String,
+    public: String,
     tools: Arc<Tools>,
     http: reqwest::Client,
+    sessions: Arc<dyn pmos_web::session::SessionStore>,
     _dir: tempfile::TempDir,
     _stop: Vec<CancellationToken>,
 }
@@ -268,6 +272,7 @@ async fn web() -> Web {
         serve(Router::new().fallback(toolserver).with_state(tools.clone())).await;
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("team.yaml"), TEAM).unwrap();
+    let door = support::door::listener().await;
     let cfg = Config {
         bind: "127.0.0.1:0".parse().unwrap(),
         // Never called by these routes.
@@ -287,16 +292,30 @@ async fn web() -> Web {
         session_idle: Duration::hours(8),
         session_max: Duration::hours(24),
         internal_bind: None,
-        password_login: false,
+        // The admin door's sign-in (it never serves development sign-in).
+        password_login: true,
         trusted_proxies: Vec::new(),
+        admin: Some(support::door::tunnel(door.port)),
+        password_clients: Vec::new(),
     };
-    let (base, stop_web) = serve(pmos_web::build(cfg, Deps::in_memory()).unwrap()).await;
+    let sessions: Arc<dyn pmos_web::session::SessionStore> =
+        Arc::new(pmos_web::session::MemorySessionStore::new());
+    let deps = Deps {
+        sessions: sessions.clone(),
+        ..Deps::in_memory()
+    };
+    let server = pmos_web::app::build_server(cfg, deps).unwrap();
+    let (public, stop_web) = serve(server.public).await;
+    let port = door.port;
+    let stop_admin = support::door::serve(door, server.admin.unwrap());
     Web {
-        base,
+        base: support::door::base(port),
+        public,
         tools,
-        http: reqwest::Client::new(),
+        http: support::door::client(port),
+        sessions,
         _dir: dir,
-        _stop: vec![stop_tools, stop_web],
+        _stop: vec![stop_tools, stop_web, stop_admin],
     }
 }
 
@@ -304,7 +323,7 @@ impl Web {
     async fn send(&self, cookie: Option<&str>, method: Method, path: &str) -> Reply {
         let mut req = self.http.request(method, format!("{}{path}", self.base));
         if let Some(c) = cookie {
-            req = req.header("cookie", format!("__Host-pmos={c}"));
+            req = req.header("cookie", format!("__Host-pmos-admin={c}"));
         }
         let res = req.send().await.unwrap();
         let status = res.status();
@@ -323,12 +342,36 @@ impl Web {
         self.send(Some(cookie), Method::GET, path).await
     }
 
-    /// Sign in as `handle`: the session cookie.
+    /// An admin-door session for `handle`: its cookie. Every request checks the person's roles.
     async fn login(&self, handle: &str) -> String {
-        let res = self
-            .http
-            .post(format!("{}/api/auth/dev-login", self.base))
-            .header("origin", self.base.clone())
+        support::door::session(&self.sessions, handle).await.0
+    }
+
+    /// `GET` on the public door with a public-door session.
+    async fn get_public(&self, cookie: &str, path: &str) -> Reply {
+        let res = reqwest::Client::new()
+            .get(format!("{}{path}", self.public))
+            .header("cookie", format!("__Host-pmos={cookie}"))
+            .send()
+            .await
+            .unwrap();
+        let status = res.status();
+        let headers = res.headers().clone();
+        let text = res.text().await.unwrap();
+        let body = serde_json::from_str(&text).unwrap_or(Value::Null);
+        Reply {
+            status,
+            headers,
+            text,
+            body,
+        }
+    }
+
+    /// Sign in on the public door (development sign-in): the session cookie.
+    async fn login_public(&self, handle: &str) -> String {
+        let res = reqwest::Client::new()
+            .post(format!("{}/api/auth/dev-login", self.public))
+            .header("origin", self.public.clone())
             .json(&json!({ "handle": handle }))
             .send()
             .await
@@ -375,15 +418,28 @@ async fn role_matrix() {
         ("ana", vec![]),
         ("rex", vec![]),
     ] {
-        let cookie = w.login(who).await;
+        // Slice H10: these routes are on the admin door, which serves an Admin or an Auditor
+        // only; a PM or a Reviewer is refused there before any route runs, and that session
+        // ends (so each route gets a session of its own here).
+        let door_refuses = matches!(who, "ana" | "rex");
         for route in ROUTES {
+            let cookie = w.login(who).await;
             let before = w.tools.calls().len();
             let r = w.get(&cookie, route).await;
             if allowed.contains(&route) {
                 assert_eq!(r.status, StatusCode::OK, "{who} {route}: {}", r.text);
             } else {
                 assert_eq!(r.status, StatusCode::FORBIDDEN, "{who} {route}");
-                assert_eq!(r.body["code"], "forbidden", "{who} {route}");
+                let code = if door_refuses {
+                    "admin_door_not_allowed"
+                } else {
+                    "forbidden"
+                };
+                assert_eq!(r.body["code"], code, "{who} {route}");
+                if door_refuses {
+                    let again = w.get(&cookie, route).await;
+                    assert_eq!(again.body["code"], "signed_out", "{who}: the session ended");
+                }
                 assert_eq!(
                     w.tools.calls().len(),
                     before,
@@ -441,13 +497,27 @@ async fn me_lists_permissions() {
             .map(|p| p.as_str().unwrap().to_string())
             .collect()
     };
-    let ana = w.get(&w.login("ana").await, "/api/me").await;
+    // A PM on the public door (the admin door refuses them).
+    let ana = w.get_public(&w.login_public("ana").await, "/api/me").await;
+    assert_eq!(ana.body["door"], "public");
+    assert!(
+        ana.body.get("admin_url").is_none(),
+        "no admin address for a PM"
+    );
+    let refused = w.get(&w.login("ana").await, "/api/me").await;
+    assert_eq!(refused.body["code"], "admin_door_not_allowed");
+    // An Auditor on the public door is given the admin door's address.
+    let audrey_public = w
+        .get_public(&w.login_public("audrey").await, "/api/me")
+        .await;
+    assert_eq!(audrey_public.body["admin_url"], json!(w.base));
     assert_eq!(ana.body["roles"], json!(["pm"]), "unchanged");
     assert!(ana.body["csrf_token"].is_string(), "unchanged");
     let p = perms(&ana);
     assert!(p.contains(&"decide-own-approval".to_string()));
     assert!(!p.contains(&"view-audit-log".to_string()));
     let audrey = w.get(&w.login("audrey").await, "/api/me").await;
+    assert_eq!(audrey.body["door"], "admin");
     // Audit metadata, and the platform's configuration read-only (the policy and content
     // screens, `admin_proposals.rs`).
     assert_eq!(
@@ -758,7 +828,7 @@ impl Web {
         let mut req = self
             .http
             .request(method, format!("{}{path}", self.base))
-            .header("cookie", format!("__Host-pmos={cookie}"))
+            .header("cookie", format!("__Host-pmos-admin={cookie}"))
             .header("x-pmos-csrf", csrf);
         if let Some(o) = origin {
             req = req.header("origin", o);
@@ -873,8 +943,30 @@ async fn user_routes_forward_signed_for_the_admin() {
 async fn user_writes_need_an_admin_the_origin_and_the_csrf_token() {
     let w = web().await;
     let base = w.base.clone();
-    // An auditor or a PM: refused here, with no upstream call.
-    for who in ["audrey", "ana"] {
+    // A PM: the admin door itself refuses them (slice H10), before any route.
+    let ana = w.login("ana").await;
+    for (method, path, body) in user_writes() {
+        let before = w.tools.calls().len();
+        let mut req = w
+            .http
+            .request(method, format!("{}{path}", w.base))
+            .header("cookie", format!("__Host-pmos-admin={ana}"))
+            .header("origin", base.clone());
+        if let Some(b) = body {
+            req = req.json(&b);
+        }
+        let res = req.send().await.unwrap();
+        assert!(
+            matches!(
+                res.status(),
+                StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED
+            ),
+            "ana {path}"
+        );
+        assert_eq!(w.tools.calls().len(), before, "ana {path}");
+    }
+    // An auditor: refused here, with no upstream call.
+    for who in ["audrey"] {
         let cookie = w.login(who).await;
         for (method, path, body) in user_writes() {
             let before = w.tools.calls().len();
@@ -899,7 +991,7 @@ async fn user_writes_need_an_admin_the_origin_and_the_csrf_token() {
         let mut req = w
             .http
             .request(method.clone(), format!("{}{path}", w.base))
-            .header("cookie", format!("__Host-pmos={cookie}"))
+            .header("cookie", format!("__Host-pmos-admin={cookie}"))
             .header("origin", base.clone());
         if let Some(b) = &body {
             req = req.json(b);

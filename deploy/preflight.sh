@@ -233,7 +233,7 @@ NETWORK_GATEWAY_DEFAULT=10.201.77.1
 NETWORK_IP_RANGE_DEFAULT=10.201.77.128/25
 NETWORK_INSPECT_FORMAT='{{range .IPAM.Config}}{{.Subnet}} {{.Gateway}} {{.IPRange}};{{end}}{{index .Options "com.docker.network.bridge.name"}}'
 # The published ports (deploy/compose.yaml, always on 127.0.0.1) as deploy/pmos-admin's
-# port_checks reads them; the admin listener (8772, slice H10) and OpenShell's gateway (17670).
+# port_checks reads them; the admin door (8772, slice H10: on PMOS_WEB_ADMIN_PUBLISH) and OpenShell's gateway (17670).
 PORT_KEYS=(TOOLSERVER:8710 GATEWAY:8740 BOTS:8750 CONSOLE:8760 WEB:8770)
 ADMIN_PORT=8772
 # The web app's internal listener (PMOS_WEB_INTERNAL_BIND, slice H9): on the `pmos` network only,
@@ -842,6 +842,8 @@ c_exposure() {
     return
   fi
   d0=$(cmd_out docker0-addr ip -4 -o addr show dev docker0 | awk '{ sub(/\/.*/, "", $4); print $4 }' || true)
+  ADMIN_PUBLISH=$(ev PMOS_WEB_ADMIN_PUBLISH)
+  ADMIN_PUBLISH=${ADMIN_PUBLISH:-127.0.0.1}
   while read -r addr port; do
     [ -n "$port" ] || continue
     ok=1
@@ -854,18 +856,18 @@ c_exposure() {
       # verify on a real host).
       is_loopback "$addr" || { [ -n "$d0" ] && [ "$addr" = "$d0" ]; } || ok=0
     else
-      for p in "${PORTS[@]}" "$ADMIN_PORT"; do
-        # 8772 (the admin listener) belongs on PMOS_WEB_ADMIN_PUBLISH from slice H10; until
-        # then nothing of PM OS listens there, so only loopback is accepted.
+      for p in "${PORTS[@]}"; do
         [ "$port" = "$p" ] && ! is_loopback "$addr" && ok=0
       done
+      # 8772, the admin door (slice H10): only on PMOS_WEB_ADMIN_PUBLISH (127.0.0.1 by default).
+      if [ "$port" = "$ADMIN_PORT" ] && [ "$addr" != "$ADMIN_PUBLISH" ]; then ok=0; fi
     fi
     [ "$ok" = 1 ] || probs+=("$addr:$port")
   done <<<"$lst"
   if [ ${#probs[@]} -eq 0 ]; then
-    res H-EXPOSURE pass "${PORTS[*]} and $ADMIN_PORT on loopback only; $INTERNAL_PORT not published; $OPENSHELL_PORT on loopback${d0:+ or $d0}" "nothing of PM OS listens outside loopback but the reverse proxy"
+    res H-EXPOSURE pass "${PORTS[*]} on loopback only; $ADMIN_PORT on $ADMIN_PUBLISH only; $INTERNAL_PORT not published; $OPENSHELL_PORT on loopback${d0:+ or $d0}" "nothing of PM OS listens outside loopback but the reverse proxy"
   else
-    res H-EXPOSURE fail "listening outside loopback: ${probs[*]}" "nothing of PM OS listens outside loopback but the reverse proxy" "publish every PM OS port on 127.0.0.1 only and never $INTERNAL_PORT (deploy/compose.yaml), and keep OpenShell's gateway local"
+    res H-EXPOSURE fail "listening outside loopback: ${probs[*]}" "nothing of PM OS listens outside loopback but the reverse proxy" "publish every PM OS port on 127.0.0.1 only, the admin door ($ADMIN_PORT) on PMOS_WEB_ADMIN_PUBLISH only, and never $INTERNAL_PORT (deploy/compose.yaml), and keep OpenShell's gateway local"
   fi
 }
 ACK_PRIVATE=0 # 1 when H-PRIVATE passes on its acknowledgement
@@ -890,21 +892,183 @@ c_devlogin() {
     res H-DEVLOGIN pass "on, on a host that measures private (a closed test network only)" "development sign-in off, or a closed private network"
   fi
 }
+# Slice H10 (decision D2 (a)): on `public`, password sign-in only from PMOS_WEB_PASSWORD_CLIENTS,
+# each entry no wider than a /16 (IPv4) or a /48 (IPv6); a too-wide entry fails on every host
+# (pmos-web refuses it everywhere). Development sign-in on public is H-DEVLOGIN's.
+password_clients_problems() { # the list → one line per bad entry
+  python3 -I -c '
+import ipaddress, sys
+for e in (x.strip() for x in sys.argv[1].split(",")):
+    if not e:
+        continue
+    try:
+        if "/" not in e:
+            raise ValueError
+        n = ipaddress.ip_network(e, strict=True)
+    except ValueError:
+        print(f"{e}: not a network written address/length with no host bits"); continue
+    mapped = n.version == 6 and n.network_address.ipv4_mapped is not None
+    if (n.version == 4 and n.prefixlen < 16) or (n.version == 6 and n.prefixlen < 48) or (mapped and n.prefixlen < 112):
+        print(f"{e}: wider than a /16 (IPv4) or a /48 (IPv6)")
+' "$1"
+}
 c_signin() {
+  local clients probs
+  clients=$(ev PMOS_WEB_PASSWORD_CLIENTS)
   if ! web_on; then
     res H-SIGNIN pass "the web app is off" "sign-in as decision D2 (a) says"
+    return
+  fi
+  probs=$(password_clients_problems "$clients")
+  if [ -n "$probs" ]; then
+    res H-SIGNIN fail "PMOS_WEB_PASSWORD_CLIENTS: $(paste -sd';' <<<"$probs")" "sign-in as decision D2 (a) says" "name only the VPN's or the office's own ranges, each no wider than a /16 (IPv4) or a /48 (IPv6); 0.0.0.0/0, ::/0 and ::ffff:0:0/96 are the internet"
+  elif [ "$EXPOSURE" = public ] && [ "$(ev PMOS_WEB_PASSWORD_LOGIN)" = 1 ] && [ -z "$clients" ]; then
+    res H-SIGNIN fail "PMOS_EXPOSURE=public with password sign-in and PMOS_WEB_PASSWORD_CLIENTS blank" "sign-in as decision D2 (a) says" "set PMOS_WEB_PASSWORD_CLIENTS (a VPN or office range), or turn password sign-in off and use Microsoft sign-in (decision D2); pmos-web refuses to start as it is"
+  elif [ "$EXPOSURE" = public ] && [ "$(ev PMOS_WEB_PASSWORD_LOGIN)" = 1 ]; then
+    res H-SIGNIN pass "PMOS_EXPOSURE=public: Microsoft sign-in, and password sign-in only from $clients" "sign-in as decision D2 (a) says"
   elif [ "$EXPOSURE" = public ]; then
-    res H-SIGNIN fail "the web app on, PMOS_EXPOSURE=public" "sign-in as decision D2 (a) says" "pmos-web does not serve a public host yet (spec slice H10), and refuses to start on one. A host reached only from a network the company controls (a VPN, an SSH tunnel): set PMOS_EXPOSURE=private in deploy/.env; H-PRIVATE then checks the host looks private, and a closed test host with a public address needs sudo deploy/pmos-admin host acknowledge H-PRIVATE --reason \"…\". Any other host: leave the web app off until H10"
+    res H-SIGNIN pass "PMOS_EXPOSURE=public: Microsoft sign-in only" "sign-in as decision D2 (a) says"
   else
-    res H-SIGNIN pass "the web app on, PMOS_EXPOSURE=private" "sign-in as decision D2 (a) says" "the password allow-list rules come with slice H10"
+    res H-SIGNIN pass "the web app on, PMOS_EXPOSURE=private${clients:+; password sign-in only from $clients}" "sign-in as decision D2 (a) says"
   fi
 }
-c_admin() {
-  if web_on; then
-    res H-ADMIN warn "not checked until slice H10" "the admin routes on their own listener" "until H10 the admin routes are served on the web app's own port, 8770: keep it unreachable from outside"
-  else
-    res H-ADMIN skip "the web app is off" "the admin routes on their own listener"
+# Slice H10 (decision D3 (b), every host; r7, X6): the admin door's settings, and any nginx server or
+# Caddy site that forwards to its publish address and port while listening on a public address (or
+# on the unspecified one while the host has a public address). Only what nginx -T and caddy adapt
+# print is read; another kind of forwarder (socat, HAProxy, ssh -R) isn't seen (§3.8, a stated limit).
+proxy_forwarders() { # publish port public-host(0|1) → one "<what> listens on <addr>" line per bad one
+  local nginx caddy
+  nginx=$(cmd_out nginx-T nginx -T || true)
+  caddy=""
+  if [ -n "$ROOT" ] || command -v caddy >/dev/null 2>&1; then
+    caddy=$(cmd_out caddy-adapt caddy adapt --config /etc/caddy/Caddyfile || true)
   fi
+  NGINX="$nginx" CADDY="$caddy" python3 -I -c '
+import ipaddress, json, os, re, sys
+publish, port, public_host = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+targets = {f"{publish}:{port}"}
+if publish.startswith("127."):
+    targets |= {f"localhost:{port}", f"127.0.0.1:{port}"}
+def bad_listen(addr):
+    a = addr.strip()
+    if a.startswith("["):
+        host = a[1:a.index("]")]
+    elif a.count(":") == 1:
+        host = a.split(":")[0]
+    elif re.fullmatch(r"\d+", a) or a == "":
+        host = ""
+    else:
+        host = a
+    if host in ("", "*", "0.0.0.0", "::"):
+        return public_host
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return True  # a name: unknown, so not trusted
+    nets = [ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+            "100.64.0.0/10", "127.0.0.0/8", "::1/128", "fc00::/7")]
+    return not any(ip.version == n.version and ip in n for n in nets)
+def forwards(text):
+    for m in re.finditer(r"proxy_pass\s+\w+://([^/;\s]+)", text):
+        if m.group(1) in targets:
+            return True
+    return False
+# nginx -T: each file follows a "# configuration file <path>:" line; includes are inlined.
+text = os.environ.get("NGINX", "")
+files, cur, name = {}, [], None
+for line in text.splitlines():
+    m = re.match(r"# configuration file (.+):$", line)
+    if m:
+        if name: files[name] = "\n".join(cur)
+        name, cur = m.group(1), []
+    else:
+        cur.append(line)
+if name: files[name] = "\n".join(cur)
+if not files and text:
+    files["nginx"] = text
+def inline(body, depth=0):
+    def sub(m):
+        if depth > 5: return ""
+        return "\n".join(inline(files[f], depth + 1) for f in files if f == m.group(1) or f.endswith("/" + m.group(1)))
+    return re.sub(r"\binclude\s+([^;]+);", sub, body)
+for body in files.values():
+    body = re.sub(r"#.*", "", inline(body))
+    i = 0
+    while True:
+        m = re.search(r"\bserver\s*\{", body[i:])
+        if not m: break
+        start = i + m.end()
+        level, j = 1, start
+        while j < len(body) and level:
+            level += {"{": 1, "}": -1}.get(body[j], 0)
+            j += 1
+        block = body[start:j - 1]
+        i = j
+        if not forwards(block):
+            continue
+        for lm in re.finditer(r"^\s*listen\s+([^;\s]+)", block, re.M):
+            if bad_listen(lm.group(1)):
+                print(f"an nginx server forwarding to {publish}:{port} listens on {lm.group(1)}")
+# caddy adapt: JSON.
+try:
+    c = json.loads(os.environ.get("CADDY") or "{}")
+except ValueError:
+    c = {}
+for sname, srv in ((c.get("apps") or {}).get("http") or {}).get("servers", {}).items():
+    dials = json.dumps(srv.get("routes", []))
+    if not any(f"\"dial\": \"{t}\"" in dials for t in targets):
+        continue
+    for l in srv.get("listen", []):
+        addr = l.split("/", 1)[-1] if "/" in l else l
+        if bad_listen(addr):
+            print(f"a Caddy site ({sname}) forwarding to {publish}:{port} listens on {l}")
+' "$1" "$2" "$3"
+}
+c_admin() {
+  local url publish proxies probs=() host fwd public_host=0 kind
+  if ! web_on; then
+    res H-ADMIN skip "the web app is off" "the admin routes on their own listener"
+    return
+  fi
+  url=$(ev PMOS_WEB_ADMIN_URL)
+  publish=$(ev PMOS_WEB_ADMIN_PUBLISH)
+  publish=${publish:-127.0.0.1}
+  proxies=$(ev PMOS_WEB_ADMIN_TRUSTED_PROXIES)
+  [ -n "$url" ] || probs+=("PMOS_WEB_ADMIN_URL is blank (the admin door needs its own address)")
+  kind=$(addr_class "$publish" | awk '{ print $2 }')
+  case "$publish" in
+    127.* | ::1) kind=loopback ;;
+    169.254.* | fe80:*) kind=public ;; # link-local isn't a place to publish the admin door
+  esac
+  [ "$kind" = private ] || [ "$kind" = loopback ] || probs+=("PMOS_WEB_ADMIN_PUBLISH=$publish is outside loopback, RFC 1918, 100.64.0.0/10 and IPv6 unique-local")
+  case "$url" in
+    http://*)
+      [ "$kind" = loopback ] || probs+=("an http admin URL (the tunnel mode) with PMOS_WEB_ADMIN_PUBLISH=$publish, which isn't loopback")
+      [ -z "$proxies" ] || probs+=("an http admin URL with PMOS_WEB_ADMIN_TRUSTED_PROXIES set")
+      host=${url#http://}
+      host=${host%%/*}
+      case "${host%:*}" in
+        localhost | *.localhost | 127.0.0.1 | '[::1]') ;;
+        *) probs+=("an http admin URL on $host, which isn't a loopback name") ;;
+      esac
+      ;;
+    https://*) [ -n "$proxies" ] || probs+=("an https admin URL without PMOS_WEB_ADMIN_TRUSTED_PROXIES") ;;
+    "") ;;
+    *) probs+=("PMOS_WEB_ADMIN_URL=$url is neither http nor https") ;;
+  esac
+  # A host whose addresses can't be read counts as having a public one (the stricter reading).
+  if ! measure_public_addrs 2>/dev/null || [ -n "$PRIV_PUBLIC" ]; then public_host=1; fi
+  while IFS= read -r fwd; do [ -z "$fwd" ] || probs+=("$fwd"); done < <(proxy_forwarders "$publish" "$ADMIN_PORT" "$public_host")
+  if [ ${#probs[@]} -gt 0 ]; then
+    res H-ADMIN fail "$(join_sc "${probs[@]}")" "the admin routes on their own listener" "docs/runbooks/install.md, \"The admin door\": an http://<deployment>.localhost:8772 admin URL with PMOS_WEB_ADMIN_PUBLISH=127.0.0.1 (an SSH tunnel), or an https one with PMOS_WEB_ADMIN_TRUSTED_PROXIES and a TLS terminator listening on a private address only"
+    return
+  fi
+  case "$url" in
+    http://localhost:* | http://127.0.0.1:* | 'http://[::1]:'*)
+      res H-ADMIN warn "PMOS_WEB_ADMIN_URL=$url, a bare loopback name" "the admin routes on their own listener" "every tunnel to a bare localhost shares its cookies: use a deployment-unique name such as http://pmos-prod.localhost:8772"
+      ;;
+    *) res H-ADMIN pass "admin door $url, published on $publish:$ADMIN_PORT" "the admin routes on their own listener" ;;
+  esac
 }
 
 # H-PRIVATE's measurement: the sorted public addresses on this host, and whether the metadata
@@ -912,6 +1076,13 @@ c_admin() {
 # both, so the same host keeps its fingerprint and a new public address changes it.
 PRIV_PUBLIC="" PRIV_PROBE=unknown PRIV_ERR=""
 measure_private() {
+  measure_public_addrs || return 1
+  if metadata_probe; then
+    if [ "$PROBE_RESULT" = none ]; then PRIV_PROBE=no; else PRIV_PROBE=yes; fi
+  fi
+}
+# The sorted public interface addresses only (PRIV_PUBLIC), without the metadata probe.
+measure_public_addrs() {
   local j addrs
   if ! j=$(cmd_out ip-addr ip -j addr); then
     PRIV_ERR="ip -j addr failed"
@@ -928,9 +1099,6 @@ except Exception:
 ' <<<"$j") || { PRIV_ERR="ip -j addr gave no readable answer"; return 1; }
   # shellcheck disable=SC2086 # one address per word
   PRIV_PUBLIC=$(addr_class $addrs | awk '$2 == "public" { print $1 }' | sort -u | paste -sd, -)
-  if metadata_probe; then
-    if [ "$PROBE_RESULT" = none ]; then PRIV_PROBE=no; else PRIV_PROBE=yes; fi
-  fi
 }
 private_fingerprint() { # probe-answered (yes|no|unknown)
   printf 'public=%s\nmetadata=%s\n' "$PRIV_PUBLIC" "$1" | sha256sum | cut -d' ' -f1

@@ -56,9 +56,11 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{
-    auth, bad_content_type, is_json, now, parse, parse_optional, start_session, ApiError,
-    ApiResult, AppState, Signed,
+    admin_door_not_allowed, admin_door_role, auth, bad_content_type, is_json, now, parse,
+    parse_optional, record_sign_in, start_session, ApiError, ApiResult, AppState, Member,
+    SignInEvent, Signed,
 };
+use crate::session::Door;
 use crate::upstream::UpstreamError;
 
 /// Refused attempts from one address, about anything, before every password route from it
@@ -83,11 +85,34 @@ pub const MAX_BODY: usize = 4 * 1024;
 pub const PENDING_COOKIE: &str = "__Host-pmos-pending";
 /// The cookie that carries a setup in progress.
 pub const SETUP_COOKIE: &str = "__Host-pmos-setup";
+/// The admin door's (slice H10): names of their own, so nothing begun on one door is carried
+/// on the other.
+pub const ADMIN_PENDING_COOKIE: &str = "__Host-pmos-admin-pending";
+pub const ADMIN_SETUP_COOKIE: &str = "__Host-pmos-admin-setup";
+
+/// This door's pending-step cookie.
+fn pending(state: &AppState) -> &'static str {
+    match state.door() {
+        Door::Public => PENDING_COOKIE,
+        Door::Admin => ADMIN_PENDING_COOKIE,
+    }
+}
+
+/// This door's setup cookie.
+fn setup(state: &AppState) -> &'static str {
+    match state.door() {
+        Door::Public => SETUP_COOKIE,
+        Door::Admin => ADMIN_SETUP_COOKIE,
+    }
+}
 /// How long each cookie lives (the tool server's token lives as long, or less).
 const PENDING_SECS: i64 = 5 * 60;
 const SETUP_SECS: i64 = 15 * 60;
 
-pub(super) fn routes() -> Router<AppState> {
+/// Sign-in and setup, served on both doors (slice H10): on the admin door for an Admin or an
+/// Auditor only. With `PMOS_WEB_PASSWORD_CLIENTS` set, a client outside it is refused first
+/// ([`from_here`]).
+pub(super) fn sign_in_routes(state: &AppState) -> Router<AppState> {
     Router::new()
         .route("/auth/password/sign-in", post(sign_in))
         .route("/auth/password/second-step", post(second_step))
@@ -98,6 +123,17 @@ pub(super) fn routes() -> Router<AppState> {
             post(setup_authenticator),
         )
         .route("/auth/password/setup/confirm", post(setup_confirm))
+        .layer(DefaultBodyLimit::max(MAX_BODY))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            from_here,
+        ))
+}
+
+/// A signed-in person's own password routes: the public door only, where every user has a
+/// password and an authenticator (§3.8: they are changed there and used on either door).
+pub(super) fn self_service_routes(state: &AppState) -> Router<AppState> {
+    Router::new()
         .route("/auth/password/change", post(change))
         .route("/auth/password/recovery-codes", post(recovery_codes))
         .route("/auth/password/status", get(status))
@@ -105,11 +141,81 @@ pub(super) fn routes() -> Router<AppState> {
             "/auth/password/reset-notice/dismiss",
             post(dismiss_reset_notice),
         )
+        .layer(DefaultBodyLimit::max(MAX_BODY))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            from_here,
+        ))
+}
+
+/// An admin's setup codes: the admin door only.
+pub(super) fn admin_routes() -> Router<AppState> {
+    Router::new()
         .route(
             "/admin/users/{handle}/password-setup-code",
             post(issue_setup_code),
         )
         .layer(DefaultBodyLimit::max(MAX_BODY))
+}
+
+/// Why a password request is refused for where it came from (decision D2 (a)).
+fn not_from_here() -> Response {
+    ApiError::new(
+        StatusCode::FORBIDDEN,
+        "password_sign_in_not_from_here",
+        "Password sign-in isn't offered from this network. Use Microsoft sign-in, or connect \
+         to the VPN and try again.",
+    )
+    .into_response()
+}
+
+/// Decision D2 (a): with `PMOS_WEB_PASSWORD_CLIENTS` set (required on `PMOS_EXPOSURE=public`),
+/// every `/api/auth/password/*` request whose client address is outside it answers `403
+/// password_sign_in_not_from_here`, before the tool server is asked. The client address is the
+/// one the per-address limit counts: the peer, or behind a trusted proxy the client it names
+/// ([`source`]); an address that can't be known is refused (`403 proxy_not_trusted`, as
+/// [`address`] refuses it), and so is a request with no peer at all. On the admin door: in proxy
+/// mode the forwarded client the door's gate resolved; in tunnel mode the list doesn't apply
+/// (the address is the tunnel's, not the client's: §3.8).
+async fn from_here(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if state.0.password_clients.is_empty() {
+        return next.run(req).await;
+    }
+    let client = match state.door() {
+        Door::Admin => match state.0.admin.as_ref().map(|a| &a.mode) {
+            Some(crate::config::AdminMode::Tunnel { .. }) => return next.run(req).await,
+            _ => req.extensions().get::<super::AdminClient>().map(|c| c.0),
+        },
+        Door::Public => {
+            let peer = req
+                .extensions()
+                .get::<ConnectInfo<SocketAddr>>()
+                .map(|c| c.0);
+            if state.0.trusted_proxies.is_empty() && forwarded(req.headers()) {
+                return *proxy_not_trusted();
+            }
+            match source(peer, req.headers(), &state.0.trusted_proxies) {
+                Ok(ip) => ip,
+                Err(why) => {
+                    state.0.note_untrusted_proxy(why, now(&state));
+                    return *proxy_not_trusted();
+                }
+            }
+        }
+    };
+    match client {
+        Some(ip) if state.0.password_clients.iter().any(|c| c.contains(ip)) => next.run(req).await,
+        _ => {
+            tracing::info!(
+                "password sign-in refused: the client is outside PMOS_WEB_PASSWORD_CLIENTS"
+            );
+            not_from_here()
+        }
+    }
 }
 
 /// The tool server's codes on these routes, the status `pmos-web` answers with, and its own
@@ -752,7 +858,7 @@ fn pre(
     if !state.0.password_login {
         return Err(Box::new(off().into_response()));
     }
-    if !auth::same_origin(headers, state.0.public_url.as_deref()) {
+    if !auth::same_origin(headers, state.origin()) {
         return Err(Box::new(
             ApiError::new(
                 StatusCode::FORBIDDEN,
@@ -807,6 +913,13 @@ fn address(
     headers: &HeaderMap,
     peer: Option<SocketAddr>,
 ) -> Result<SourceKey, Box<Response>> {
+    if state.door() == Door::Admin {
+        // The admin door's gate already resolved the client ([`Peer`] carries it): the tunnel
+        // peer (one shared bucket for every admin, with the tool server's per-account counters,
+        // r6's accepted cost), or the client a trusted terminator named. `X-Forwarded-For` is
+        // never read again here, and never at all in tunnel mode.
+        return Ok(source_key(peer.map(|p| p.ip())));
+    }
     if state.0.trusted_proxies.is_empty() && forwarded(headers) {
         tracing::warn!(
             "password sign-in refused: a forwarded header with no trusted proxy (set PMOS_WEB_TRUSTED_PROXIES)"
@@ -854,6 +967,10 @@ impl<S: Send + Sync> FromRequestParts<S> for Peer {
     type Rejection = std::convert::Infallible;
 
     async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
+        // On the admin door, the client its gate resolved (slice H10).
+        if let Some(client) = parts.extensions.get::<super::AdminClient>() {
+            return Ok(Self(Some(SocketAddr::new(client.0, 0))));
+        }
         Ok(Self(
             parts
                 .extensions
@@ -916,7 +1033,7 @@ async fn sign_in(
         "expires_at": a.body.get("expires_at"),
     }))
     .into_response();
-    with_cookies(res, &[cookie(PENDING_COOKIE, token, PENDING_SECS)])
+    with_cookies(res, &[cookie(pending(&state), token, PENDING_SECS)])
 }
 
 fn bad_reply() -> Response {
@@ -962,6 +1079,26 @@ async fn session_for(
     if !user.is_active() {
         return Err(Box::new(super::no_longer_a_member().into_response()));
     }
+    if state.door() == Door::Admin && !admin_door_role(&Member::from_user(&user).roles) {
+        // Credentials proved, and neither Admin nor Auditor: refused before any session row or
+        // cookie exists, and audited (r7, X6 item 4). The caller clears its step cookie.
+        tracing::info!(
+            provider = "password",
+            "admin door: neither Admin nor Auditor: refused"
+        );
+        record_sign_in(
+            state,
+            None,
+            SignInEvent::Refused {
+                provider: "password",
+                reason: "admin_door_not_allowed",
+                attempted: None,
+                member: None,
+            },
+        )
+        .await;
+        return Err(Box::new(admin_door_not_allowed(state).into_response()));
+    }
     if end_others {
         state
             .0
@@ -984,7 +1121,7 @@ async fn second_step(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let subject = token_subject(&headers, PENDING_COOKIE, "pending");
+    let subject = token_subject(&headers, pending(&state), "pending");
     let mut t = match pre(&state, &headers, peer, &subject) {
         Ok(t) => t,
         Err(r) => return *r,
@@ -1001,10 +1138,10 @@ async fn second_step(
                 .into_response()
         }
     };
-    let Some(token) = read_cookie(&headers, PENDING_COOKIE) else {
+    let Some(token) = read_cookie(&headers, pending(&state)) else {
         return with_cookies(
             refused(401, &json!({"code": "sign_in_expired"}), None),
-            &[clear(PENDING_COOKIE)],
+            &[clear(pending(&state))],
         );
     };
     req["pending_token"] = json!(token);
@@ -1029,7 +1166,7 @@ async fn second_step(
             || (code == "code_failed"
                 && a.body.get("attempts_left").and_then(Value::as_i64) == Some(0));
         return if used_up {
-            with_cookies(res, &[clear(PENDING_COOKIE)])
+            with_cookies(res, &[clear(pending(&state))])
         } else {
             res
         };
@@ -1040,17 +1177,14 @@ async fn second_step(
     };
     let id = match session_for(&state, &headers, &a.body["user"], epoch, false).await {
         Ok(id) => id,
-        Err(r) => return *r,
+        Err(r) => return with_cookies(*r, &[clear(pending(&state))]),
     };
     let res = Json(json!({
         "recovery_code_used": a.body.get("recovery_code_used").and_then(Value::as_bool).unwrap_or(false),
         "recovery_codes_left": a.body.get("recovery_codes_left").and_then(Value::as_u64).unwrap_or(0),
     }))
     .into_response();
-    with_cookies(
-        res,
-        &[clear(PENDING_COOKIE), crate::session::set_cookie(&id)],
-    )
+    with_cookies(res, &[clear(pending(&state)), state.door().set_cookie(&id)])
 }
 
 // --- Setup -------------------------------------------------------------------------------------
@@ -1101,6 +1235,19 @@ async fn setup_begin(
     let Some(token) = a.body.get("setup_token").and_then(Value::as_str) else {
         return bad_reply();
     };
+    if state.door() == Door::Admin {
+        // The admin door's setup routes serve an Admin or an Auditor only, whose setup code
+        // always comes from the host (r7): anyone else `404`, and no setup cookie.
+        let handle = a.body.get("handle").and_then(Value::as_str).unwrap_or("");
+        let allowed = match state.0.directory.by_handle(handle).await {
+            Ok(u) => u.is_active() && admin_door_role(&Member::from_user(&u).roles),
+            Err(_) => false,
+        };
+        if !allowed {
+            tracing::info!("admin door: a setup for someone who is neither Admin nor Auditor: 404");
+            return off().into_response();
+        }
+    }
     let res = Json(json!({
         "handle": a.body.get("handle"),
         "kind": a.body.get("kind"),
@@ -1108,21 +1255,21 @@ async fn setup_begin(
         "password": {"min_length": 12, "max_length": 128},
     }))
     .into_response();
-    with_cookies(res, &[cookie(SETUP_COOKIE, token, SETUP_SECS)])
+    with_cookies(res, &[cookie(setup(&state), token, SETUP_SECS)])
 }
 
 /// The setup cookie, or `401 setup_expired`.
-fn setup_token(headers: &HeaderMap) -> Result<String, Box<Response>> {
-    read_cookie(headers, SETUP_COOKIE).ok_or_else(|| {
+fn setup_token(state: &AppState, headers: &HeaderMap) -> Result<String, Box<Response>> {
+    read_cookie(headers, setup(state)).ok_or_else(|| {
         Box::new(with_cookies(
             refused(401, &json!({"code": "setup_expired"}), None),
-            &[clear(SETUP_COOKIE)],
+            &[clear(setup(state))],
         ))
     })
 }
 
 /// A setup step's refusal: `setup_expired` clears the cookie.
-fn setup_refused(a: &Answer) -> Response {
+fn setup_refused(state: &AppState, a: &Answer) -> Response {
     let res = refused(a.status, &a.body, a.retry_after.clone());
     let code = a
         .body
@@ -1135,7 +1282,7 @@ fn setup_refused(a: &Answer) -> Response {
     ) || (code == "code_failed"
         && a.body.get("attempts_left").and_then(Value::as_i64) == Some(0));
     if used_up {
-        with_cookies(res, &[clear(SETUP_COOKIE)])
+        with_cookies(res, &[clear(setup(state))])
     } else {
         res
     }
@@ -1154,7 +1301,7 @@ async fn setup_password(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let subject = token_subject(&headers, SETUP_COOKIE, "setup");
+    let subject = token_subject(&headers, setup(&state), "setup");
     let mut t = match pre(&state, &headers, peer, &subject) {
         Ok(t) => t,
         Err(r) => return *r,
@@ -1163,7 +1310,7 @@ async fn setup_password(
         Ok(b) => b,
         Err(e) => return e.into_response(),
     };
-    let token = match setup_token(&headers) {
+    let token = match setup_token(&state, &headers) {
         Ok(t) => t,
         Err(r) => return *r,
     };
@@ -1181,7 +1328,7 @@ async fn setup_password(
             if a.status == 200 {
                 StatusCode::NO_CONTENT.into_response()
             } else {
-                setup_refused(&a)
+                setup_refused(&state, &a)
             }
         }
         Err(e) => {
@@ -1202,7 +1349,7 @@ async fn setup_authenticator(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let subject = token_subject(&headers, SETUP_COOKIE, "setup");
+    let subject = token_subject(&headers, setup(&state), "setup");
     let mut t = match pre(&state, &headers, peer, &subject) {
         Ok(t) => t,
         Err(r) => return *r,
@@ -1210,7 +1357,7 @@ async fn setup_authenticator(
     if let Err(e) = parse_optional::<Empty>(&body) {
         return e.into_response();
     }
-    let token = match setup_token(&headers) {
+    let token = match setup_token(&state, &headers) {
         Ok(t) => t,
         Err(r) => return *r,
     };
@@ -1239,7 +1386,7 @@ async fn setup_authenticator(
             }))
             .into_response()
         }
-        Ok(a) => setup_refused(&a),
+        Ok(a) => setup_refused(&state, &a),
         Err(e) => e.into_response(),
     }
 }
@@ -1258,7 +1405,7 @@ async fn setup_confirm(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let subject = token_subject(&headers, SETUP_COOKIE, "setup");
+    let subject = token_subject(&headers, setup(&state), "setup");
     let mut t = match pre(&state, &headers, peer, &subject) {
         Ok(t) => t,
         Err(r) => return *r,
@@ -1267,7 +1414,7 @@ async fn setup_confirm(
         Ok(b) => b,
         Err(e) => return e.into_response(),
     };
-    let token = match setup_token(&headers) {
+    let token = match setup_token(&state, &headers) {
         Ok(t) => t,
         Err(r) => return *r,
     };
@@ -1286,7 +1433,7 @@ async fn setup_confirm(
     };
     t.answered_guess(&state, a.status);
     if a.status != 200 {
-        return setup_refused(&a);
+        return setup_refused(&state, &a);
     }
     let Some(codes) = a
         .body
@@ -1302,14 +1449,14 @@ async fn setup_confirm(
     };
     let id = match session_for(&state, &headers, &a.body["user"], epoch, true).await {
         Ok(id) => id,
-        Err(r) => return *r,
+        Err(r) => return with_cookies(*r, &[clear(setup(&state))]),
     };
     let res = Json(json!({
         "kind": a.body.get("kind"),
         "recovery_codes": codes,
     }))
     .into_response();
-    with_cookies(res, &[clear(SETUP_COOKIE), crate::session::set_cookie(&id)])
+    with_cookies(res, &[clear(setup(&state)), state.door().set_cookie(&id)])
 }
 
 // --- Signed in ---------------------------------------------------------------------------------
@@ -1540,6 +1687,7 @@ async fn issue_setup_code(
             "Only an active admin can make setup codes. Nothing changed.",
         )
     })?;
+    signed.step_up(&state)?;
     if !pmos_contract::model::valid_handle(&handle) {
         return Err(ApiError::not_found());
     }

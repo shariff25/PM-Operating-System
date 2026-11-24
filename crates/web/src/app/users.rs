@@ -315,6 +315,33 @@ async fn write(
 ) -> ApiResult {
     need(signed, &[Permission::ManageMembers])?;
     write_log(signed, route);
+    write_unchecked(state, signed, method, segments, body).await
+}
+
+/// [`write`] for a sensitive action (r7, X6 item 5: a role change, an invitation, which sets
+/// roles, a deactivation, an unlinked identity): an admin, on a sign-in no older than 5
+/// minutes (`401 reauth_required` otherwise), before anything reaches the tool server.
+async fn sensitive_write(
+    state: &AppState,
+    signed: &Signed,
+    method: reqwest::Method,
+    segments: &[&str],
+    body: Option<Value>,
+    route: &str,
+) -> ApiResult {
+    need(signed, &[Permission::ManageMembers])?;
+    signed.step_up(state)?;
+    write_log(signed, route);
+    write_unchecked(state, signed, method, segments, body).await
+}
+
+async fn write_unchecked(
+    state: &AppState,
+    signed: &Signed,
+    method: reqwest::Method,
+    segments: &[&str],
+    body: Option<Value>,
+) -> ApiResult {
     let (status, v) = call(state, signed, method, segments, body.as_ref()).await?;
     written(status, &v)
 }
@@ -322,7 +349,7 @@ async fn write(
 /// `POST /api/admin/users`: invite.
 async fn create(State(state): State<AppState>, signed: Signed, body: Bytes) -> ApiResult {
     let body = body_object(&body, false)?;
-    write(
+    sensitive_write(
         &state,
         &signed,
         reqwest::Method::POST,
@@ -341,7 +368,7 @@ async fn set_roles(
 ) -> ApiResult {
     let handle = handle_param(&handle)?;
     let body = body_object(&body, false)?;
-    let done = write(
+    let done = sensitive_write(
         &state,
         &signed,
         reqwest::Method::PUT,
@@ -402,7 +429,7 @@ async fn deactivate(
 ) -> ApiResult {
     let handle = handle_param(&handle)?;
     let body = body_object(&body, true)?;
-    write(
+    sensitive_write(
         &state,
         &signed,
         reqwest::Method::POST,
@@ -441,7 +468,7 @@ async fn unlink(
     if !matches!(kind.as_str(), "entra" | "atlassian" | "github") {
         return Err(ApiError::not_found());
     }
-    write(
+    sensitive_write(
         &state,
         &signed,
         reqwest::Method::DELETE,

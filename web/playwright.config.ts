@@ -7,6 +7,10 @@ const PORT = 5191;
 const EMPTY_PORT = 5192;
 // A third with the brief not built (501), so the home page lays out without it.
 const BRIEF_OFF_PORT = 5193;
+// Slice H10: the admin door, reached at a deployment-unique `*.localhost` name (Chromium resolves
+// it to loopback), and the public door with the admin door's address for an Admin or Auditor.
+export const ADMIN_DOOR_PORT = 5194;
+export const PUBLIC_DOOR_PORT = 5195;
 
 // Use a browser that is already installed when there is one (PW_CHROMIUM, or the shared path);
 // otherwise Playwright uses the browser it downloaded itself.
@@ -48,6 +52,20 @@ export default defineConfig({
       reuseExistingServer: false,
       timeout: 60_000,
       env: { VITE_API: 'mock', VITE_MOCK_FAST: 'on', VITE_MOCK_BRIEF: 'off' },
+    },
+    {
+      command: `pnpm exec vite --host 127.0.0.1 --port ${ADMIN_DOOR_PORT} --strictPort`,
+      url: `http://127.0.0.1:${ADMIN_DOOR_PORT}`,
+      reuseExistingServer: false,
+      timeout: 60_000,
+      env: { VITE_API: 'mock', VITE_MOCK_FAST: 'on', VITE_MOCK_DOOR: 'admin' },
+    },
+    {
+      command: `pnpm exec vite --host 127.0.0.1 --port ${PUBLIC_DOOR_PORT} --strictPort`,
+      url: `http://127.0.0.1:${PUBLIC_DOOR_PORT}`,
+      reuseExistingServer: false,
+      timeout: 60_000,
+      env: { VITE_API: 'mock', VITE_MOCK_FAST: 'on', VITE_MOCK_DOOR: 'public' },
     },
   ],
 });

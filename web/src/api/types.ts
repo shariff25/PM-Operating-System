@@ -43,6 +43,16 @@ export interface Me {
   show_team_step?: boolean;
   /** Show the dismissible "New: pick your team" note on Today. */
   show_team_note?: boolean;
+  /**
+   * Which front door of PM OS this page was served by (slice H10): the browser-facing one, or
+   * the admin-only one, where only the admin and audit screens are reachable. An older server
+   * leaves it out: treat that as the public door with every screen on it.
+   */
+  door?: 'public' | 'admin';
+  /** On the public door, for an Admin or an Auditor: the admin door's own address. */
+  admin_url?: string;
+  /** On the admin door: the public door's address, when the server knows it. */
+  public_url?: string | null;
 }
 
 export type DraftKind = 'confluence_page' | 'jira_issue' | 'slack_reply' | 'slack_message';
@@ -475,6 +485,11 @@ export const SERVER_ERROR_CODES = {
   too_many_attempts: 'yes',
   sign_in_busy: 'yes',
   proxy_not_trusted: 'yes',
+  // Slice H10: the admin door and decision D2 (a).
+  password_sign_in_not_from_here: 'yes',
+  admin_door_not_allowed: 'yes',
+  reauth_required: 'yes',
+  sign_in_stopped: 'yes',
 } as const satisfies Record<string, 'yes' | 'decision' | 'unknown'>;
 
 /** Codes the server sends. */

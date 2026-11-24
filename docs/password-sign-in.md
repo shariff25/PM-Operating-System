@@ -582,6 +582,7 @@ credential (and their counters) at the end of the 24-hour grace.
 | `PMOS_WEB_TRUST_PROXY_IN_NETWORK=1` | `pmos-admin` only | Lets `PMOS_WEB_TRUSTED_PROXIES` name an address inside the `pmos` subnet (a reverse proxy in a container on the network, its address pinned); without it `up --web` accepts only the gateway (GL4), and with it warns every time. Never trusts an address outside the subnet. |
 | `PMOS_NETWORK_SUBNET`, `PMOS_NETWORK_GATEWAY` | deploy kit (`deploy/compose.yaml`) | The `pmos` network's subnet and gateway, pinned (default `10.201.77.0/24`, `10.201.77.1`). Change both only if the site already routes that range; then re-create the network (`deploy/pmos-admin down`, then `up`) and set `PMOS_WEB_TRUSTED_PROXIES` to the new gateway. `pmos-admin up --web` checks all three. |
 | `PMOS_WEB_DIRECT=1` | `pmos-web` | Browsers reach `pmos-web` with no proxy: each is counted by its own address, and a forwarded header is refused. Only on a loopback `PMOS_WEB_BIND`, and never with `PMOS_WEB_TRUSTED_PROXIES` (both refuse to start). The test stack uses it. |
+| `PMOS_WEB_PASSWORD_CLIENTS` | `pmos-web` | Decision D2 (a), slice H10: the networks password sign-in is served to, comma-separated CIDRs, each no wider than a `/16` (IPv4) or a `/48` (IPv6); `0.0.0.0/0`, `::/0` and `::ffff:0:0/96` refuse to start. **Required on `PMOS_EXPOSURE=public` with password sign-in.** With it set, every `/api/auth/password/*` request whose client address (the one the per-address limit counts) is outside it answers `403 password_sign_in_not_from_here` before the tool server is asked. On the admin door it applies in the proxy mode, to the forwarded client; in the tunnel mode the address is the tunnel's, not the client's, and it doesn't apply (an SSH login to the host stands in for it). |
 | `PMOS_WEB_DEV_LOGIN_WITH_PASSWORD=1` | `pmos-web` | Lets development sign-in run beside password sign-in (a loud warning at start-up). Without it, both on refuses to start: development sign-in lets anyone in without a password. A developer's own machine only. |
 | `PMOS_VAULT_KEY` | tool server | The vault's keys; password sign-in needs them to seal authenticator secrets. Required with live connectors; optional with fake ones. |
 | `PMOS_DEV_PASSWORD_SETUP_FOR`, `PMOS_DEV_PASSWORD_SETUP_FILE` | tool server | **Development only**: at start-up, issue a setup code for that seeded user, as the host would, into a new 0600 file. Refused with a database, live connectors, no seed or no vault key. `scripts/claude-test-stack.sh` uses it for `PMOS_TEST_PASSWORD_LOGIN=1`. |
@@ -592,6 +593,14 @@ In the deploy kit, `deploy/compose.yaml` passes `PMOS_WEB_PASSWORD_LOGIN`,
 its provider too, once `PMOS_WEB_TRUSTED_PROXIES` and an `https://` `PMOS_WEB_PUBLIC_URL` are set
 (it says what to set otherwise). `pmos-admin users password-setup <handle>` issues a code on the
 host.
+
+**On the admin door (slice H10).** Sign-in, the second step and set-up are served on the admin
+door too, with cookies of its own (`__Host-pmos-admin-pending`, `__Host-pmos-admin-setup`), for
+an Admin or an Auditor only: anyone else's correct password and code get `403
+admin_door_not_allowed` and no session, and a set-up for anyone else answers `404`. Changing a
+password, new recovery codes and the reset notice are the public door's. In the tunnel mode every
+admin shares the tunnel peer's per-address bucket, with the tool server's per-account counters
+for each account ([docs/runbooks/install.md](runbooks/install.md), "The admin door").
 
 ## The screens
 
