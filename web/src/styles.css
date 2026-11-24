@@ -2530,6 +2530,7 @@ input.pw-code {
 .bot-dot-echo { background: var(--mascot-echo); }
 .tag-preview { gap: 4px; color: var(--muted); background: var(--surface-2); border-color: var(--border-2); font-weight: 500; }
 .tag-preview-note { color: var(--muted); font-weight: 400; }
+.note-fallback { margin: 8px 0 0; color: var(--muted); font-size: 12px; }
 .need { display: inline-flex; }
 .need-badge { cursor: help; }
 .bot-reads { list-style: none; display: flex; flex-wrap: wrap; gap: 6px; }

@@ -58,7 +58,7 @@ impl PgStore {
 
 const TASK_COLUMNS: &str = "id, bot, requested_by, source, priority, text, status, checklist, \
      result, error, approvals, slack, routine_id, level, conversation, sources_sensitivity, \
-     persona, attempts, worker, lease_until, created_at, updated_at";
+     persona, models_used, fallback_used, attempts, worker, lease_until, created_at, updated_at";
 
 fn bad(what: &str, value: &str) -> StoreError {
     StoreError(format!("unexpected {what} `{value}` in storage"))
@@ -76,6 +76,7 @@ fn task_from_row(r: &PgRow) -> StoreResult<Task> {
         Some(l) => Some(Level::parse(&l).ok_or_else(|| bad("level", &l))?),
         None => None,
     };
+    let models_used: Option<Json<Vec<crate::model::ModelUse>>> = r.try_get("models_used")?;
     let read: Option<String> = r.try_get("sources_sensitivity")?;
     let sources_sensitivity = match read {
         Some(s) => Some(Sensitivity::parse(&s).ok_or_else(|| bad("sensitivity", &s))?),
@@ -99,6 +100,8 @@ fn task_from_row(r: &PgRow) -> StoreResult<Task> {
         conversation: r.try_get("conversation")?,
         sources_sensitivity,
         persona: r.try_get("persona")?,
+        models_used: models_used.map(|m| m.0),
+        fallback_used: r.try_get("fallback_used")?,
         attempts: r.try_get("attempts")?,
         worker: r.try_get("worker")?,
         lease_until: r.try_get("lease_until")?,
@@ -206,8 +209,8 @@ async fn insert_notification(
     .await?;
     sqlx::query(
         "INSERT INTO bots_notifications (seq, task_id, bot, requested_by, slack, kind, text,
-             approvals, outcomes, routine_id, at, persona)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+             approvals, outcomes, routine_id, at, persona, fallback_used)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
     )
     .bind(seq)
     .bind(&task.id)
@@ -221,6 +224,7 @@ async fn insert_notification(
     .bind(&task.routine_id)
     .bind(now)
     .bind(&task.persona)
+    .bind(task.fallback_used)
     .execute(conn)
     .await?;
     Ok(())
@@ -356,7 +360,7 @@ impl BotsStore for PgStore {
         sqlx::query(
             "UPDATE bots_tasks SET status = $2, checklist = $3, result = $4, error = $5,
                  approvals = $6, attempts = $7, worker = $8, lease_until = $9, updated_at = $10,
-                 sources_sensitivity = $11
+                 sources_sensitivity = $11, models_used = $12, fallback_used = $13
              WHERE id = $1",
         )
         .bind(id)
@@ -370,6 +374,8 @@ impl BotsStore for PgStore {
         .bind(task.lease_until)
         .bind(now)
         .bind(task.sources_sensitivity.map(|s| s.to_string()))
+        .bind(task.models_used.as_ref().map(Json))
+        .bind(task.fallback_used)
         .execute(&mut *tx)
         .await?;
         if let Some((kind, text)) = &change.event {
@@ -532,7 +538,7 @@ impl BotsStore for PgStore {
     async fn notifications(&self, after: i64, limit: usize) -> StoreResult<Vec<Notification>> {
         let rows = sqlx::query(
             "SELECT seq, task_id, bot, requested_by, slack, kind, text, approvals, outcomes,
-                    routine_id, at, persona
+                    routine_id, at, persona, fallback_used
              FROM bots_notifications WHERE seq > $1 ORDER BY seq LIMIT $2",
         )
         .bind(after)
@@ -560,6 +566,7 @@ impl BotsStore for PgStore {
                     outcomes: outcomes.0,
                     routine_id: r.try_get("routine_id")?,
                     persona: r.try_get("persona")?,
+                    fallback_used: r.try_get("fallback_used")?,
                     at: r.try_get("at")?,
                 })
             })

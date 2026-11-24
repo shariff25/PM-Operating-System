@@ -73,18 +73,21 @@ async fn main() -> Result<()> {
     ));
 
     let stop = CancellationToken::new();
-    let rt = Arc::new(Runtime::new(
-        store,
-        Arc::new(catalog),
-        people,
-        ToolServer::new(&config.toolserver_url, &config.service_token.0),
-        Gateway::new(
-            &config.gateway_url,
-            &config.gateway_token.0,
-            config.model_source,
-        ),
-        stop.clone(),
-    ));
+    let rt = Arc::new(
+        Runtime::new(
+            store,
+            Arc::new(catalog),
+            people,
+            ToolServer::new(&config.toolserver_url, &config.service_token.0),
+            Gateway::new(
+                &config.gateway_url,
+                &config.gateway_token.0,
+                config.model_source,
+            ),
+            stop.clone(),
+        )
+        .with_fallback_mode(config.fallback_for_benchmarked),
+    );
     // Their first pass runs now: tasks interrupted by the last shutdown are recovered and a
     // routine missed while down runs once.
     let mut loops = rt.spawn_loops();

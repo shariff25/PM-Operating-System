@@ -2976,6 +2976,10 @@ struct TaskOut {
     persona: Option<String>,
     /// Whether `persona` is offered now (`true` for Nudge); see `DraftSummary`.
     persona_offered: bool,
+    /// Answered (in part) by a fallback model (slice MP7): the app shows "Answered by a
+    /// fallback model: not benchmarked for this bot" on the reply. Left out when false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    fallback_used: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     events: Option<Vec<EventOut>>,
 }
@@ -2991,6 +2995,7 @@ fn task_out(t: Task, events: Option<&[TaskEvent]>, offered: &bots::Offered) -> T
         retrying,
         persona_offered: bots::is_offered(persona.as_deref(), offered),
         persona,
+        fallback_used: t.fallback_used,
         events: events.map(progress::milestones),
         id: t.id,
         bot: t.bot,
@@ -3327,6 +3332,7 @@ mod tests {
             updated_at: String::new(),
             sources_sensitivity: None,
             persona: None,
+            fallback_used: false,
         };
         assert!(settle(&task("working", None)).is_none());
         assert_eq!(

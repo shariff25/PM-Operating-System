@@ -86,6 +86,19 @@ export function PreviewTag({ short }: { short?: boolean }) {
   );
 }
 
+/**
+ * "Answered by a fallback model: not benchmarked for this bot": on a reply, and each of its draft
+ * cards, that a model other than the bot's benchmarked one answered (docs/model-providers-spec.md
+ * §4.10). Shown wherever the Preview line would be, every time.
+ */
+export function FallbackNote() {
+  return (
+    <p className="note-fallback" role="note">
+      {copy.bots.fallbackNote}
+    </p>
+  );
+}
+
 /** "Needs an analytics source", with what the bot does without it as its description. */
 export function NeedBadges({ needs }: { needs: readonly BotNeed[] }) {
   const base = useId();

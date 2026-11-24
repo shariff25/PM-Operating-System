@@ -778,6 +778,9 @@ fn task_metadata(task: &Task) -> Value {
         "error": null,
         "checklist": [],
         "approvals": task.approvals,
+        // Labels and hashes only (§4.9): an Auditor sees which labelled models answered.
+        "models_used": task.models_used,
+        "fallback_used": task.fallback_used,
         "routine_id": task.routine_id,
         "attempts": task.attempts,
         "created_at": task.created_at,
@@ -1030,6 +1033,12 @@ struct CompleteBody {
     approvals: Vec<String>,
     #[serde(default)]
     worker: Option<String>,
+    /// Which labelled models answered the task (slice MP7, §4.9).
+    #[serde(default)]
+    models_used: Option<Vec<model::ModelUse>>,
+    /// A call was answered by a fallback model (§4.10).
+    #[serde(default)]
+    fallback_used: Option<bool>,
 }
 
 async fn complete(
@@ -1043,11 +1052,14 @@ async fn complete(
     let req: CompleteBody = body(&bytes)?;
     let task = state
         .rt
-        .complete(
+        .complete_with(
             &id,
             req.worker.as_deref(),
             &req.result,
             req.approvals,
+            req.models_used
+                .map(|m| (m, req.fallback_used.unwrap_or(false)))
+                .or(req.fallback_used.map(|f| (Vec::new(), f))),
             model::now(),
         )
         .await?;

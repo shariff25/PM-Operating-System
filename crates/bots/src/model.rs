@@ -213,6 +213,15 @@ pub struct Task {
     /// never by the model.
     #[serde(default)]
     pub persona: Option<String>,
+    /// Which labelled models answered the task's model calls, as its worker reported them
+    /// (`docs/model-providers-spec.md` §4.9, slice MP7): labels and hashes, never a model id.
+    /// `None`: not reported (still running, or from before routes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models_used: Option<Vec<ModelUse>>,
+    /// A call of the task was answered by a fallback model (§4.10): the web app and Slack mark
+    /// the answer "Answered by a fallback model: not benchmarked for this bot".
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fallback_used: bool,
     pub attempts: i32,
     /// The worker holding the current claim, while `working`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -222,6 +231,34 @@ pub struct Task {
     pub lease_until: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// One labelled model's calls for a task (§4.9): what the worker read from the gateway's
+/// `x-pmos-model` and `x-pmos-model-sha256` headers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelUse {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_sha256: Option<String>,
+    pub calls: u64,
+}
+
+impl ModelUse {
+    /// A label as the gateway gives one (1 to 64 letters, digits, `.`, `_`, `-`), a hash in
+    /// lowercase hex, and a sane count.
+    pub fn valid(&self) -> bool {
+        !self.label.is_empty()
+            && self.label.len() <= 64
+            && self
+                .label
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+            && self.model_sha256.as_ref().is_none_or(|h| {
+                h.len() == 64 && h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            })
+            && self.calls <= 1_000_000
+    }
 }
 
 impl Task {
@@ -252,6 +289,8 @@ impl Task {
             level: None,
             conversation: None,
             sources_sensitivity: None,
+            models_used: None,
+            fallback_used: false,
             persona: None,
             attempts: 0,
             worker: None,
@@ -448,6 +487,10 @@ pub struct Notification {
     /// on items stored before the field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persona: Option<String>,
+    /// The task was answered (in part) by a fallback model (slice MP7, §4.10): the Slack
+    /// service marks the reply and each draft card. Left out when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fallback_used: bool,
     pub at: DateTime<Utc>,
 }
 
@@ -553,6 +596,7 @@ mod tests {
             outcomes: Vec::new(),
             routine_id: None,
             persona: None,
+            fallback_used: false,
             at: now(),
         };
         let plain = serde_json::to_value(&n).unwrap();

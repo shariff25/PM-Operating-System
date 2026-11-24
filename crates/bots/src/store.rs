@@ -81,6 +81,8 @@ pub struct Transition {
     pub checklist: Option<Vec<ChecklistItem>>,
     /// The highest data class the task's sessions read (`Task::sources_sensitivity`).
     pub sensitivity: Option<crate::model::Sensitivity>,
+    /// Which labelled models answered the task, and whether a fallback did (slice MP7).
+    pub models: Option<(Vec<crate::model::ModelUse>, bool)>,
     pub attempts_delta: i32,
     /// `(kind, text)` added to the task's events.
     pub event: Option<(String, String)>,
@@ -305,6 +307,10 @@ pub fn apply(task: &mut Task, change: &Transition, now: DateTime<Utc>) -> Result
     if let Some(s) = change.sensitivity {
         task.sources_sensitivity = Some(s);
     }
+    if let Some((used, fallback)) = &change.models {
+        task.models_used = Some(used.clone());
+        task.fallback_used = *fallback;
+    }
     task.attempts += change.attempts_delta;
     task.updated_at = now;
     Ok(())
@@ -335,6 +341,7 @@ fn notification_for(
         outcomes: n.outcomes.clone(),
         routine_id: task.routine_id.clone(),
         persona: task.persona.clone(),
+        fallback_used: task.fallback_used,
         at: now,
     }
 }

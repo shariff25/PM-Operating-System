@@ -24,7 +24,7 @@ use crate::clients::{
     valid_approval_id, ApprovalState, CallError, Gateway, SessionGrant, TaskDraft, ToolServer,
 };
 use crate::model::{
-    self, ApprovalOutcome, ChecklistItem, Draft, Level, MemberSettings, NewNotification,
+    self, ApprovalOutcome, ChecklistItem, Draft, Level, MemberSettings, ModelUse, NewNotification,
     Notification, NotificationKind, Routine, Schedule, Sensitivity, SlackRef, Source, Task,
     TaskStatus, TraceKind, Turn, GAVE_UP_REASON, LEASE_SECONDS, MAX_ATTEMPTS, REDACTED_MARKER,
     RETRY_EVENT, WORKER_STOPPED_EVENT,
@@ -282,6 +282,51 @@ pub struct Runtime {
     /// (no `TEST-CONTENT` marker, a file marked restricted). While set, nothing is claimed and
     /// the runtime isn't ready.
     content_refused: std::sync::Mutex<Option<String>>,
+    /// What a benchmarked bot's answer from a fallback model gets (§4.10).
+    fallback_mode: FallbackMode,
+}
+
+/// `PMOS_FALLBACK_FOR_BENCHMARKED` (`docs/model-providers-spec.md` §4.10; the owner's open
+/// question Q2, built at its recommended default `mark`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FallbackMode {
+    /// The answer is kept and marked "Answered by a fallback model: not benchmarked for
+    /// this bot" (the default).
+    #[default]
+    Mark,
+    /// A benchmarked bot's calls are pinned to each role's primary (`X-Pmos-Fallback: off`),
+    /// so the call fails as "the model is busy" rather than be answered by an unbenchmarked
+    /// model. Preview bots and Nudge are always `Mark`.
+    Refuse,
+}
+
+impl FallbackMode {
+    pub fn parse(v: Option<&str>) -> std::result::Result<Self, String> {
+        match v.map(str::trim) {
+            None | Some("") | Some("mark") => Ok(Self::Mark),
+            Some("refuse") => Ok(Self::Refuse),
+            Some(other) => Err(format!(
+                "PMOS_FALLBACK_FOR_BENCHMARKED must be `mark` or `refuse`, not `{other}`"
+            )),
+        }
+    }
+}
+
+/// The most entries a task's `models_used` may have.
+pub const MAX_MODELS_USED: usize = 32;
+
+/// Whether a task's model calls must keep to each role's primary (`X-Pmos-Fallback: off`,
+/// §4.10): every eval task (a benchmark measures one model), and under `refuse` a task for a
+/// benchmarked bot (a persona that is neither always-on nor a Preview).
+pub fn fallback_off(source: Source, persona: Option<&Persona>, mode: FallbackMode) -> bool {
+    if source == Source::Eval {
+        return true;
+    }
+    mode == FallbackMode::Refuse
+        && persona.is_some_and(|p| {
+            !p.always_on
+                && !pmos_contract::personas::is_preview(p.always_on, p.preview, p.benchmarked)
+        })
 }
 
 /// How long a not-on-team refusal at claim stands for a Slack ask of the same bot by the same
@@ -320,7 +365,14 @@ impl Runtime {
             stop,
             not_on_team: std::sync::Mutex::default(),
             content_refused: std::sync::Mutex::default(),
+            fallback_mode: FallbackMode::Mark,
         }
+    }
+
+    /// `PMOS_FALLBACK_FOR_BENCHMARKED` (slice MP7, §4.10).
+    pub fn with_fallback_mode(mut self, mode: FallbackMode) -> Self {
+        self.fallback_mode = mode;
+        self
     }
 
     /// Fake-data mode: set when the content check fails at a reload (with why), cleared when
@@ -676,6 +728,12 @@ impl Runtime {
                     headers.insert("X-Pmos-Priority".into(), json!(task.priority.as_str()));
                     // X4: the worker names this source on every model call of the task.
                     headers.insert("X-Pmos-Model-Source".into(), json!(source));
+                    // §4.10 (slice MP7): an eval task measures one model, so its calls are
+                    // pinned to each role's primary; with PMOS_FALLBACK_FOR_BENCHMARKED=refuse,
+                    // so are a benchmarked bot's.
+                    if fallback_off(task.source, persona.map(|(p, _)| p), self.fallback_mode) {
+                        headers.insert("X-Pmos-Fallback".into(), json!("off"));
+                    }
                     let model_role = serde_json::to_value(role.model)
                         .ok()
                         .and_then(|v| v.as_str().map(str::to_string))
@@ -986,6 +1044,29 @@ impl Runtime {
         approvals: Vec<String>,
         now: DateTime<Utc>,
     ) -> Result<Task> {
+        self.complete_with(id, worker, result, approvals, None, now)
+            .await
+    }
+
+    /// [`Runtime::complete`], with which labelled models answered the task and whether a
+    /// fallback did, as the worker read them from the gateway's answers (slice MP7).
+    pub async fn complete_with(
+        &self,
+        id: &str,
+        worker: Option<&str>,
+        result: &str,
+        approvals: Vec<String>,
+        models: Option<(Vec<ModelUse>, bool)>,
+        now: DateTime<Utc>,
+    ) -> Result<Task> {
+        if let Some((used, _)) = &models {
+            if used.len() > MAX_MODELS_USED || used.iter().any(|u| !u.valid()) {
+                return Err(Error::BadRequest(format!(
+                    "models_used: at most {MAX_MODELS_USED} entries, each a label (1 to 64 \
+                     letters, digits, `.`, `_`, `-`), an optional SHA-256 in hex and a count"
+                )));
+            }
+        }
         if let Some(e) = too_long("the result", result, MAX_RESULT_CHARS) {
             return Err(e);
         }
@@ -1001,6 +1082,7 @@ impl Runtime {
         change.lease = Lease::Clear;
         change.result = Some(result.to_string());
         change.sensitivity = Some(self.finished_level(id).await);
+        change.models = models;
         if approvals.is_empty() {
             change.to = Some(TaskStatus::Done);
             change.event = Some(("status".into(), "done".into()));

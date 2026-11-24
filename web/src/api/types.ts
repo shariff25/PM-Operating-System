@@ -248,6 +248,11 @@ export interface Task {
   /** The bot the task ran as, by key; null is Nudge. An older server leaves it out: Nudge. */
   persona?: string | null;
   persona_offered?: boolean;
+  /**
+   * A call of the task was answered by a fallback model (docs/model-providers-spec.md §4.10):
+   * the reply and its draft cards say so. Absent: false.
+   */
+  fallback_used?: boolean;
 }
 
 // ---- The bot marketplace (docs/web-api.md, "Bots") ----
