@@ -1,4 +1,4 @@
-# PM OS on the DGX Spark: every service in one stack (docs/runbooks/install.md).
+# PM OS on one host: every service in one stack (docs/runbooks/install.md).
 #
 #   deploy/pmos-admin up              core services (Postgres, docs, tool server, gateway, bots, Slack)
 #   deploy/pmos-admin up --models     plus the two vLLM model servers on the GPU
@@ -40,7 +40,7 @@ x-service: &service
     options: { max-size: "20m", max-file: "5" }
 
 x-proxy: &proxy
-  # The Spark's outbound proxy, if it has one. Internal names never go through it.
+  # This host's outbound proxy, if it has one. Internal names never go through it.
   HTTPS_PROXY: ${HTTPS_PROXY:-}
   NO_PROXY: localhost,127.0.0.1,.pmos.internal,postgres,vllm-default,vllm-extraction,${NO_PROXY:-}
 
@@ -339,7 +339,7 @@ services:
       pmos: { aliases: [web.pmos.internal] }
     ports: ["127.0.0.1:${PMOS_WEB_PORT:-8770}:8770"]
     environment:
-      # Entra sign-in reaches login.microsoftonline.com through the Spark's proxy, if it has one.
+      # Entra sign-in reaches login.microsoftonline.com through this host's proxy, if it has one.
       <<: *proxy
       PMOS_WEB_BIND: 0.0.0.0:8770
       # The server-to-server route (PUT /internal/brief/{handle}, the daily brief from the Slack
@@ -451,7 +451,8 @@ services:
       bots: { condition: service_healthy }
     profiles: [bringup-personal]
 
-  # The local models (verify on the Spark: image tag, model ids and memory split).
+  # The local models, for PMOS_MODEL_SOURCE=local only (verify on a real host: image tag, model
+  # ids and memory split).
   # PMOS_VLLM_IMAGE has no default (slice H4): the host's operator chooses the image for its
   # architecture and GPU, pinned by tag. Blank, `--profile models` fails ("neither an image nor
   # a build context"), so pmos-admin's every-profile commands (status, logs, restart, down)

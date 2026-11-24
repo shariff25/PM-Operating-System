@@ -94,7 +94,7 @@ every token and password in it as above, and the vault key as below.
   2. Run `docker image prune` to drop old images.
   3. Check `/srv/pmos/state`.
 
-## The Spark is gone
+## The host is gone
 
-Follow [backup-restore.md](backup-restore.md) on a new machine, using the latest off-Spark
+Follow [backup-restore.md](backup-restore.md) on a new machine, using the latest off-host
 backup and the `deploy/.env` from the password manager.

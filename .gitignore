@@ -8,7 +8,7 @@ dist/
 # Local agent worktrees and tool state
 /.claude/
 
-# Spark deployment: secrets and backups stay on the machine
+# Deployment: secrets and backups stay on the host
 /deploy/.env
 /deploy/.env.*
 /deploy/live.env

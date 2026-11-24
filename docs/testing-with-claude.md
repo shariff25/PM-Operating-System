@@ -9,16 +9,16 @@ the bots in the web app (`PMOS_TEST_WEB=1`, which shows a "test stack: fake data
 every page) or through the benchmarks (`PMOS_TEST_EVALS=1`). The Slack rows below describe the
 stack as it was before H4.
 
-**Testing only (decided 2026-11-14).** Before the Spark's local models are up, PM OS can be
+**Testing only (decided 2026-11-14).** Before local models are up, PM OS can be
 tried end to end with a Claude model behind the gateway, in a Slack workspace made for testing.
 Prompts to Claude leave the machine. So this setup uses only:
 - a test Slack workspace;
 - fake Jira, Confluence and Slack fixtures;
 - your company's public docs site (`PMOS_DOCS_BASE_URL`), if you set one.
 
-Never use it with real PM tokens or company data. The production rule (local open-weight
-models only) is unchanged: the gateway refuses the Claude upstream unless
-`PMOS_GATEWAY_CLOUD_TEST=1` is set.
+Never use it with real PM tokens or company data. Production takes local models or the one
+owner-approved hosted model (not built yet); a test upstream still needs
+`PMOS_GATEWAY_CLOUD_TEST=1` and fake data: the gateway refuses the Claude upstream without it.
 
 The same stack can use another provider's model instead of Claude: see
 [Another provider](#another-provider).
@@ -36,7 +36,7 @@ The same stack can use another provider's model instead of Claude: see
 | `requests`, `remove <handle>` | Platform-owner commands. You are an admin in the test stack's user database (its seed). |
 
 **Not in this test:** real Jira, Confluence or Slack reads, account linking, GitHub memory and
-the approval commit. Those need the Spark setup (`docs/toolserver.md`).
+the approval commit. Those need a real host's setup (`docs/toolserver.md`).
 
 ## 1. Create the test Slack workspace and app
 

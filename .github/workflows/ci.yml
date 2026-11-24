@@ -48,10 +48,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo run --locked -q -p pmos -- lint --root content
       # The eval files: categories, tasks, the taxonomy, judges and every tag used
-      # (docs/evals.md). The benchmark runs themselves are the Spark's eval gate.
+      # (docs/evals.md). The benchmark runs themselves are the eval gate (evals-gate.yml).
       - run: cargo run --locked -q -p pmos-evals -- check --root evals --content content
       # Every bot's OpenShell policy is current and keeps the 0f rules (docs/sandbox-policies.md).
       - run: cargo run --locked -q -p pmos -- policy check --root content --policies policies
+      # No doc or comment still promises that prompts stay on local models (any-host spec §3.9).
+      - name: Model promises
+        run: scripts/check-model-promises.sh --self-test && scripts/check-model-promises.sh
 
   harness:
     name: Harness (typecheck, test)

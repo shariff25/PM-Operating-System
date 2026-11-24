@@ -289,8 +289,8 @@ struct ModelsFile {
     class: Option<String>,
 }
 
-/// What kind of gateway this is (review finding R3): only the Spark's own gateway
-/// (`deploy/gateway.yaml`) says `production`; anything else, a config that says nothing
+/// What kind of gateway this is (review finding R3): only the deployment's own
+/// gateway (`deploy/gateway.yaml`) says `production`; anything else, a config that says nothing
 /// included, is `test`. A `production` gateway refuses testing-only upstreams and the stub.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GatewayClass {
@@ -983,7 +983,8 @@ fn valid_role_name(name: &str) -> bool {
 
 /// A host that can't be on the public internet: loopback or private addresses, a name with
 /// no dot (a compose service such as `vllm`), `localhost`, `*.pmos.internal`, or one the
-/// platform owner listed. Anything else is refused, so prompts never leave the Spark (ADM-3).
+/// platform owner listed. Anything else is refused. Only a `class: test` gateway (`hosted-test`,
+/// fake data) takes these; a `class: production` one takes only [`is_production_host`] names.
 pub fn is_local_host(host: &str, extra: &[String]) -> bool {
     let host = host.trim_start_matches('[').trim_end_matches(']');
     if let Ok(ip) = host.parse::<IpAddr>() {
@@ -1003,7 +1004,7 @@ pub fn is_local_host(host: &str, extra: &[String]) -> bool {
 
 /// A `class: production` gateway's model server host (F3, review at 2544d01): a DNS name
 /// `<label>.<…>.pmos.internal`, each label lowercase letters, digits and inner hyphens. On
-/// the Spark these are the vLLM services' network aliases in `deploy/compose.yaml`.
+/// PM OS's host these are the vLLM services' network aliases in `deploy/compose.yaml`.
 /// `.internal` is reserved for private use, so such a name never resolves on the internet.
 pub fn is_production_host(host: &str) -> bool {
     let Some(name) = host.strip_suffix(".pmos.internal") else {
@@ -1214,7 +1215,7 @@ impl Config {
 
     /// The class this gateway serves as: the config's, except that with the stub model on it
     /// is always `test`, so a stub run never counts as production. A first install runs the
-    /// Spark's own `class: production` config with `PMOS_GATEWAY_STUB=1` until the model
+    /// deployment's own `class: production` config with `PMOS_GATEWAY_STUB=1` until the model
     /// servers are up (`deploy/env.example`), so the gateway starts then, with a warning
     /// (`Some`, the text to log), rather than refusing as it did at 2544d01. The router applies
     /// the same rule ([`crate::router`]).

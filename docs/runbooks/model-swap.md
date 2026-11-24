@@ -2,6 +2,8 @@
 
 Callers ask for a role (`pmos/default`, `pmos/extraction`), never a model. Swapping a model
 changes only `deploy/.env` and `deploy/gateway.yaml`, and then has to pass the benchmarks.
+This runbook is for local models (`PMOS_MODEL_SOURCE=local`); `hosted`, one hosted model the
+owner has approved, is not built yet (`docs/openshell-any-host-spec.md` §3.6).
 
 1. **Choose and check.** Is the new model open-weight, licensed for this use, and does it fit in
    the GPU share next to the other model?

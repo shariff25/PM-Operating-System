@@ -23,7 +23,7 @@ service and personal agents go through the same server, so they follow the same 
 | A bad draft gets one correction | A write tool refused twice for invalid arguments in a session is refused for the rest of it, without reaching the connector (see **Invalid drafts**) | — |
 | Every draft is labelled | Each approval item has a row in the feedback ledger: what became of it, never its text (see **Feedback ledger**) | — |
 | A Slack post reaches only who it may | Before a Slack write runs, its channel's members are checked against the user database and the draft's sources: restricted sources never reach outsiders, and a Slack Connect channel needs a second confirmation (see **Slack drafts**) | SLK-6 |
-| No Slack text past a day | An undecided Slack draft expires after 24 hours; a decided one loses its text 24 hours after the decision (see **Slack drafts**) | SLK-8 |
+| No Slack text past a day | On PM OS's host, Slack text is removed after 24 hours: an undecided Slack draft expires after 24 hours; a decided one loses its text 24 hours after the decision (see **Slack drafts**). Under `hosted` (not built yet) the provider also receives it; its retention of Slack text is no longer than 24 hours by the provider record's condition (`docs/openshell-any-host-spec.md` §3.9, condition 3) | SLK-8 |
 
 ## How a write gets approved
 
@@ -172,8 +172,8 @@ item it returned, in `source_titles`: a map from the `sources` entry to the titl
   space one space, at most 120 characters (`audit::source_title`). Never a body, a
   description, a comment, a snippet or an excerpt.
 - **Never Slack.** A Slack read records only `slack:{channel}:{ts}`, as before: no title,
-  channel name or text, because Slack text may be kept at most 24 hours (SLK-8, D6) and the
-  audit log is kept for good. The connector's Slack "titles" are built from the channel
+  channel name or text, because on PM OS's host Slack text is kept at most 24 hours (SLK-8, D6) and the
+  audit log is kept for 90 days. The connector's Slack "titles" are built from the channel
   and the message, so none is recorded, and the sources endpoint ignores any it finds.
 - **Why it is metadata:** a title names the thing that was read, like the key or page id
   already in `sources`; it is what the PM sees as a link in Jira or Confluence anyway. It
@@ -606,7 +606,7 @@ approved in the harness with a grant doesn't go through this check.
 The members count against the user database, read for each decision: with an empty
 directory, everyone is an outsider; with the database unreachable, nothing is posted.
 
-**The 24-hour expiry (SLK-8).** A sweeper runs at start-up and every 10 minutes:
+**The 24-hour expiry (SLK-8).** On PM OS's host, Slack text is removed after 24 hours. Under `hosted` (not built yet) the provider also receives it; its retention of Slack text is no longer than 24 hours by the provider record's condition (`docs/openshell-any-host-spec.md` §3.9, condition 3). A sweeper runs at start-up and every 10 minutes:
 - **Undecided drafts expire.** A `pending` Slack draft older than `PMOS_SLACK_DRAFT_TTL_HOURS`
   (default 24) becomes `expired`. Every string argument except a top-level `channel`,
   `thread_ts` and `message_ts` becomes `"[expired]"`; the `args_hash` is kept, and `redacted_at` records when.
@@ -1053,7 +1053,7 @@ read scope (see **Bot sessions**); its writes still act as the PM.
 
 These API shapes were checked against developer.atlassian.com, docs.slack.dev and
 docs.github.com in November 2026, and tested against local mocks (`tests/live_connectors.rs`,
-`tests/github.rs`). The first real call happens on the Spark after Gate 1.
+`tests/github.rs`). The first real call happens on PM OS's host after Gate 1.
 
 **Linking an account.**
 1. The Slack bot (its Accounts tab, or a first-use prompt) asks `/internal/oauth/{provider}/start` for a URL and sends the PM there.
@@ -1089,7 +1089,7 @@ new one, which replaces the old.
 - "permission denied" on a 403, audited as `denied`.
 - A rate limit with its `Retry-After`.
 
-**What the model gets back** is bounded, because the context window on the Spark's local model is shared by every session:
+**What the model gets back** is bounded, because the model's context window is shared by every session:
 - **Bodies:** a Jira description, a Confluence page or a docs page is cut at 12,000 characters and marked `truncated`.
 - **Jira comments:** at most 20, each cut at 1,000 characters.
 - **Slack threads:** at most 50 messages, each cut at 2,000 characters.
@@ -1739,7 +1739,7 @@ Every `PMOS_CONTENT_SYNC_SECS`, and right after a member commit, the tool server
 `git rev-parse --show-toplevel`), with `tokio::process`. If HEAD isn't the commit last loaded,
 it reloads like `POST /internal/reindex`, with the same lint gate: content that fails is
 pulled but not loaded, and is tried again on the next sync. Failures are logged and never stop
-the server. The checkout's own git setup is used (such as a deploy key on the Spark); the tool
+the server. The checkout's own git setup is used (such as a deploy key on the host); the tool
 server holds no git credentials and never waits on a prompt (`GIT_TERMINAL_PROMPT=0`).
 `pmos-slack` and `pmos-bots` read the same checkout, so they see a change as soon as the pull
 lands.
@@ -1876,6 +1876,6 @@ After a merge to the content repo, the content sync pulls and reloads within
 - **`pmos-admin ledger`** (the summary, and `--export` as JSON lines) lives with the deployment
   kit; until it does, call `GET /internal/ledger/summary` and `GET /internal/ledger` with the
   service token.
-- **First real calls** with real tokens and data, on the Spark after Gate 1. The sandbox network policy (0f) must allow only the tool server and gateway, not these hosts.
+- **First real calls** with real tokens and data, on PM OS's host after Gate 1. The sandbox network policy (0f) must allow only the tool server, the gateway and the runtime, not these hosts.
 - **Embeddings** in the context index, once the gateway (0d) serves the embedding model.
 - **Paging** past the first page of results (`nextPageToken`, `cursor`). Skills ask for small result sets for now.

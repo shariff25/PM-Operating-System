@@ -205,7 +205,8 @@ with `edit_distance ≥ PMOS_TRIAGE_MIN_EDIT` (default 0.3).
 - `evals/**`;
 - `deploy/gateway.yaml`.
 
-It runs on a **self-hosted runner on the Spark** (labels `self-hosted, pmos-spark`) with
+It runs on a **self-hosted runner on a host the owner chooses (not yet decided)**, labels
+`self-hosted, pmos-spark`, with
 `deploy/pmos-admin evals-gate`. That runs `pmos-evals gate` for **every category** whenever any
 of those paths changed, then posts the markdown as the job summary.
 
@@ -218,9 +219,9 @@ of those paths changed, then posts the markdown as the job summary.
 - **The cost.** A full run is every task times its repeats: 103 tasks × 3 = 309 attempts on
   2026-11-23, one model call at a time on the eval stack, for every PR that touches a role, a
   skill or a bot.
-- **The runner's home is to be decided.** The `pmos-spark` label is from the earlier Spark plan;
-  the owner dropped the Spark as a target on 2026-11-22. Wherever the runner moves, it must be
-  a host the improver's sandbox cannot reach. The label is unchanged until that is decided.
+- **The runner's home is to be decided.** Wherever the runner goes, it must be a host the
+  improver's sandbox cannot reach. The label `pmos-spark` is a historical name from an earlier
+  plan, unchanged until that is decided.
 
 **Registering the runner** is in `docs/runbooks/upgrade.md`. Until a runner is registered, the
 job waits; a platform owner runs `pmos-admin evals-gate` by hand and pastes the result into the

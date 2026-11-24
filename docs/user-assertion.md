@@ -224,8 +224,8 @@ entry.
 ## Clocks
 
 - **Signing and verifying hosts must agree on the time within the skew.** The default skew is
-  5 seconds and the maximum is 30. Run NTP (chrony or systemd-timesyncd) everywhere; on the
-  Spark, all services share one clock.
+  5 seconds and the maximum is 30. Run NTP (chrony or systemd-timesyncd) everywhere; on PM OS's
+  host, all services share one clock.
 - **The clock is injected.** `sign` and `verify` take `now` in unix seconds, and `unix_now()`
   reads the system clock. Tests pass fixed times.
 - **Choose a short lifetime.** A caller should sign each request just before sending it with a
@@ -368,7 +368,7 @@ The mode, the start-up rule, the refusals and the verifier are shared code
   for the console and its keys. To limit a compromised `pmos-web` to the people who actually
   signed in, the key must live outside its process, with something that checks the sign-in
   (a separate signer, or identity-provider tokens the receivers verify). That is not built.
-- **On the single-box deployment** (the Spark, `deploy/compose.yaml`), every key and token is
+- **On the single-box deployment** (PM OS's host, `deploy/compose.yaml`), every key and token is
   in one `deploy/.env` on one host. Each container is given only its own keys, so a compromise
   of one container's process (say, `pmos-web`) does not hand over the console's keys or the
   service token. A compromise of the host, or of anything that can read `deploy/.env` or

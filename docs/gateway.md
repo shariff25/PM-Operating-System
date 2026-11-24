@@ -1,11 +1,14 @@
 # The model gateway: `pmos-gateway`
 
-Every bot reaches the language model through one OpenAI-compatible endpoint on the Spark.
-The gateway does four jobs:
+Every bot reaches the language model through one OpenAI-compatible endpoint on PM OS's
+host. The gateway does four jobs:
 - **Picks the model:** callers name a *role* (`pmos/default`, `pmos/extraction`,
-  `pmos/reasoning`), never a model, and the gateway knows which local model serves each role.
-- **Keeps prompts on the Spark:** it refuses to start with a model server that isn't local
-  (ADM-3).
+  `pmos/reasoning`), never a model, and the gateway knows which model serves each role.
+- **Sends prompts only where the model source allows** (ADM-3, as the owner's decisions of
+  2026-11-22 narrowed it): under `local` it refuses to start with any model server but the two
+  pinned local ones on PM OS's host; a remote upstream runs only under `hosted-test`, with fake
+  data; `hosted` (one owner-approved hosted model, for real data) is not built and is refused
+  ("Model sources" below).
 - **Shares the GPU fairly** (MOD-4).
 - **Logs every call:** metadata only, never the text.
 
@@ -463,7 +466,7 @@ One event per call:
   summaries, review at 6bb806f: before, only the first and last handle of a minute were
   kept). The `403` warning in the service log is written only with a line of its own.
 
-It never holds prompts or answers. Events go to the service log, and with `PMOS_GATEWAY_USAGE_LOG` also to a JSON-lines file for shipping off-box. Because every upstream must be local outside testing, "restricted data sent off the Spark" is zero by construction; the upstream host on each event lets anyone check (a testing-only upstream shows its remote host).
+It never holds prompts or answers. Events go to the service log, and with `PMOS_GATEWAY_USAGE_LOG` also to a JSON-lines file for shipping off-box. Under `local` every upstream is one of the model servers on PM OS's host; a remote upstream runs only under `hosted-test`, where the data is fake by rule, so real data sent to an endpoint nobody approved is zero by construction. Each event's `upstream` (the host, or for a labelled role its kind, such as `remote-test`) shows which kind of model server served the call.
 
 ## Configuration
 | Variable | Default | Notes |
@@ -518,7 +521,8 @@ for a labelled role, `model_sha256`.
 - `openai+https://<host>/<base path>`: a remote test upstream, any OpenAI-compatible API on the
   internet (testing only, below).
 
-**Allowed upstream hosts:**
+**Allowed upstream hosts** for a `class: test` gateway (`hosted-test`, fake data only; a
+`class: production` gateway takes only `<name>.pmos.internal` names, next paragraph):
 - loopback and private addresses;
 - names without a dot, such as compose services like `vllm`;
 - `localhost` and `*.pmos.internal`;
@@ -529,15 +533,15 @@ Anything else stops the gateway at start-up.
 **A production gateway's hosts** (review at 2544d01, F3): with `class: production`, every
 upstream's host must be a name `<name>.pmos.internal` (lowercase letters, digits and inner
 hyphens per label), and `local-hosts` must be empty. An address, a name without a dot or a
-`local-hosts` entry, all of which a test gateway accepts, could point at a machine off the
-Spark (a search domain, a typo, an extra entry) without anyone reviewing it as such.
+`local-hosts` entry, all of which a test gateway accepts, could point at a machine off
+PM OS's host (a search domain, a typo, an extra entry) without anyone reviewing it as such.
 `.internal` is reserved for private networks, so these names never resolve on the internet.
 `deploy/gateway.yaml` names the vLLM services `vllm-default.pmos.internal` and
 `vllm-extraction.pmos.internal`, their network aliases in `deploy/compose.yaml` (as every
 other service there already has one); before 2026-11-22 it used the bare service names.
 
 **The stub with a production config** (the regression at 2544d01): a first install runs the
-Spark's own `deploy/gateway.yaml` (`class: production`) with `PMOS_GATEWAY_STUB=1` until the
+deployment's own `deploy/gateway.yaml` (`class: production`) with `PMOS_GATEWAY_STUB=1` until the
 model servers are up (`deploy/env.example`; the install runbook's "Turn off the stub" comes
 later). The gateway then starts as before, logs a warning, and serves as class `test`:
 `GET /v1/pmos/roles` says `class: test` and `stub: true`, so no eval run against it counts.
@@ -553,8 +557,9 @@ deploy-kit job and a fresh install.
 **The Claude test upstream (testing only, decided 2026-11-14):**
 - **What it is:** an upstream written `anthropic+https://api.anthropic.com` sends a role's
   calls to the Claude Messages API (`crates/gateway/src/anthropic.rs`), so PM OS can be tried
-  before the Spark's local models are up.
-- **When the gateway accepts it:** only with `PMOS_GATEWAY_CLOUD_TEST=1`. It then logs a
+  before local models are up.
+- **When the gateway accepts it:** only with `PMOS_GATEWAY_CLOUD_TEST=1`, which needs
+  `PMOS_MODEL_SOURCE=hosted-test` and a `class: test` config (fake data). It then logs a
   warning at start-up that prompts leave the machine.
 - **What changes for callers:** nothing. They still send OpenAI-style requests, and the
   gateway translates them:
@@ -573,7 +578,8 @@ deploy-kit job and a fresh install.
 - **What it is:** an upstream written `openai+https://<host>/<base path>`, such as
   `openai+https://generativelanguage.googleapis.com/v1beta/openai`, sends a role's calls to
   that OpenAI-compatible API, so PM OS can be tried with another provider's model.
-- **When the gateway accepts it:** only with `PMOS_GATEWAY_CLOUD_TEST=1`, only over `https`,
+- **When the gateway accepts it:** only with `PMOS_GATEWAY_CLOUD_TEST=1` (so only under
+  `PMOS_MODEL_SOURCE=hosted-test`, fake data), only over `https`,
   and only with `PMOS_GATEWAY_REMOTE_KEY` set; otherwise it refuses to start. At start-up it
   logs a warning per role that a remote test upstream is on and prompts leave the machine, and
   `GET /readyz` reports `"cloud_test": true`.

@@ -3,7 +3,7 @@
 //! `git pull --ff-only` in the repo that holds `PMOS_CONTENT_ROOT`. If HEAD is no longer the
 //! commit last indexed, it reloads like `POST /internal/reindex`, with the same lint gate.
 //!
-//! The checkout's own git setup is used (such as a deploy key on the Spark): the tool server
+//! The checkout's own git setup is used (such as a deploy key on the host): the tool server
 //! holds no git credentials. Failures are logged and don't stop the server. `pmos-slack` and
 //! `pmos-bots` read the same checkout, so they see a change as soon as the pull lands.
 

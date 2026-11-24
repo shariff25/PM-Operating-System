@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PM OS operations on the Spark, for platform-owner PMs (docs/runbooks/README.md).
+# PM OS operations on its host, for platform-owner PMs (docs/runbooks/README.md).
 #
 #   pmos-admin build                  build the service and worker images on this machine
 #   pmos-admin up [--models] [--console] [--web] [--bringup]
@@ -139,8 +139,8 @@ compose() {
 # - a file every account may read or write, or its group may write, is refused (only warned
 #   about for pause and down): `chmod 600 deploy/.env`;
 # - a file its group may read, or that is readable through an ACL, is warned about, not
-#   refused: the Spark's eval-gate runner reads it through an ACL by design
-#   (docs/runbooks/upgrade.md, "Registering the Spark CI runner": `setfacl -m u:gh-runner:r`),
+#   refused: the eval-gate runner reads it through an ACL by design
+#   (docs/runbooks/upgrade.md, "Registering the eval-gate runner": `setfacl -m u:gh-runner:r`),
 #   and an ACL shows as group read;
 # - a file owned by another account than the caller is warned about, not refused, for the
 #   same runner (root is not warned: it reads every file anyway).

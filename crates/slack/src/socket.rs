@@ -1,4 +1,4 @@
-//! Slack Socket Mode: the bot dials out to Slack, so the Spark needs no inbound connection.
+//! Slack Socket Mode: the bot dials out to Slack, so PM OS's host needs no inbound connection.
 //!
 //! 1. `apps.connections.open` with the app-level token (`xapp-…`) returns a `wss://` URL.
 //! 2. Slack sends `hello`, then envelopes `{envelope_id, type, payload, …}`.

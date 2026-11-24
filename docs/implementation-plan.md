@@ -1,17 +1,17 @@
 # PM OS — implementation plan and phases
 
 ## Context
-The PM OS PRD defines an internal agent workspace for the product team, running on one DGX Spark: 8 launch skills, a 7-persona reviewer panel, a team
+The PM OS PRD defines an internal agent workspace for the product team, running on one host (since the owner's decision of 2026-11-22, any suitable Linux host): 8 launch skills, a 7-persona reviewer panel, a team
 context library, a Slack reply assistant with human approval, every run in an NVIDIA OpenShell sandbox, pilot by
 week 7 and full team by week 12. This repo (`shariff25/pm-operating-system`) is empty apart from a README. It becomes
 both the team's content repo (the PRD's "files are the source of truth") and the service code.
 
 Decisions already made in this conversation:
 - **Backend in Rust; frontend in TypeScript.** The agent harness is also TypeScript, because Deep Agents has no Rust port.
-- **Open-weight models only, no frontier API.** Qwen3.6-35B-A3B is the default model and Nemotron 3 Nano 30B-A3B handles extraction and triage, both on vLLM. The bake-off adds Qwen 3.5 122B and gpt-oss-120b as challengers.
+- **Models: local open-weight models on PM OS's host, or one hosted model the owner has approved** (D1, 2026-11-22; `docs/openshell-any-host-spec.md` §3.6 and §3.9). The hosted path (`hosted`) is designed and not yet built, and no provider is approved yet, so today real data goes only to local models. Qwen3.6-35B-A3B is the default local model and Nemotron 3 Nano 30B-A3B handles extraction and triage, both on vLLM. The bake-off adds Qwen 3.5 122B and gpt-oss-120b as challengers.
 - **Harness: LangChain Deep Agents (`deepagents` 1.16.5, MIT, TypeScript) for the team service; Hermes on NemoClaw for personal agents.**
 - **Context layer:** markdown in git (`content/`), indexed into Postgres (pgvector + full-text search) on merge, served only through the Rust tool server's MCP tools. Memory also lives in Postgres and is exposed to the harness as `/memories/*.md`. There is no Letta, Mem0, Graphiti or Cognee in v1.
-- **Named bots, not features** (decided 2026-11-14, from the Grok Bot lessons; see [`bot-decisions.md`](bot-decisions.md)). PM OS is a small team of named bots, each with a job, memory, its own OpenShell sandbox and a policy. They run always-on on the Spark, read freely, and draft anything outbound for a PM to approve. That doc's decisions D1–D11 are requirements, and they supersede the older bullets below where they differ:
+- **Named bots, not features** (decided 2026-11-14, from the Grok Bot lessons; see [`bot-decisions.md`](bot-decisions.md)). PM OS is a small team of named bots, each with a job, memory, its own OpenShell sandbox and a policy. They run always-on on PM OS's host, read freely, and draft anything outbound for a PM to approve. That doc's decisions D1–D11 are requirements, and they supersede the older bullets below where they differ:
   - one sandbox per bot (not per session);
   - memory as markdown in git (not Postgres);
   - a small PM-facing console (not admin pages only);
@@ -29,7 +29,7 @@ CLI pmos (Rust) ────────────────────┘ 
                                                        └─ HTTP ─► gateway (Rust): one OpenAI-compatible endpoint ─► vLLM
 ```
 (Before 2026-11-14 this was one sandbox per session behind an orchestrator; see `bot-decisions.md`.)
-The sandbox network policy allows only the tool server and the gateway. All writes outside PM OS become approval items.
+The sandbox network policy allows only the tool server, the gateway and the bot runtime, each name pinned to its own address (`allowed_ips`, slice H3). All writes outside PM OS become approval items.
 
 ## Repo layout
 ```
@@ -73,7 +73,7 @@ when they click.
   - Anyone else who tags it gets a private note saying who to ask. Readers (PMM, SEs, engineering leads) come in Phase 3.
 - **The bot token is only for plumbing:** receiving events, private replies, review cards, modals and App Home. It never reads channels for answers and never posts visible messages.
 - **Ephemeral replies don't last** (they're gone on reload), so every draft is also an Inbox item until it is posted or discarded.
-- **Connection:** Socket Mode, so the Spark needs no inbound connection from Slack. The OAuth callback only needs to be reachable from PMs' browsers on the internal network.
+- **Connection:** Socket Mode, so PM OS's host needs no inbound connection from Slack. The OAuth callback only needs to be reachable from PMs' browsers on the internal network.
 
 ### Where each web-workspace requirement now lives
 Reopened 2026-11-16: the web workspace is being built as the web client ([`web-client.md`](web-client.md)). The rows below are the record of what the Slack-side design covers, and the web client's own phases decide how the WEB and SUR rows are built.
@@ -113,9 +113,9 @@ No real tokens or data are used before Gate 1. Work packages are in build order;
    - Audit log (ADM-2).
 4. **0d. Gateway (Rust).**
    - OpenAI-compatible `/v1/chat/completions` and `/v1/embeddings`.
-   - Model pinned per skill; local vLLM routes only (ADM-3).
+   - Model pinned per skill. Under `local`, the local vLLM routes only (ADM-3); a remote test upstream only under `hosted-test`, with fake data; `hosted`, one owner-approved hosted model, is designed and not built (`docs/gateway.md`, "Model sources").
    - Priority queue: interactive work, then scheduled jobs, then personal agents, with a per-user cap (MOD-4).
-   - Egress log, which provides the "Restricted data sent off the Spark" metric.
+   - Usage log, which records the kind of upstream that served each call. The earlier metric, restricted data sent off the host being zero by construction, no longer holds once `hosted` is built; it is replaced by "real data sent to an endpoint not on the approved list" (zero by construction: such an endpoint runs only as `hosted-test`, with fake data) and tasks served per model source (`docs/openshell-any-host-spec.md` §3.6, "What this removes").
 5. **0e. Harness and orchestrator.**
    - The harness wires `createDeepAgent` to the gateway, tool-server MCP tools, skills and memory.
    - The orchestrator queues runs, starts one OpenShell sandbox per session, and turns approval pauses into inbox items.
@@ -131,7 +131,7 @@ No real tokens or data are used before Gate 1. Work packages are in build order;
    - A load test for 5 concurrent sessions. It reports latency; latency is not a priority and doesn't gate (decided 2026-11-14).
    - A measured time baseline for the core artifacts.
 
-**What runs where:** steps 0a–0c and 0f–0g are built and tested here against fakes and a stub model. vLLM, the OpenShell runtime, real OAuth and the baseline need the Spark.
+**What runs where:** steps 0a–0c and 0f–0g are built and tested here against fakes and a stub model. vLLM, the OpenShell runtime, real OAuth and the baseline need a real host (vLLM a GPU host the owner controls).
 
 **Gate 1:** evals pass, every load-test task finishes (latency is reported, not gated), and the sandbox red-team passes.
 
@@ -141,7 +141,7 @@ No real tokens or data are used before Gate 1. Work packages are in build order;
   - bot definitions in `content/bots/<name>/BOT.md`: name, job, team or personal scope, owner, skills, data class, per-action `auto`/`approve`/`never` settings (v1: all `approve`), and, for team bots, the Jira projects, Confluence spaces and Slack channels its owner chose for it to read, enforced by the tool server; checked by `pmos lint`;
   - a durable task queue in Postgres that resumes or fails with a reason after a reboot (D2);
   - task status events and a checklist, posted as one Slack message per milestone (D6);
-  - a 30-day trace store (D6);
+  - a 30-day trace store on PM OS's host (D6; under `hosted` the provider also receives the prompts, and keeping them no longer than this is a condition of approving it, `docs/openshell-any-host-spec.md` §3.9, condition 3);
   - one long-lived sandbox per bot (D3);
   - **role templates** in `content/roles/<role>/` (D12): each one sets a single role's job text, default skills, data class, approval settings and sandbox policy, and every bot is created from one;
   - **one role per bot, no coordinator bot in v1** (D12): a bot may read other bots' outputs in the same scope, nothing more. The runtime counts how often PMs chain bots by hand, and a Chief of Staff bot is considered once 3 PMs do it.
@@ -172,7 +172,7 @@ No real tokens or data are used before Gate 1. Work packages are in build order;
 - Account linking from Slack: the Accounts tab and first-use prompts start the OAuth flows the tool server already has.
 - The `pmos` CLI running the same skills (SUR-2).
 - The remaining launch skills: `/review` (parallel sub-agents, one critique grouped by severity), `/call-synth`, `/competitive-brief`, `/release-notes` and `/status-update`. (Built.)
-- The Slack reply assistant, SLK-1 to SLK-8: triage, grounded drafts, an approval card, an audience check, and a 24-hour expiry that deletes stored Slack content.
+- The Slack reply assistant, SLK-1 to SLK-8: triage, grounded drafts, an approval card, an audience check, and a 24-hour expiry that deletes stored Slack content on PM OS's host (under `hosted`, the provider's retention of Slack text is no longer than 24 hours by the provider record's condition, `docs/openshell-any-host-spec.md` §3.9, condition 3).
 - Read connectors for call transcripts and CRM (OUT-3).
 
 **Gate 2:** champions use it weekly, with no guardrail incident.
@@ -201,7 +201,7 @@ No real tokens or data are used before Gate 1. Work packages are in build order;
 - More connectors.
 - Context-update pull requests proposed from calls (CTX-5).
 - Skill chaining (SKL-6).
-- A second Spark if p90 queue time passes 2 minutes.
+- A second model server if p90 queue time passes 2 minutes.
 - Optionally Graphiti, for temporal facts.
 
 ## First PR: 0a contract and lint, plus the workspaces
@@ -246,12 +246,12 @@ Done in the first pull request. The formats are specified in `docs/contract.md`.
   - User tokens are stored encrypted in the tool server and attached only to that user's sandbox (OpenShell credential placeholders).
 
 - **Atlassian Cloud is confirmed.** Connectors use Atlassian Cloud REST with per-user OAuth 2.0 (3LO), through `api.atlassian.com/ex/{jira|confluence}/{cloudId}`.
-- **Models are local and open-weight only.** The gateway has no outbound model route at all.
+- **Models (amended by the owner on 2026-11-22, D1):** the gateway's only outbound model route is the one hosted model on the owner-approved list (`hosted`), or a test endpoint with fake data (`hosted-test`). `hosted` is not built yet, so today the gateway serves `local` or `hosted-test` only.
 - **The platform owners are product managers**, not a dedicated engineer.
   - Platform-owner rights go to named PMs in the `admin` role.
   - Sandbox-policy changes still need a second platform-owner PM who isn't the author (POL-2).
   - Operations must stay PM-runnable:
-    - one `docker compose` stack on the Spark;
+    - one `docker compose` stack on PM OS's host;
     - `pmos admin` commands for health, restart, model swap and token revocation;
     - day-2 runbooks in `docs/runbooks/` written for a technical PM;
     - upgrades only through the eval gate.
@@ -267,19 +267,19 @@ Done in the first pull request. The formats are specified in `docs/contract.md`.
 | 0c-2b Real Atlassian and Slack connectors, encrypted token store | Done | Each PM's own token; AES-256-GCM vault; OAuth 3LO and Slack v2; tested against local mock APIs; first real call after Gate 1 |
 | Public docs + `/docs` in Slack | Done | `crates/docs` (`pmos-docs` MCP server over your docs site, `PMOS_DOCS_BASE_URL`), docs connector and `docs` skill in the tool server, `crates/slack` (Socket Mode, `/docs`), `content/team.yaml`; see `docs/docs-server.md` |
 | Staff-engineer review fixes | Done | Four reviews (security, correctness, scale and operations, design and tests), checked against the code. The 8 blockers and the pilot list are fixed; see **Review follow-ups** for what's left |
-| 0d Gateway | Done | `crates/gateway`: role aliases to local vLLM only, fair queue (interactive, scheduled, personal; per-person cap), usage log, workaround registry (D11), stub model for CI; see `docs/gateway.md` |
+| 0d Gateway | Done | `crates/gateway`: role aliases to the deployment's model source (local vLLM under `local`; a hosted test model with fake data under `hosted-test`), fair queue (interactive, scheduled, personal; per-person cap), usage log, workaround registry (D11), stub model for CI; see `docs/gateway.md` |
 | 0e Bots | Built (mocks and stub model) | `content/bots`, `content/roles` and their lint; tool-server bot sessions (allowlist per role, `never` actions, team-bot read scope with its own account); `crates/bots` runtime (durable tasks with leases, routines, 30-day traces, notifications, one worker token per bot); `harness` worker; Slack DMs, progress, approval cards and routines; `crates/console`. Checked end to end with the real binaries and the stub model. See `docs/bot-runtime-spec.md` |
-| 0f Sandbox policies | Built; verify on the Spark | `crates/policy`, `pmos policy generate/check` in CI, `policies/bots/docs.yaml`, red-team kit. Format checked against OpenShell's repo; items marked "verify on the Spark" in `docs/sandbox-policies.md` |
-| 0g Evals | Built; first live run on the Spark | `crates/evals`, `evals/categories/docs-qa` (20 real questions), failure tags, weekly reports, load test. Latency is reported, not gated (decided 2026-11-14) |
-| Onboarding and GitHub memory | Built (this PR); first live run on the Spark | New members ask in Slack, a platform owner approves, PM OS commits `team.yaml` and their personal bot; guided setup; each PM's memory in a private repo in your GitHub org ([spec](onboarding-spec.md)) |
-| Spark deployment kit | Built (this PR); first run on the Spark | `deploy/`: one Compose stack (Postgres, docs, tool server, gateway, bots, Slack, console, two vLLM servers), the service and worker images, `setup.sh`, `pmos-admin` (status, logs, backup and restore, reindex, revoke, bot sandboxes, smoke test, benchmarks), and runbooks in `docs/runbooks/`. CI builds the images, starts the stack and runs a task end to end. |
-| Improvement loop, phases 0–1 (tooling) | Built (this PR); runs on the Spark | From the deep research ([report](research/self-improvement-loops.md), [spec](improvement-loop-spec.md)). **Measurement:** a feedback ledger of every draft's outcome, one-tap reject reasons, a daily triage digest for each bot's quality owner. **Benchmarks:** 3 runs per task, pass^3 and error bars, flips and a gate, should-decline cases, checks on drafts, second-level failure tags, calibrated judges, seed draft categories. **Running them:** an eval stack, and an eval gate on PRs (self-hosted Spark runner). **Later, each after its gate:** shadow and canary releases, the improver bot (phase 2), training (phase 3). |
-| Slack reply assistant (SLK-1 to SLK-8) | Built (this PR); first live run on the Spark | `reply assistant on` starts a routine on the PM's personal bot that finds questions to them (with their own token), drafts grounded replies with the `slack-reply` skill, one per thread, and shows each on a card (Post as you, Edit, Snooze, Reject). The audience check blocks restricted drafts where outsiders would see them and asks again for Slack Connect. Drafts expire after 24 hours and their text is deleted ([how it works](slack-reply.md), [spec](slack-reply-spec.md)). |
-| Tagging in channels and the App Home | Built (this PR); first live run on the Spark | **Tagging:** `@PM OS` in a thread starts the PM's personal bot on that thread, read with the PM's own token; the draft arrives in their DM on the reply card, one per tagged message (`slack.post_reply` gains `message_ts`). **App Home:** an Inbox to tick drafts and approve or reject them together, Skills grouped by each skill's new `track`, and Accounts to connect or disconnect. The tool server lets the Slack app list a member's pending approvals and unlink a member's account. The Slack app needs updating and reinstalling ([how it works](slack-home.md), [spec](slack-mentions-and-home-spec.md)) |
+| 0f Sandbox policies | Built; verify on a real host | `crates/policy`, `pmos policy generate/check` in CI, `policies/bots/docs.yaml`, red-team kit. Format checked against OpenShell's repo; items to verify on a real host in `docs/sandbox-policies.md` |
+| 0g Evals | Built; first live run on a real host | `crates/evals`, `evals/categories/docs-qa` (20 real questions), failure tags, weekly reports, load test. Latency is reported, not gated (decided 2026-11-14) |
+| Onboarding and GitHub memory | Built (this PR); first live run on a real host | New members ask in Slack, a platform owner approves, PM OS commits `team.yaml` and their personal bot; guided setup; each PM's memory in a private repo in your GitHub org ([spec](onboarding-spec.md)) |
+| Deployment kit | Built (this PR); not yet run on OpenShell | `deploy/`: one Compose stack (Postgres, docs, tool server, gateway, bots, Slack, console, two vLLM servers), the service and worker images, `setup.sh`, `pmos-admin` (status, logs, backup and restore, reindex, revoke, bot sandboxes, smoke test, benchmarks), and runbooks in `docs/runbooks/`. CI builds the images, starts the stack and runs a task end to end. |
+| Improvement loop, phases 0–1 (tooling) | Built (this PR); runs on PM OS's host | From the deep research ([report](research/self-improvement-loops.md), [spec](improvement-loop-spec.md)). **Measurement:** a feedback ledger of every draft's outcome, one-tap reject reasons, a daily triage digest for each bot's quality owner. **Benchmarks:** 3 runs per task, pass^3 and error bars, flips and a gate, should-decline cases, checks on drafts, second-level failure tags, calibrated judges, seed draft categories. **Running them:** an eval stack, and an eval gate on PRs (a self-hosted runner on a host the owner chooses, not yet decided). **Later, each after its gate:** shadow and canary releases, the improver bot (phase 2), training (phase 3). |
+| Slack reply assistant (SLK-1 to SLK-8) | Built (this PR); first live run on a real host | `reply assistant on` starts a routine on the PM's personal bot that finds questions to them (with their own token), drafts grounded replies with the `slack-reply` skill, one per thread, and shows each on a card (Post as you, Edit, Snooze, Reject). The audience check blocks restricted drafts where outsiders would see them and asks again for Slack Connect. Drafts expire after 24 hours and their text is deleted on PM OS's host ([how it works](slack-reply.md), [spec](slack-reply-spec.md)). |
+| Tagging in channels and the App Home | Built (this PR); first live run on a real host | **Tagging:** `@PM OS` in a thread starts the PM's personal bot on that thread, read with the PM's own token; the draft arrives in their DM on the reply card, one per tagged message (`slack.post_reply` gains `message_ts`). **App Home:** an Inbox to tick drafts and approve or reject them together, Skills grouped by each skill's new `track`, and Accounts to connect or disconnect. The tool server lets the Slack app list a member's pending approvals and unlink a member's account. The Slack app needs updating and reinstalling ([how it works](slack-home.md), [spec](slack-mentions-and-home-spec.md)) |
 | Claude test in a test Slack workspace (testing only) | Built; **deferred until the test workspace is ready** (2026-11-15) | Every service on one machine with Claude behind the gateway, fake Jira, Confluence and Slack, and your public docs site, if one is set. Waiting on a test Slack workspace and app, plus four environment variables: `PMOS_SLACK_BOT_TOKEN`, `PMOS_SLACK_APP_TOKEN`, `PMOS_TEST_SLACK_ID` and `PMOS_GATEWAY_ANTHROPIC_KEY` ([guide](testing-with-claude.md)) |
-| PM craft (senior-PM bar) | Built (this PR); the bar is measured on the Spark | PM OS works to a written bar: problem first, alternatives, a recommendation, a measurable outcome with a guardrail, the riskiest assumption. **Content:** six playbooks, 23 skills on one pattern (ask, draft from a template and an exemplar, check against the bar, propose a Confluence draft), 18 templates, five exemplars, four new reviewers (`senior-pm`, `data-scientist`, `design-ux`, `ai-safety`), and an AI-product track. **Code:** the review panel as read-only sub-agents (up to 4 a run), `stats.sample_size` and `stats.compare` in the tool server, the `reasoning` model role, playbook lint. **Benchmarks:** `evals/categories/pm-craft` (23 seed tasks, structure checks) and three advisory judges. Whether the local models meet the bar is decided by those benchmarks on the real stack; the `reasoning` role can be pointed at a larger model if they don't ([how PMs use it](pm-craft.md), [spec](pm-craft-spec.md)). |
-| Staff and Principal PMs | Built (this PR); measured on the Spark | A level each PM sets (`senior`, `staff`, `principal`; `level staff` in a DM) that changes the scope, horizon and audience the bot works at. **Content:** 12 skills in two tracks (Leading across teams, Company bets), 10 templates, 3 playbooks, 3 reviewers (`cfo`, `cto`, `ceo`) and 4 exemplars. **Code:** the level in the bot runtime (a settings store, two routes, `level` in the claim), `jira.rollup` across teams, `stats.cashflow` for business cases, and the bets register (`bets.list`, `bets.read`, `bets.record`) with a monthly review routine. **Benchmarks:** `evals/categories/staff-craft` and `principal-craft` (8 seed tasks each) and two advisory judges. Whether the local models work at this level is decided by those benchmarks on the real stack ([how PMs use it](levels.md), [spec](staff-principal-spec.md)). |
-| **Gate 1** | Needs the Spark | vLLM with the chosen models; OpenShell; the Slack app and the GitHub App; the first platform owners in the user database (`pmos-admin users bootstrap-admin`; everyone else onboards through the bot); the red-team run; two passing benchmark weeks; the load test (every task finishes) |
+| PM craft (senior-PM bar) | Built (this PR); the bar is measured on a real host | PM OS works to a written bar: problem first, alternatives, a recommendation, a measurable outcome with a guardrail, the riskiest assumption. **Content:** six playbooks, 23 skills on one pattern (ask, draft from a template and an exemplar, check against the bar, propose a Confluence draft), 18 templates, five exemplars, four new reviewers (`senior-pm`, `data-scientist`, `design-ux`, `ai-safety`), and an AI-product track. **Code:** the review panel as read-only sub-agents (up to 4 a run), `stats.sample_size` and `stats.compare` in the tool server, the `reasoning` model role, playbook lint. **Benchmarks:** `evals/categories/pm-craft` (23 seed tasks, structure checks) and three advisory judges. Whether the local models meet the bar is decided by those benchmarks on the real stack; the `reasoning` role can be pointed at a larger model if they don't ([how PMs use it](pm-craft.md), [spec](pm-craft-spec.md)). |
+| Staff and Principal PMs | Built (this PR); measured on a real host | A level each PM sets (`senior`, `staff`, `principal`; `level staff` in a DM) that changes the scope, horizon and audience the bot works at. **Content:** 12 skills in two tracks (Leading across teams, Company bets), 10 templates, 3 playbooks, 3 reviewers (`cfo`, `cto`, `ceo`) and 4 exemplars. **Code:** the level in the bot runtime (a settings store, two routes, `level` in the claim), `jira.rollup` across teams, `stats.cashflow` for business cases, and the bets register (`bets.list`, `bets.read`, `bets.record`) with a monthly review routine. **Benchmarks:** `evals/categories/staff-craft` and `principal-craft` (8 seed tasks each) and two advisory judges. Whether the local models work at this level is decided by those benchmarks on the real stack ([how PMs use it](levels.md), [spec](staff-principal-spec.md)). |
+| **Gate 1** | Needs a real host | vLLM with the chosen models on a GPU host the owner controls; OpenShell; the Slack app and the GitHub App; the first platform owners in the user database (`pmos-admin users bootstrap-admin`; everyone else onboards through the bot); the red-team run; two passing benchmark weeks; the load test (every task finishes) |
 
 0c notes:
 - Connectors share one `Connector` trait (`read` and `write`, both keyed by action) instead of one trait per system. The real Jira, Confluence and Slack connectors each implement it.
@@ -290,10 +290,10 @@ From the staff-engineer review (2026-11-14). Fixed before any real token: every 
 the pilot list. Still open, roughly in priority order:
 
 **Security and code-practices review (2026-11-15).** Fixed in batch 1
-([spec](security-fixes-spec.md)), before the Spark's CI runner is registered or any real PM
+([spec](security-fixes-spec.md)), before the eval-gate runner is registered or any real PM
 token is used:
-- ~~S1: the eval gate ran a pull request's own `pmos-admin` beside the Spark's secrets.~~ Fixed:
-  `pull_request_target`, the Spark's installed script, the PR checked out as data.
+- ~~S1: the eval gate ran a pull request's own `pmos-admin` beside the host's secrets.~~ Fixed:
+  `pull_request_target`, the host's installed script, the PR checked out as data.
 - ~~S2: the Slack bot's token could grant admin, redirect a draft by editing it, read any PM's
   approvals by id, and see approval ids in the ledger.~~ Fixed.
 - ~~S3: the benchmark token could run tasks as any PM and reach Slack.~~ Fixed:
@@ -346,7 +346,7 @@ Still open from that review:
 - Elect one docs-sync leader.
 
 **Security hardening:**
-- TLS (or mTLS) between services, and the public OAuth callback on its own listener, separate from `/internal` and `/mcp`. *Until then, the install runbook's reverse proxy exposes only `/oauth/*`; every service port is published on 127.0.0.1 only.*
+- TLS (or mTLS) between services, and the public OAuth callback on its own listener, separate from `/internal` and `/mcp`. *Until then, the install runbook's reverse proxy exposes only the tool server's `/oauth/*` (and, when the web app is on, the web app, never its `/healthz`, `/readyz` or `/internal/` routes); every service port is published on 127.0.0.1 only.*
 - Untrusted-content wrapping:
   - wrap connector error text too;
   - give memory notes provenance, a cap, and approval when written from runs that read untrusted content.

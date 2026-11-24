@@ -1,7 +1,7 @@
 # Sandbox policies
 
 Every PM OS bot runs in its own NVIDIA OpenShell sandbox (decision D3). This folder holds what
-that sandbox is allowed to do. The format, the rules and how to apply a policy on the Spark are
+that sandbox is allowed to do. The format, the rules and how to apply a policy on the host are
 in [`docs/sandbox-policies.md`](../docs/sandbox-policies.md).
 
 | Path | What | Written by |
@@ -9,7 +9,7 @@ in [`docs/sandbox-policies.md`](../docs/sandbox-policies.md).
 | `bots/<bot>.yaml` | The bot's OpenShell sandbox policy | `pmos policy generate` |
 | `bots/<bot>.sandbox.yaml` | Its launch spec: the only providers to attach and content to upload | `pmos policy generate` |
 | `providers/*.yaml` | The two OpenShell provider profiles every bot's credentials come from | `pmos policy generate` |
-| `redteam/` | The red-team checklist and the isolation script to run on the Spark | by hand |
+| `redteam/` | The red-team checklist and the isolation script to run on the host | by hand |
 
 ## Don't edit the generated files
 
@@ -49,7 +49,7 @@ its author.** Platform owners are the active `admin` users in the PM OS user dat
   policies, never a tool or a host (the lint refuses a persona whose tools exceed
   `pm-assistant`'s), so it is a filesystem change, below.
 - **Filesystem, credential and process changes** go through the content repo's usual
-  pull-request review, plus a platform owner. They also need the sandbox recreated on the Spark
+  pull-request review, plus a platform owner. They also need the sandbox recreated on the host
   (OpenShell applies them only at startup).
 - **Widening never goes in by hand.** Change the code or the content, regenerate, and let review
   see the diff in `policies/`.
@@ -127,7 +127,7 @@ The file isn't committed here because the owners' GitHub handles aren't in the r
 (they are in the user database), and a CODEOWNERS line with no valid owner protects nothing.
 It waits on the owner: until it exists, none of the lines above is enforced.
 
-## Applying on the Spark
+## Applying on the host
 
 Network rules apply to a running sandbox with
 `openshell policy set pmos-<bot> --policy policies/bots/<bot>.yaml --wait`. Filesystem, Landlock

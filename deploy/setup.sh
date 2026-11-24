@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# First-time setup of PM OS on the Spark (docs/runbooks/install.md). Safe to run again: it
+# First-time setup of PM OS on its host (docs/runbooks/install.md). Safe to run again: it
 # never replaces a value already in deploy/.env, and only fills in what's missing.
 #
 #   deploy/setup.sh [--content /srv/pmos/content-repo] [--clone <git url>] [--state /srv/pmos/state]

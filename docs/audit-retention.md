@@ -2,7 +2,9 @@
 
 The owner's decision (`CLAUDE.md`, f): audit events are **purged at 90 days, with no
 archive**. One controlled job deletes older events and records its own run; nothing else can
-delete an event, and that job cannot delete a newer one. This page says what is deleted, when,
+delete an event, and that job cannot delete a newer one. The audit log never leaves PM OS's
+host. Prompts are not audit events: under `hosted` (not built yet) what the provider keeps is in
+its provider record (`docs/openshell-any-host-spec.md` §3.9, condition 3). This page says what is deleted, when,
 what never is, how the database enforces it, how to check, and what an auditor sees.
 
 ## What is deleted, and when

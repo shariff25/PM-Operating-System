@@ -7,7 +7,7 @@ bot, from the Slack message to the result, and it survives restarts (D2). Its jo
 - **Approvals:** a result with outbound writes waits until the PM has decided every item.
 - **Notifications:** one ordered feed that the Slack app long-polls for milestones and results.
 - **Routines:** plain-language schedules (D8), parsed by the model and checked in code.
-- **Traces:** kept 30 days, with Slack text removed after 24 hours (D6, SLK-8).
+- **Traces:** on PM OS's host, traces are kept 30 days, with Slack text removed after 24 hours (D6, SLK-8). Under `hosted` (not built yet) the provider also receives the prompts; its retention is no longer than PM OS's (24 hours for Slack text, 30 days for other prompt text) by the provider record's condition (`docs/openshell-any-host-spec.md` §3.9, condition 3).
 
 The interface is §3 of `docs/bot-runtime-spec.md`; this page is how to run it.
 
@@ -30,7 +30,7 @@ PMOS_GATEWAY_URL=http://127.0.0.1:8740/v1 PMOS_GATEWAY_TOKEN=… \
 cargo run -p pmos-bots
 ```
 
-**On the Spark:** set `PMOS_BOTS_DATABASE_URL`. Migrations run at start-up and are tracked in
+**On PM OS's host:** set `PMOS_BOTS_DATABASE_URL`. Migrations run at start-up and are tracked in
 `_pmos_bots_migrations`, so the runtime can share a database with the tool server and the
 docs server.
 
@@ -69,7 +69,7 @@ When a platform owner approves someone in Slack, the tool server adds them to th
 database and commits their `bots/pm-<handle>/BOT.md` and its policy, and `pm-<handle>` appears in `GET /v1/bots` without a
 restart. Nothing claims its tasks yet: worker tokens are per bot and live in config, and a
 bot's sandbox is started by hand. Until that is automated, a platform owner does this on the
-Spark for each new member (the bot is `pm-<handle>`, as `personal_bot_name` makes it):
+host for each new member (the bot is `pm-<handle>`, as `personal_bot_name` makes it):
 
 1. **Policies.** Pull the content repo, then run `cargo run -q -p pmos -- policy generate`
    and `cargo run -q -p pmos -- policy check`. Commit `policies/bots/pm-<handle>.yaml` and
@@ -104,7 +104,7 @@ doesn't have. The pull request that adds it regenerates every `policies/bots/pm-
 `docs/bot-marketplace-spec.md` §4). OpenShell applies uploads only when a sandbox starts, so
 after that pull request merges a platform owner does this **once per personal bot**:
 
-1. Pull the content repo on the Spark; `cargo run -q -p pmos -- policy check` is green.
+1. Pull the content repo on the host; `cargo run -q -p pmos -- policy check` is green.
 2. For each `pm-<handle>`: stop its worker, delete the sandbox `pmos-pm-<handle>`, and create
    it again from `policies/bots/pm-<handle>.sandbox.yaml` with the same two providers, as in
    **Creating a bot's sandbox** in `docs/sandbox-policies.md`. Tokens and providers are
@@ -379,7 +379,7 @@ sends a `needs_approval` notification with the ids.
   Routine tasks have `slack: null`; reply to the owner's DM.
 - **Order:** numbers are allocated under a row lock held until commit, so they become
   visible in order. A cursor never skips an item written by a slower transaction.
-- **Kept:** 30 days, like traces.
+- **Kept:** 30 days on PM OS's host, like traces.
 
 ## Routines (D8)
 - **Parse** (`POST /v1/routines/parse {bot, owner, text, tz}`): asks the gateway

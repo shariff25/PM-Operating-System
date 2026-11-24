@@ -1,4 +1,4 @@
-//! **Testing only:** a Claude model behind the gateway, for trying PM OS before the Spark's
+//! **Testing only:** a Claude model behind the gateway, for trying PM OS before the
 //! local models are up (decided 2026-11-14).
 //!
 //! It is off unless `PMOS_GATEWAY_CLOUD_TEST=1` and a role's upstream is written

@@ -1,13 +1,15 @@
 # PM OS gateway: which local model serves each role. Callers name a role (`pmos/default`),
 # never a model, so swapping a model is a change here plus a benchmark run (D11).
 #
-# - upstreams: the vLLM servers on the Spark (OpenAI-compatible base URLs). Only local or
-#   private-network hosts are accepted: prompts never leave the Spark.
+# - upstreams: local vLLM servers for development (OpenAI-compatible base URLs). This config
+#   has no `class:`, so it is a `class: test` gateway (docs/gateway.md, "Model sources"); without
+#   PMOS_GATEWAY_CLOUD_TEST=1 it accepts only local or private-network hosts. The deployment's
+#   own gateway config is deploy/gateway.yaml.
 # - roles: `model` is each server's --served-model-name. `workarounds` switches on entries
 #   from the gateway's workaround registry (GET /v1/pmos/workarounds).
 # - limits: how many requests run at once, per person, and how many may wait.
 #
-# Confirm the served model names on the Spark before first use.
+# Confirm the served model names on the host before first use.
 upstreams:
   qwen: http://127.0.0.1:8001/v1
   nemotron: http://127.0.0.1:8002/v1

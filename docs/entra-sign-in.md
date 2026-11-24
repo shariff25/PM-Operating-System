@@ -311,7 +311,7 @@ The independent re-check of `eb24d28` (2026-11-21); its password findings are in
 ## In the deploy kit
 
 `deploy/compose.yaml` passes the four `PMOS_WEB_ENTRA_*` variables from `deploy/.env` (blank by
-default, so off) to the web app, with the Spark's outbound proxy, and the tenant id, client id
+default, so off) to the web app, with the host's outbound proxy, and the tenant id, client id
 and authority (not the secret) to the tool server as `PMOS_ENTRA_*`, so the two always agree;
 no new line in `deploy/.env`. `deploy/pmos-admin status` reads the web app's `/readyz`, which
 shows `entra_link`. `deploy/pmos-admin up --web`
