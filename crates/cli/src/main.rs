@@ -110,6 +110,43 @@ enum PolicyCommand {
         #[arg(long, value_enum, default_value_t = Format::Text)]
         format: Format,
     },
+    /// Prove every bot's policy against the hand-written boundary with OpenShell's pinned
+    /// policy prover (docs/openshell-prover-and-sandbox-audit-spec.md §A.3), beside
+    /// `pmos policy check`. Only `proved` passes. Exits 0 when every bot is proved and nothing
+    /// disagrees with the check, 1 otherwise (a missing or unpinned prover included), 2 when it
+    /// could not run.
+    Prove {
+        /// Path to the content root (for `pmos policy check`'s rules beside each proof).
+        #[arg(long, default_value = "content")]
+        root: PathBuf,
+        /// Path to the policies: every `bots/<bot>.yaml` is proved.
+        #[arg(long, default_value = "policies")]
+        policies: PathBuf,
+        /// The boundary (CI passes the base branch's copy).
+        #[arg(long, default_value = pmos_policy::prove::BOUNDARY_PATH)]
+        boundary: PathBuf,
+        /// The prover binary. Default: `openshell-prover` on PATH.
+        #[arg(long)]
+        prover: Option<PathBuf>,
+        /// The pin: version and SHA-256s.
+        #[arg(long, default_value = pmos_policy::prove::LOCK_PATH)]
+        lock: PathBuf,
+        /// Prove this one file instead (a sandbox's effective policy on the host); needs --bot.
+        #[arg(long, requires = "bot")]
+        candidate: Option<PathBuf>,
+        /// The bot the --candidate belongs to.
+        #[arg(long, requires = "candidate")]
+        bot: Option<String>,
+        #[arg(long, value_enum, default_value_t = Format::Text)]
+        format: Format,
+    },
+    /// The boundary-alone rule (spec §A.6): a change to policies/boundary/ may change no other
+    /// file. Reads the changed paths, one per line (`git diff --name-only base...head`), from
+    /// --changed-files (`-` for standard input). Exits 1 when the rule is broken.
+    BoundaryAlone {
+        #[arg(long)]
+        changed_files: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -157,6 +194,30 @@ fn main() -> Result<ExitCode> {
                     format,
                 },
         } => policy_check(&root, &policies, format),
+        Command::Policy {
+            command:
+                PolicyCommand::Prove {
+                    root,
+                    policies,
+                    boundary,
+                    prover,
+                    lock,
+                    candidate,
+                    bot,
+                    format,
+                },
+        } => Ok(policy_prove(&ProveArgs {
+            root,
+            policies,
+            boundary,
+            prover,
+            lock,
+            candidate: candidate.zip(bot),
+            format,
+        })),
+        Command::Policy {
+            command: PolicyCommand::BoundaryAlone { changed_files },
+        } => boundary_alone(&changed_files),
         Command::Bot {
             command: BotCommand::AddPersonal { root, handle },
         } => bot_add_personal(&root, &handle),
@@ -307,4 +368,155 @@ fn policy_check(root: &Path, policies: &Path, format: Format) -> Result<ExitCode
         }
     }
     Ok(exit(!report.passed()))
+}
+
+struct ProveArgs {
+    root: PathBuf,
+    policies: PathBuf,
+    boundary: PathBuf,
+    prover: Option<PathBuf>,
+    lock: PathBuf,
+    candidate: Option<(PathBuf, String)>,
+    format: Format,
+}
+
+/// `openshell-prover` on PATH, or a path that doesn't exist (which is `not_available`).
+fn prover_on_path() -> PathBuf {
+    std::env::var_os("PATH")
+        .and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|d| d.join("openshell-prover"))
+                .find(|p| p.is_file())
+        })
+        .unwrap_or_else(|| PathBuf::from("openshell-prover (not found on PATH)"))
+}
+
+/// `pmos policy prove`.
+fn policy_prove(a: &ProveArgs) -> ExitCode {
+    use pmos_policy::prove::{self, Candidate, Lock, Prover};
+    use std::collections::BTreeSet;
+    let lock = match Lock::read(&a.lock) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("error: the prover pin can't be read: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    if !a.boundary.is_file() {
+        eprintln!("error: no boundary at {}", a.boundary.display());
+        return ExitCode::from(2);
+    }
+    let mapped = prove::all_mapped_rules();
+    let today = Local::now().date_naive();
+    let candidates: Vec<Candidate> = match &a.candidate {
+        Some((path, bot)) => {
+            if !pmos_contract::bots::valid_name(bot) {
+                eprintln!("error: `{bot}` is not a bot name");
+                return ExitCode::from(2);
+            }
+            // The check's rules on this one file, for this bot as the content defines it.
+            let failed: BTreeSet<String> = match (
+                std::fs::read_to_string(path),
+                pmos_policy::generate(&a.root, today),
+            ) {
+                (Ok(text), Ok(g)) => {
+                    let ctx = g
+                        .bots
+                        .iter()
+                        .find(|c| c.bot == *bot)
+                        .cloned()
+                        .unwrap_or_else(|| pmos_policy::BotContext::unknown(bot));
+                    pmos_policy::check_policy(&ctx, &path.display().to_string(), &text)
+                        .into_iter()
+                        .map(|v| v.rule.to_string())
+                        .filter(|r| mapped.contains(r.as_str()))
+                        .collect()
+                }
+                _ => BTreeSet::new(),
+            };
+            vec![Candidate {
+                bot: bot.clone(),
+                path: path.clone(),
+                label: path.display().to_string(),
+                check_failed: failed,
+            }]
+        }
+        None => {
+            let found = match prove::candidates(&a.policies) {
+                Ok(f) if !f.is_empty() => f,
+                Ok(_) => {
+                    eprintln!("error: no policies under {}/bots", a.policies.display());
+                    return ExitCode::from(2);
+                }
+                Err(e) => {
+                    eprintln!("error: {}/bots: {e}", a.policies.display());
+                    return ExitCode::from(2);
+                }
+            };
+            let report = pmos_policy::check(&a.root, &a.policies, today);
+            found
+                .into_iter()
+                .map(|(bot, path)| {
+                    let suffix = format!("bots/{bot}.yaml");
+                    let nested = format!("/{suffix}");
+                    let failed = report
+                        .violations
+                        .iter()
+                        .filter(|v| v.path == suffix || v.path.ends_with(&nested))
+                        .map(|v| v.rule.to_string())
+                        .filter(|r| mapped.contains(r.as_str()))
+                        .collect();
+                    Candidate {
+                        label: path.display().to_string(),
+                        bot,
+                        path,
+                        check_failed: failed,
+                    }
+                })
+                .collect()
+        }
+    };
+    let scratch = match tempfile::tempdir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("error: no scratch directory: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let prover = Prover::new(a.prover.clone().unwrap_or_else(prover_on_path), lock);
+    let report = prove::prove_all(&prover, &a.boundary, &candidates, scratch.path());
+    match a.format {
+        Format::Json => match serde_json::to_string_pretty(&report) {
+            Ok(s) => println!("{s}"),
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::from(2);
+            }
+        },
+        Format::Text => print!("{}", prove::render_text(&report)),
+    }
+    exit(!report.passed())
+}
+
+/// `pmos policy boundary-alone`.
+fn boundary_alone(changed_files: &Path) -> Result<ExitCode> {
+    let text = if changed_files == Path::new("-") {
+        let mut s = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)?;
+        s
+    } else {
+        std::fs::read_to_string(changed_files)
+            .with_context(|| format!("reading {}", changed_files.display()))?
+    };
+    let changed: Vec<&str> = text.lines().collect();
+    match pmos_policy::prove::boundary_alone(&changed) {
+        Ok(()) => {
+            println!("boundary-alone: ok");
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(e) => {
+            println!("error[boundary-alone] {e}");
+            Ok(ExitCode::FAILURE)
+        }
+    }
 }

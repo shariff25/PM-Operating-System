@@ -19,6 +19,5 @@ pmos-contract.workspace = true
 pmos-evals.workspace = true
 pmos-policy.workspace = true
 serde_json.workspace = true
-
-[dev-dependencies]
+# A scratch directory for the prover's network views (`pmos policy prove`).
 tempfile.workspace = true

@@ -1,0 +1,29 @@
+# The OpenShell policy prover that CI's `policy-prover` job and `pmos-admin policy prove` may run
+# (docs/openshell-prover-and-sandbox-audit-spec.md §A.7). Read as data (KEY=value; never sourced).
+#
+# NOT PINNED YET. Until the owner (or a platform owner, in its own pull request under CODEOWNERS)
+# fills these in from a reviewed OpenShell release, every proof is `not_available` and the CI job
+# fails with "prover not available"; it never passes. To pin:
+#   1. pick the release (the prover's page is in OpenShell's v0.1.0 docs onward; v0.1.9 is the
+#      version the spec was written against) and download
+#      openshell-prover-x86_64-unknown-linux-musl.tar.gz and
+#      openshell-prover-aarch64-unknown-linux-musl.tar.gz with
+#      openshell-prover-checksums-sha256.txt from its GitHub release;
+#   2. check each archive against that file, then put each archive's SHA-256 below (CI checks the
+#      download against THIS file, not only against the release's own checksum file);
+#   3. extract `openshell-prover` from each and put the binary's SHA-256 below (what
+#      `pmos policy prove` checks before it runs anything);
+#   4. PROVER_VERSION is the exact version `openshell-prover --version` prints (verify the flag);
+#   5. PROVER_RELEASE_TAG is the GitHub release's tag CI downloads from (such as v0.1.9).
+# A bump is its own pull request; CI then runs the old and the new prover and fails if any bot's
+# status differs (PRV-8).
+PROVER_VERSION=
+PROVER_RELEASE_TAG=
+PROVER_ARCHIVE_SHA256_X86_64=
+PROVER_ARCHIVE_SHA256_AARCH64=
+PROVER_BINARY_SHA256_X86_64=
+PROVER_BINARY_SHA256_AARCH64=
+# The OpenShell version whose OCSF records the sandbox-audit collector's parsing was last verified
+# on (spec §B.8): empty until the host acceptance run (slice B6). Until then every OpenShell version
+# the collector sees is recorded once as "format unverified".
+OPENSHELL_FORMAT_VERIFIED=

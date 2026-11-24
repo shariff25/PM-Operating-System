@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# A stand-in for OpenShell's `openshell-prover` (docs/openshell-prover-and-sandbox-audit-spec.md
+# §A.8), for tests only: it proves nothing. It answers as the real prover's documentation says it
+# would (v0.1.9: JSON with `result`, `reason_code`, `reason`, `coverage.domains`,
+# `counterexample`; exit 0, 1, 2 or 3), with an answer chosen by the SHA-256 of the candidate
+# file: the file `answers` beside this script holds lines `<sha256> <answer>`; a candidate not
+# listed gets `within`, unless it still has an MCP rule (`protocol: mcp`), which is `unsupported`
+# as the documentation says of the real one. The real prover's field names and version flag are
+# to verify (slice A2).
+#
+# Answers: within, exceeds, unsupported, inconclusive, exit2, exit0-exceeds, exit1-within,
+# missing-domain, not-json, hang. `--version` prints `openshell-prover <version>`, the version
+# in the file `version` beside this script (default 0.1.9).
+set -u
+here=$(cd "$(dirname "$0")" && pwd)
+all='"coverage":{"domains":["filesystem","network_l4","network_rest","process","landlock"]}'
+if [ "${1:-}" = --version ]; then
+  v=0.1.9
+  [ -f "$here/version" ] && v=$(cat "$here/version")
+  printf 'openshell-prover %s\n' "$v"
+  exit 0
+fi
+[ "${1:-}" = check ] || { echo "usage: openshell-prover check <candidate> --boundary <boundary> [--output json] [--timeout N]" >&2; exit 2; }
+candidate=${2:-}
+[ -f "$candidate" ] || { printf '{"result":"error","reason":"no candidate"}\n'; exit 2; }
+shift 2
+boundary=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --boundary) boundary=${2:-}; shift 2 ;;
+    --output | --timeout) shift 2 ;;
+    *) printf '{"result":"error","reason":"unknown argument"}\n'; exit 2 ;;
+  esac
+done
+[ -f "$boundary" ] || { printf '{"result":"error","reason":"no boundary"}\n'; exit 2; }
+sum=$(sha256sum "$candidate" | cut -d' ' -f1)
+answer=within
+if [ -f "$here/answers" ]; then
+  found=$(awk -v s="$sum" '$1 == s { print $2; exit }' "$here/answers")
+  [ -n "$found" ] && answer=$found
+fi
+if [ "$answer" = within ] && grep -q 'protocol: mcp' "$candidate"; then answer=unsupported; fi
+case "$answer" in
+  within) printf '{"result":"within_boundary",%s}\n' "$all"; exit 0 ;;
+  exceeds) printf '{"result":"exceeds_boundary","counterexample":"filesystem write /sandbox",%s}\n' "$all"; exit 1 ;;
+  unsupported) printf '{"result":"unsupported","reason_code":"unsupported_policy_shape","reason":"the policy uses MCP rules"}\n'; exit 3 ;;
+  inconclusive) printf '{"result":"inconclusive","reason_code":"resource_limit","reason":"too many endpoints"}\n'; exit 3 ;;
+  exit2) printf '{"result":"error","reason":"could not parse the candidate"}\n'; exit 2 ;;
+  exit0-exceeds) printf '{"result":"exceeds_boundary","counterexample":"process run_as_user root",%s}\n' "$all"; exit 0 ;;
+  exit1-within) printf '{"result":"within_boundary",%s}\n' "$all"; exit 1 ;;
+  missing-domain) printf '{"result":"within_boundary","coverage":{"domains":["filesystem","network_l4","process","landlock"]}}\n'; exit 0 ;;
+  not-json) printf 'within_boundary (text, not JSON)\n'; exit 0 ;;
+  hang) exec sleep 600 ;;
+  *) printf '{"result":"error","reason":"unknown canned answer"}\n'; exit 2 ;;
+esac

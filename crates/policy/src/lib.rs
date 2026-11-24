@@ -33,6 +33,7 @@ pub mod admin;
 pub mod check;
 pub mod generate;
 pub mod openshell;
+pub mod prove;
 pub mod spec;
 pub mod yaml;
 
