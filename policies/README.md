@@ -127,9 +127,18 @@ The file isn't committed here because the owners' GitHub handles aren't in the r
 (they are in the user database), and a CODEOWNERS line with no valid owner protects nothing.
 It waits on the owner: until it exists, none of the lines above is enforced.
 
+**The prover's boundary** (`boundary/pmos-bot.yaml`, docs/openshell-prover-and-sandbox-audit-spec.md
+§A.2 and §A.6) is written by hand and never generated. A pull request that changes anything under
+`policies/boundary/` may change no other file (CI's `policy-prover` job fails otherwise), and CI
+proves a pull request's policies against the base branch's copy. The `/policies/` line above
+covers it; whether it gets its own line owned by the owner alone is the owner's question (the
+spec's §6, question 2). Making `policy-prover` a required check is the owner's too (question 1).
+
 ## Applying on the host
 
 Network rules apply to a running sandbox with
 `openshell policy set pmos-<bot> --policy policies/bots/<bot>.yaml --wait`. Filesystem, Landlock
 and process changes need the sandbox recreated. After either, run
-[`redteam/isolation.sh`](redteam/isolation.sh). Details are in `docs/sandbox-policies.md`.
+[`redteam/isolation.sh`](redteam/isolation.sh), and `deploy/pmos-admin policy prove <bot>`, as the
+gateway's user: OpenShell's pinned prover on the policy the sandbox now enforces, recorded for
+Policy Admin (only `proved` passes). Details are in `docs/sandbox-policies.md`.
