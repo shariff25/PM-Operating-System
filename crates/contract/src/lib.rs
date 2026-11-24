@@ -10,6 +10,7 @@ pub mod bots;
 pub mod cite;
 pub mod frontmatter;
 pub mod lint;
+pub mod mcp;
 pub mod model;
 pub mod model_source;
 pub mod onboarding;

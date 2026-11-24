@@ -146,6 +146,7 @@ pub fn lint(root: &Path, opts: &LintOptions) -> Report {
     cx.check_people();
     cx.check_roles_and_bots(registry.as_ref());
     cx.check_personas(registry.as_ref(), opts);
+    cx.check_mcp_servers(registry.as_ref());
 
     cx.report
         .diagnostics
@@ -277,6 +278,38 @@ impl Cx {
             }
         }
         Some(registry)
+    }
+
+    /// `mcp/<id>.yaml`: MCP server records (`docs/mcp-servers-spec.md` §2.2). Each must have
+    /// the record's shape, name tools in `tools.yaml` and the approvals; no registry name may be
+    /// mapped by two records.
+    fn check_mcp_servers(&mut self, registry: Option<&ToolRegistry>) {
+        let loaded = crate::mcp::read_dir(&self.root);
+        let mut records = Vec::new();
+        for l in loaded {
+            self.report.files_checked += 1;
+            match l.record {
+                Err(e) => self.error("mcp-parse", &l.path, e),
+                Ok(record) => {
+                    if let Some(registry) = registry {
+                        let stem = l
+                            .path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        for p in crate::mcp::validate(&record, &stem, registry) {
+                            self.error(p.code, &l.path, p.message);
+                        }
+                    }
+                    records.push(record);
+                }
+            }
+        }
+        let dir = self.root.join(crate::mcp::MCP_DIR);
+        for p in crate::mcp::cross_check(&records.iter().collect::<Vec<_>>()) {
+            self.error(p.code, &dir, p.message);
+        }
     }
 
     fn check_master(&mut self) {

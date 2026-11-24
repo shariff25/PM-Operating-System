@@ -212,6 +212,72 @@ pub struct Config {
     /// `PMOS_GATEWAY_URL`: the model gateway, whose `/readyz` says the source it serves; every
     /// session open and tool call checks it (`crate::model_source`). Required.
     pub gateway_url: String,
+    /// Fake connectors with `PMOS_MCP_SYSTEMS=jira` (the spec's `fake-mcp` mode,
+    /// `docs/mcp-servers-spec.md` §4): Jira served through the MCP client by the fake MCP
+    /// server, in this process. (`PMOS_CONNECTORS` keeps its two values: the runtime and
+    /// `pmos-web` read it too.)
+    pub fake_mcp: bool,
+    /// `PMOS_MCP_SYSTEMS` (slices M3 and M6): registry systems served through an MCP server
+    /// instead of the built-in connector. Default empty: every system on its built-in connector,
+    /// the quick way back. With live connectors each is served by its approved record in
+    /// `content/mcp/`; with fake ones `jira` is served by the fake MCP server. `docs` is served
+    /// by its record (`pmos-docs`) with either. Confluence and Slack are refused until slice M8.
+    pub mcp_systems: Vec<String>,
+    /// `PMOS_MCP_COMPARE` (slice M7): systems whose reads run on both the in-process fake and
+    /// the fake MCP server, the answers compared and the comparison audited. Fake connectors
+    /// only, so only fake data is compared. `jira` only.
+    pub mcp_compare: Vec<String>,
+}
+
+/// A comma- or space-separated list setting.
+fn list_setting(get: &impl Fn(&str) -> Option<String>, key: &str) -> Vec<String> {
+    get(key)
+        .unwrap_or_default()
+        .split([',', ' '])
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// `PMOS_MCP_SYSTEMS` and `PMOS_MCP_COMPARE`, checked against the connectors.
+fn mcp_settings(
+    get: &impl Fn(&str) -> Option<String>,
+    live: bool,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    let systems = list_setting(get, "PMOS_MCP_SYSTEMS");
+    for s in &systems {
+        match s.as_str() {
+            "jira" | "docs" => {}
+            "confluence" | "slack" => {
+                return Err(format!(
+                    "PMOS_MCP_SYSTEMS: `{s}` can't be served by an MCP server yet (slice M8 of docs/mcp-servers-spec.md)"
+                ))
+            }
+            other => {
+                return Err(format!(
+                    "PMOS_MCP_SYSTEMS must list `jira` or `docs`, not `{other}`"
+                ))
+            }
+        }
+    }
+    let compare = list_setting(get, "PMOS_MCP_COMPARE");
+    for s in &compare {
+        if s != "jira" {
+            return Err(format!("PMOS_MCP_COMPARE must be `jira`, not `{s}`"));
+        }
+        if live {
+            return Err(
+                "PMOS_MCP_COMPARE runs on fake data only: it needs PMOS_CONNECTORS=fake (the owner's decision of 2026-11-24)"
+                    .into(),
+            );
+        }
+        if systems.contains(s) {
+            return Err(format!(
+                "PMOS_MCP_COMPARE={s} compares the built-in fake with the fake MCP server; leave `{s}` out of PMOS_MCP_SYSTEMS"
+            ));
+        }
+    }
+    Ok((systems, compare))
 }
 
 /// The tool server's Entra settings: the first-link route validates ID tokens for this tenant
@@ -344,6 +410,10 @@ impl Config {
             }
             None => return Err("PMOS_CONNECTORS is required (`live` or `fake`)".into()),
         };
+        let (mcp_systems, mcp_compare) =
+            mcp_settings(&get, matches!(connectors, Connectors::Live(_)))?;
+        let fake_mcp =
+            matches!(connectors, Connectors::Fake) && mcp_systems.iter().any(|s| s == "jira");
         // The dev seed for the in-memory user store (docs/user-database-spec.md §3): never
         // with a database (users come from the host commands there) or live connectors.
         let users_seed = get("PMOS_USERS_SEED")
@@ -551,6 +621,9 @@ impl Config {
             entra: entra_settings(&get)?,
             model_source,
             gateway_url,
+            fake_mcp,
+            mcp_systems,
+            mcp_compare,
         })
     }
 }
@@ -1585,6 +1658,53 @@ mod tests {
                 ("PMOS_CONTENT_ROOT", "/srv/content"),
             ],
         ))
+        .is_ok());
+    }
+
+    #[test]
+    fn mcp_switches_are_off_by_default_and_checked() {
+        let base = [
+            ("PMOS_SERVICE_TOKEN", TOKEN),
+            ("PMOS_DEV", "1"),
+            ("PMOS_CONNECTORS", "fake"),
+        ];
+        let with = |extra: &[(&str, &str)]| {
+            let mut pairs = base.to_vec();
+            pairs.extend_from_slice(extra);
+            cfg(&pairs)
+        };
+        let off = with(&[]).unwrap();
+        assert!(off.mcp_systems.is_empty() && off.mcp_compare.is_empty() && !off.fake_mcp);
+        // Fake connectors: Jira through the fake MCP server.
+        let on = with(&[("PMOS_MCP_SYSTEMS", "jira")]).unwrap();
+        assert!(on.fake_mcp);
+        assert_eq!(on.mcp_systems, vec!["jira"]);
+        assert!(with(&[("PMOS_MCP_SYSTEMS", "docs")]).is_ok());
+        for refused in ["confluence", "slack"] {
+            assert!(with(&[("PMOS_MCP_SYSTEMS", refused)])
+                .unwrap_err()
+                .contains("slice M8"));
+        }
+        assert!(with(&[("PMOS_MCP_SYSTEMS", "github")]).is_err());
+        // The comparison: fake data, Jira, not also switched.
+        assert_eq!(
+            with(&[("PMOS_MCP_COMPARE", "jira")]).unwrap().mcp_compare,
+            vec!["jira"]
+        );
+        assert!(with(&[("PMOS_MCP_COMPARE", "confluence")]).is_err());
+        assert!(with(&[("PMOS_MCP_COMPARE", "jira"), ("PMOS_MCP_SYSTEMS", "jira")]).is_err());
+        // PMOS_CONNECTORS keeps its two values (the runtime and pmos-web read it too).
+        assert!(cfg(&[
+            ("PMOS_SERVICE_TOKEN", TOKEN),
+            ("PMOS_DEV", "1"),
+            ("PMOS_CONNECTORS", "fake-mcp")
+        ])
+        .is_err());
+        // Fake-data mode still allows the fake MCP server.
+        assert!(with(&[
+            ("PMOS_MODEL_SOURCE", "hosted-test"),
+            ("PMOS_MCP_SYSTEMS", "jira")
+        ])
         .is_ok());
     }
 }

@@ -236,6 +236,38 @@ expect H-EGRESS skip 0 "local"
 # command it would run is that one URL; on a host it is curl to 127.0.0.1 and the gateway port).
 ! grep -n 'REMOTE_KEY\|HOSTED_KEY\|hosted-model.key' "$PF" | grep -v '^[0-9]*: *#' || fail "the preflight reads a model key"
 
+# --- H-MCP: the tool server's own /readyz, with systems on MCP servers ------------------------
+host
+env_lines
+pf
+expect H-MCP skip 0 "no PMOS_MCP_SYSTEMS"
+env_lines PMOS_MCP_SYSTEMS=jira
+pf --starting
+expect H-MCP pass 0 "starting"
+pf
+expect H-MCP pass 0 "no tool server yet"
+setcmd toolserver-readyz '{"ready":true,"checks":{"jira":"ok"}}'
+pf
+expect H-MCP fail 1 "switched but no server"
+setcmd toolserver-readyz '{"ready":true,"checks":{"jira":"ok"},"mcp":{"acme-jira":{"status":"changed","hosts":["mcp.example.com"]}}}'
+pf
+expect H-MCP fail 1 "a changed tool"
+[[ "$(field H-MCP measured)" == *"acme-jira=changed"* ]] || fail "H-MCP doesn't name the server"
+setcmd toolserver-readyz '{"ready":false,"checks":{"jira":"down"},"mcp":{"acme-jira":{"status":"down","hosts":["mcp.example.com"]}}}'
+pf
+expect H-MCP fail 1 "a server down"
+setcmd toolserver-readyz '{"ready":true,"checks":{"jira":"ok"},"mcp":{"acme-jira":{"status":"ok","hosts":["auth.example.com","mcp.example.com"]},"pmos-docs":{"status":"per_user","hosts":[]}}}'
+pf
+expect H-MCP pass 0 "every server ok"
+env_lines PMOS_MCP_SYSTEMS=jira HTTPS_PROXY=http://proxy.example.com:3128
+pf
+expect H-MCP warn 0 "behind a proxy"
+[[ "$(field H-MCP hint)" == *"auth.example.com mcp.example.com"* ]] || fail "H-MCP doesn't list the hosts the proxy should allow"
+setcmd toolserver-readyz 'not json'
+pf
+expect H-MCP fail 1 "unreadable"
+env_lines
+
 # --- H-PORTS, from the configured ports -------------------------------------------------------
 host
 printf 'LISTEN 0 4096 127.0.0.1:8710 0.0.0.0:*\n' >>"$R/cmd/ss"

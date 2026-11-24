@@ -34,6 +34,11 @@ async fn main() -> Result<()> {
     if args.first().map(String::as_str) == Some("users") {
         std::process::exit(pmos_toolserver::users::host::main(args[1..].to_vec()).await);
     }
+    // `pmos-toolserver mcp digests <record.yaml>`: an operator's command for an Admin preparing
+    // an approval (docs/toolserver.md, "MCP servers").
+    if args.first().map(String::as_str) == Some("mcp") {
+        std::process::exit(pmos_toolserver::mcp_client::host::main(args[1..].to_vec()).await);
+    }
 
     tracing_subscriber::fmt()
         .json()
@@ -59,14 +64,32 @@ async fn main() -> Result<()> {
     }
     let catalog =
         Catalog::load(&config.content_root, Utc::now().date_naive()).context("loading content")?;
+    // MCP server records (docs/mcp-servers-spec.md §2.2): every record in the content checkout is
+    // checked at start, whether or not a system is switched onto it.
+    let mcp_records = load_mcp_records(&config.content_root)?;
+    let mut refusals = pmos_toolserver::mcp_client::startup_refusals(&mcp_records);
+    if fake_only {
+        refusals.extend(pmos_toolserver::mcp_client::fake_data_refusals(
+            &mcp_records,
+        ));
+    }
+    if !refusals.is_empty() {
+        anyhow::bail!(refusals.join("\n"));
+    }
     let cancel = CancellationToken::new();
 
+    // MCP servers' per-PM tokens (slice M4): their own table beside the vault's.
+    let mut mcp_store: Arc<dyn pmos_toolserver::mcp_client::oauth::McpCredentials> =
+        Arc::new(pmos_toolserver::mcp_client::oauth::MemoryMcpCredentials::default());
     let mut stores = match &config.database_url {
         Some(url) => {
             let pg = PgStore::connect(url)
                 .await
                 .context("connecting to Postgres")?;
             pg.migrate().await.context("applying migrations")?;
+            mcp_store = Arc::new(pmos_toolserver::mcp_client::oauth::PgMcpCredentials::new(
+                pg.pool().clone(),
+            ));
             // The permanent marker (slice H4): written at a start with live connectors or
             // GitHub memory, whatever the source; a fake-data start refuses a database with it.
             let real = matches!(config.connectors, Connectors::Live(_))
@@ -150,7 +173,7 @@ async fn main() -> Result<()> {
 
     let mut github_setup = None;
     let mut proposals = None;
-    let (connectors, oauth): (Vec<Arc<dyn Connector>>, Option<Arc<OAuth>>) = match &config
+    let (mut connectors, oauth): (Vec<Arc<dyn Connector>>, Option<Arc<OAuth>>) = match &config
         .connectors
     {
         Connectors::Fake => {
@@ -239,6 +262,109 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Per-PM OAuth to MCP servers (slice M4): with live connectors and any `oauth_per_user`
+    // record, its tokens sealed with the vault's keys in their own table.
+    let mut mcp_oauth = None;
+    if let Connectors::Live(live) = &config.connectors {
+        if mcp_records
+            .iter()
+            .any(|r| r.auth == pmos_contract::mcp::AuthKind::OauthPerUser)
+        {
+            let o = Arc::new(
+                pmos_toolserver::mcp_client::oauth::McpOAuth::new(
+                    &mcp_records,
+                    live.vault_keys.clone(),
+                    mcp_store.clone(),
+                    people.clone(),
+                    mcp_state_key(config.service_token.expose()),
+                    live.public_url.clone(),
+                    |k| std::env::var(k).ok(),
+                    pmos_toolserver::mcp_client::transport::TestRoutes::default(),
+                    Some(stores.audit.clone()),
+                )
+                .map_err(anyhow::Error::msg)?,
+            );
+            tracing::info!("MCP account linking on: each PM links their own account per server");
+            mcp_oauth = Some(o);
+        }
+    }
+    let mcp_tokens: Option<Arc<dyn pmos_toolserver::mcp_client::UserTokens>> = mcp_oauth
+        .clone()
+        .map(|o| o as Arc<dyn pmos_toolserver::mcp_client::UserTokens>);
+    // Systems switched onto MCP (PMOS_MCP_SYSTEMS; default none, the quick way back): with
+    // fake connectors Jira goes through the fake MCP server in this process; every other
+    // system named is served by its approved record, which an active Admin must have approved.
+    let mut switched: Vec<Arc<dyn Connector>> = Vec::new();
+    let mut mcp_servers = Vec::new();
+    if config.fake_mcp {
+        let (jira, _fake) =
+            pmos_toolserver::mcp_client::start_fake(Some(stores.audit.clone()), cancel.clone())
+                .await
+                .map_err(anyhow::Error::msg)?;
+        tracing::warn!("PMOS_MCP_SYSTEMS=jira with fake connectors: Jira is served by the fake MCP server (fixtures)");
+        switched.extend(jira.connectors);
+        mcp_servers.extend(jira.servers);
+    }
+    let from_records: Vec<String> = config
+        .mcp_systems
+        .iter()
+        .filter(|s| !(config.fake_mcp && s.as_str() == "jira"))
+        .cloned()
+        .collect();
+    if !from_records.is_empty() {
+        let dir = stores.users.directory(Utc::now()).await.map_err(|e| {
+            anyhow::anyhow!("the user database can't be read to check MCP approvals: {e}")
+        })?;
+        pmos_toolserver::mcp_client::check_approvals(&mcp_records, &dir)
+            .map_err(|e| anyhow::anyhow!(e.join("\n")))?;
+        let served = pmos_toolserver::mcp_client::connectors_for(
+            &mcp_records,
+            &from_records,
+            |k| std::env::var(k).ok(),
+            mcp_tokens.clone(),
+            Some(stores.audit.clone()),
+            &pmos_toolserver::mcp_client::transport::TestRoutes::default(),
+        )
+        .map_err(anyhow::Error::msg)?;
+        for c in &served.connectors {
+            tracing::info!(
+                system = c.system(),
+                "served through its approved MCP server record"
+            );
+        }
+        switched.extend(served.connectors);
+        mcp_servers.extend(served.servers);
+    }
+    // Side by side (PMOS_MCP_COMPARE, fake connectors only, so fake data only): each read runs
+    // on the in-process fake and on the fake MCP server, the built-in answer is returned and
+    // the comparison audited (`mcp.compare`). Writes go to the built-in fake only.
+    if !config.mcp_compare.is_empty() {
+        let (shadow, _fake) =
+            pmos_toolserver::mcp_client::start_fake(Some(stores.audit.clone()), cancel.clone())
+                .await
+                .map_err(anyhow::Error::msg)?;
+        for shadow in shadow.connectors {
+            let system = shadow.system().to_string();
+            if !config.mcp_compare.contains(&system) {
+                continue;
+            }
+            if let Some(builtin) = connectors.iter().find(|c| c.system() == system).cloned() {
+                tracing::warn!(system = %system, "PMOS_MCP_COMPARE: reads run on the fake and the fake MCP server, and are compared");
+                switched.push(Arc::new(
+                    pmos_toolserver::mcp_client::compare::SideBySide::new(
+                        builtin,
+                        shadow,
+                        stores.audit.clone(),
+                    ),
+                ));
+            }
+        }
+    }
+    for c in switched {
+        connectors.retain(|old| old.system() != c.system());
+        connectors.push(c);
+    }
+
     for skill in &config.bot_skills {
         if catalog.skill(skill).is_none() {
             anyhow::bail!("PMOS_BOT_SKILLS names unknown skill `{skill}`");
@@ -253,6 +379,7 @@ async fn main() -> Result<()> {
         .with_ledger_fast_approval_seconds(config.ledger_fast_approval_seconds)
         .with_slack_draft_ttl_hours(config.slack_draft_ttl_hours)
         .with_audit_retention_days(config.audit_retention_days)
+        .with_mcp_servers(mcp_servers)
         // Slice H4: every session open and tool call checks the gateway's model source.
         .with_model_source(Arc::new(pmos_toolserver::model_source::SourceGuard::new(
             config.model_source,
@@ -277,6 +404,9 @@ async fn main() -> Result<()> {
     }
     if let Some((handle, file)) = &config.dev_password_setup {
         dev_password_setup(&svc, handle, file).await?;
+    }
+    if let Some(o) = mcp_oauth {
+        svc = svc.with_mcp_oauth(o);
     }
     let svc = Arc::new(svc);
     // Audit retention (docs/audit-retention.md): daily, the first run a few minutes after
@@ -511,6 +641,27 @@ fn spawn_deactivation_sweeper(svc: Arc<ToolService>, cancel: CancellationToken) 
             }
         }
     });
+}
+
+/// Every record in `<content>/mcp/`, checked against the registry; none when there is no such
+/// directory.
+fn load_mcp_records(
+    content_root: &std::path::Path,
+) -> Result<Vec<pmos_contract::mcp::ServerRecord>> {
+    let registry = pmos_contract::ToolRegistry::from_yaml(
+        &std::fs::read_to_string(content_root.join("tools.yaml")).context("reading tools.yaml")?,
+    )
+    .context("parsing tools.yaml")?;
+    pmos_contract::mcp::load(content_root, &registry).map_err(|e| anyhow::anyhow!(e.join("\n")))
+}
+
+/// The key that signs MCP servers' OAuth `state`: from the service token, under its own label.
+fn mcp_state_key(service_token: &str) -> Vec<u8> {
+    use hmac::{Hmac, Mac};
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(service_token.as_bytes())
+        .expect("HMAC takes any key length");
+    mac.update(b"pmos-mcp-oauth-state-v1");
+    mac.finalize().into_bytes().to_vec()
 }
 
 /// The key that signs OAuth `state`, derived from the service token so there is one fewer

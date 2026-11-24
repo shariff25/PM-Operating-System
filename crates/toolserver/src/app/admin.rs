@@ -72,6 +72,8 @@ pub(super) fn routes(state: AppState) -> Router<AppState> {
             axum::routing::post(open_proposal).layer(DefaultBodyLimit::max(MAX_PROPOSAL_BODY)),
         )
         .route("/admin/protection", get(protection))
+        // MCP servers (`docs/mcp-servers-spec.md` §5): Policy Admin's read-only view.
+        .route("/admin/mcp", get(mcp_servers))
         .route("/admin/actions", axum::routing::post(record_action))
         .route("/admin/events", axum::routing::post(sign_in_event))
         .layer(middleware::from_fn_with_state(state, identify_admin_client))
@@ -1264,6 +1266,23 @@ async fn protection(
         );
     }
     crate::proposals::protection(state.onboarding.oauth(), state.onboarding.proposals(), user).await
+}
+
+/// The MCP servers this tool server reaches, as Policy Admin shows them: per server its
+/// operator, URL host, auth kind, scopes, data class, systems, approved tools with their class
+/// and digest, and its last `tools/list` check. Metadata only: never a token, and the tool
+/// names the server lists are the server's own words, shown to Admins and Auditors only.
+async fn mcp_servers(
+    State(state): State<AppState>,
+    Extension(client): Extension<Client>,
+    Query(q): Query<ViewerParams>,
+) -> Response {
+    let need = [Permission::ViewPolicies];
+    if let Err(refused) = viewer(&state, client, q.user.as_deref(), "admin.mcp", &need).await {
+        return *refused;
+    }
+    Json(json!({ "servers": crate::mcp_client::policy_view(state.svc.mcp_servers()) }))
+        .into_response()
 }
 
 /// The actions `pmos-web` may record ([`record_action`]).
