@@ -288,3 +288,14 @@ echo "  3. sudo deploy/pmos-admin host-names apply     # the three service names
 echo "     sudo deploy/pmos-admin host-firewall apply  # the metadata block (H-METADATA)"
 echo "  4. deploy/pmos-admin up        # runs the host preflight, then starts the stack;"
 echo "                                 # then deploy/pmos-admin status"
+# pmos-web refuses PMOS_EXPOSURE=public until slice H10 (the admin listener), and public is the
+# default written above (§3.1, the value that allows less), so say so here, not first at `up --web`.
+if [ "$(env_value PMOS_EXPOSURE)" = public ]; then
+  echo "  The web app (deploy/pmos-admin up --web) can't run here yet: with PMOS_EXPOSURE=public it"
+  echo "  refuses to start until the admin listener is built (spec slice H10), and up --web refuses."
+  echo "  On a host reached only from a network the company controls (a VPN, an SSH tunnel), set"
+  echo "  PMOS_EXPOSURE=private in deploy/.env (or run setup.sh with --exposure private on a new"
+  echo "  install); if the host preflight's H-PRIVATE then fails (a public address, or a metadata"
+  echo "  service that answers) on a closed test host, record it with"
+  echo "    sudo deploy/pmos-admin host acknowledge H-PRIVATE --reason \"<why this host is private>\""
+fi

@@ -380,6 +380,8 @@ your site already routes that range. The proxy must send `X-Forwarded-For` (ngin
 | `The pmos network's gateway is <a>, but deploy/.env pins PMOS_NETWORK_GATEWAY=<b>` | The network was made before the kit pinned it (or with other settings). Run `deploy/pmos-admin down && deploy/pmos-admin up --web`: `down` removes the network and `up` makes it at the pinned address. Every service restarts. |
 | `PMOS_WEB_TRUSTED_PROXIES names <x>, but ... the gateway, <g>` | The setting is stale (an old, unpinned gateway such as `172.18.0.1`). Set the printed line. A proxy in a container on the `pmos` network may be listed by its own address inside the subnet. |
 | `PMOS_WEB_PUBLIC_URL must be the web app's https:// address` | Set it. |
+| `PMOS_EXPOSURE=public in deploy/.env, and the web app (pmos-web) does not run on a public host` | `public` is `setup.sh`'s default, and `pmos-web` refuses it until the admin listener (slice H10) is built. On a host reached only from a network the company controls (a VPN, an SSH tunnel), set `PMOS_EXPOSURE=private` in `deploy/.env`; if the preflight's H-PRIVATE then fails on a closed test host (a public address, or a metadata service that answers), record it with `sudo deploy/pmos-admin host acknowledge H-PRIVATE --reason "<why>"`. Otherwise leave the web app off. |
+| `PMOS_WEB_BRIEF_URL=… is the web app's browser-facing port` (any `up`) | A value from before slice H9. Set `PMOS_WEB_BRIEF_URL=http://web.pmos.internal:8771`, or leave it blank to send no brief. |
 
 **What a reverse proxy in front of the web app must not forward, and how big a body it takes.**
 These rules hold on every host, private or not:
@@ -393,7 +395,8 @@ These rules hold on every host, private or not:
   port, no proxy rule, and the preflight's H-EXPOSURE fails if anything on the host listens on it.
   The Slack service reaches it by name, so with the brief on set
   `PMOS_WEB_BRIEF_URL=http://web.pmos.internal:8771` (`deploy/env.example`). The browser-facing
-  port answers `404` for the route, so a URL ending in `:8770` sends no brief.
+  port answers `404` for the route, so a URL ending in `:8770` sends no brief, and `deploy/pmos-admin
+  up` refuses any value but `http://<name>:8771` (blank: no brief).
 - Body sizes: `client_max_body_size 2m;` on the web app's server block (nginx; axum's own default).
   The web app's limits are lower on most routes (the brief's route takes 128 KiB, password
   sign-in 4 KiB). The admin routes' 16 MiB bodies are not served on this port.
