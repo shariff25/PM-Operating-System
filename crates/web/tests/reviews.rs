@@ -226,6 +226,8 @@ async fn web() -> Web {
         internal_bind: None,
         password_login: false,
         trusted_proxies: Vec::new(),
+        admin: None,
+        password_clients: Vec::new(),
     };
     let (base, stop_web) = serve(pmos_web::build(cfg, Deps::in_memory()).unwrap()).await;
     Web {

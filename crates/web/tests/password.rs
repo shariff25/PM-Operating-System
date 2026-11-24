@@ -267,6 +267,8 @@ async fn web(trusted: &[&str]) -> Web {
             .iter()
             .map(|t| t.parse::<IpAddr>().unwrap())
             .collect(),
+        admin: None,
+        password_clients: Vec::new(),
     };
     let clock = Arc::new(Mutex::new(
         DateTime::parse_from_rfc3339("2026-11-20T09:00:00Z")

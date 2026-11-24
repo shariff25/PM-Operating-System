@@ -37,13 +37,13 @@ use pmos_directory::resolve::{
 use crate::auth::{
     self, AuthProvider, DevLoginProvider, PasswordProvider, SignInError, SignInInput,
 };
-use crate::config::{Config, NO_PROVIDER};
+use crate::config::{AdminDoor, AdminMode, Cidr, Config, NO_PROVIDER};
 use crate::drafts::{self, Draft, Suggestion};
 use crate::entra::{self, Entra, Failure};
 use crate::followups::{BriefConfig, FollowUpStore, MemoryFollowUpStore};
 use crate::progress::{self, EventOut, Progress};
 use crate::session::{
-    self, IdHash, MemorySessionStore, Session, SessionStore, StoreError, CSRF_HEADER,
+    self, Door, IdHash, MemorySessionStore, Session, SessionStore, StoreError, CSRF_HEADER,
 };
 use crate::settings::{DraftEdit, MemorySettingsStore, SettingsStore, StoredSuggestion, UserState};
 use crate::upstream::{
@@ -183,10 +183,66 @@ struct Inner {
     sources: password::SourceLimiter,
     /// The bot catalog's last read, for attribution (`app/bots.rs`).
     catalog: std::sync::Mutex<Option<(std::time::Instant, Arc<bots::Catalog>)>>,
+    /// The admin door's settings (slice H10): `None` serves no admin route anywhere.
+    admin: Option<AdminDoor>,
+    /// The admin door's sign-in providers: Entra (only with `PMOS_WEB_ADMIN_ENTRA=1`, its own
+    /// redirect URI and flow cookie) and password sign-in. Never development sign-in.
+    admin_providers: Vec<Arc<dyn AuthProvider>>,
+    admin_entra: Option<Arc<Entra>>,
+    /// `PMOS_WEB_PASSWORD_CLIENTS` (D2 (a)).
+    password_clients: Vec<Cidr>,
+    /// Admin-door requests answered `404` for a `Host` other than the admin URL's authority
+    /// (r7, X6), and for a peer or forwarded client the door doesn't take, since start-up:
+    /// `/readyz` reports both.
+    admin_bad_host: std::sync::atomic::AtomicU64,
+    admin_refused_peer: std::sync::atomic::AtomicU64,
+    /// Set while `PMOS_EXPOSURE=private` and the public URL resolves to a public address (the
+    /// check every 10 minutes, `main`): sign-in answers `503 sign_in_stopped` on both doors.
+    sign_in_stopped: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// The app's state, and which door the router it serves is (slice H10): the two doors share
+/// everything but what [`AppState::door`] picks (cookie, origin, session bounds, providers).
 #[derive(Clone)]
-pub struct AppState(Arc<Inner>);
+pub struct AppState(Arc<Inner>, Door);
+
+impl AppState {
+    /// The door this router serves.
+    pub fn door(&self) -> Door {
+        self.1
+    }
+
+    /// The origin writes must come from: `PMOS_WEB_PUBLIC_URL` on the public door (the
+    /// request's own `Host` without it), `PMOS_WEB_ADMIN_URL` on the admin door.
+    fn origin(&self) -> Option<&str> {
+        match self.1 {
+            Door::Public => self.0.public_url.as_deref(),
+            Door::Admin => self.0.admin.as_ref().map(|a| a.url.as_str()),
+        }
+    }
+
+    /// This door's session bounds: idle, then absolute.
+    fn bounds(&self) -> (chrono::Duration, chrono::Duration) {
+        match (self.1, &self.0.admin) {
+            (Door::Admin, Some(a)) => (a.idle, a.max),
+            _ => (self.0.idle, self.0.max),
+        }
+    }
+
+    fn providers(&self) -> &[Arc<dyn AuthProvider>] {
+        match self.1 {
+            Door::Public => &self.0.providers,
+            Door::Admin => &self.0.admin_providers,
+        }
+    }
+
+    fn entra(&self) -> Option<Arc<Entra>> {
+        match self.1 {
+            Door::Public => self.0.entra.clone(),
+            Door::Admin => self.0.admin_entra.clone(),
+        }
+    }
+}
 
 /// What `pmos-web` serves ([`build_server`]): the browser-facing router; the
 /// server-to-server router when `PMOS_WEB_INTERNAL_BIND` gives it its own listener; and the
@@ -196,7 +252,15 @@ pub struct Server {
     /// `Some` only with `internal_bind`: `PUT /internal/brief/{handle}`, `/healthz` and
     /// `/readyz`. Without it, the internal route is on `public`.
     pub internal: Option<Router>,
+    /// `Some` only with the admin door (`PMOS_WEB_ADMIN_BIND`, slice H10): `/api/admin/*`, the
+    /// admin door's sign-in routes and the static app. It must be served with each
+    /// connection's peer address (`into_make_service_with_connect_info`): without one, every
+    /// request answers `404`.
+    pub admin: Option<Router>,
     pub housekeeping: Housekeeping,
+    /// Set it to stop sign-in on both doors (`503 sign_in_stopped`): `main`'s private-exposure
+    /// check, when the public URL starts resolving to a public address.
+    pub sign_in_stopped: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// How often expired sessions, follow-ups, `changed` items, edits and suggestions are
@@ -272,6 +336,29 @@ pub fn build_server(config: Config, deps: Deps) -> Result<Server, String> {
         .public_url
         .as_deref()
         .is_some_and(|u| u.starts_with("https://"));
+    // The admin door's providers (slice H10): never development sign-in; Entra only with its
+    // own registered redirect URI.
+    let mut admin_providers: Vec<Arc<dyn AuthProvider>> = Vec::new();
+    let mut admin_entra = None;
+    if let Some(door) = &config.admin {
+        if door.entra {
+            if let Some(c) = &config.entra {
+                let e = Arc::new(Entra::for_admin_door(c.clone(), &door.url)?);
+                admin_providers.push(e.clone());
+                admin_entra = Some(e);
+            }
+        }
+        if config.password_login {
+            admin_providers.push(Arc::new(PasswordProvider));
+        }
+        if admin_providers.is_empty() {
+            return Err(crate::config::ADMIN_NO_PROVIDER.into());
+        }
+    }
+    let admin_hsts = config
+        .admin
+        .as_ref()
+        .is_some_and(|a| a.url.starts_with("https://"));
     let static_root = match &config.static_dir {
         None => None,
         Some(dir) => {
@@ -299,7 +386,8 @@ pub fn build_server(config: Config, deps: Deps) -> Result<Server, String> {
         )),
         deps.clock.clone(),
     ));
-    let state = AppState(Arc::new(Inner {
+    let sign_in_stopped: Arc<std::sync::atomic::AtomicBool> = Default::default();
+    let inner = Arc::new(Inner {
         directory,
         runtime: Runtime::new(http.clone(), &config.bots_url, &config.bots_token),
         toolserver: ToolServer::new(http, &config.toolserver_url, &config.toolserver_token),
@@ -325,7 +413,16 @@ pub fn build_server(config: Config, deps: Deps) -> Result<Server, String> {
         trusted_proxies: config.trusted_proxies,
         sources: Default::default(),
         catalog: Default::default(),
-    }));
+        admin: config.admin.clone(),
+        admin_providers,
+        admin_entra,
+        password_clients: config.password_clients,
+        admin_bad_host: Default::default(),
+        admin_refused_peer: Default::default(),
+        sign_in_stopped: sign_in_stopped.clone(),
+    });
+    let state = AppState(inner.clone(), Door::Public);
+    let admin_state = AppState(inner, Door::Admin);
     let api = Router::new()
         .route("/auth/providers", get(auth_providers))
         .route("/auth/login", get(entra_login))
@@ -351,23 +448,30 @@ pub fn build_server(config: Config, deps: Deps) -> Result<Server, String> {
         .route("/tasks/{id}", get(get_task))
         .merge(brief::routes())
         .merge(bots::routes())
-        .merge(admin::routes())
-        .merge(admin_bots::routes())
-        .merge(users::routes())
         .merge(reviews::routes())
-        .merge(policy::routes())
-        .merge(content::routes())
-        .merge(password::routes())
-        .fallback(|| async { ApiError::not_found() })
-        // A known path with another method: JSON too, never an empty body or the app.
-        .method_not_allowed_fallback(|| async {
-            ApiError::new(
-                StatusCode::METHOD_NOT_ALLOWED,
-                "method_not_allowed",
-                "This route doesn't take that method.",
-            )
-        })
-        .layer(axum::middleware::from_fn(require_json));
+        .merge(password::sign_in_routes(&state))
+        .merge(password::self_service_routes(&state));
+    // Decision D3 (b): no `/api/admin/*` route on this door, on any host: they answer `404`
+    // (the fallback), and live only on the admin door below.
+    let api = finish_api(api);
+    // The admin door's `/api` (slice H10, §3.8): its own sign-in (no development sign-in, no
+    // password change or recovery codes: those are the public door's), `/api/me`, and every
+    // `/api/admin/*` route, the Auditor's views and a held draft's release included.
+    let admin_api = finish_api(
+        Router::new()
+            .route("/auth/providers", get(auth_providers))
+            .route("/auth/login", get(entra_login))
+            .route("/auth/callback", get(entra_callback))
+            .route("/auth/logout", post(logout))
+            .route("/me", get(me))
+            .merge(admin::routes())
+            .merge(admin_bots::routes())
+            .merge(users::routes())
+            .merge(policy::routes())
+            .merge(content::routes())
+            .merge(password::sign_in_routes(&admin_state))
+            .merge(password::admin_routes()),
+    );
     let health = || {
         Router::new()
             .route("/healthz", get(|| async { "ok" }))
@@ -394,13 +498,165 @@ pub fn build_server(config: Config, deps: Deps) -> Result<Server, String> {
     };
     let public = public
         .fallback(static_files)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            sign_in_gate,
+        ))
         .layer(axum::middleware::from_fn_with_state(hsts, security_headers))
         .with_state(state.clone());
+    // The admin door: its `/api` and the static app (the admin screens), nothing else (no
+    // health, internal or old draft routes). Every request first meets the peer and `Host`
+    // checks (`admin_gate`), which answer `404` before any route runs; no answer carries a CORS
+    // header, ever.
+    let admin = admin_state.0.admin.is_some().then(|| {
+        Router::new()
+            .nest("/api", admin_api)
+            .fallback(static_files)
+            .layer(axum::middleware::from_fn_with_state(
+                admin_state.clone(),
+                sign_in_gate,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                admin_state.clone(),
+                admin_gate,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
+                admin_hsts,
+                security_headers,
+            ))
+            .with_state(admin_state.clone())
+    });
     Ok(Server {
         public,
         internal,
+        admin,
         housekeeping: Housekeeping(state),
+        sign_in_stopped,
     })
+}
+
+/// An `/api` router's shared ending: `404` JSON for any other path, `405` JSON for another
+/// method, and JSON required on every write with a body.
+fn finish_api(api: Router<AppState>) -> Router<AppState> {
+    api.fallback(|| async { ApiError::not_found() })
+        // A known path with another method: JSON too, never an empty body or the app.
+        .method_not_allowed_fallback(|| async {
+            ApiError::new(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method_not_allowed",
+                "This route doesn't take that method.",
+            )
+        })
+        .layer(axum::middleware::from_fn(require_json))
+}
+
+/// The client address the admin door's gate resolved (the tunnel peer, or the client a trusted
+/// terminator named), for password sign-in's per-address limit and D2 (a)'s allow-list.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AdminClient(pub std::net::IpAddr);
+
+/// The admin door's checks, before any route (r7, X6):
+///
+/// 1. **Who may connect, by mode.** Tunnel mode: only `PMOS_WEB_ADMIN_TUNNEL_PEER`;
+///    `X-Forwarded-For` is never read. Proxy mode: only a peer in
+///    `PMOS_WEB_ADMIN_TRUSTED_PROXIES`, naming a client (read as `password::source` reads it on
+///    the public door) in loopback, RFC 1918, `100.64.0.0/10` or IPv6 unique-local. Anything
+///    else, a connection with no known peer included, is `404`.
+/// 2. **`Host`** must be exactly the authority of `PMOS_WEB_ADMIN_URL` (the host without case,
+///    the port as the URL writes it); a missing one is refused. Else `404`, counted for
+///    `/readyz` as `admin_bad_host` (DNS rebinding through a tunnel's loopback address).
+/// 3. **No CORS:** any `Access-Control-*` header is removed from every answer.
+async fn admin_gate(
+    State(state): State<AppState>,
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    use std::sync::atomic::Ordering;
+    let Some(door) = state.0.admin.as_ref() else {
+        return ApiError::not_found().into_response();
+    };
+    let peer = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|c| c.0);
+    let canonical = crate::config::canonical_ip;
+    let client = match (&door.mode, peer) {
+        (_, None) => None,
+        (AdminMode::Tunnel { peer: want }, Some(p)) => {
+            (canonical(p.ip()) == canonical(*want)).then_some(p.ip())
+        }
+        (AdminMode::Proxy { trusted }, Some(p)) => {
+            let from_trusted = trusted.iter().any(|t| canonical(*t) == canonical(p.ip()));
+            if from_trusted {
+                match password::source(Some(p), req.headers(), trusted) {
+                    Ok(Some(ip)) if crate::config::in_admin_ranges(ip) => Some(ip),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
+    };
+    let Some(client) = client else {
+        state.0.admin_refused_peer.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!("admin door: a peer or forwarded client it doesn't take: 404");
+        return ApiError::not_found().into_response();
+    };
+    let host_ok = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|h| h.eq_ignore_ascii_case(&door.authority));
+    if !host_ok {
+        state.0.admin_bad_host.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!("admin door: a Host other than PMOS_WEB_ADMIN_URL's: 404");
+        return ApiError::not_found().into_response();
+    }
+    req.extensions_mut().insert(AdminClient(client));
+    let mut res = next.run(req).await;
+    strip_cors(res.headers_mut());
+    res
+}
+
+/// Remove every `Access-Control-*` header (the admin door sends none, ever: r7, X6).
+fn strip_cors(h: &mut HeaderMap) {
+    let names: Vec<header::HeaderName> = h
+        .keys()
+        .filter(|k| k.as_str().starts_with("access-control-"))
+        .cloned()
+        .collect();
+    for n in names {
+        h.remove(n);
+    }
+}
+
+/// Is this a sign-in route (every `/api/auth/*` but sign-out and the providers list)?
+fn is_sign_in_path(path: &str) -> bool {
+    path.starts_with("/api/auth/") && path != "/api/auth/logout" && path != "/api/auth/providers"
+}
+
+/// While the private-exposure check has stopped sign-in (`PMOS_EXPOSURE=private` and the public
+/// URL resolving to a public address, r6), every sign-in route answers `503 sign_in_stopped`.
+async fn sign_in_gate(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if is_sign_in_path(req.uri().path())
+        && state
+            .0
+            .sign_in_stopped
+            .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "sign_in_stopped",
+            "Sign-in is stopped on this PM OS: its address no longer looks private. Tell a \
+             platform owner.",
+        )
+        .into_response();
+    }
+    next.run(req).await
 }
 
 /// `GET /drafts/{id}` and `GET /d/{id}`: a `303` to the app's own route for the draft,
@@ -520,6 +776,14 @@ async fn readyz(State(state): State<AppState>) -> Response {
             "checks": body,
             "unrecorded_sign_in_events": unrecorded,
             "untrusted_proxy_refusals": untrusted,
+            // Slice H10: admin-door requests answered 404 for a wrong Host, and for a peer or
+            // forwarded client the door doesn't take (both counted, never checks).
+            "admin_bad_host": state.0.admin_bad_host.load(std::sync::atomic::Ordering::Relaxed),
+            "admin_refused_peer": state
+                .0
+                .admin_refused_peer
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "sign_in_stopped": state.0.sign_in_stopped.load(std::sync::atomic::Ordering::Relaxed),
             "warnings": warnings,
         })),
     )
@@ -759,7 +1023,7 @@ fn is_write(method: &Method) -> bool {
 
 /// Same origin, and the session's CSRF token in `X-Pmos-Csrf`.
 fn check_write(state: &AppState, headers: &HeaderMap, session: &Session) -> Result<(), ApiError> {
-    if !auth::same_origin(headers, state.0.public_url.as_deref()) {
+    if !auth::same_origin(headers, state.origin()) {
         tracing::warn!(user = %session.handle, "refused a write from another origin");
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
@@ -884,20 +1148,60 @@ impl Signed {
     fn bot(&self) -> String {
         personal_bot_name(self.handle())
     }
+
+    /// Step-up (r7, X6 item 5): the sensitive admin actions need a sign-in on the admin door no
+    /// older than [`STEP_UP`] (the session's `created_at`: a session begins at sign-in).
+    /// Older: `401 reauth_required`; the admin screens send the browser through sign-in again,
+    /// which makes a new session, and retry.
+    fn step_up(&self, state: &AppState) -> Result<(), ApiError> {
+        if state.door() == Door::Admin && now(state) - self.session.created_at <= STEP_UP {
+            return Ok(());
+        }
+        tracing::info!(user = %self.handle(), "a sensitive admin action on a sign-in older than 5 minutes: reauth_required");
+        Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "reauth_required",
+            "Sign in again to do this: it needs a sign-in from the last 5 minutes.",
+        ))
+    }
+}
+
+/// How fresh a sign-in a sensitive admin action needs (r7, X6 item 5). A constant, not a
+/// setting.
+pub const STEP_UP: chrono::Duration = chrono::Duration::minutes(5);
+
+/// May `roles` use the admin door? Admin or Auditor only (§3.8).
+pub(crate) fn admin_door_role(roles: &[Role]) -> bool {
+    roles.contains(&Role::Admin) || roles.contains(&Role::Auditor)
+}
+
+/// The admin door's refusal of anyone who is neither Admin nor Auditor (r7, X6 item 4).
+pub(crate) fn admin_door_not_allowed(state: &AppState) -> ApiError {
+    let public = state
+        .0
+        .public_url
+        .as_deref()
+        .unwrap_or("the PM OS address you normally use");
+    ApiError::new(
+        StatusCode::FORBIDDEN,
+        "admin_door_not_allowed",
+        format!("This address is for Admins and Auditors only: use {public}."),
+    )
 }
 
 async fn live_session(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<Option<(IdHash, Session)>, ApiError> {
-    let Some(cookie) = session::cookie_value(headers) else {
+    let Some(cookie) = state.door().cookie_value(headers) else {
         return Ok(None);
     };
     let id = session::hash_id(&cookie);
+    let (idle, max) = state.bounds();
     let found = state
         .0
         .sessions
-        .touch(&id, now(state), state.0.idle, state.0.max)
+        .touch(&id, now(state), idle, max, state.door())
         .await
         .map_err(ApiError::store)?;
     Ok(found.map(|s| (id, s)))
@@ -973,6 +1277,7 @@ async fn signed_in(parts: &Parts, state: &AppState, allow_stale: bool) -> Result
             last_known_good: Some(known),
             ..
         }) if allow_stale
+            && state.door() == Door::Public
             && parts.method == Method::GET
             && known.age <= LAST_KNOWN_GOOD
             && session.password_epoch.is_none() =>
@@ -1020,6 +1325,13 @@ async fn signed_in(parts: &Parts, state: &AppState, allow_stale: bool) -> Result
         end_this().await?;
         return Err(entra_needs_host());
     }
+    if state.door() == Door::Admin && !admin_door_role(&Member::from_user(&user).roles) {
+        // Re-checked on every admin-door request from the user database, not the session row:
+        // a role removed while a session is open ends it here (r7, X6 item 4).
+        tracing::info!(user = %session.handle, "no longer an Admin or Auditor: the admin-door session ends");
+        end_this().await?;
+        return Err(admin_door_not_allowed(state));
+    }
     if is_write(&parts.method) {
         check_write(state, &parts.headers, &session)?;
     }
@@ -1058,10 +1370,10 @@ struct DevLogin {
 /// user database by handle. Fails closed: with the tool server unreachable it answers
 /// `503 users_unavailable`.
 async fn dev_login(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> ApiResult {
-    let Some(provider) = state.0.providers.iter().find(|p| p.name() == "dev") else {
+    let Some(provider) = state.providers().iter().find(|p| p.name() == "dev") else {
         return Err(ApiError::not_found());
     };
-    if !auth::same_origin(&headers, state.0.public_url.as_deref()) {
+    if !auth::same_origin(&headers, state.origin()) {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
             "bad_origin",
@@ -1127,7 +1439,7 @@ async fn dev_login(State(state): State<AppState>, headers: HeaderMap, body: Byte
     let id = start_session(&state, &headers, &user, provider.name(), None, None).await?;
     Ok((
         StatusCode::NO_CONTENT,
-        [(header::SET_COOKIE, session::set_cookie(&id))],
+        [(header::SET_COOKIE, state.door().set_cookie(&id))],
     )
         .into_response())
 }
@@ -1261,7 +1573,13 @@ async fn start_session(
     entra: Option<(String, String)>,
     password_epoch: Option<i64>,
 ) -> Result<String, ApiError> {
-    if let Some(old) = session::cookie_value(headers) {
+    // The admin door makes sessions only for an Admin or an Auditor, checked before any row or
+    // cookie exists (r7, X6 item 4). Each sign-in route checks it first, to clear its own flow
+    // cookie and audit the refusal; this is the backstop.
+    if state.door() == Door::Admin && !admin_door_role(&Member::from_user(user).roles) {
+        return Err(admin_door_not_allowed(state));
+    }
+    if let Some(old) = state.door().cookie_value(headers) {
         state
             .0
             .sessions
@@ -1286,11 +1604,12 @@ async fn start_session(
                 entra_oid: entra.as_ref().map(|(oid, _)| oid.clone()),
                 entra_tid: entra.map(|(_, tid)| tid),
                 password_epoch,
+                door: state.door(),
             },
         )
         .await
         .map_err(ApiError::store)?;
-    tracing::info!(user = %user.handle, provider, "signed in");
+    tracing::info!(user = %user.handle, provider, door = state.door().as_str(), "signed in");
     let roles = Member::from_user(user).roles;
     record_sign_in(
         state,
@@ -1425,7 +1744,7 @@ async fn record_sign_in(
 
 /// `GET /api/auth/providers` (no session): which sign-in buttons the app shows.
 async fn auth_providers(State(state): State<AppState>) -> ApiResult {
-    let names: Vec<&str> = state.0.providers.iter().map(|p| p.name()).collect();
+    let names: Vec<&str> = state.providers().iter().map(|p| p.name()).collect();
     Ok(Json(json!({ "providers": names })).into_response())
 }
 
@@ -1462,7 +1781,7 @@ async fn entra_login(
     State(state): State<AppState>,
     query: Result<axum::extract::Query<LoginQuery>, axum::extract::rejection::QueryRejection>,
 ) -> ApiResult {
-    let Some(entra) = state.0.entra.clone() else {
+    let Some(entra) = state.entra() else {
         return Err(ApiError::not_found());
     };
     let return_to = query.ok().and_then(|q| q.0.return_to);
@@ -1491,10 +1810,10 @@ async fn entra_callback(
     headers: HeaderMap,
     query: Result<axum::extract::Query<CallbackQuery>, axum::extract::rejection::QueryRejection>,
 ) -> ApiResult {
-    let Some(entra) = state.0.entra.clone() else {
+    let Some(entra) = state.entra() else {
         return Err(ApiError::not_found());
     };
-    let clear = entra::clear_flow_cookie();
+    let clear = entra.clear_cookie();
     let fail = |f: Failure| {
         tracing::warn!(provider = "entra", why = f.why(), "sign-in refused");
         Ok(redirect(
@@ -1584,12 +1903,79 @@ async fn entra_callback(
             ));
         }
     };
+    if state.door() == Door::Admin && !admin_door_role(&Member::from_user(&user).roles) {
+        // Neither Admin nor Auditor: refused before any session row or cookie exists, the flow
+        // cookie cleared in the same answer, and audited (r7, X6 item 4).
+        tracing::info!(
+            provider = "entra",
+            "admin door: neither Admin nor Auditor: refused"
+        );
+        record_sign_in(
+            &state,
+            None,
+            SignInEvent::Refused {
+                provider: "entra",
+                reason: "admin_door_not_allowed",
+                attempted: None,
+                member: None,
+            },
+        )
+        .await;
+        return Ok(landing_page(
+            StatusCode::FORBIDDEN,
+            &signed_out_at("admin_door_not_allowed"),
+            std::slice::from_ref(&clear),
+        ));
+    }
     let entra_id = (signed.identity.oid.clone(), signed.identity.tid.clone());
     let id = start_session(&state, &headers, &user, entra.name(), Some(entra_id), None).await?;
-    Ok(redirect(
-        &entra::safe_return(Some(&started.return_to)),
-        &[clear, session::set_cookie(&id)],
-    ))
+    let to = entra::safe_return(Some(&started.return_to));
+    let cookies = [clear, state.door().set_cookie(&id)];
+    Ok(match state.door() {
+        Door::Public => redirect(&to, &cookies),
+        // The admin door's session cookie is `SameSite=Strict`, which a browser doesn't send on
+        // the rest of a navigation that began at another site (Entra's return here). So a small
+        // page moves the browser on: a same-site navigation, which carries it (r7, X6 item 5).
+        Door::Admin => landing_page(StatusCode::OK, &to, &cookies),
+    })
+}
+
+/// A small page that sets `cookies` and moves the browser to `location` (a same-origin path)
+/// by a same-site navigation: `<meta http-equiv="refresh">`, which the `/api` policy allows (it
+/// loads nothing), with a link for a browser that doesn't follow it.
+fn landing_page(status: StatusCode, location: &str, cookies: &[String]) -> Response {
+    let safe = if location.starts_with('/') && !location.starts_with("//") {
+        location
+    } else {
+        "/"
+    };
+    let escaped: String = safe
+        .chars()
+        .map(|c| match c {
+            '&' => "&amp;".to_string(),
+            '"' => "&quot;".to_string(),
+            '<' => "&lt;".to_string(),
+            '>' => "&gt;".to_string(),
+            c => c.to_string(),
+        })
+        .collect();
+    let page = format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta http-equiv=\"refresh\" content=\"0;url={escaped}\"><title>PM OS</title></head>\
+         <body><p><a href=\"{escaped}\">Continue to PM OS</a></p></body></html>"
+    );
+    let mut res = (
+        status,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        page,
+    )
+        .into_response();
+    for c in cookies {
+        if let Ok(v) = HeaderValue::from_str(c) {
+            res.headers_mut().append(header::SET_COOKIE, v);
+        }
+    }
+    res
 }
 
 async fn logout(State(state): State<AppState>, headers: HeaderMap) -> ApiResult {
@@ -1627,7 +2013,7 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> ApiResult 
     }
     Ok((
         StatusCode::NO_CONTENT,
-        [(header::SET_COOKIE, session::clear_cookie())],
+        [(header::SET_COOKIE, state.door().clear_cookie())],
     )
         .into_response())
 }
@@ -1654,6 +2040,19 @@ async fn me_json(state: &AppState, signed: &Signed, st: &UserState) -> Response 
     });
     if let Some(o) = body.as_object_mut() {
         o.extend(bots::me_fields(st, &team));
+        // Slice H10: which door this is. On the public door an Admin or Auditor is given the
+        // admin door's address (the admin screens live there only); on the admin door, the
+        // public door's.
+        o.insert("door".into(), json!(state.door().as_str()));
+        match (state.door(), &state.0.admin) {
+            (Door::Public, Some(a)) if admin_door_role(&signed.member.roles) => {
+                o.insert("admin_url".into(), json!(a.url));
+            }
+            (Door::Admin, _) => {
+                o.insert("public_url".into(), json!(state.0.public_url));
+            }
+            _ => {}
+        }
     }
     Json(body).into_response()
 }

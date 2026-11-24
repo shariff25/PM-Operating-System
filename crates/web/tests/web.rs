@@ -606,6 +606,8 @@ fn config(bots_url: &str, tools_url: &str, root: &std::path::Path) -> Config {
         internal_bind: None,
         password_login: false,
         trusted_proxies: Vec::new(),
+        admin: None,
+        password_clients: Vec::new(),
     }
 }
 
@@ -1403,11 +1405,14 @@ async fn on_the_last_known_good_path_slack_is_withheld_and_writes_fail() {
     assert!(!r.body.to_string().contains("DPA"));
     // Everything that reaches another service, and every write, fails closed.
     let calls = w.tools.calls().len();
-    for path in ["/api/drafts", "/api/tasks", "/api/admin/audit"] {
+    for path in ["/api/drafts", "/api/tasks"] {
         let r = w.get(&b, path).await;
         assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{path}");
         assert_eq!(r.code(), "users_unavailable", "{path}");
     }
+    // Slice H10: the admin routes aren't on this door at all (decision D3 (b)).
+    let r = w.get(&b, "/api/admin/audit").await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND);
     for (method, path, body) in [
         (
             Method::PUT,
@@ -4062,6 +4067,7 @@ async fn readyz_checks_the_store_and_both_upstreams() {
         json!({"ready": true, "checks": {"store": "ok",
                                          "bot_runtime": "ok", "tool_server": "ok"},
                "unrecorded_sign_in_events": 0, "untrusted_proxy_refusals": 0,
+               "admin_bad_host": 0, "admin_refused_peer": 0, "sign_in_stopped": false,
                "warnings": []})
     );
     // `team.yaml` isn't what readiness depends on any more.

@@ -250,6 +250,8 @@ async fn propose(State(state): State<AppState>, signed: Signed, body: Bytes) -> 
         Action::PolicyProposal,
     )
     .await?;
+    // A sensitive admin action: a sign-in no older than 5 minutes (r7, X6 item 5).
+    signed.step_up(&state)?;
     let b: ProposeBody = parse(&body)?;
     let (title, reason) = proposal::check_meta(&proposal::Meta {
         title: b.title,

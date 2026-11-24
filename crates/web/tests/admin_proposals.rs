@@ -344,10 +344,12 @@ fn blobs_of(root: &Path) -> BTreeMap<String, String> {
     out
 }
 
+/// The admin routes live on the admin door only (slice H10): `base` and `http` reach it.
 struct Web {
     base: String,
     tools: Arc<Mock>,
     http: reqwest::Client,
+    sessions: Arc<dyn pmos_web::session::SessionStore>,
     dir: tempfile::TempDir,
     _stop: Vec<CancellationToken>,
 }
@@ -373,6 +375,7 @@ async fn web() -> Web {
     let (bots_url, stop_bots) = serve(Router::new().fallback(runtime)).await;
     let dir = fixture();
     let content = dir.path().join("content");
+    let door = support::door::listener().await;
     let ring = pmos_assertion::KeyRing::new(
         pmos_assertion::Key::from_base64("wt1", WEB_TOOLS_KEY).unwrap(),
     );
@@ -394,25 +397,35 @@ async fn web() -> Web {
         session_idle: Duration::hours(8),
         session_max: Duration::hours(24),
         internal_bind: None,
-        password_login: false,
+        // The admin door's sign-in (it never serves development sign-in).
+        password_login: true,
         trusted_proxies: Vec::new(),
+        admin: Some(support::door::tunnel(door.port)),
+        password_clients: Vec::new(),
     };
     let admin = AdminConfig {
         policies_root: Some(dir.path().join("policies")),
         gateway_config: Some(dir.path().join("gateway.yaml")),
         ..AdminConfig::default()
     };
+    let sessions: Arc<dyn pmos_web::session::SessionStore> =
+        Arc::new(pmos_web::session::MemorySessionStore::new());
     let deps = Deps {
         admin,
+        sessions: sessions.clone(),
         ..Deps::in_memory()
     };
-    let (base, stop_web) = serve(pmos_web::build(cfg, deps).unwrap()).await;
+    let server = pmos_web::app::build_server(cfg, deps).unwrap();
+    let (_public, stop_web) = serve(server.public).await;
+    let port = door.port;
+    let stop_admin = support::door::serve(door, server.admin.unwrap());
     Web {
-        base,
+        base: support::door::base(port),
         tools,
-        http: reqwest::Client::new(),
+        http: support::door::client(port),
+        sessions,
         dir,
-        _stop: vec![stop_tools, stop_bots, stop_web],
+        _stop: vec![stop_tools, stop_bots, stop_web, stop_admin],
     }
 }
 
@@ -437,7 +450,7 @@ impl Web {
             .header("origin", self.base.clone());
         if let Some(w) = who {
             req = req
-                .header("cookie", format!("__Host-pmos={}", w.cookie))
+                .header("cookie", format!("__Host-pmos-admin={}", w.cookie))
                 .header("x-pmos-csrf", &w.csrf);
         }
         if let Some(b) = body {
@@ -462,38 +475,10 @@ impl Web {
         self.send(Some(who), Method::POST, path, Some(body)).await
     }
 
+    /// An admin-door session for `handle` (every request checks the person's roles there).
     async fn login(&self, handle: &str) -> Who {
-        let res = self
-            .http
-            .post(format!("{}/api/auth/dev-login", self.base))
-            .header("origin", self.base.clone())
-            .json(&json!({ "handle": handle }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::NO_CONTENT);
-        let cookie = res.headers()["set-cookie"].to_str().unwrap().to_string();
-        let cookie = cookie
-            .strip_prefix("__Host-pmos=")
-            .unwrap()
-            .split(';')
-            .next()
-            .unwrap()
-            .to_string();
-        let me = self
-            .http
-            .get(format!("{}/api/me", self.base))
-            .header("cookie", format!("__Host-pmos={cookie}"))
-            .send()
-            .await
-            .unwrap()
-            .json::<Value>()
-            .await
-            .unwrap();
-        Who {
-            cookie,
-            csrf: me["csrf_token"].as_str().unwrap().to_string(),
-        }
+        let (cookie, csrf) = support::door::session(&self.sessions, handle).await;
+        Who { cookie, csrf }
     }
 
     fn content(&self) -> PathBuf {
@@ -567,28 +552,25 @@ async fn role_matrix_for_every_route() {
     }
     let adam = w.login("adam").await;
     let audrey = w.login("audrey").await;
-    for (who, name) in [
-        (&w.login("ana").await, "ana"),
-        (&w.login("rex").await, "rex"),
-    ] {
+    // A PM or a Reviewer: slice H10 serves these routes on the admin door only, which refuses
+    // anyone but an Admin or an Auditor before any route runs (and ends that session), so no
+    // route's own refusal is reached or recorded for them.
+    for name in ["ana", "rex"] {
         for (method, path, body, _) in &routes {
-            let r = w.send(Some(who), method.clone(), path, body.clone()).await;
+            let who = w.login(name).await;
+            let r = w.send(Some(&who), method.clone(), path, body.clone()).await;
             assert_eq!(r.status, StatusCode::FORBIDDEN, "{name} {path}");
-            assert_eq!(r.code(), "forbidden", "{name} {path}");
+            assert_eq!(r.code(), "admin_door_not_allowed", "{name} {path}");
+            let text = r.body.to_string();
+            assert!(!text.contains(RESTRICTED_BODY), "{name} {path}: {text}");
         }
-        // Every refusal is recorded at the tool server, as theirs, with no file text (A4).
-        let refusals: Vec<Call> = w
-            .tools
-            .events()
-            .into_iter()
-            .filter(|c| c.query == format!("user={name}"))
-            .collect();
-        assert_eq!(refusals.len(), routes.len(), "{name}: {refusals:?}");
-        for c in &refusals {
-            assert_eq!(c.body["outcome"], "denied");
-            assert_eq!(c.body["detail"], "role");
-            assert!(c.assertion.is_some(), "signed for them");
-        }
+        assert!(
+            w.tools
+                .events()
+                .iter()
+                .all(|c| c.query != format!("user={name}")),
+            "{name}: no route ran"
+        );
     }
     for (method, path, body, auditor) in &routes {
         let r = w
@@ -645,7 +627,7 @@ async fn role_matrix_for_every_route() {
         .http
         .post(format!("{}/api/admin/policy/validate", w.base))
         .header("origin", w.base.clone())
-        .header("cookie", format!("__Host-pmos={}", adam.cookie))
+        .header("cookie", format!("__Host-pmos-admin={}", adam.cookie))
         .json(&validate_spec)
         .send()
         .await
@@ -694,10 +676,9 @@ async fn me_lists_the_new_permissions() {
     ] {
         assert!(adam.contains(&p.to_string()), "{p}");
     }
-    let ana = perms(&w.get(&w.login("ana").await, "/api/me").await);
-    assert!(!ana
-        .iter()
-        .any(|p| p.contains("content") || p.contains("polic")));
+    // A PM isn't served on the admin door at all (slice H10).
+    let ana = w.get(&w.login("ana").await, "/api/me").await;
+    assert_eq!(ana.code(), "admin_door_not_allowed");
 }
 
 // A1: restricted context and a PM's own master file, through validation.
@@ -705,7 +686,18 @@ async fn me_lists_the_new_permissions() {
 #[tokio::test]
 async fn an_auditor_or_a_pm_cant_read_restricted_or_personal_files_through_validation() {
     let w = web().await;
-    for who in ["audrey", "ana"] {
+    // A PM never gets past the admin door (slice H10): refused before any route.
+    let ana = w.login("ana").await;
+    let r = w
+        .post(
+            &ana,
+            "/api/admin/content/validate",
+            json!({"changes": [{"path": ANA_MASTER, "delete": true}]}),
+        )
+        .await;
+    assert_eq!(r.code(), "admin_door_not_allowed");
+    assert!(!r.body.to_string().contains(ANA_BODY));
+    for who in ["audrey"] {
         let s = w.login(who).await;
         for path in [RESTRICTED, ANA_MASTER] {
             // The reviewer's scenario: propose to delete it, read the diff.

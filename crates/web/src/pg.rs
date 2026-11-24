@@ -23,7 +23,7 @@ use sqlx::{PgConnection, Row};
 use crate::followups::{
     expiry, Changed, Day, FollowUp, FollowUpStore, Kind, NewFollowUp, CHANGED_TTL_HOURS,
 };
-use crate::session::{IdHash, Session, SessionStore, StoreError};
+use crate::session::{Door, IdHash, Session, SessionStore, StoreError};
 use crate::settings::{
     DraftEdit, PracticeDraft, SettingsStore, StoredSuggestion, Update, UserState,
     EDIT_RETENTION_DAYS,
@@ -122,12 +122,13 @@ impl SessionStore for PgStore {
         sqlx::query(
             "INSERT INTO web_sessions
                  (id_hash, handle, csrf_token, created_at, last_seen, entra_oid, entra_tid,
-                  password_epoch)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                  password_epoch, door)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
              ON CONFLICT (id_hash) DO UPDATE SET handle = EXCLUDED.handle,
                  csrf_token = EXCLUDED.csrf_token, created_at = EXCLUDED.created_at,
                  last_seen = EXCLUDED.last_seen, entra_oid = EXCLUDED.entra_oid,
-                 entra_tid = EXCLUDED.entra_tid, password_epoch = EXCLUDED.password_epoch",
+                 entra_tid = EXCLUDED.entra_tid, password_epoch = EXCLUDED.password_epoch,
+                 door = EXCLUDED.door",
         )
         .bind(&id[..])
         .bind(&session.handle)
@@ -137,6 +138,7 @@ impl SessionStore for PgStore {
         .bind(&session.entra_oid)
         .bind(&session.entra_tid)
         .bind(session.password_epoch)
+        .bind(session.door.as_str())
         .execute(&self.pool)
         .await
         .map_err(err)?;
@@ -149,19 +151,24 @@ impl SessionStore for PgStore {
         now: DateTime<Utc>,
         idle: Duration,
         max: Duration,
+        door: Door,
     ) -> Result<Option<Session>, StoreError> {
+        // Only a session made on this door (slice H10); one made on the other door reads as
+        // none and is removed below, like an expired one.
         let row = sqlx::query(
             "UPDATE web_sessions SET last_seen = $2
              WHERE id_hash = $1
+               AND door = $5
                AND last_seen + make_interval(secs => $3) > $2
                AND created_at + make_interval(secs => $4) > $2
              RETURNING handle, csrf_token, created_at, last_seen, entra_oid, entra_tid,
-                       password_epoch",
+                       password_epoch, door",
         )
         .bind(&id[..])
         .bind(now)
         .bind(secs(idle))
         .bind(secs(max))
+        .bind(door.as_str())
         .fetch_optional(&self.pool)
         .await
         .map_err(err)?;
@@ -174,6 +181,12 @@ impl SessionStore for PgStore {
                 entra_oid: r.try_get("entra_oid").map_err(err)?,
                 entra_tid: r.try_get("entra_tid").map_err(err)?,
                 password_epoch: r.try_get("password_epoch").map_err(err)?,
+                door: {
+                    let d: String = r.try_get("door").map_err(err)?;
+                    Door::parse(&d).ok_or_else(|| {
+                        StoreError("web_sessions.door holds an unknown door".into())
+                    })?
+                },
             })),
             None => {
                 // Expired (or never there): make sure nothing is left of it.

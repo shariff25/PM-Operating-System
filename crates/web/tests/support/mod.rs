@@ -507,3 +507,107 @@ impl FakeBots {
         Json(self.team(handle)).into_response()
     }
 }
+
+/// The admin door in tests (slice H10): a listener bound first, so the door's URL can name its
+/// port; a client that resolves the door's `*.localhost` name to it; the door served with peer
+/// addresses (as `main` serves it); and a session put straight into the store, for tests about
+/// the admin routes themselves (`tests/admin_door.rs` signs in through the door).
+pub mod door {
+    use std::sync::Arc;
+
+    use chrono::{DateTime, Utc};
+    use pmos_web::config::{AdminDoor, AdminMode};
+    use pmos_web::session::{self, Door, Session, SessionStore};
+    use tokio_util::sync::CancellationToken;
+
+    /// The admin door's host name in tests: a deployment-unique `*.localhost` name (r7).
+    pub const HOST: &str = "pmos-test.localhost";
+
+    pub struct Listener {
+        pub listener: tokio::net::TcpListener,
+        pub port: u16,
+    }
+
+    pub async fn listener() -> Listener {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        Listener { listener, port }
+    }
+
+    /// Tunnel mode, as an SSH tunnel to a loopback publish reaches it: the peer is 127.0.0.1.
+    pub fn tunnel(port: u16) -> AdminDoor {
+        AdminDoor {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            url: base(port),
+            authority: format!("{HOST}:{port}"),
+            mode: AdminMode::Tunnel {
+                peer: "127.0.0.1".parse().unwrap(),
+            },
+            idle: chrono::Duration::minutes(30),
+            max: chrono::Duration::minutes(480),
+            entra: false,
+        }
+    }
+
+    pub fn base(port: u16) -> String {
+        format!("http://{HOST}:{port}")
+    }
+
+    /// A client that reaches `HOST` at the listener, sending `Host: pmos-test.localhost:<port>`.
+    pub fn client(port: u16) -> reqwest::Client {
+        reqwest::Client::builder()
+            .resolve(HOST, ([127, 0, 0, 1], port).into())
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap()
+    }
+
+    /// Serve `router` on `l` with each connection's peer address.
+    pub fn serve(l: Listener, router: axum::Router) -> CancellationToken {
+        let cancel = CancellationToken::new();
+        let ct = cancel.clone();
+        tokio::spawn(async move {
+            axum::serve(
+                l.listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move { ct.cancelled_owned().await })
+            .await
+            .unwrap();
+        });
+        cancel
+    }
+
+    /// An admin-door session for `handle`, made at `at`, straight into `store`: its cookie
+    /// value and CSRF token. Whoever it is for, every request still checks their roles in the
+    /// user database.
+    pub async fn session_at(
+        store: &Arc<dyn SessionStore>,
+        handle: &str,
+        at: DateTime<Utc>,
+    ) -> (String, String) {
+        let id = session::random_token();
+        let csrf = session::random_token();
+        store
+            .insert(
+                session::hash_id(&id),
+                Session {
+                    handle: handle.into(),
+                    csrf_token: csrf.clone(),
+                    created_at: at,
+                    last_seen: at,
+                    entra_oid: None,
+                    entra_tid: None,
+                    password_epoch: None,
+                    door: Door::Admin,
+                },
+            )
+            .await
+            .unwrap();
+        (id, csrf)
+    }
+
+    pub async fn session(store: &Arc<dyn SessionStore>, handle: &str) -> (String, String) {
+        session_at(store, handle, Utc::now()).await
+    }
+}

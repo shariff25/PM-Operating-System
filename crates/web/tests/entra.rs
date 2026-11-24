@@ -194,6 +194,10 @@ async fn listener() -> (tokio::net::TcpListener, String) {
 
 struct Harness {
     web: String,
+    /// The admin door (slice H10) with Entra on it (`PMOS_WEB_ADMIN_ENTRA=1`), at its
+    /// `*.localhost` name, and a client that reaches it.
+    admin: String,
+    admin_http: reqwest::Client,
     idp: Arc<IdpState>,
     tools: Arc<Tools>,
     http: reqwest::Client,
@@ -284,6 +288,7 @@ async fn harness_with(change: impl FnOnce(&mut Config)) -> Harness {
     )
     .await;
     let (web_listener, web_base) = listener().await;
+    let door = support::door::listener().await;
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("team.yaml"), TEAM).unwrap();
     let mut config = Config {
@@ -303,16 +308,32 @@ async fn harness_with(change: impl FnOnce(&mut Config)) -> Harness {
         internal_bind: None,
         password_login: false,
         trusted_proxies: Vec::new(),
+        admin: None,
+        password_clients: Vec::new(),
     };
     change(&mut config);
+    if config.entra.is_some() {
+        config.admin = Some(pmos_web::config::AdminDoor {
+            entra: true,
+            ..support::door::tunnel(door.port)
+        });
+    }
     let clock = Arc::new(Mutex::new(Utc::now()));
     let c = clock.clone();
     let deps = Deps {
         clock: Arc::new(move || *c.lock().unwrap()),
         ..Deps::in_memory()
     };
-    let stop_web = serve(web_listener, pmos_web::build(config, deps).unwrap()).await;
+    let server = pmos_web::app::build_server(config, deps).unwrap();
+    let stop_web = serve(web_listener, server.public).await;
+    let port = door.port;
+    let stop_admin = match server.admin {
+        Some(r) => support::door::serve(door, r),
+        None => CancellationToken::new(),
+    };
     Harness {
+        admin: support::door::base(port),
+        admin_http: support::door::client(port),
         web: web_base,
         idp,
         tools,
@@ -322,7 +343,7 @@ async fn harness_with(change: impl FnOnce(&mut Config)) -> Harness {
             .unwrap(),
         clock,
         _dir: dir,
-        _stop: vec![stop_idp, stop_tools, stop_web],
+        _stop: vec![stop_idp, stop_tools, stop_web, stop_admin],
     }
 }
 
@@ -383,6 +404,11 @@ impl Harness {
 
     /// Entra hands out a code for this flow's PKCE challenge, redeemable for `id_token`.
     fn issue(&self, challenge: &str, id_token: String) -> String {
+        self.issue_to(&self.web, challenge, id_token)
+    }
+
+    /// As [`Harness::issue`], for a flow whose redirect URI is `base`'s callback.
+    fn issue_to(&self, base: &str, challenge: &str, id_token: String) -> String {
         let code = format!(
             "code-{}-0AAAAAAAAAAsecretcode",
             self.idp.next.fetch_add(1, Ordering::SeqCst)
@@ -396,7 +422,7 @@ impl Harness {
             code.clone(),
             Grant {
                 challenge: challenge.into(),
-                redirect_uri: format!("{}/api/auth/callback", self.web),
+                redirect_uri: format!("{base}/api/auth/callback"),
                 id_token,
             },
         );
@@ -479,6 +505,141 @@ impl Harness {
 
 fn good(_: &Begun, claims: Value) -> String {
     sign(&claims, keys::KEY_A_DER, "key-a")
+}
+
+// The admin door (slice H10, r7's X6).
+
+/// On the admin door: its own redirect URI and flow cookie (`SameSite=Lax`, since Entra's return
+/// is a navigation from another site); the callback answers a small page that moves the browser
+/// on (a same-site navigation), setting the `SameSite=Strict` admin session cookie; a PM gets no
+/// session at all, and the refusal is audited.
+#[tokio::test]
+async fn the_admin_door_signs_an_admin_in_with_its_own_redirect_and_a_strict_cookie() {
+    let h = harness().await;
+    let mut ada = support::FakeUser::new("ada", &["admin"]);
+    ada.entra = Some((TENANT.into(), ANA_OID.into(), true));
+    h.tools.directory.remove("ana");
+    h.tools.directory.add(ada);
+    let flow = |who: &'static str| {
+        let h = &h;
+        async move {
+            let res = h
+                .admin_http
+                .get(format!("{}/api/auth/login", h.admin))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::SEE_OTHER, "{who}");
+            let set = res.headers()["set-cookie"].to_str().unwrap().to_string();
+            assert!(set.starts_with("__Host-pmos-admin-entra="), "{set}");
+            assert!(
+                set.contains("SameSite=Lax") && set.contains("Secure"),
+                "{set}"
+            );
+            let authorize =
+                reqwest::Url::parse(res.headers()["location"].to_str().unwrap()).unwrap();
+            let q: HashMap<String, String> = authorize.query_pairs().into_owned().collect();
+            assert_eq!(q["redirect_uri"], format!("{}/api/auth/callback", h.admin));
+            let begun = Begun {
+                cookie: set.split(';').next().unwrap().to_string(),
+                set_cookie: set.clone(),
+                state: q["state"].clone(),
+                nonce: q["nonce"].clone(),
+                challenge: q["code_challenge"].clone(),
+                authorize,
+            };
+            let token = good(&begun, h.claims(&begun, "Ana@Contoso.example"));
+            let code = h.issue_to(&h.admin, &begun.challenge, token);
+            h.admin_http
+                .get(format!("{}/api/auth/callback", h.admin))
+                .query(&[("code", code.as_str()), ("state", begun.state.as_str())])
+                .header("sec-fetch-site", "cross-site")
+                .header("cookie", begun.cookie)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    let res = flow("ada").await;
+    assert_eq!(res.status(), StatusCode::OK, "a page, not a redirect");
+    let cookies: Vec<String> = res
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .map(|v| v.to_str().unwrap().to_string())
+        .collect();
+    let session = cookies
+        .iter()
+        .find(|c| c.starts_with("__Host-pmos-admin=") && !c.contains("Max-Age=0"))
+        .expect("the admin session cookie");
+    assert!(
+        session.ends_with("Path=/; Secure; HttpOnly; SameSite=Strict"),
+        "{session}"
+    );
+    assert!(!cookies.iter().any(|c| c.starts_with("__Host-pmos=")));
+    assert!(cookies
+        .iter()
+        .any(|c| c.starts_with("__Host-pmos-admin-entra=;") && c.contains("Max-Age=0")));
+    let page = res.text().await.unwrap();
+    assert!(
+        page.contains("http-equiv=\"refresh\" content=\"0;url=/\""),
+        "{page}"
+    );
+    // The first admin page: the Strict cookie, sent by the same-site navigation.
+    let value = session
+        .strip_prefix("__Host-pmos-admin=")
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap();
+    let me = h
+        .admin_http
+        .get(format!("{}/api/me", h.admin))
+        .header("cookie", format!("__Host-pmos-admin={value}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(me.status(), StatusCode::OK);
+    // A flow begun on the public door can't finish on the admin door.
+    let public = h.begin(None).await;
+    let res = h
+        .admin_http
+        .get(format!("{}/api/auth/callback", h.admin))
+        .query(&[("code", "x"), ("state", public.state.as_str())])
+        .header(
+            "cookie",
+            public
+                .cookie
+                .replace("__Host-pmos-entra=", "__Host-pmos-admin-entra="),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert!(!res.headers().get_all("set-cookie").iter().any(|c| c
+        .to_str()
+        .unwrap()
+        .starts_with("__Host-pmos-admin=")
+        && !c.to_str().unwrap().contains("Max-Age=0")));
+    // Ada a PM now: refused with no session, a 403 page to the signed-out reason, audited.
+    h.tools
+        .directory
+        .update("ada", |u| u.roles = vec!["pm".into()]);
+    h.past_the_cache();
+    let res = flow("ada as a pm").await;
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    assert!(!res.headers().get_all("set-cookie").iter().any(|c| {
+        let c = c.to_str().unwrap();
+        c.starts_with("__Host-pmos-admin=") || c.starts_with("__Host-pmos=")
+    }));
+    assert!(res
+        .text()
+        .await
+        .unwrap()
+        .contains("signed-out?reason=admin_door_not_allowed"));
+    assert!(h
+        .events()
+        .iter()
+        .any(|e| e["reason"] == "admin_door_not_allowed" && e["provider"] == "entra"));
 }
 
 // The happy path.

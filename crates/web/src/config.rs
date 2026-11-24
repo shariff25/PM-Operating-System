@@ -68,6 +68,403 @@ pub struct Config {
     /// (`PUT /internal/brief/{handle}`), which the browser-facing `bind` then doesn't serve.
     /// Without it, that route is on `bind`, refusing anything that looks like a browser.
     pub internal_bind: Option<SocketAddr>,
+    /// The admin door (slice H10, `PMOS_WEB_ADMIN_*`): the admin-only listener, its origin,
+    /// who may reach it and its session bounds. `None` without `PMOS_WEB_ADMIN_BIND`: then no
+    /// admin route is served anywhere, and `pmos-web` itself refuses to start
+    /// ([`crate::host::check_deployment`]).
+    pub admin: Option<AdminDoor>,
+    /// `PMOS_WEB_PASSWORD_CLIENTS` (decision D2 (a)): the networks password sign-in is served
+    /// to, each no wider than a `/16` (IPv4) or a `/48` (IPv6). Empty: no allow-list (refused on
+    /// `PMOS_EXPOSURE=public` with password sign-in on). Set: every `/api/auth/password/*`
+    /// request from a client address outside it answers `403 password_sign_in_not_from_here`
+    /// before the tool server is asked.
+    pub password_clients: Vec<Cidr>,
+}
+
+/// Who may reach the admin door, by its URL's scheme (r7, X6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdminMode {
+    /// An `http` admin URL on a loopback name: an SSH tunnel to a loopback publish. Only
+    /// `PMOS_WEB_ADMIN_TUNNEL_PEER` (the `pmos` network's gateway in the kit) may connect, and
+    /// `X-Forwarded-For` is never read.
+    Tunnel { peer: IpAddr },
+    /// An `https` admin URL: a TLS terminator in front. Only the peers in
+    /// `PMOS_WEB_ADMIN_TRUSTED_PROXIES` may connect, and the client they name in
+    /// `X-Forwarded-For` must be in loopback, RFC 1918, `100.64.0.0/10` or IPv6 unique-local.
+    Proxy { trusted: Vec<IpAddr> },
+}
+
+/// The admin door's settings (slice H10, `docs/openshell-any-host-spec.md` §3.8, "The admin
+/// listener's sign-in").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminDoor {
+    /// `PMOS_WEB_ADMIN_BIND` (8772 in the kit): unspecified, loopback or a private address.
+    pub bind: SocketAddr,
+    /// `PMOS_WEB_ADMIN_URL`: the door's own origin, such as `https://pmos-admin.corp.example` or
+    /// `http://pmos-prod.localhost:8772`. Writes must come from it.
+    pub url: String,
+    /// The authority every request's `Host` must equal: the URL's host (lower-cased) and its
+    /// port as the URL writes it.
+    pub authority: String,
+    pub mode: AdminMode,
+    /// `PMOS_WEB_ADMIN_SESSION_IDLE_MINUTES` (default 30, at most 60) and
+    /// `PMOS_WEB_ADMIN_SESSION_MAX_MINUTES` (default 480, at most 720).
+    pub idle: Duration,
+    pub max: Duration,
+    /// `PMOS_WEB_ADMIN_ENTRA=1`: `<PMOS_WEB_ADMIN_URL>/api/auth/callback` is registered as a
+    /// second redirect URI in the Entra app registration, so the admin door offers Microsoft
+    /// sign-in. Off by default: the admin door is then password-only (the owner's open question,
+    /// §8.2 item 9; the spec's default).
+    pub entra: bool,
+}
+
+/// The longest idle and absolute admin session `pmos-web` starts with (r7, X6).
+pub const ADMIN_IDLE_LIMIT_MINUTES: i64 = 60;
+pub const ADMIN_MAX_LIMIT_MINUTES: i64 = 12 * 60;
+
+/// The narrowest an allow-list entry may be widened to (decision D2 (a)).
+pub const PASSWORD_CLIENTS_V4_MIN: u8 = 16;
+pub const PASSWORD_CLIENTS_V6_MIN: u8 = 48;
+
+/// An IPv4 or IPv6 network, written `address/length` with no host bits set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cidr {
+    net: IpAddr,
+    len: u8,
+}
+
+impl Cidr {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let (addr, len) = s
+            .split_once('/')
+            .ok_or(format!("`{s}` isn't a network written address/length"))?;
+        let net: IpAddr = addr
+            .parse()
+            .map_err(|_| format!("`{s}` isn't a network written address/length"))?;
+        let max = if net.is_ipv4() { 32 } else { 128 };
+        let len: u8 = match len.parse::<u8>() {
+            Ok(n) if n <= max && (len == "0" || !len.starts_with('0')) => n,
+            _ => return Err(format!("`{s}`: the length must be 0 to {max}")),
+        };
+        let c = Self { net, len };
+        if c.masked(net) != net {
+            return Err(format!(
+                "`{s}` has bits set past its length: write the network's first address"
+            ));
+        }
+        Ok(c)
+    }
+
+    fn masked(&self, ip: IpAddr) -> IpAddr {
+        match ip {
+            IpAddr::V4(v4) => {
+                let bits = u32::from(v4);
+                let mask = if self.len == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - self.len)
+                };
+                IpAddr::V4((bits & mask).into())
+            }
+            IpAddr::V6(v6) => {
+                let bits = u128::from(v6);
+                let mask = if self.len == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - self.len)
+                };
+                IpAddr::V6((bits & mask).into())
+            }
+        }
+    }
+
+    /// Is `ip` in this network? An IPv4-mapped IPv6 address counts as its IPv4 address.
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        let ip = canonical_ip(ip);
+        let net = canonical_ip(self.net);
+        let len = match (self.net, net) {
+            // `::ffff:a.b.c.d/n` written as IPv6: the IPv4 part's length.
+            (IpAddr::V6(_), IpAddr::V4(_)) => self.len.saturating_sub(96),
+            _ => self.len,
+        };
+        if ip.is_ipv4() != net.is_ipv4() {
+            return false;
+        }
+        Cidr { net, len }.masked(ip) == net
+    }
+
+    /// The width as D2 (a) bounds it: an IPv4-mapped network counts as IPv4.
+    fn too_wide(&self) -> bool {
+        match (self.net, canonical_ip(self.net)) {
+            (IpAddr::V4(_), _) => self.len < PASSWORD_CLIENTS_V4_MIN,
+            (IpAddr::V6(_), IpAddr::V4(_)) => self.len < 96 + PASSWORD_CLIENTS_V4_MIN,
+            (IpAddr::V6(v6), IpAddr::V6(_)) => {
+                // `::ffff:0:0/96` and anything holding it is the whole IPv4 internet.
+                let mapped = u128::from(v6) >> 32 == 0xffff;
+                self.len < PASSWORD_CLIENTS_V6_MIN || (mapped && self.len < 96 + 16)
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for Cidr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.net, self.len)
+    }
+}
+
+/// An IPv4-mapped IPv6 address as IPv4; anything else as it is.
+pub fn canonical_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        v4 => v4,
+    }
+}
+
+/// Loopback, RFC 1918, `100.64.0.0/10` (VPN overlays commonly use it) or IPv6 unique-local
+/// (`fc00::/7`): where the admin door may be bound and its clients may be (§3.8).
+pub fn in_admin_ranges(ip: IpAddr) -> bool {
+    match canonical_ip(ip) {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            v4.is_loopback()
+                || o[0] == 10
+                || (o[0] == 172 && (16..=31).contains(&o[1]))
+                || (o[0] == 192 && o[1] == 168)
+                || (o[0] == 100 && (64..=127).contains(&o[1]))
+        }
+        IpAddr::V6(v6) => v6.is_loopback() || (v6.segments()[0] & 0xfe00) == 0xfc00,
+    }
+}
+
+/// [`in_admin_ranges`] plus link-local (`169.254.0.0/16`, `fe80::/10`): what a `private`
+/// host's public URL may resolve to (§3.8, `PMOS_EXPOSURE=private` checked by the service).
+pub fn in_private_host_ranges(ip: IpAddr) -> bool {
+    in_admin_ranges(ip)
+        || match canonical_ip(ip) {
+            IpAddr::V4(v4) => v4.is_link_local(),
+            IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+        }
+}
+
+/// `PMOS_WEB_PASSWORD_CLIENTS`: comma-separated networks, each within D2 (a)'s bounds. The error
+/// names the entry.
+pub fn parse_password_clients(list: &str) -> Result<Vec<Cidr>, String> {
+    let mut out = Vec::new();
+    for entry in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let c = Cidr::parse(entry).map_err(|e| format!("PMOS_WEB_PASSWORD_CLIENTS: {e}"))?;
+        if c.too_wide() {
+            return Err(format!(
+                "PMOS_WEB_PASSWORD_CLIENTS: `{entry}` is wider than decision D2 (a) allows \
+                 (no shorter than /{PASSWORD_CLIENTS_V4_MIN} for IPv4 or \
+                 /{PASSWORD_CLIENTS_V6_MIN} for IPv6): a list that holds the internet is not a \
+                 list. Name the VPN's or the office's own ranges"
+            ));
+        }
+        out.push(c);
+    }
+    Ok(out)
+}
+
+/// Is the host part of an `http` admin URL a loopback name (r7): `localhost`, a name ending in
+/// `.localhost` (which Chromium and Firefox resolve to loopback and treat as a secure context),
+/// `127.0.0.1` or `[::1]`.
+fn loopback_name(host: &str) -> bool {
+    let h = host.to_ascii_lowercase();
+    h == "localhost" || h.ends_with(".localhost") || h == "127.0.0.1" || h == "[::1]"
+}
+
+/// Why the admin door won't start (slice H10). Each names the settings to fix.
+pub const ADMIN_URL_REQUIRED: &str = "PMOS_WEB_ADMIN_BIND is set without PMOS_WEB_ADMIN_URL: \
+     the admin door needs its own origin, such as https://pmos-admin.corp.example (a TLS \
+     terminator on a private address) or http://<deployment>.localhost:8772 (an SSH tunnel), \
+     docs/runbooks/install.md";
+pub const ADMIN_HTTPS_NEEDS_PROXIES: &str = "PMOS_WEB_ADMIN_URL is https: pmos-web serves no TLS \
+     itself, so a terminator is in front. Set PMOS_WEB_ADMIN_TRUSTED_PROXIES to the address it \
+     reaches pmos-web from (in the deploy kit, the `pmos` network's gateway, PMOS_NETWORK_GATEWAY)";
+pub const ADMIN_HTTP_WITH_PROXIES: &str = "PMOS_WEB_ADMIN_URL is http (the tunnel mode), and \
+     PMOS_WEB_ADMIN_TRUSTED_PROXIES names a proxy: a tunnel has none, and X-Forwarded-For is never \
+     read in that mode. Unset PMOS_WEB_ADMIN_TRUSTED_PROXIES, or put a TLS terminator in front \
+     and use an https admin URL";
+pub const ADMIN_HTTP_NOT_LOOPBACK: &str = "PMOS_WEB_ADMIN_URL is http on a name that isn't \
+     loopback: browsers keep the admin door's Secure cookie only on https or a loopback name, and \
+     an admin's password must never cross a network in the clear. Use \
+     http://<deployment>.localhost:<port> through an SSH tunnel, or https through a TLS \
+     terminator on a private address";
+pub const ADMIN_TUNNEL_NEEDS_PEER: &str = "PMOS_WEB_ADMIN_URL is http (the tunnel mode): set \
+     PMOS_WEB_ADMIN_TUNNEL_PEER to the one address the tunnel arrives from (in the deploy kit, \
+     the `pmos` network's gateway, PMOS_NETWORK_GATEWAY, which deploy/compose.yaml passes)";
+pub const ADMIN_NO_PROVIDER: &str = "the admin door has no sign-in: development sign-in is never \
+     served there. Turn on password sign-in (PMOS_WEB_PASSWORD_LOGIN=1), or, with Entra ID \
+     sign-in configured, register <PMOS_WEB_ADMIN_URL>/api/auth/callback as a second redirect URI \
+     and set PMOS_WEB_ADMIN_ENTRA=1";
+
+/// The admin door's settings, or `None` when `PMOS_WEB_ADMIN_BIND` is unset (and no other
+/// `PMOS_WEB_ADMIN_*` setting is either).
+#[allow(clippy::too_many_arguments)]
+fn admin_door(
+    set: &dyn Fn(&str) -> Option<String>,
+    flag: &dyn Fn(&str) -> Result<bool, String>,
+    bind: SocketAddr,
+    internal_bind: Option<SocketAddr>,
+    public_url: Option<&str>,
+    entra_on: bool,
+    password_login: bool,
+) -> Result<Option<AdminDoor>, String> {
+    const OTHERS: [&str; 7] = [
+        "PMOS_WEB_ADMIN_URL",
+        "PMOS_WEB_ADMIN_TRUSTED_PROXIES",
+        "PMOS_WEB_ADMIN_TUNNEL_PEER",
+        "PMOS_WEB_ADMIN_SESSION_IDLE_MINUTES",
+        "PMOS_WEB_ADMIN_SESSION_MAX_MINUTES",
+        "PMOS_WEB_ADMIN_ENTRA",
+        "PMOS_WEB_ADMIN_PUBLISH",
+    ];
+    let Some(admin_bind) = set("PMOS_WEB_ADMIN_BIND") else {
+        // PMOS_WEB_ADMIN_PUBLISH is the kit's (compose publishes the port); it never reaches
+        // pmos-web, so it isn't a half-set door here. The rest are.
+        if let Some(k) = OTHERS[..6].iter().find(|k| set(k).is_some()) {
+            return Err(format!(
+                "{k} is set without PMOS_WEB_ADMIN_BIND: set the admin door's listener too, or \
+                 unset every PMOS_WEB_ADMIN_* setting"
+            ));
+        }
+        return Ok(None);
+    };
+    let admin_bind: SocketAddr = admin_bind
+        .trim()
+        .parse()
+        .map_err(|e| format!("PMOS_WEB_ADMIN_BIND: {e}"))?;
+    let ip = admin_bind.ip();
+    if !(ip.is_unspecified() || in_admin_ranges(ip)) {
+        return Err(format!(
+            "PMOS_WEB_ADMIN_BIND {admin_bind}: the admin door is never on a public address. Bind \
+             it to 0.0.0.0 in a container (the kit publishes it on PMOS_WEB_ADMIN_PUBLISH), to \
+             loopback, or to an RFC 1918, 100.64.0.0/10 or IPv6 unique-local address"
+        ));
+    }
+    if admin_bind == bind || internal_bind == Some(admin_bind) {
+        return Err(
+            "PMOS_WEB_ADMIN_BIND must differ from PMOS_WEB_BIND and PMOS_WEB_INTERNAL_BIND".into(),
+        );
+    }
+    let url = set("PMOS_WEB_ADMIN_URL").ok_or(ADMIN_URL_REQUIRED)?;
+    let url = origin("PMOS_WEB_ADMIN_URL", url)?;
+    let parsed = reqwest::Url::parse(&url).map_err(|e| format!("PMOS_WEB_ADMIN_URL: {e}"))?;
+    let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+    let authority = match parsed.port() {
+        Some(p) => format!("{host}:{p}"),
+        None => host.clone(),
+    };
+    // No cookie of one door is sent to the other: the two origins' hosts differ (r6; on an
+    // http admin URL too, the stricter reading: two doors on one loopback name would share its
+    // cookie jar).
+    let public_host = public_url
+        .and_then(|u| reqwest::Url::parse(u).ok())
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase));
+    if public_host.as_deref() == Some(host.as_str()) {
+        return Err(format!(
+            "PMOS_WEB_ADMIN_URL's host `{host}` is PMOS_WEB_PUBLIC_URL's: cookies are kept by host \
+             name, not by port, so the two doors' cookies would be sent to each other. Give the \
+             admin door a name of its own"
+        ));
+    }
+    let proxies = match set("PMOS_WEB_ADMIN_TRUSTED_PROXIES") {
+        None => Vec::new(),
+        Some(list) => list
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                s.parse::<IpAddr>().map_err(|_| {
+                    format!("PMOS_WEB_ADMIN_TRUSTED_PROXIES: `{s}` isn't an IP address")
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    let mode = match parsed.scheme() {
+        "https" => {
+            if public_host.is_none() {
+                return Err(
+                    "PMOS_WEB_ADMIN_URL is https: set PMOS_WEB_PUBLIC_URL too, so \
+                     pmos-web can check the two doors' host names differ"
+                        .into(),
+                );
+            }
+            if proxies.is_empty() {
+                return Err(ADMIN_HTTPS_NEEDS_PROXIES.into());
+            }
+            AdminMode::Proxy { trusted: proxies }
+        }
+        _ => {
+            if !proxies.is_empty() {
+                return Err(ADMIN_HTTP_WITH_PROXIES.into());
+            }
+            if !loopback_name(&host) {
+                return Err(ADMIN_HTTP_NOT_LOOPBACK.into());
+            }
+            if parsed.port().is_none() {
+                return Err(
+                    "PMOS_WEB_ADMIN_URL is http: write its port, as the tunnel's local \
+                     end listens on it (http://<deployment>.localhost:8772)"
+                        .into(),
+                );
+            }
+            let peer = set("PMOS_WEB_ADMIN_TUNNEL_PEER").ok_or(ADMIN_TUNNEL_NEEDS_PEER)?;
+            let peer: IpAddr = peer.trim().parse().map_err(|_| {
+                format!(
+                    "PMOS_WEB_ADMIN_TUNNEL_PEER: `{}` isn't an IP address",
+                    peer.trim()
+                )
+            })?;
+            AdminMode::Tunnel { peer }
+        }
+    };
+    let minutes = |k: &str, default: i64, most: i64| -> Result<Duration, String> {
+        match set(k) {
+            None => Ok(Duration::minutes(default)),
+            Some(v) => match v.trim().parse::<i64>() {
+                Ok(n) if (1..=most).contains(&n) => Ok(Duration::minutes(n)),
+                _ => Err(format!(
+                    "{k} must be a whole number of minutes, 1 to {most} (the admin door's \
+                     sessions are bounded, r7)"
+                )),
+            },
+        }
+    };
+    let idle = minutes(
+        "PMOS_WEB_ADMIN_SESSION_IDLE_MINUTES",
+        30,
+        ADMIN_IDLE_LIMIT_MINUTES,
+    )?;
+    let max = minutes(
+        "PMOS_WEB_ADMIN_SESSION_MAX_MINUTES",
+        8 * 60,
+        ADMIN_MAX_LIMIT_MINUTES,
+    )?;
+    if idle > max {
+        return Err("PMOS_WEB_ADMIN_SESSION_IDLE_MINUTES can't be longer than \
+             PMOS_WEB_ADMIN_SESSION_MAX_MINUTES"
+            .into());
+    }
+    let entra = flag("PMOS_WEB_ADMIN_ENTRA")?;
+    if entra && !entra_on {
+        return Err("PMOS_WEB_ADMIN_ENTRA=1 needs Entra ID sign-in configured \
+             (PMOS_WEB_ENTRA_*)"
+            .into());
+    }
+    if !entra && !password_login {
+        return Err(ADMIN_NO_PROVIDER.into());
+    }
+    Ok(Some(AdminDoor {
+        bind: admin_bind,
+        url,
+        authority,
+        mode,
+        idle,
+        max,
+        entra,
+    }))
 }
 
 impl std::fmt::Debug for Config {
@@ -88,6 +485,8 @@ impl std::fmt::Debug for Config {
             .field("session_idle", &self.session_idle)
             .field("session_max", &self.session_max)
             .field("internal_bind", &self.internal_bind)
+            .field("admin", &self.admin)
+            .field("password_clients", &self.password_clients)
             .finish()
     }
 }
@@ -312,7 +711,22 @@ impl Config {
         if internal_bind.is_some_and(|i| i == bind) {
             return Err("PMOS_WEB_INTERNAL_BIND must differ from PMOS_WEB_BIND".into());
         }
+        let admin = admin_door(
+            &set,
+            &flag,
+            bind,
+            internal_bind,
+            public_url.as_deref(),
+            entra.is_some(),
+            password_login,
+        )?;
+        let password_clients = match set("PMOS_WEB_PASSWORD_CLIENTS") {
+            None => Vec::new(),
+            Some(list) => parse_password_clients(&list)?,
+        };
         Ok(Self {
+            admin,
+            password_clients,
             bind,
             internal_bind,
             bots_url: http_url(
@@ -732,5 +1146,306 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.bots_url, "http://bots.pmos.internal:8750");
         assert_eq!(cfg.public_url.as_deref(), Some("https://pmos.example.com"));
+    }
+
+    // --- Slice H10: the admin door and D2 (a)'s allow-list -------------------------------------
+
+    type DoorCase = (
+        Vec<(&'static str, &'static str)>,
+        Vec<&'static str>,
+        &'static str,
+    );
+
+    const AK: &str = "web:toolserver:k1:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+
+    /// Password sign-in on, behind the kit's proxy, with an admin door in tunnel mode.
+    fn door_base() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("PMOS_WEB_BOTS_TOKEN", BOTS),
+            ("PMOS_WEB_TOOLSERVER_TOKEN", TOOLS),
+            ("PMOS_WEB_PASSWORD_LOGIN", "1"),
+            ("PMOS_ASSERTION_KEYS", AK),
+            ("PMOS_WEB_BIND", "0.0.0.0:8770"),
+            ("PMOS_WEB_TRUSTED_PROXIES", "10.201.77.1"),
+            ("PMOS_WEB_PUBLIC_URL", "https://pmos.example.com"),
+            ("PMOS_WEB_ADMIN_BIND", "0.0.0.0:8772"),
+            ("PMOS_WEB_ADMIN_URL", "http://pmos-prod.localhost:8772"),
+            ("PMOS_WEB_ADMIN_TUNNEL_PEER", "10.201.77.1"),
+        ]
+    }
+
+    fn door(extra: &[(&'static str, &'static str)], drop: &[&str]) -> Result<Config, String> {
+        let mut pairs: Vec<(&str, &str)> = door_base()
+            .into_iter()
+            .filter(|(k, _)| !drop.contains(k) && !extra.iter().any(|(e, _)| e == k))
+            .collect();
+        pairs.extend_from_slice(extra);
+        Config::from_lookup(lookup(&pairs))
+    }
+
+    #[test]
+    fn the_admin_door_in_tunnel_mode() {
+        let cfg = door(&[], &[]).unwrap();
+        let a = cfg.admin.unwrap();
+        assert_eq!(a.url, "http://pmos-prod.localhost:8772");
+        assert_eq!(a.authority, "pmos-prod.localhost:8772");
+        assert_eq!(
+            a.mode,
+            AdminMode::Tunnel {
+                peer: "10.201.77.1".parse().unwrap()
+            }
+        );
+        assert_eq!((a.idle, a.max), (Duration::minutes(30), Duration::hours(8)));
+        assert!(!a.entra, "password-only by default");
+        // Without the door, nothing of it is set; half of it refuses.
+        let none = door(
+            &[],
+            &[
+                "PMOS_WEB_ADMIN_BIND",
+                "PMOS_WEB_ADMIN_URL",
+                "PMOS_WEB_ADMIN_TUNNEL_PEER",
+            ],
+        )
+        .unwrap();
+        assert!(none.admin.is_none());
+        let err = door(&[], &["PMOS_WEB_ADMIN_BIND"]).unwrap_err();
+        assert!(err.contains("without PMOS_WEB_ADMIN_BIND"), "{err}");
+        // Loopback names: localhost, *.localhost, 127.0.0.1, [::1].
+        for url in [
+            "http://localhost:8772",
+            "http://127.0.0.1:8772",
+            "http://[::1]:8772",
+            "http://PMOS.localhost:9000",
+        ] {
+            assert!(door(&[("PMOS_WEB_ADMIN_URL", url)], &[]).is_ok(), "{url}");
+        }
+    }
+
+    #[test]
+    fn the_admin_door_refuses_every_unsafe_shape() {
+        let cases: Vec<DoorCase> = vec![
+            // An http admin URL on a name that isn't loopback.
+            (
+                vec![("PMOS_WEB_ADMIN_URL", "http://10.0.0.5:8772")],
+                vec![],
+                "isn't loopback",
+            ),
+            (
+                vec![("PMOS_WEB_ADMIN_URL", "http://pmos-admin.corp:8772")],
+                vec![],
+                "isn't loopback",
+            ),
+            (
+                vec![("PMOS_WEB_ADMIN_URL", "http://localhost.evil.example:8772")],
+                vec![],
+                "isn't loopback",
+            ),
+            // http with a proxy list; https without one.
+            (
+                vec![("PMOS_WEB_ADMIN_TRUSTED_PROXIES", "10.201.77.1")],
+                vec![],
+                "tunnel mode",
+            ),
+            (
+                vec![("PMOS_WEB_ADMIN_URL", "https://pmos-admin.corp.example")],
+                vec![],
+                "PMOS_WEB_ADMIN_TRUSTED_PROXIES",
+            ),
+            // The tunnel's peer, and an http URL's port, required.
+            (
+                vec![],
+                vec!["PMOS_WEB_ADMIN_TUNNEL_PEER"],
+                "PMOS_WEB_ADMIN_TUNNEL_PEER",
+            ),
+            (
+                vec![("PMOS_WEB_ADMIN_URL", "http://pmos-prod.localhost")],
+                vec![],
+                "write its port",
+            ),
+            // The public URL's host, on either scheme.
+            (
+                vec![
+                    ("PMOS_WEB_ADMIN_URL", "https://pmos.example.com:8443"),
+                    ("PMOS_WEB_ADMIN_TRUSTED_PROXIES", "10.201.77.1"),
+                ],
+                vec!["PMOS_WEB_ADMIN_TUNNEL_PEER"],
+                "PMOS_WEB_PUBLIC_URL's",
+            ),
+            (
+                vec![
+                    ("PMOS_WEB_PUBLIC_URL", "http://localhost:8770"),
+                    ("PMOS_WEB_DIRECT", "1"),
+                ],
+                vec!["PMOS_WEB_TRUSTED_PROXIES", "PMOS_WEB_BIND"],
+                "",
+            ),
+            // A path, no URL.
+            (
+                vec![("PMOS_WEB_ADMIN_URL", "https://a.corp/x")],
+                vec![],
+                "no path",
+            ),
+            (vec![], vec!["PMOS_WEB_ADMIN_URL"], "PMOS_WEB_ADMIN_URL"),
+            // A public bind; the same bind as the public door.
+            (
+                vec![("PMOS_WEB_ADMIN_BIND", "203.0.113.7:8772")],
+                vec![],
+                "never on a public address",
+            ),
+            (
+                vec![("PMOS_WEB_ADMIN_BIND", "0.0.0.0:8770")],
+                vec![],
+                "must differ",
+            ),
+            // Session bounds.
+            (
+                vec![("PMOS_WEB_ADMIN_SESSION_IDLE_MINUTES", "61")],
+                vec![],
+                "1 to 60",
+            ),
+            (
+                vec![("PMOS_WEB_ADMIN_SESSION_MAX_MINUTES", "721")],
+                vec![],
+                "1 to 720",
+            ),
+            (
+                vec![
+                    ("PMOS_WEB_ADMIN_SESSION_IDLE_MINUTES", "60"),
+                    ("PMOS_WEB_ADMIN_SESSION_MAX_MINUTES", "30"),
+                ],
+                vec![],
+                "can't be longer",
+            ),
+            // Entra on the door without Entra; no provider at all.
+            (
+                vec![("PMOS_WEB_ADMIN_ENTRA", "1")],
+                vec![],
+                "needs Entra ID",
+            ),
+        ];
+        for (extra, drop, want) in cases {
+            match door(&extra, &drop) {
+                Err(e) => assert!(e.contains(want), "{extra:?}: {e}"),
+                // The one case above with a blank `want` is the http public URL on
+                // `localhost` beside an admin door on `pmos-prod.localhost`: allowed, since
+                // the two hosts differ.
+                Ok(_) => assert!(want.is_empty(), "{extra:?} {drop:?} started"),
+            }
+        }
+        // The same host on http: refused (stricter than r7 asks: one cookie jar).
+        let err = door(
+            &[
+                ("PMOS_WEB_PUBLIC_URL", "http://localhost:8770"),
+                ("PMOS_WEB_ADMIN_URL", "http://localhost:8772"),
+                ("PMOS_WEB_DIRECT", "1"),
+                ("PMOS_WEB_BIND", "127.0.0.1:8770"),
+            ],
+            &["PMOS_WEB_TRUSTED_PROXIES"],
+        )
+        .unwrap_err();
+        assert!(err.contains("PMOS_WEB_PUBLIC_URL's"), "{err}");
+        // No provider for the door: development sign-in is never served there.
+        let mut dev = vec![
+            ("PMOS_WEB_DEV_LOGIN", "1"),
+            ("PMOS_WEB_BOTS_TOKEN", BOTS),
+            ("PMOS_WEB_TOOLSERVER_TOKEN", TOOLS),
+            ("PMOS_WEB_ADMIN_BIND", "127.0.0.1:8772"),
+            ("PMOS_WEB_ADMIN_URL", "http://pmos-dev.localhost:8772"),
+            ("PMOS_WEB_ADMIN_TUNNEL_PEER", "127.0.0.1"),
+        ];
+        let err = Config::from_lookup(lookup(&dev)).unwrap_err();
+        assert!(err.contains("the admin door has no sign-in"), "{err}");
+        dev.retain(|(k, _)| !k.starts_with("PMOS_WEB_ADMIN"));
+        assert!(Config::from_lookup(lookup(&dev)).unwrap().admin.is_none());
+    }
+
+    #[test]
+    fn the_admin_door_in_proxy_mode() {
+        let cfg = door(
+            &[
+                ("PMOS_WEB_ADMIN_URL", "https://PMOS-Admin.corp.example"),
+                ("PMOS_WEB_ADMIN_TRUSTED_PROXIES", "10.201.77.1, fd00::1"),
+                ("PMOS_WEB_ADMIN_SESSION_IDLE_MINUTES", "60"),
+                ("PMOS_WEB_ADMIN_SESSION_MAX_MINUTES", "720"),
+            ],
+            &[],
+        )
+        .unwrap();
+        let a = cfg.admin.unwrap();
+        assert_eq!(a.url, "https://pmos-admin.corp.example");
+        assert_eq!(a.authority, "pmos-admin.corp.example");
+        assert!(matches!(a.mode, AdminMode::Proxy { ref trusted } if trusted.len() == 2));
+        assert_eq!(
+            (a.idle, a.max),
+            (Duration::minutes(60), Duration::hours(12))
+        );
+        // Its bind: unspecified, loopback or private only.
+        for bind in [
+            "127.0.0.1:8772",
+            "10.1.2.3:8772",
+            "100.64.0.9:8772",
+            "[fd00::5]:8772",
+            "[::]:8772",
+        ] {
+            assert!(
+                door(&[("PMOS_WEB_ADMIN_BIND", bind)], &[]).is_ok(),
+                "{bind}"
+            );
+        }
+        for bind in [
+            "8.8.8.8:8772",
+            "100.128.0.1:8772",
+            "[2001:db8::1]:8772",
+            "169.254.1.1:8772",
+        ] {
+            assert!(
+                door(&[("PMOS_WEB_ADMIN_BIND", bind)], &[]).is_err(),
+                "{bind}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_password_allow_list_is_bounded() {
+        for ok in [
+            "10.1.0.0/16",
+            "192.168.4.0/24",
+            "203.0.113.7/32",
+            "2001:db8:1::/48",
+            "2001:db8:1:2::/64",
+            "::ffff:10.1.0.0/112",
+        ] {
+            assert!(parse_password_clients(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "0.0.0.0/0",
+            "::/0",
+            "::ffff:0:0/96",
+            "10.0.0.0/15",
+            "2001:db8::/47",
+            "::ffff:10.0.0.0/111",
+        ] {
+            let err = parse_password_clients(bad).unwrap_err();
+            assert!(err.contains(bad) && err.contains("D2 (a)"), "{bad}: {err}");
+        }
+        for bad in [
+            "10.1.0.0",
+            "10.1.0.1/16",
+            "10.1.0.0/33",
+            "10.1.0.0/016",
+            "pmos/16",
+        ] {
+            assert!(parse_password_clients(bad).is_err(), "{bad}");
+        }
+        let list = parse_password_clients("10.1.0.0/16, 2001:db8:1::/48").unwrap();
+        assert_eq!(list.len(), 2);
+        assert!(list[0].contains("10.1.9.9".parse().unwrap()));
+        assert!(list[0].contains("::ffff:10.1.9.9".parse().unwrap()));
+        assert!(!list[0].contains("10.2.0.0".parse().unwrap()));
+        assert!(list[1].contains("2001:db8:1:ffff::1".parse().unwrap()));
+        assert!(!list[1].contains("2001:db8:2::1".parse().unwrap()));
+        let cfg = door(&[("PMOS_WEB_PASSWORD_CLIENTS", "10.1.0.0/16")], &[]).unwrap();
+        assert_eq!(cfg.password_clients.len(), 1);
+        assert!(door(&[("PMOS_WEB_PASSWORD_CLIENTS", "0.0.0.0/0")], &[]).is_err());
     }
 }

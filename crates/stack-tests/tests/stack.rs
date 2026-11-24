@@ -145,6 +145,11 @@ fn ring(id: &str, key: &str) -> KeyRing {
 
 struct Stack {
     web: String,
+    /// The admin door (slice H10): `/api/admin/*` live only there, reached at its
+    /// `*.localhost` name with peer addresses, as a tunnel reaches it.
+    admin: String,
+    admin_http: reqwest::Client,
+    web_sessions: Arc<dyn pmos_web::session::SessionStore>,
     runtime: String,
     /// The console, behind a stand-in sign-in proxy (`X-Forwarded-User`).
     console: String,
@@ -303,7 +308,9 @@ async fn start_with(hostile: bool) -> Stack {
     )
     .await;
 
-    // pmos-web, signing with the same keys.
+    // pmos-web, signing with the same keys, with its admin door.
+    let admin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let admin_port = admin_listener.local_addr().unwrap().port();
     let config = Config {
         bind: "127.0.0.1:0".parse().unwrap(),
         bots_url: runtime.clone(),
@@ -328,14 +335,43 @@ async fn start_with(hostile: bool) -> Stack {
         internal_bind: None,
         password_login: true,
         trusted_proxies: Vec::new(),
+        admin: Some(pmos_web::config::AdminDoor {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            url: format!("http://{ADMIN_HOST}:{admin_port}"),
+            authority: format!("{ADMIN_HOST}:{admin_port}"),
+            mode: pmos_web::config::AdminMode::Tunnel {
+                peer: "127.0.0.1".parse().unwrap(),
+            },
+            idle: chrono::Duration::minutes(30),
+            max: chrono::Duration::minutes(480),
+            entra: false,
+        }),
+        password_clients: Vec::new(),
     };
     let web_clock = Arc::new(Mutex::new(Utc::now()));
     let clock = web_clock.clone();
+    let web_sessions: Arc<dyn pmos_web::session::SessionStore> =
+        Arc::new(pmos_web::session::MemorySessionStore::new());
     let deps = Deps {
         clock: Arc::new(move || *clock.lock().unwrap()),
+        sessions: web_sessions.clone(),
         ..Deps::in_memory()
     };
-    let web = serve(pmos_web::build(config, deps).unwrap(), &cancel).await;
+    let server = pmos_web::app::build_server(config, deps).unwrap();
+    let web = serve(server.public, &cancel).await;
+    {
+        let ct = cancel.clone();
+        let router = server.admin.unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                admin_listener,
+                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move { ct.cancelled_owned().await })
+            .await
+            .unwrap();
+        });
+    }
 
     // The console, as deployed behind a sign-in proxy, signing for the runtime and the tool
     // server. Its content root is the hostile one too: it reads no content at all (U4d).
@@ -368,6 +404,13 @@ async fn start_with(hostile: bool) -> Stack {
 
     Stack {
         web,
+        admin: format!("http://{ADMIN_HOST}:{admin_port}"),
+        admin_http: reqwest::Client::builder()
+            .resolve(ADMIN_HOST, ([127, 0, 0, 1], admin_port).into())
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap(),
+        web_sessions,
         runtime,
         console,
         slack_people,
@@ -385,10 +428,14 @@ async fn start_with(hostile: bool) -> Stack {
     }
 }
 
-/// A signed-in browser: its cookie and CSRF token.
+/// The admin door's host name here (a deployment-unique `*.localhost` name, r7).
+const ADMIN_HOST: &str = "pmos-stack.localhost";
+
+/// A signed-in browser: its cookie and CSRF token, and whether it is on the admin door.
 struct Browser {
     cookie: String,
     csrf: String,
+    admin: bool,
 }
 
 impl Stack {
@@ -399,17 +446,21 @@ impl Stack {
         path: &str,
         body: Option<Value>,
     ) -> (StatusCode, Value, reqwest::header::HeaderMap) {
-        let mut req = self
-            .http
-            .request(method.clone(), format!("{}{path}", self.web));
+        let on_admin = b.is_some_and(|b| b.admin);
+        let (base, http, name) = if on_admin {
+            (&self.admin, &self.admin_http, "__Host-pmos-admin")
+        } else {
+            (&self.web, &self.http, "__Host-pmos")
+        };
+        let mut req = http.request(method.clone(), format!("{base}{path}"));
         if let Some(b) = b {
-            req = req.header("cookie", format!("__Host-pmos={}", b.cookie));
+            req = req.header("cookie", format!("{name}={}", b.cookie));
             if method != Method::GET {
                 req = req.header("x-pmos-csrf", &b.csrf);
             }
         }
         if method != Method::GET {
-            req = req.header("origin", self.web.clone());
+            req = req.header("origin", base.clone());
         }
         if let Some(body) = body {
             req = req.json(&body);
@@ -419,6 +470,36 @@ impl Stack {
         let headers = res.headers().clone();
         let body = res.json().await.unwrap_or(Value::Null);
         (status, body, headers)
+    }
+
+    /// An admin-door session for `handle`, made now by pmos-web's clock (its roles are checked
+    /// in the user database on every request there). The admin door serves no development
+    /// sign-in, so the session goes straight into pmos-web's store.
+    async fn admin_login(&self, handle: &str) -> Browser {
+        let id = pmos_web::session::random_token();
+        let csrf = pmos_web::session::random_token();
+        let at = *self.web_clock.lock().unwrap();
+        self.web_sessions
+            .insert(
+                pmos_web::session::hash_id(&id),
+                pmos_web::session::Session {
+                    handle: handle.into(),
+                    csrf_token: csrf.clone(),
+                    created_at: at,
+                    last_seen: at,
+                    entra_oid: None,
+                    entra_tid: None,
+                    password_epoch: None,
+                    door: pmos_web::session::Door::Admin,
+                },
+            )
+            .await
+            .unwrap();
+        Browser {
+            cookie: id,
+            csrf,
+            admin: true,
+        }
     }
 
     async fn login(&self, handle: &str) -> Browser {
@@ -443,6 +524,7 @@ impl Stack {
         let mut b = Browser {
             cookie,
             csrf: String::new(),
+            admin: false,
         };
         let (status, me, _) = self.send(Some(&b), Method::GET, "/api/me", None).await;
         assert_eq!(status, StatusCode::OK, "{me}");
@@ -654,7 +736,7 @@ async fn a_deactivation_in_the_user_database_ends_the_web_session_within_ten_sec
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_admin_changes_people_through_pmos_web_and_the_tool_server_decides() {
     let s = start().await;
-    let admin = s.login("stack-admin").await;
+    let admin = s.admin_login("stack-admin").await;
     let (status, list, _) = s
         .send(Some(&admin), Method::GET, "/api/admin/users", None)
         .await;
@@ -722,7 +804,9 @@ async fn an_admin_changes_people_through_pmos_web_and_the_tool_server_decides() 
     assert_eq!(body["user"]["sign_in_name_confirmed"], true);
     s.login("cy").await;
     // A PM may not.
-    let ben = s.login("ben").await;
+    // A PM may not: on the public door the route isn't there (404), and the admin door refuses
+    // a PM before any route (slice H10).
+    let ben = s.admin_login("ben").await;
     let (status, _, _) = s
         .send(
             Some(&ben),
@@ -741,7 +825,7 @@ async fn an_admin_changes_people_through_pmos_web_and_the_tool_server_decides() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_reviewer_recommends_through_pmos_web_and_the_owner_sees_it() {
     let s = start().await;
-    let admin = s.login("stack-admin").await;
+    let admin = s.admin_login("stack-admin").await;
     let (_, list, _) = s
         .send(Some(&admin), Method::GET, "/api/admin/users", None)
         .await;
@@ -912,13 +996,19 @@ impl Stack {
 
         // An admin read: refused to Ana and Ben (admins only in the file), served to the
         // database's admin.
+        // Slice H10: not on the public door at all; on the admin door, refused to anyone but an
+        // Admin or an Auditor.
         for (who, browser) in [("ana", &ana), ("ben", &self.login("ben").await)] {
             for path in ["/api/admin/users", "/api/admin/overview"] {
                 let (status, body, _) = self.send(Some(browser), Method::GET, path, None).await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{who} {path}: {body}");
+                let door = self.admin_login(who).await;
+                let (status, body, _) = self.send(Some(&door), Method::GET, path, None).await;
                 assert_eq!(status, StatusCode::FORBIDDEN, "{who} {path}: {body}");
+                assert_eq!(body["code"], "admin_door_not_allowed", "{who} {path}");
             }
         }
-        let admin = self.login("stack-admin").await;
+        let admin = self.admin_login("stack-admin").await;
         let (status, list, _) = self
             .send(Some(&admin), Method::GET, "/api/admin/users", None)
             .await;
@@ -1109,6 +1199,7 @@ impl Stack {
         let mut b = Browser {
             cookie,
             csrf: String::new(),
+            admin: false,
         };
         let (status, me, _) = self.send(Some(&b), Method::GET, "/api/me", None).await;
         assert_eq!(status, StatusCode::OK, "{me}");
@@ -1251,7 +1342,7 @@ async fn password_sign_in_through_pmos_web_and_the_real_tool_server() {
     assert_eq!(providers["providers"], json!(["password", "dev"]));
 
     // The admin makes a setup code (shown once); the Team page shows it pending.
-    let admin = s.login("stack-admin").await;
+    let admin = s.admin_login("stack-admin").await;
     let (status, issued, _) = s
         .send(
             Some(&admin),
@@ -1293,7 +1384,7 @@ async fn password_sign_in_through_pmos_web_and_the_real_tool_server() {
         (status, body["code"].as_str()),
         (StatusCode::FORBIDDEN, Some("self_change"))
     );
-    let ben = s.login("ben").await;
+    let ben = s.admin_login("ben").await;
     let (status, _, _) = s
         .send(
             Some(&ben),

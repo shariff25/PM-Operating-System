@@ -941,7 +941,7 @@ pub const SIGN_IN_PROVIDERS: [&str; 3] = ["entra", "dev", "password"];
 
 /// Why a sign-in was refused, as `pmos-web` codes it (its signed-out page's `reason`).
 /// `wrong_account` is from before the user database (no longer sent, still accepted).
-pub const SIGN_IN_REFUSALS: [&str; 11] = [
+pub const SIGN_IN_REFUSALS: [&str; 12] = [
     "not_a_member",
     "wrong_account",
     "expired",
@@ -953,6 +953,8 @@ pub const SIGN_IN_REFUSALS: [&str; 11] = [
     "entra_needs_host",
     "entra_misconfigured",
     "users_unavailable",
+    // Slice H10: the admin door refused someone who is neither Admin nor Auditor.
+    "admin_door_not_allowed",
 ];
 
 /// Who a refused sign-in is recorded as: nobody signed in.

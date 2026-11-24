@@ -342,8 +342,13 @@ fn ring() -> pmos_assertion::KeyRing {
     pmos_assertion::KeyRing::new(pmos_assertion::Key::from_base64("wt1", WEB_TOOLS_KEY).unwrap())
 }
 
+/// `base` is the public door; `/api/admin/*` go to the admin door (slice H10), `admin`, with an
+/// admin-door session from [`Web::admin_login`].
 struct Web {
     base: String,
+    admin: String,
+    admin_http: reqwest::Client,
+    sessions: Arc<dyn pmos_web::session::SessionStore>,
     m: Arc<Mocks>,
     http: reqwest::Client,
     _dir: tempfile::TempDir,
@@ -369,6 +374,7 @@ async fn web_with(deps: Deps) -> Web {
         serve(Router::new().fallback(toolserver).with_state(m.clone())).await;
     let (bots_url, stop_bots) = serve(Router::new().fallback(runtime).with_state(m.clone())).await;
     let dir = tempfile::tempdir().unwrap();
+    let door = support::door::listener().await;
     let cfg = Config {
         bind: "127.0.0.1:0".parse().unwrap(),
         bots_url,
@@ -387,16 +393,26 @@ async fn web_with(deps: Deps) -> Web {
         session_idle: Duration::hours(8),
         session_max: Duration::hours(24),
         internal_bind: None,
-        password_login: false,
+        // The admin door's sign-in (it never serves development sign-in).
+        password_login: true,
         trusted_proxies: Vec::new(),
+        admin: Some(support::door::tunnel(door.port)),
+        password_clients: Vec::new(),
     };
-    let (base, stop_web) = serve(pmos_web::build(cfg, deps).unwrap()).await;
+    let sessions = deps.sessions.clone();
+    let server = pmos_web::app::build_server(cfg, deps).unwrap();
+    let (base, stop_web) = serve(server.public).await;
+    let port = door.port;
+    let stop_admin = support::door::serve(door, server.admin.unwrap());
     Web {
         base,
+        admin: support::door::base(port),
+        admin_http: support::door::client(port),
+        sessions,
         m,
         http: reqwest::Client::new(),
         _dir: dir,
-        _stop: vec![stop_tools, stop_bots, stop_web],
+        _stop: vec![stop_tools, stop_bots, stop_web, stop_admin],
     }
 }
 
@@ -408,6 +424,20 @@ async fn reply(res: reqwest::Response) -> Reply {
 }
 
 impl Web {
+    /// An admin-door session for `handle` (its roles are checked on every request there).
+    async fn admin_login(&self, handle: &str) -> String {
+        support::door::session(&self.sessions, handle).await.0
+    }
+
+    /// The door a path is on, its client and its session cookie's name.
+    fn door_for(&self, path: &str) -> (&str, &reqwest::Client, &'static str) {
+        if path.starts_with("/api/admin/") {
+            (&self.admin, &self.admin_http, "__Host-pmos-admin")
+        } else {
+            (&self.base, &self.http, "__Host-pmos")
+        }
+    }
+
     async fn login(&self, handle: &str) -> String {
         let res = self
             .http
@@ -429,9 +459,10 @@ impl Web {
     }
 
     async fn get(&self, cookie: &str, path: &str) -> Reply {
-        let mut req = self.http.get(format!("{}{path}", self.base));
+        let (base, http, name) = self.door_for(path);
+        let mut req = http.get(format!("{base}{path}"));
         if !cookie.is_empty() {
-            req = req.header("cookie", format!("__Host-pmos={cookie}"));
+            req = req.header("cookie", format!("{name}={cookie}"));
         }
         reply(req.send().await.unwrap()).await
     }
@@ -447,15 +478,27 @@ impl Web {
         origin: Option<&str>,
         csrf: bool,
     ) -> Reply {
-        let mut req = self
-            .http
-            .request(method, format!("{}{path}", self.base))
-            .json(body);
+        let (base, http, name) = self.door_for(path);
+        let mut req = http.request(method, format!("{base}{path}")).json(body);
         if !cookie.is_empty() {
-            req = req.header("cookie", format!("__Host-pmos={cookie}"));
+            req = req.header("cookie", format!("{name}={cookie}"));
             if csrf {
-                let me = self.get(cookie, "/api/me").await;
-                req = req.header("x-pmos-csrf", me.body["csrf_token"].as_str().unwrap());
+                let me = if name == "__Host-pmos-admin" {
+                    reply(
+                        http.get(format!("{base}/api/me"))
+                            .header("cookie", format!("{name}={cookie}"))
+                            .send()
+                            .await
+                            .unwrap(),
+                    )
+                    .await
+                } else {
+                    self.get(cookie, "/api/me").await
+                };
+                req = req.header(
+                    "x-pmos-csrf",
+                    me.body["csrf_token"].as_str().unwrap_or_default(),
+                );
             }
         }
         if let Some(o) = origin {
@@ -465,13 +508,13 @@ impl Web {
     }
 
     async fn put(&self, cookie: &str, path: &str, body: &Value) -> Reply {
-        let base = self.base.clone();
+        let base = self.door_for(path).0.to_string();
         self.write(cookie, Method::PUT, path, body, Some(&base), true)
             .await
     }
 
     async fn post(&self, cookie: &str, path: &str, body: &Value) -> Reply {
-        let base = self.base.clone();
+        let base = self.door_for(path).0.to_string();
         self.write(cookie, Method::POST, path, body, Some(&base), true)
             .await
     }
@@ -1437,12 +1480,13 @@ async fn the_admin_bots_view_is_for_admins_and_auditors_and_metadata_only() {
     let w = web().await;
     *w.m.admin_personas.lock().unwrap() = admin_personas();
     for who in ["ana", "rex"] {
-        let c = w.login(who).await;
+        // Slice H10: the admin door itself refuses a PM or a Reviewer.
+        let c = w.admin_login(who).await;
         let before = w.m.calls("toolserver").len();
         let r = w.get(&c, "/api/admin/bots").await;
         assert_eq!(
             (r.status, &r.body["code"]),
-            (StatusCode::FORBIDDEN, &json!("forbidden")),
+            (StatusCode::FORBIDDEN, &json!("admin_door_not_allowed")),
             "{who}"
         );
         let after: Vec<Call> = w.m.calls("toolserver")[before..].to_vec();
@@ -1454,7 +1498,7 @@ async fn the_admin_bots_view_is_for_admins_and_auditors_and_metadata_only() {
         );
     }
     for (who, may_release) in [("adam", true), ("audrey", false)] {
-        let c = w.login(who).await;
+        let c = w.admin_login(who).await;
         let r = w.get(&c, "/api/admin/bots").await;
         assert_eq!(r.status, StatusCode::OK, "{who}: {}", r.text);
         assert_eq!(r.body["can_release"], may_release, "{who}");
@@ -1498,7 +1542,7 @@ async fn the_admin_bots_view_is_for_admins_and_auditors_and_metadata_only() {
     }
     // The tool server's own refusal is the same answer.
     *w.m.admin_personas.lock().unwrap() = Value::Null;
-    let c = w.login("adam").await;
+    let c = w.admin_login("adam").await;
     let r = w.get(&c, "/api/admin/bots").await;
     assert_eq!(r.status, StatusCode::BAD_GATEWAY, "{}", r.text);
 }
@@ -1508,12 +1552,23 @@ async fn an_admin_releases_a_held_draft_through_the_tool_server() {
     let w = web().await;
     let path = "/api/admin/bots/drafts/apr_9/release";
     // Only an Admin (edit-content): an Auditor and a PM are refused before the tool server.
-    for who in ["audrey", "ana"] {
-        let c = w.login(who).await;
-        let r = w.post(&c, path, &json!({})).await;
+    for (who, code) in [("audrey", "forbidden"), ("ana", "admin_door_not_allowed")] {
+        let c = w.admin_login(who).await;
+        // A PM has no admin-door session to fetch a CSRF token with: the door refuses first.
+        let admin = w.admin.clone();
+        let r = w
+            .write(
+                &c,
+                Method::POST,
+                path,
+                &json!({}),
+                Some(&admin),
+                who != "ana",
+            )
+            .await;
         assert_eq!(
             (r.status, &r.body["code"]),
-            (StatusCode::FORBIDDEN, &json!("forbidden")),
+            (StatusCode::FORBIDDEN, &json!(code)),
             "{who}"
         );
     }
@@ -1522,9 +1577,9 @@ async fn an_admin_releases_a_held_draft_through_the_tool_server() {
         .calls("toolserver")
         .iter()
         .all(|c| !c.uri.contains("/release")));
-    let c = w.login("adam").await;
+    let c = w.admin_login("adam").await;
     // The CSRF token is required, as on every write.
-    let base = w.base.clone();
+    let base = w.admin.clone();
     let r = w
         .write(&c, Method::POST, path, &json!({}), Some(&base), false)
         .await;
@@ -1678,7 +1733,7 @@ async fn the_audit_log_filters_by_bot_and_shows_it() {
         event("ev_2", Value::Null),
         event("ev_3", json!("<b>bad</b>")),
     ];
-    let c = w.login("audrey").await;
+    let c = w.admin_login("audrey").await;
     let r = w.get(&c, "/api/admin/audit?persona=chief").await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text);
     let sent =
