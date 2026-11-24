@@ -227,6 +227,17 @@ still counts as `local` and `public` for the checks that depend on it. `pmos-adm
 `PMOS_WEB_BRIEF_URL` that is not `http://<name>:8771`, and `up --web` on a `public` host refuses
 before anything else runs, saying the web app waits for H10.
 
+**Slice H7 status (2026-11-24): built and merged on `claude/web-app`, not yet reviewed.**
+`policies/redteam/checklist.md` gains "Run it on the host", P-0, P-7 to P-9, RT-11 to RT-21 and
+E-5. `isolation.sh` adds RT-11 to RT-13b and RT-18 (`--dry-run`, `--only`; RT-13b's hosts line
+only with `--allow-host-changes`, restored by an exit trap; RT-18 prints only found or not
+found). New: `exposure.sh` (RT-14, RT-15), `stack.sh` (RT-16, RT-19, RT-20, RT-21; a file this
+spec does not name) and `lib.sh`. RT-14's routes through 443 and the published 8772 wait for
+H10; RT-19 and RT-20 wait for H12 (RT-19 also for an approved entry). Each is reported "not
+built: skipped" with exit status 3, which is not a pass. Tested with stand-ins by
+`scripts/test-redteam.sh` in CI. Not verified: anything on OpenShell or a real host, including
+the log formats the probes read.
+
 **The owner's requirement, 2026-11-22:** "I want to deploy it in another platform apart from
 spark", and, asked which cloud, "OpenShell on another platform generic implementation". So PM OS's
 bots must be able to run in NVIDIA OpenShell sandboxes on hosts other than the DGX Spark, through
