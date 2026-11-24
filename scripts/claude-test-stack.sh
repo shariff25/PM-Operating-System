@@ -330,7 +330,7 @@ limits:
 clients:
   runtime: {trusted: true, max-in-flight: $GW_IN_FLIGHT, per-user-share: $GW_PER_USER}
   worker: {trusted: true, max-in-flight: $GW_IN_FLIGHT, per-user-share: $GW_PER_USER}
-  evals: {max-in-flight: 2, priority: personal}
+  evals: {max-in-flight: 2, priority: personal, route: pin}
 EOF
 else
   GATEWAY_CONFIG=config/gateway.claude-test.yaml

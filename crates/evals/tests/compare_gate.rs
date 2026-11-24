@@ -59,6 +59,7 @@ fn report(date: &str, tasks: &[(&str, Option<&str>, &[bool])]) -> Report {
         judges: vec![],
         judges_skipped: None,
         isolation: None,
+        route: None,
         tasks: tasks
             .iter()
             .flat_map(|(id, c, runs)| {

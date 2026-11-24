@@ -85,4 +85,4 @@ clients:
   bot-*: {trusted: true, max-in-flight: 3, person-pool: team-bots}
   # The eval stack (deploy/compose.evals.yaml): its runtime, workers and judges share this
   # token. One slot, background priority, so a benchmark never takes production's capacity.
-  evals: {max-in-flight: 1, priority: personal}
+  evals: {max-in-flight: 1, priority: personal, route: pin}

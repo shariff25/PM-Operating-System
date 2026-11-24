@@ -53,6 +53,14 @@ pub struct Report {
     /// none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gateway_models: Option<GatewayModels>,
+    /// Which models answered the run's calls, as the gateway's answers said
+    /// (`docs/model-providers-spec.md` §4.10, slice MP6): the runner pins every call to each
+    /// role's primary (`X-Pmos-Fallback: off` on judge calls; the runtime pins every `eval`
+    /// task's calls), and records what came back. A run with a fallback answer, or a label
+    /// that isn't the primary's, counts towards no bar ([`crate::history::counts`]). `None` in
+    /// reports from before routes (2026-11-24).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<RouteRecord>,
     /// The version (`version:` in `PERSONA.md`) of the persona the category's tasks asked,
     /// read from the content the run used. For display only: what counts is
     /// [`Report::persona_hash`].
@@ -81,6 +89,68 @@ pub struct Report {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judges_skipped: Option<String>,
     pub tasks: Vec<TaskReport>,
+}
+
+/// Which models answered a run's calls ([`Report::route`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RouteRecord {
+    /// What the runner pinned each role to: `primary` (the default, and the only one built).
+    pub pinned: String,
+    /// Each label that answered, with its model hash and how many calls it answered.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub answered: BTreeMap<String, Answered>,
+    /// A call came back marked `x-pmos-fallback: 1` (should be impossible with the pin).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fallback_used: bool,
+    /// Finished tasks whose runtime didn't say which models answered them.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub unrecorded: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// One label's share of a run's calls ([`RouteRecord::answered`]).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct Answered {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_sha256: Option<String>,
+    pub calls: u64,
+}
+
+/// One label's calls for one task, as the harness reports them (`models_used`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelUse {
+    pub label: String,
+    #[serde(default)]
+    pub model_sha256: Option<String>,
+    pub calls: u64,
+}
+
+impl RouteRecord {
+    /// Adds one answer (or one task's `models_used`).
+    pub fn add(&mut self, label: &str, model_sha256: Option<&str>, calls: u64, fallback: bool) {
+        let a = self.answered.entry(label.to_string()).or_default();
+        if a.model_sha256.is_none() {
+            a.model_sha256 = model_sha256.map(str::to_string);
+        } else if model_sha256.is_some() && a.model_sha256.as_deref() != model_sha256 {
+            // One label, two models: never a primary's run.
+            self.fallback_used = true;
+        }
+        a.calls += calls;
+        self.fallback_used |= fallback;
+    }
+
+    pub fn merge(&mut self, other: &RouteRecord) {
+        for (label, a) in &other.answered {
+            self.add(label, a.model_sha256.as_deref(), a.calls, false);
+        }
+        self.fallback_used |= other.fallback_used;
+        self.unrecorded += other.unrecorded;
+    }
 }
 
 /// What the gateway said about its roles for one run ([`Report::gateway_models`]).

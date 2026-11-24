@@ -639,6 +639,8 @@ pub struct Gateway {
     token: String,
     /// The source the gateway reported at the run's first roles read.
     source: std::sync::Arc<tokio::sync::OnceCell<String>>,
+    /// Which models answered the judge calls (slice MP6).
+    answered: std::sync::Arc<std::sync::Mutex<crate::report::RouteRecord>>,
 }
 
 impl Gateway {
@@ -657,7 +659,19 @@ impl Gateway {
             base,
             token: token.to_string(),
             source: std::sync::Arc::default(),
+            answered: std::sync::Arc::default(),
         }
+    }
+
+    /// Which models answered this run's judge calls (slice MP6).
+    pub fn route_record(&self) -> crate::report::RouteRecord {
+        let mut r = self
+            .answered
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        r.pinned = "primary".into();
+        r
     }
 
     /// The source this run expects: the one the gateway reported at its first roles read.
@@ -718,6 +732,9 @@ impl Gateway {
             .header("X-Pmos-Priority", "personal")
             .header("X-Pmos-Run", format!("eval-judge:{}", judge.name))
             .header(pmos_contract::model_source::HEADER, &source)
+            // §4.10 (slice MP6): a judge is pinned to its role's primary, so the run measures
+            // one model; the gateway answers 503 rather than ask a fallback.
+            .header("X-Pmos-Fallback", "off")
             .json(&body)
             .send()
             .await
@@ -732,6 +749,30 @@ impl Gateway {
                 "the gateway now serves another model source than this run started on ({source}); \
                  judging stopped (model_source_changed)"
             ));
+        }
+        let header = |k: &str| {
+            resp.headers()
+                .get(k)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        let fallback = header("x-pmos-fallback").as_deref() == Some("1");
+        if code.is_success() {
+            if let Some(label) = header("x-pmos-model") {
+                self.answered.lock().unwrap_or_else(|p| p.into_inner()).add(
+                    &label,
+                    header("x-pmos-model-sha256").as_deref(),
+                    1,
+                    fallback,
+                );
+            }
+        }
+        if fallback {
+            return Err(
+                "the gateway answered with a fallback model, which this run doesn't measure; \
+                 judging stopped (fallback_used)"
+                    .into(),
+            );
         }
         let text = resp.text().await.map_err(|e| format!("the gateway: {e}"))?;
         if !code.is_success() {

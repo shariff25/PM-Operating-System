@@ -846,6 +846,8 @@ pub async fn run_category(
             .map(|j| j.judges.iter().map(|(_, s)| s.clone()).collect())
             .unwrap_or_default(),
         judges_skipped: opts.judges_skipped.clone(),
+        // Filled in by the caller, from every lane's runtime and the judges' gateway.
+        route: None,
         tasks: lines.into_iter().flatten().collect(),
     }
 }

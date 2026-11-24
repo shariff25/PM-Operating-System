@@ -832,6 +832,50 @@ fn declared(headers: &HeaderMap) -> Result<Declared, String> {
     })
 }
 
+/// Why a call's route headers were refused (§4.10).
+enum RouteRefused {
+    /// `X-Pmos-Fallback` that isn't `on` or `off` (`400`).
+    Malformed(String),
+    /// `X-Pmos-Route-Model` from a client that isn't `pin`, or naming no model of the role's
+    /// route (`403`).
+    NotPinnable,
+}
+
+/// The one hop (index into the role's route) a call may use, or `None` for the whole route:
+/// `pin` with `X-Pmos-Route-Model` names it; `primary-only`, or `X-Pmos-Fallback: off` from
+/// any client, keeps hop 1. A one-hop role has only hop 1 anyway, but a pin still has to name
+/// its label.
+fn route_choice(
+    headers: &HeaderMap,
+    policy: &ClientPolicy,
+    role: &Role,
+) -> Result<Option<usize>, RouteRefused> {
+    use crate::config::RouteRule;
+    let fallback_off = match headers.get("x-pmos-fallback").map(|v| v.to_str()) {
+        None => false,
+        Some(Ok("off")) => true,
+        Some(Ok("on")) => false,
+        Some(_) => {
+            return Err(RouteRefused::Malformed(
+                "X-Pmos-Fallback must be `off` (or `on`)".into(),
+            ))
+        }
+    };
+    if let Some(v) = headers.get("x-pmos-route-model") {
+        if policy.route != RouteRule::Pin {
+            return Err(RouteRefused::NotPinnable);
+        }
+        let label = v.to_str().map_err(|_| RouteRefused::NotPinnable)?;
+        return role
+            .hops()
+            .iter()
+            .position(|h| h.label.as_deref() == Some(label))
+            .map(Some)
+            .ok_or(RouteRefused::NotPinnable);
+    }
+    Ok((fallback_off || policy.route == RouteRule::PrimaryOnly).then_some(0))
+}
+
 /// Why no slot was had.
 #[derive(Clone, Copy)]
 enum NoSlot {
@@ -1190,6 +1234,31 @@ async fn forward(
             );
         }
     };
+    // §4.10 (slice MP6): which hops this client may use. Only a `pin` client may name one in
+    // `X-Pmos-Route-Model`; any client may narrow itself to the primary with
+    // `X-Pmos-Fallback: off`; no client can ask for more than its setting allows. Checked
+    // before the call is queued, so a refusal sends nothing anywhere.
+    let only = match route_choice(&headers, &policy, &role) {
+        Ok(o) => o,
+        Err(RouteRefused::Malformed(m)) => {
+            return error(StatusCode::BAD_REQUEST, "invalid_request_error", m)
+        }
+        Err(RouteRefused::NotPinnable) => {
+            inner.usage.record_refusal(refused_line(
+                403,
+                who.user.clone(),
+                who.run.clone(),
+                who.priority,
+                "names a model of the route this client may not pin",
+            ));
+            return error(
+                StatusCode::FORBIDDEN,
+                "permission_error",
+                "this client may not choose the model (X-Pmos-Route-Model), or the role's route \
+                 has no such model",
+            );
+        }
+    };
     req["model"] = json!(role.model);
 
     // The person's cap applies when the gateway believes the person (a trusted client's
@@ -1295,7 +1364,7 @@ async fn forward(
                 owner,
                 priority: who.priority,
                 started,
-                only: None,
+                only,
             },
         )
         .await;

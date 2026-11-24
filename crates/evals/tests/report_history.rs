@@ -76,6 +76,7 @@ fn report(date: &str, passed: usize, total: usize) -> Report {
         judges: Vec::new(),
         judges_skipped: None,
         isolation: None,
+        route: None,
         tasks,
     }
 }

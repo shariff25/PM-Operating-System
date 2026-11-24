@@ -902,3 +902,84 @@ async fn one_run_stays_on_the_model_that_answered_it() {
         "hosted-model-a"
     );
 }
+
+// Slice MP6 (§4.10): only a `pin` client chooses the model; `X-Pmos-Fallback: off` narrows.
+
+#[tokio::test]
+async fn only_a_pin_client_chooses_the_model_and_any_client_can_only_narrow() {
+    let gw = gateway(&[FULL, FULL], "clients: {evals: {route: pin}}\n").await;
+    // The runtime may not pin: 403, and nothing reaches any model.
+    let res = ask(&gw, hello(false))
+        .header("x-pmos-route-model", "hosted-model-b")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 403);
+    assert_eq!(gw.mocks[0].calls() + gw.mocks[1].calls(), 0);
+    // The evals client may pin a model of the route...
+    let res = ask_as(&gw, EVALS, hello(false))
+        .header("x-pmos-route-model", "hosted-model-b")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(header(res.headers(), "x-pmos-model"), "hosted-model-b");
+    assert_eq!(header(res.headers(), "x-pmos-fallback"), "1");
+    assert_eq!(header(res.headers(), "x-pmos-route-hop"), "2");
+    assert_eq!(
+        gw.mocks[0].calls(),
+        0,
+        "a pinned call never tries another hop"
+    );
+    // ...but no label outside it.
+    let res = ask_as(&gw, EVALS, hello(false))
+        .header("x-pmos-route-model", "hosted-model-z")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 403);
+    // A pinned hop that fails is not routed around.
+    gw.mocks[0].always(Step::Status(503, None, "busy"));
+    let res = ask_as(&gw, EVALS, hello(false))
+        .header("x-pmos-route-model", "hosted-model-a")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 503);
+    assert_eq!(gw.mocks[1].calls(), 1, "only the earlier pinned call");
+    // X-Pmos-Fallback: off from any client keeps the primary: the fallback gets nothing.
+    let res = ask(&gw, hello(false))
+        .header("x-pmos-fallback", "off")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 503);
+    assert_eq!(gw.mocks[1].calls(), 1);
+    // A value that is neither on nor off is refused.
+    let res = ask(&gw, hello(false))
+        .header("x-pmos-fallback", "maybe")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 400);
+    // Without the header, the runtime falls back as usual.
+    let res = ask(&gw, hello(false)).send().await.unwrap();
+    assert_eq!(header(res.headers(), "x-pmos-model"), "hosted-model-b");
+}
+
+#[tokio::test]
+async fn a_primary_only_client_never_falls_back() {
+    let gw = gateway(&[FULL, FULL], "clients: {runtime: {route: primary-only}}\n").await;
+    gw.mocks[0].always(Step::Status(503, None, "busy"));
+    let res = ask(&gw, hello(false)).send().await.unwrap();
+    assert_eq!(res.status(), 503);
+    assert_eq!(gw.mocks[1].calls(), 0);
+    // `X-Pmos-Fallback: on` asks for no more than the client's setting allows.
+    let res = ask(&gw, hello(false))
+        .header("x-pmos-fallback", "on")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 503);
+    assert_eq!(gw.mocks[1].calls(), 0);
+}

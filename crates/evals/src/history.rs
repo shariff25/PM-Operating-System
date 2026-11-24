@@ -106,6 +106,10 @@ pub struct ProductionModels {
     /// the gateway reports it (`model_sha256`), so a model swapped behind an unchanged label
     /// restarts the streak (the label hardening of the review at 52dbae2).
     pub model_sha256: BTreeMap<String, String>,
+    /// Some role of the production config has a `route:` (`docs/model-providers-spec.md`
+    /// §4.10): its production model is the route's primary, and a report counts only if it
+    /// recorded which models answered its calls ([`crate::report::Report::route`]).
+    pub routed: bool,
 }
 
 impl From<BTreeMap<String, String>> for ProductionModels {
@@ -114,6 +118,7 @@ impl From<BTreeMap<String, String>> for ProductionModels {
         Self {
             roles,
             model_sha256: BTreeMap::new(),
+            routed: false,
         }
     }
 }
@@ -172,8 +177,24 @@ pub fn production_models(evals_root: &Path) -> Result<ProductionModels, String> 
         .ok_or_else(|| format!("{}: no `roles`", path.display()))?;
     let mut out = ProductionModels::default();
     for (name, role) in roles {
-        let label = role.get("label").and_then(|l| l.as_str());
-        let model = role.get("model").and_then(|m| m.as_str());
+        let mut label = role.get("label").and_then(|l| l.as_str());
+        let mut model = role.get("model").and_then(|m| m.as_str());
+        // A routed role (slice MP6): its production model is the route's primary, the first
+        // label of `route:`, whose id is under `models:`. A fallback is never benchmarked by a
+        // run on the primary (§4.10).
+        if let Some(route) = role.get("route").and_then(|r| r.as_sequence()) {
+            out.routed = true;
+            let primary = route
+                .first()
+                .and_then(|l| l.as_str())
+                .ok_or_else(|| format!("{}: a role's `route:` is empty", path.display()))?;
+            label = Some(primary);
+            model = v
+                .get("models")
+                .and_then(|m| m.get(primary))
+                .and_then(|m| m.get("model"))
+                .and_then(|m| m.as_str());
+        }
         let (Some(name), Some(model)) = (name.as_str(), model) else {
             return Err(format!(
                 "{}: a role without a name or `model`",
@@ -360,6 +381,45 @@ pub fn counts(
     }
     if m.upstreams.values().any(|u| u != "local") {
         return Err("a role was served by an upstream that isn't local".into());
+    }
+    // Slice MP6 (§4.10): a claim holds for the model that produced it. Every call of the run
+    // must have been answered by a role's primary: no fallback, no other label or hash.
+    match &report.route {
+        Some(r) => {
+            if r.fallback_used {
+                return Err("a call of the run was answered by a fallback model".into());
+            }
+            if r.pinned != "primary" {
+                return Err(format!(
+                    "the run was pinned to `{}`, not each role's primary",
+                    r.pinned
+                ));
+            }
+            if production.routed && r.unrecorded > 0 {
+                return Err(format!(
+                    "{} of its tasks didn't record which models answered them",
+                    r.unrecorded
+                ));
+            }
+            for (label, a) in &r.answered {
+                let primary = production.roles.iter().any(|(role, l)| {
+                    l == label && production.model_sha256.get(role) == a.model_sha256.as_ref()
+                });
+                if !primary {
+                    return Err(format!(
+                        "a call was answered by `{label}`, which is no role's production primary"
+                    ));
+                }
+            }
+        }
+        None if production.routed => {
+            return Err(
+                "the production gateway has routes, and the run didn't record which models \
+                 answered its calls"
+                    .into(),
+            );
+        }
+        None => {}
     }
     if m.roles != production.roles || m.model_sha256 != production.model_sha256 {
         let differ: Vec<String> = production

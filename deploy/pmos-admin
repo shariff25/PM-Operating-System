@@ -569,7 +569,7 @@ clients:
   runtime: {trusted: true, max-in-flight: 2}
   bot-pm-*: {trusted: true, max-in-flight: 3, user: from-name}
   bot-*: {trusted: true, max-in-flight: 3}
-  evals: {max-in-flight: 1, priority: personal}
+  evals: {max-in-flight: 1, priority: personal, route: pin}
 EOF
   ) && mv -f "$cfg.new" "$cfg" || { say "couldn't write $cfg" >&2; return 1; }
   say "model source: hosted-test, every role as $label (TESTING ONLY: prompts leave this host; fake data only)"

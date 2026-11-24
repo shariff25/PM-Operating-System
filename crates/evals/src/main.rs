@@ -431,6 +431,28 @@ async fn run_and_write(
         None => latest_report(&dir, &category.name).map_err(anyhow::Error::msg)?,
     };
     let mut report = run_category(&r.rt, &r.url, &category, &opts).await;
+    // Slice MP6: which models answered the run's calls, from every runtime the tasks ran on
+    // and from the judges' gateway.
+    let mut route = pmos_evals::report::RouteRecord {
+        pinned: "primary".into(),
+        ..Default::default()
+    };
+    let mut readers: Vec<&Runtime> = under_test.iter().collect();
+    readers.push(&r.rt);
+    let mut merged_from = std::collections::BTreeSet::new();
+    for rt in readers {
+        // A runtime and its clones share one record; merge each once.
+        if merged_from.insert(rt.record_id()) {
+            route.merge(&rt.route_record());
+        }
+    }
+    if let Some(j) = &opts.judges {
+        route.merge(&j.gateway.route_record());
+    }
+    if route.fallback_used {
+        eprintln!("warning: a call of this run was answered by a fallback model; the report won't count towards a bar");
+    }
+    report.route = Some(route);
     report.persona_version = persona_version.flatten();
     report.persona_hash = persona_hash.flatten();
     report.gateway_models = match models_before {
