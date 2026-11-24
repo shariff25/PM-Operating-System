@@ -2230,7 +2230,7 @@ export const copy = {
           missing: 'Not proved: no proof is recorded for this sandbox (deploy/pmos-admin policy prove).',
           unknown: "Prover result unavailable: the tool server didn't answer. Not proved.",
           notProvedHeading: 'Never proved, whatever the result',
-          viewNote: 'Proved on the network view (MCP rules removed, which only widens).',
+          viewNote: 'Proved on the network view (MCP rules removed, which only widens; credential bindings removed, which the prover doesn\'t model).',
           denialsLabel: 'Sandbox denials',
           denialsNone: 'None recorded in the last 7 days.',
           denialsOff: 'Not collected on this host: the sandbox-audit collector is off.',

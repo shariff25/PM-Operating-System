@@ -1,7 +1,8 @@
 //! `pmos policy prove` against the stand-in prover (`deploy/test/stand-ins/openshell-prover`):
 //! the classification matrix, the pin (hash and version), the network view, the disagreement
 //! with `pmos policy check`, and the hand-written boundary (spec §A.8). Nothing here runs the
-//! real prover; slice A2's CI job does, when the owner pins one.
+//! real prover; CI's `policy-prover` job builds the pinned one from source and runs it
+//! (`scripts/policy-prover-ci.sh`). The stand-in answers in the real prover's format.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -10,7 +11,7 @@ use std::time::Duration;
 
 use pmos_policy::prove::{
     self, network_view, network_view_text, prove_all, sha256_hex, Candidate, Finding, Lock, Prover,
-    Status, VIEW_NOTE, VIEW_REMOVED_KEYS,
+    Status, VIEW_NOTE, VIEW_REMOVED_KEYS, VIEW_UNMODELLED_KEYS,
 };
 use pmos_policy::{openshell, Service};
 use serde_json::{json, Value};
@@ -205,6 +206,90 @@ fn a_wrong_hash_a_missing_binary_or_no_pin_is_not_available() {
     assert_eq!(r.outcome.reason_code.as_deref(), Some("no_binary"));
 }
 
+/// A source build's binary is checked against the build record of the pinned commit (spec §A.7):
+/// only a record of the pinned commit and version, with the binary's own SHA-256, lets it run.
+#[test]
+fn a_source_build_is_checked_against_its_build_record() {
+    const COMMIT: &str = "152c59d3178039e3fbb4a5595f9fff7216a6be92";
+    const OTHER: &str = "ce58cf8e9b953281352d98a637e41616295b1318";
+    let stand = Stand::new();
+    let arch = std::env::consts::ARCH.to_ascii_uppercase();
+    let lock = Lock::parse(&format!(
+        "PROVER_VERSION=0.1.9\nPROVER_SOURCE_REPO=https://github.com/NVIDIA/OpenShell\nPROVER_SOURCE_TAG=v0.1.9\nPROVER_SOURCE_COMMIT={COMMIT}\nPROVER_Z3_FEATURE=vendored-z3\n"
+    ))
+    .unwrap();
+    let record = |commit: &str, version: &str, sha: &str| {
+        Lock::parse(&format!(
+            "PROVER_VERSION={version}\nPROVER_SOURCE_COMMIT={commit}\nPROVER_BINARY_SHA256_{arch}={sha}\n"
+        ))
+        .unwrap()
+    };
+    let with = |r: Option<Lock>| {
+        let mut p = stand.with(lock.clone());
+        p.build_record = r;
+        p
+    };
+    // The record of the pinned commit and version, with the binary's hash: proved.
+    let r = prove_one(
+        &with(Some(record(COMMIT, "0.1.9", &stand.sha()))),
+        &docs_policy(),
+    );
+    assert_eq!(r.outcome.status, Status::Proved, "{:?}", r.outcome);
+    let report = prove_all(
+        &with(Some(record(COMMIT, "0.1.9", &stand.sha()))),
+        &boundary(),
+        &[],
+        Path::new("/nonexistent"),
+    );
+    assert_eq!(report.prover.source_commit.as_deref(), Some(COMMIT));
+    assert_eq!(report.prover.sha256_pinned_by, Some("build_record"));
+    // No record, and no hash in the lock: nothing to check the binary against.
+    let r = prove_one(&with(None), &docs_policy());
+    assert_eq!(r.outcome.status, Status::NotAvailable);
+    assert_eq!(r.outcome.reason_code.as_deref(), Some("not_pinned"));
+    // A record of another commit, of another version, or without this architecture's hash.
+    for bad in [
+        record(OTHER, "0.1.9", &stand.sha()),
+        record(COMMIT, "0.1.8", &stand.sha()),
+        Lock::parse(&format!(
+            "PROVER_VERSION=0.1.9\nPROVER_SOURCE_COMMIT={COMMIT}\n"
+        ))
+        .unwrap(),
+    ] {
+        let r = prove_one(&with(Some(bad)), &docs_policy());
+        assert_eq!(r.outcome.status, Status::NotAvailable);
+        assert_eq!(
+            r.outcome.reason_code.as_deref(),
+            Some("build_record_mismatch")
+        );
+    }
+    // The right record, another binary.
+    let r = prove_one(
+        &with(Some(record(COMMIT, "0.1.9", &"0".repeat(64)))),
+        &docs_policy(),
+    );
+    assert_eq!(r.outcome.reason_code.as_deref(), Some("hash_mismatch"));
+    // A record with a lock that pins no source commit (a release pin): refused, not trusted.
+    let release = stand.lock();
+    let mut p = stand.with(release);
+    p.build_record = Some(record(COMMIT, "0.1.9", &stand.sha()));
+    let r = prove_one(&p, &docs_policy());
+    assert_eq!(
+        r.outcome.reason_code.as_deref(),
+        Some("build_record_mismatch")
+    );
+}
+
+#[test]
+fn the_committed_lock_pins_a_source_commit_built_with_vendored_z3() {
+    let committed = Lock::read(&repo().join(prove::LOCK_PATH)).unwrap();
+    assert!(!committed.version.is_empty());
+    assert!(committed.source_repo.starts_with("https://github.com/"));
+    assert_eq!(committed.source_commit.len(), 40);
+    assert!(!committed.source_tag.is_empty());
+    assert_eq!(committed.z3_feature, "vendored-z3");
+}
+
 #[test]
 fn another_version_is_a_mismatch_older_says_too_old() {
     for (v, code) in [
@@ -393,6 +478,9 @@ fn generated_policy(g: &mut Gen) -> Value {
             "tls": "skip",
             "ports": [1, 2],
         });
+        if g.next() % 2 == 0 {
+            endpoint["credential_binding"] = json!({"provider": "pmos-docs-gateway"});
+        }
         if protocol != "none" {
             endpoint["protocol"] = json!(protocol);
         }
@@ -414,7 +502,7 @@ fn generated_policy(g: &mut Gen) -> Value {
 }
 
 #[test]
-fn the_view_only_ever_deletes_five_keys_of_mcp_endpoints() {
+fn the_view_only_ever_deletes_five_keys_of_mcp_endpoints_and_credential_bindings() {
     let mut g = Gen(0x9e37_79b9_7f4a_7c15);
     for case in 0..300 {
         let policy = generated_policy(&mut g);
@@ -428,13 +516,17 @@ fn the_view_only_ever_deletes_five_keys_of_mcp_endpoints() {
             assert_eq!(parts.len(), 6, "case {case}: {p} isn't an endpoint key");
             assert_eq!(parts[1], "network_policies");
             assert_eq!(parts[3], "endpoints");
-            assert!(
-                VIEW_REMOVED_KEYS.contains(&parts[5]),
-                "case {case}: the view changed {p}"
-            );
             let endpoint = &policy["network_policies"][parts[2]]["endpoints"]
                 [parts[4].parse::<usize>().unwrap()];
-            assert_eq!(endpoint["protocol"], "mcp", "case {case}: {p} wasn't MCP");
+            if VIEW_UNMODELLED_KEYS.contains(&parts[5]) {
+                // Removed from any endpoint.
+            } else {
+                assert!(
+                    VIEW_REMOVED_KEYS.contains(&parts[5]),
+                    "case {case}: the view changed {p}"
+                );
+                assert_eq!(endpoint["protocol"], "mcp", "case {case}: {p} wasn't MCP");
+            }
             // Deleted, never changed: the view has no such key.
             let v_endpoint = &view["network_policies"][parts[2]]["endpoints"]
                 [parts[4].parse::<usize>().unwrap()];
@@ -454,9 +546,31 @@ fn the_view_only_ever_deletes_five_keys_of_mcp_endpoints() {
 }
 
 #[test]
-fn the_view_of_a_non_mcp_policy_is_the_policy() {
+fn the_view_of_a_non_mcp_policy_without_credential_bindings_is_the_policy() {
     let text = docs_policy().replace("protocol: mcp", "protocol: rest");
-    let value: Value = serde_norway::from_str(&text).unwrap();
+    let mut value: Value = serde_norway::from_str(&text).unwrap();
+    // With its credential bindings, only they go.
+    let (view, changed) = network_view(&value);
+    assert!(changed);
+    let mut paths = Vec::new();
+    diff(&value, &view, String::new(), &mut paths);
+    assert_eq!(
+        paths,
+        [
+            "/network_policies/pmos_gateway/endpoints/0/credential_binding",
+            "/network_policies/pmos_runtime/endpoints/0/credential_binding",
+        ]
+    );
+    // Without them, nothing.
+    for rule in value["network_policies"]
+        .as_object_mut()
+        .unwrap()
+        .values_mut()
+    {
+        for e in rule["endpoints"].as_array_mut().unwrap() {
+            e.as_object_mut().unwrap().remove("credential_binding");
+        }
+    }
     let (view, changed) = network_view(&value);
     assert!(!changed);
     assert_eq!(view, value);
@@ -544,6 +658,9 @@ fn every_checked_in_policys_view_keeps_only_boundary_shaped_endpoints() {
                 for k in VIEW_REMOVED_KEYS {
                     assert!(e.get(k).is_none(), "{bot}: {k} left in the view");
                 }
+            }
+            for k in VIEW_UNMODELLED_KEYS {
+                assert!(e.get(k).is_none(), "{bot}: {k} left in the view");
             }
         }
     }

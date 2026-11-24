@@ -6,21 +6,28 @@
 #
 # 1. The boundary-alone rule (PRV-5): with --base, a change to policies/boundary/ may change no
 #    other file (`pmos policy boundary-alone` on `git diff --name-only <base>...HEAD`).
-# 2. The pinned prover (PRV-7): deploy/openshell-prover.lock names the release, the version and the
-#    SHA-256 of each archive and binary. Nothing pinned: every bot is `not_available` and the job
-#    FAILS with "prover not available" (it is never a pass). Pinned: the archive is downloaded and
-#    checked against the lock's SHA-256 (not only the release's own checksum file).
+# 2. The pinned prover (PRV-7): deploy/openshell-prover.lock pins the prover's SOURCE (repository,
+#    tag, full commit SHA, version, Z3 feature). scripts/build-openshell-prover.sh fetches the tag,
+#    refuses any commit but the pinned one, builds it (offline, empty environment) and writes a
+#    build record (commit, version, the binary's SHA-256) that `pmos policy prove --build-record`
+#    checks the binary against. Optional, only if filled in: a release archive whose SHA-256 and
+#    binary SHA-256 are in the lock. Nothing pinned, or the fetch, the commit check or the build
+#    fails, or no binary comes out: every bot is `not_available` and the job FAILS with "prover
+#    not available" (it is never a pass). The binary's SHA-256, `--version` and the build record
+#    are printed, and the whole JSON report (the proof record) too.
 # 3. Every bot's policy is proved against the BASE branch's boundary (so a pull request can't widen
 #    a policy and its boundary together); without --base, or when the base has no boundary yet
 #    (the pull request that adds it), the checked-out one, and the job says so.
 # 4. With the real prover, the acceptance checks of §A.8: the unmodified policy is `unsupported`
-#    (MCP); planted widenings (a fourth host, a /24, a writable /sandbox, best_effort, root) are
-#    each `exceeds`.
+#    (credential bindings, then MCP); planted widenings (a fourth host, a /24, a new gateway route,
+#    best_effort, root) are `exceeds`, and a writable /sandbox is `unsupported`
+#    (unresolved_filesystem_path); see below. None of them is ever `proved`.
 # 5. A pin bump (PRV-8): when the base's lock pins another prover, both run and the job fails if
 #    any bot's status differs.
 #
-# Tests only (scripts/test-policy-prover-ci.sh): --prover <binary> --lock <file> use a given
-# binary and pin instead of downloading; the binary must still match that pin. The workflow never
+# Tests only (scripts/test-policy-prover-ci.sh): --prover <binary> [--build-record <file>]
+# --lock <file> use a given binary and pin instead of building; the binary must still match that
+# pin. --source-url <url> builds from another repository (a local fixture). The workflow never
 # passes them. The job has no secrets and no write token.
 set -euo pipefail
 
@@ -28,12 +35,16 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 base=""
 given_prover=""
+given_record=""
+source_url=""
 lock="deploy/openshell-prover.lock"
 while [ $# -gt 0 ]; do
   case "$1" in
     --base) [ $# -ge 2 ] || { echo "usage: $0 [--base <ref>]" >&2; exit 2; }; base=$2; shift 2 ;;
     --prover) given_prover=$2; shift 2 ;;
+    --build-record) given_record=$2; shift 2 ;;
     --lock) lock=$2; shift 2 ;;
+    --source-url) source_url=$2; shift 2 ;;
     *) echo "usage: $0 [--base <ref>]" >&2; exit 2 ;;
   esac
 done
@@ -44,6 +55,9 @@ if [ -z "$PMOS" ]; then
 fi
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/policy-prover.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
+# Where the prover is built (its source, Cargo target and binary). The workflow sets
+# PMOS_PROVER_DIR to a directory it caches by the pinned commit, so the long Z3 build runs once.
+PROVER_DIR=${PMOS_PROVER_DIR:-$WORK/prover}
 failed=0
 note() { printf '%s\n' "$*"; }
 
@@ -79,40 +93,71 @@ else
   note "proving against this checkout's boundary (BOOTSTRAP or a push: no base boundary to hold it to; the reviewer must read the boundary itself)"
 fi
 
-# 2. The pinned prover.
-fetch_prover() { # lock-file destination-dir: prints the binary's path, or nothing
-  local l=$1 d=$2 version tag sum url
+# 2. The pinned prover: built from the pinned source commit (the default), or, only when the lock
+#    also pins a release archive and its binary, downloaded and checked against the lock.
+# obtain_prover lock-file work-dir: prints the binary's path, or nothing. A source build leaves
+# its build record beside the binary (build.record).
+obtain_prover() {
+  local l=$1 d=$2 version commit tag sum url built
   version=$(lock_value "$l" PROVER_VERSION)
+  commit=$(lock_value "$l" PROVER_SOURCE_COMMIT)
+  [ -n "$version" ] || return 0
+  if [ -n "$commit" ]; then
+    built=$(scripts/build-openshell-prover.sh --lock "$l" --out "$d" ${source_url:+--source-url "$source_url"}) ||
+      { note "the pinned prover source couldn't be fetched and built (see above)" >&2; return 0; }
+    [ -n "$built" ] && [ -x "$built" ] && [ -f "$(dirname "$built")/build.record" ] || return 0
+    printf '%s\n' "$built"
+    return 0
+  fi
   tag=$(lock_value "$l" PROVER_RELEASE_TAG)
   sum=$(lock_value "$l" "PROVER_ARCHIVE_SHA256_$ARCH_KEY")
-  [ -n "$version" ] && [ -n "$tag" ] && [ -n "$sum" ] || return 0
+  [ -n "$tag" ] && [ -n "$sum" ] || return 0
   mkdir -p "$d"
-  # Verify with the real release (slice A2): the repository and the archive's name and layout.
+  # Optional path, unverified: no one has confirmed the release archives' names or contents.
   url="https://github.com/NVIDIA/OpenShell/releases/download/$tag/openshell-prover-$arch-unknown-linux-musl.tar.gz"
   curl -fsSL --proto '=https' --retry 3 -o "$d/prover.tar.gz" "$url" || { note "the pinned prover couldn't be downloaded from $url" >&2; return 0; }
   printf '%s  %s\n' "$sum" "$d/prover.tar.gz" | sha256sum -c --quiet - || { note "the downloaded archive's SHA-256 isn't the pinned one: not run" >&2; return 0; }
   tar -xzf "$d/prover.tar.gz" -C "$d"
   find "$d" -type f -name openshell-prover -perm -u+x | head -n1
 }
+record=""
 if [ -n "$given_prover" ]; then
   prover=$given_prover
+  record=$given_record
 else
-  prover=$(fetch_prover "$lock" "$WORK/new")
+  prover=$(obtain_prover "$lock" "$PROVER_DIR/new") || true
+  if [ -n "$prover" ] && [ -n "$(lock_value "$lock" PROVER_SOURCE_COMMIT)" ]; then
+    record="$(dirname "$prover")/build.record"
+  fi
 fi
 if [ -z "$prover" ]; then
-  note "prover not available: $lock pins no prover for $arch (or it couldn't be fetched and checked). Every bot is not_available; this job fails until the owner pins one (see the lock file)."
+  note "prover not available: $lock pins no prover for $arch, or it couldn't be fetched, built and checked. Every bot is not_available; this job fails until it is (see the lock file)."
   prover="$WORK/no-prover"
+else
+  note "prover: $prover"
+  note "prover SHA-256: $(sha256sum "$prover" | cut -d' ' -f1)"
+  note "prover --version: $(env -i PATH=/usr/bin:/bin "$prover" --version 2>/dev/null || echo '(failed)')"
+  if [ -n "$record" ]; then note "build record ($record):"; grep -v '^#' "$record" | sed 's/^/  /'; fi
 fi
+record_args=()
+[ -n "$record" ] && record_args=(--build-record "$record")
 
-# Every bot, against the boundary. `pmos policy prove` checks the binary's SHA-256 and version
-# against the pin itself, and reports `not_available` or `version_mismatch` if they differ.
+# Every bot, against the boundary. `pmos policy prove` checks the binary's SHA-256 (against the
+# build record of the pinned commit, or the lock) and version itself, and reports `not_available`
+# or `version_mismatch` if they differ.
 set +e
 "$PMOS" policy prove --root content --policies policies --boundary "$WORK/boundary.yaml" \
-  --prover "$prover" --lock "$lock"
+  --prover "$prover" --lock "$lock" "${record_args[@]}"
 code=$?
 "$PMOS" policy prove --root content --policies policies --boundary "$WORK/boundary.yaml" \
-  --prover "$prover" --lock "$lock" --format json >"$WORK/new.json"
+  --prover "$prover" --lock "$lock" "${record_args[@]}" --format json >"$WORK/new.json"
 set -e
+# The proof record: the whole JSON report (prover path, version, SHA-256, source commit, boundary
+# and candidate hashes, every result), in the log and, with PMOS_PROOF_RECORD, in that file (the
+# workflow uploads it).
+note "proof record:"
+cat "$WORK/new.json"
+if [ -n "${PMOS_PROOF_RECORD:-}" ]; then cp "$WORK/new.json" "$PMOS_PROOF_RECORD"; fi
 case "$code" in
   0) ;;
   1) failed=1 ;;
@@ -125,30 +170,55 @@ python3 -I -c 'import json,sys; sys.exit(0 if any(r["status"] not in ("not_avail
 
 # 4. The acceptance checks with the prover (only when it ran: not_available proves nothing here).
 if [ "$pinned" = 1 ]; then
-  plant() { # name sed-expression
-    sed -e "$2" policies/bots/docs.yaml >"$WORK/planted-$1.yaml"
+  # Each planted widening must be refused as what the real prover says of it (verified against
+  # the prover built from source at v0.1.10 on 2026-11-24): a new host, a wider range, a new REST
+  # route, best_effort and root are `exceeds`. A new writable path is `unsupported` with
+  # `unresolved_filesystem_path`, not `exceeds`: the prover compares write paths exactly and
+  # won't decide a path the boundary doesn't list (Landlock resolves paths inside the sandbox),
+  # unless the boundary allows no writes at all. Either way it is never `proved`.
+  plant() { # name expected-status expected-reason-code-or-"-" sed-expression
+    sed -e "$4" policies/bots/docs.yaml >"$WORK/planted-$1.yaml"
     cmp -s policies/bots/docs.yaml "$WORK/planted-$1.yaml" && { note "planted widening $1 changed nothing" >&2; failed=1; return; }
     set +e
     "$PMOS" policy prove --root content --boundary "$WORK/boundary.yaml" --prover "$prover" --lock "$lock" \
-      --candidate "$WORK/planted-$1.yaml" --bot docs --format json >"$WORK/planted-$1.json"
+      "${record_args[@]}" --candidate "$WORK/planted-$1.yaml" --bot docs --format json >"$WORK/planted-$1.json"
     set -e
-    got=$(statuses "$WORK/planted-$1.json" | awk '{print $2}')
-    if [ "$got" = exceeds ]; then note "planted widening $1: exceeds (as it must)"; else note "planted widening $1: $got, not exceeds" >&2; failed=1; fi
+    got=$(python3 -I -c 'import json,sys; r=json.load(open(sys.argv[1]))["results"][0]; print(r["status"], r.get("reason_code") or "-", r.get("counterexample") or "")' "$WORK/planted-$1.json")
+    read -r status code cx <<<"$got"
+    if [ "$status" = "$2" ] && { [ "$3" = - ] || [ "$code" = "$3" ]; }; then
+      shown=$status
+      [ "$code" = - ] || shown="$status [$code]"
+      note "planted widening $1: $shown, as it must${cx:+: $cx}"
+    else
+      note "planted widening $1: $status [$code], not $2 [$3]" >&2
+      failed=1
+    fi
   }
-  plant fourth-host 's|^  pmos_toolserver:$|  pmos_planted:\n    binaries:\n      - path: /usr/local/bin/node\n    endpoints:\n      - host: planted.example\n        port: 443\n  pmos_toolserver:|'
-  plant range-24 's|10\.201\.77\.11/32|10.201.77.0/24|'
-  plant writable-sandbox 's|^    - /sandbox/workspace$|    - /sandbox|'
-  plant best-effort 's|compatibility: hard_requirement|compatibility: best_effort|'
-  plant root 's|run_as_user: sandbox|run_as_user: root|'
-  # The unmodified policy, straight to the prover (no view): the MCP rules are unsupported.
-  set +e
-  "$prover" check policies/bots/docs.yaml --boundary "$WORK/boundary.yaml" --output json --timeout 60 >"$WORK/raw.json"
-  raw=$?
-  set -e
-  if [ "$raw" = 3 ] && grep -q '"unsupported"' "$WORK/raw.json"; then
-    note "the unmodified policy: unsupported (MCP rules), as documented"
+  plant fourth-host exceeds - 's|^  pmos_toolserver:$|  pmos_planted:\n    binaries:\n      - path: /usr/local/bin/node\n    endpoints:\n      - host: planted.example\n        port: 443\n  pmos_toolserver:|'
+  plant range-24 exceeds - 's|10\.201\.77\.11/32|10.201.77.0/24|'
+  plant writable-sandbox unsupported unresolved_filesystem_path 's|^    - /sandbox/workspace$|    - /sandbox|'
+  plant best-effort exceeds - 's|compatibility: hard_requirement|compatibility: best_effort|'
+  plant root exceeds - 's|run_as_user: sandbox|run_as_user: root|'
+  plant gateway-route exceeds - 's|path: /v1/chat/completions|path: /v1/models|'
+  # The unmodified policy, straight to the prover (no view): unsupported. Its credential bindings
+  # are refused first ("authority outside the initial model"); with them removed and the MCP rules
+  # kept, it must still be unsupported, naming the MCP endpoint: the premise of the network view.
+  raw_check() { # file: prints "exit result reason"
+    set +e
+    env -i PATH=/usr/bin:/bin "$prover" check "$1" --boundary "$WORK/boundary.yaml" --output json --timeout 60s >"$1.json"
+    local e=$?
+    set -e
+    python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); print(sys.argv[2], d.get("result"), d.get("reason") or "")' "$1.json" "$e" 2>/dev/null || echo "$e none"
+  }
+  cp policies/bots/docs.yaml "$WORK/raw.yaml"
+  read -r raw raw_result raw_reason <<<"$(raw_check "$WORK/raw.yaml")"
+  sed -e '/^        credential_binding:$/,+1d' policies/bots/docs.yaml >"$WORK/raw-mcp.yaml"
+  read -r mcp mcp_result mcp_reason <<<"$(raw_check "$WORK/raw-mcp.yaml")"
+  if [ "$raw" = 3 ] && [ "$raw_result" = unsupported ] && [ "$mcp" = 3 ] && [ "$mcp_result" = unsupported ] &&
+    ! grep -q credential_binding "$WORK/raw-mcp.yaml" && [[ "$mcp_reason" == *"'pmos_toolserver'"* ]]; then
+    note "the unmodified policy: unsupported ($raw_reason); without its credential bindings, still unsupported for the MCP endpoint ($mcp_reason)"
   else
-    note "the unmodified policy: exit $raw, not unsupported; the network view's premise needs review" >&2
+    note "the unmodified policy: exit $raw $raw_result ($raw_reason); without credential bindings: exit $mcp $mcp_result ($mcp_reason): the network view's premise needs review" >&2
     failed=1
   fi
 fi
@@ -157,14 +227,18 @@ fi
 if [ -n "$base" ] && [ -z "$given_prover" ] && git cat-file -e "$base:deploy/openshell-prover.lock" 2>/dev/null; then
   git show "$base:deploy/openshell-prover.lock" >"$WORK/base.lock"
   if ! cmp -s "$WORK/base.lock" "$lock" && [ -n "$(lock_value "$WORK/base.lock" PROVER_VERSION)" ]; then
-    old=$(fetch_prover "$WORK/base.lock" "$WORK/old")
+    old=$(obtain_prover "$WORK/base.lock" "$PROVER_DIR/old") || true
     if [ -z "$old" ]; then
-      note "pin bump: the base's prover couldn't be fetched, so the statuses can't be compared" >&2
+      note "pin bump: the base's prover couldn't be obtained, so the statuses can't be compared" >&2
       failed=1
     else
+      old_record=()
+      if [ -n "$(lock_value "$WORK/base.lock" PROVER_SOURCE_COMMIT)" ]; then
+        old_record=(--build-record "$(dirname "$old")/build.record")
+      fi
       set +e
       "$PMOS" policy prove --root content --policies policies --boundary "$WORK/boundary.yaml" \
-        --prover "$old" --lock "$WORK/base.lock" --format json >"$WORK/old.json"
+        --prover "$old" --lock "$WORK/base.lock" "${old_record[@]}" --format json >"$WORK/old.json"
       set -e
       if [ "$(statuses "$WORK/old.json")" != "$(statuses "$WORK/new.json")" ]; then
         note "pin bump: a bot's status changed between the old and the new prover (PRV-8):" >&2
