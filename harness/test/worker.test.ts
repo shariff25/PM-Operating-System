@@ -405,6 +405,42 @@ describe("harness worker", () => {
     expect(request?.headers["x-pmos-model-source"]).toBe("local");
     expect(request?.headers.authorization).toBe("Bearer gateway-token-0123456789abcdef0123456789");
     expect(request?.body.model).toBe("pmos/default");
+    // Every model call is streamed, with the token counts asked for (docs/gateway.md).
+    expect(request?.body.stream).toBe(true);
+    expect(request?.body.stream_options).toEqual({ include_usage: true });
+  });
+
+  it("streams a tool call and its follow-up turn, and finishes with the answer", async () => {
+    const gateway = await startFakeGateway("Port 4443.", undefined, [
+      { toolCall: { name: "docs_search", args: { query: "ports" } } },
+      {},
+    ]);
+    cleanups.push(gateway.close);
+    const { runtime, mcp } = await setup({
+      claims: [claim("tsk_stream_tool")],
+      config: { gatewayUrl: gateway.url },
+    });
+    const done = await waitFor(() => finished(runtime, "tsk_stream_tool"));
+    expect(done.body).toEqual({ result: "Port 4443.", approvals: [] });
+    expect(mcp.calls.map((c) => c.args)).toContainEqual({ query: "ports" });
+    expect(gateway.requests).toHaveLength(2);
+    expect(gateway.requests.every((r) => r.body.stream === true)).toBe(true);
+  });
+
+  it("fails a task whose streamed answer is cut off, never completing with the part", async () => {
+    const gateway = await startFakeGateway("Port 4443, see the docs.", undefined, [{ cut: true }]);
+    cleanups.push(gateway.close);
+    const { runtime } = await setup({
+      claims: [claim("tsk_cut")],
+      config: { gatewayUrl: gateway.url },
+    });
+    const failed = await waitFor(() => finished(runtime, "tsk_cut"));
+    expect(failed.path).toContain("/fail");
+    expect(failed.body.reason).toBe(
+      "The model gateway's answer was cut off before it finished. Please try again in a few minutes.",
+    );
+    expect(runtime.forTask("tsk_cut", "complete")).toHaveLength(0);
+    expect(gateway.requests).toHaveLength(1);
   });
 
   it("ends a task when the model source changes between two answers, and sends nothing more", async () => {

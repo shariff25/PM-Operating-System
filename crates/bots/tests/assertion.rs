@@ -618,12 +618,13 @@ async fn every_route_client_and_assertion_under_require() {
             json!(null),
             &["slack", "web", "console"],
         ),
-        // Signed, the console cancels (its viewer's own task, or any for an admin).
+        // Signed, the console cancels (its viewer's own task, or any for an admin). Evals may
+        // cancel eval tasks only: this one is a 404 for it.
         (
             Method::POST,
             format!("/v1/tasks/{tid}/cancel"),
             json!({}),
-            &["slack", "web", "console"],
+            &["slack", "web", "console", "evals"],
         ),
     ];
     for (method, path, body, allowed) in &rows {

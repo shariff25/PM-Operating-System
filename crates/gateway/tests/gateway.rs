@@ -24,6 +24,8 @@ const TOKEN: &str = "gateway-test-token-0123456789abcdef";
 #[derive(Default)]
 struct Vllm {
     seen: Mutex<Vec<(String, String)>>,
+    /// Per call, in order: whether it asked for a stream, and whether it had `stream_options`.
+    streamed: Mutex<Vec<(bool, bool)>>,
 }
 
 fn last_user(body: &Value) -> String {
@@ -42,6 +44,10 @@ async fn mock_chat(State(v): State<Arc<Vllm>>, body: Bytes) -> Response {
         .lock()
         .unwrap()
         .push((body["model"].as_str().unwrap().to_string(), asked.clone()));
+    v.streamed.lock().unwrap().push((
+        body["stream"] == json!(true),
+        body.get("stream_options").is_some(),
+    ));
     if asked.starts_with("slow") {
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
@@ -53,9 +59,16 @@ async fn mock_chat(State(v): State<Arc<Vllm>>, body: Bytes) -> Response {
             .into_response();
     }
     if body["stream"] == json!(true) {
-        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n\
-                   data: {\"choices\":[{\"delta\":{\"content\":\" there\"}}]}\n\n\
-                   data: [DONE]\n\n";
+        let mut sse = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n\
+                   data: {\"choices\":[{\"delta\":{\"content\":\" there\"}}]}\n\n"
+            .to_string();
+        if body["stream_options"]["include_usage"] == json!(true) {
+            // Split across two writes would be the same to the caller; one event here.
+            sse.push_str(
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2,\"total_tokens\":9}}\n\n",
+            );
+        }
+        sse.push_str("data: [DONE]\n\n");
         return ([("content-type", "text/event-stream")], sse).into_response();
     }
     Json(json!({
@@ -374,12 +387,13 @@ async fn workarounds_apply_per_role_and_switch_off_together() {
 
 #[tokio::test]
 async fn streams_pass_through_and_are_logged_when_they_end() {
-    let (up, _vllm, stop_up) = start_vllm().await;
+    let (up, vllm, stop_up) = start_vllm().await;
     let gw = start_gateway(&up, wide(), false, true).await;
+    // `extraction` has no workaround, so its stream passes through as the model server sent it.
     let res = http()
         .post(format!("{}/v1/chat/completions", gw.base))
         .bearer_auth(TOKEN)
-        .json(&json!({"model": "pmos/default", "stream": true,
+        .json(&json!({"model": "pmos/extraction", "stream": true,
                       "messages": [{"role": "user", "content": "hi"}]}))
         .send()
         .await
@@ -392,7 +406,93 @@ async fn streams_pass_through_and_are_logged_when_they_end() {
     let ev = gw.usage.recent().pop().unwrap();
     assert!(ev.stream);
     assert_eq!(ev.status, 200);
+    // No usage in the stream: none on the line.
+    assert_eq!((ev.prompt_tokens, ev.completion_tokens), (None, None));
+    assert_eq!(vllm.streamed.lock().unwrap().last(), Some(&(true, false)));
+
+    // Asked with `include_usage`, the stream's token counts reach the usage line, as a whole
+    // answer's do, and the event passes on untouched.
+    let res = http()
+        .post(format!("{}/v1/chat/completions", gw.base))
+        .bearer_auth(TOKEN)
+        .json(&json!({"model": "pmos/extraction", "stream": true,
+                      "stream_options": {"include_usage": true},
+                      "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    let text = res.text().await.unwrap();
+    assert!(text.contains("\"prompt_tokens\":7") && text.ends_with("data: [DONE]\n\n"));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let ev = gw.usage.recent().pop().unwrap();
+    assert!(ev.stream);
+    assert_eq!((ev.prompt_tokens, ev.completion_tokens), (Some(7), Some(2)));
     gw.stop.cancel();
+    stop_up.cancel();
+}
+
+/// A streamed call to a role whose workaround needs the whole answer (`default`, strip-think):
+/// the model server is asked for a whole answer (no `stream`, no `stream_options`), the
+/// workaround applies, and the caller gets it as an event stream with a finish reason, the
+/// usage and `[DONE]`. With workarounds off, the stream passes through as before.
+#[tokio::test]
+async fn a_streamed_call_to_a_role_with_a_workaround_gets_the_whole_answer_as_a_stream() {
+    let (up, vllm, stop_up) = start_vllm().await;
+    let on = start_gateway(&up, wide(), false, true).await;
+    let ask = json!({"model": "pmos/default", "stream": true,
+                     "stream_options": {"include_usage": true},
+                     "messages": [{"role": "user", "content": "q"}]});
+    let res = http()
+        .post(format!("{}/v1/chat/completions", on.base))
+        .bearer_auth(TOKEN)
+        .json(&ask)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.headers()["content-type"], "text/event-stream");
+    assert_eq!(res.headers()["x-pmos-upstream-attempts"], "1");
+    let text = res.text().await.unwrap();
+    assert_eq!(vllm.streamed.lock().unwrap().last(), Some(&(false, false)));
+    assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
+    let events: Vec<Value> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter(|d| *d != "[DONE]")
+        .map(|d| serde_json::from_str(d).unwrap())
+        .collect();
+    assert_eq!(events[0]["choices"][0]["delta"]["content"], "The answer.");
+    assert_eq!(
+        events[0]["choices"][0]["delta"]["reasoning_content"],
+        "reasoning here"
+    );
+    assert!(!text.contains("<think>"));
+    let last = events.last().unwrap();
+    assert_eq!(last["choices"][0]["finish_reason"], "stop");
+    assert_eq!(last["usage"]["prompt_tokens"], 12);
+    let ev = on.usage.recent().pop().unwrap();
+    assert!(ev.stream);
+    assert_eq!(ev.workarounds, vec!["strip-think"]);
+    assert_eq!(
+        (ev.prompt_tokens, ev.completion_tokens),
+        (Some(12), Some(3))
+    );
+
+    let off = start_gateway(&up, wide(), false, false).await;
+    let text = http_as(off.source)
+        .post(format!("{}/v1/chat/completions", off.base))
+        .bearer_auth(TOKEN)
+        .json(&ask)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(text.contains("Hello") && text.contains(" there"), "{text}");
+    assert_eq!(vllm.streamed.lock().unwrap().last(), Some(&(true, true)));
+    on.stop.cancel();
+    off.stop.cancel();
     stop_up.cancel();
 }
 

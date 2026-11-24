@@ -286,6 +286,28 @@ a new route: nothing about who may create, approve, reject or release drafts cha
   before, against `--bots-url` with `--concurrency`. Don't use that for categories with Slack
   replies.
 
+**Timeouts: a timed-out attempt is cancelled** (after E3, 2026-11-24). When an attempt's
+`--timeout-secs` passes, the runner cancels its task on the runtime
+(`POST /v1/tasks/{id}/cancel`, which client `evals` may call for eval tasks only) and, if a
+worker had the task, waits up to 45 s (`CANCEL_WAIT`) for the runtime to record that the worker
+let it go (the event `the worker stopped after the cancel`, `docs/bots-runtime.md`; the harness
+worker stops at its first heartbeat after the cancel, at most 30 s later) before the lane goes
+to the next attempt. In E3 the runner gave up without cancelling, the lane's one worker kept
+running the old task, and the next attempt there waited 10 to 166 s behind it.
+- **What the report records:** the attempt's line (and, for a thread, the turn that timed out)
+  gets `cancel: {cancelled, worker_stopped?, secs, error?}`, and the Markdown's failure details
+  a **Timed out** line: cancelled and the worker stopped; cancelled while still queued (nothing
+  to wait for); cancelled but the worker hadn't said it stopped within the wait; or not
+  cancelled, with why (the runtime refused it, didn't answer within 15 s, or the task had
+  finished in the meantime). Reports from before have no `cancel`.
+- **A failed cancel never hangs the run:** the call has 15 s, the wait 45 s, and either
+  outcome is recorded and the run goes on.
+- **Tagging is unchanged:** the line keeps the status seen before the timeout, and the
+  runner's own two cancel events are left out of the events the tag reads, so a timeout is
+  still `never-claimed`, `silent-timeout` or `model/timed-out`, never `cancelled`.
+- **Not measured yet:** the tests run against the mock runtime (`crates/evals/tests/cancel.rs`)
+  and the runtime's own tests; no eval run has used it.
+
 **Checked on the test stack (E2, 2026-11-22):** `slack-reply`'s `answer-sso-question` twice in a
 row on one lane passed 2 of 2 isolated; the same two attempts without isolation passed 1 of 2,
 the second getting `already_drafted`. The tests in `crates/evals/tests/isolation.rs` fail without

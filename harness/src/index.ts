@@ -20,6 +20,12 @@ export {
   type McpToolSet,
   type McpToolsOptions,
 } from "./mcp-tools.js";
+export {
+  ModelStreamError,
+  STREAM_IDLE_MS,
+  checkedStreamFetch,
+  type ModelStreamProblem,
+} from "./model-stream.js";
 export { FIRST_MILESTONE, Progress, TaskTracer, milestoneFor, toolFamily } from "./progress.js";
 export {
   ClaimSchema,

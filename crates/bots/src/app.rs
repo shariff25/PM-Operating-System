@@ -6,7 +6,7 @@
 //! | `slack` | create tasks as `X-Pmos-User`; read that PM's tasks and routines; read and set that PM's settings; read the shared notification feed and the bot list (no PM needed) |
 //! | `worker` | claim, heartbeat, events, trace, complete, fail |
 //! | `console` | for the viewer its assertion names (every call under `require`): their own tasks and routines in full, or for an admin everyone's with the ask, result and prompt of others left out; one task's detail for its PM or an admin; settings; pause, resume, delete and cancel their own (any for an admin) |
-//! | `evals` | create tasks with `source: "eval"` (and a task's own `level`) as a handle in `PMOS_EVALS_AS` only, with no Slack target; read them and their drafts |
+//! | `evals` | create tasks with `source: "eval"` (and a task's own `level`) as a handle in `PMOS_EVALS_AS` only, with no Slack target; read them and their drafts, and cancel them |
 //!
 //! A task's drafts (`GET /v1/tasks/{id}/drafts`) are for the console and evals only: the
 //! runtime reads them from the tool server with its own service token, so the evals client
@@ -801,7 +801,12 @@ async fn cancel_task(
 ) -> Reply {
     allow(
         &caller,
-        &[ClientKind::Slack, ClientKind::Web, ClientKind::Console],
+        &[
+            ClientKind::Slack,
+            ClientKind::Web,
+            ClientKind::Console,
+            ClientKind::Evals,
+        ],
         "cancel tasks",
     )?;
     // The console cancels only signed for a viewer, in every mode (R1): the task's own PM
@@ -811,9 +816,12 @@ async fn cancel_task(
             "the console cancels a task only with a user assertion for the viewer",
         ));
     }
+    // The benchmark runner cancels an eval task it gave up on (`visible`: eval tasks only), so
+    // its worker stops and the lane is free for the next attempt (docs/evals.md).
     visible_task(&state, &caller, &id).await?;
     let by = match caller.kind {
         ClientKind::Slack | ClientKind::Web => caller.user().to_string(),
+        ClientKind::Evals => "the benchmark runner".to_string(),
         _ => caller.acting.clone().unwrap_or_default(),
     };
     let task = state.rt.cancel(&id, &by, model::now()).await?;

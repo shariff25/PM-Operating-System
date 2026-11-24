@@ -13,6 +13,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Duration, Utc};
+use pmos_evals::client::WORKER_STOPPED_EVENT;
 use serde_json::{json, Value};
 
 pub const TOKEN: &str = "evals-test-token-0123456789abcdef0123";
@@ -38,6 +39,10 @@ pub struct Script {
     pub trace: Vec<Value>,
     /// The task's drafts, as `(tool, args)`; their ids are the approval ids.
     pub drafts: Vec<(&'static str, Value)>,
+    /// Cancelled while working: how long until its worker lets it go (the runtime's
+    /// `the worker stopped after the cancel` event, and, with `serial`, the lane free again).
+    /// `None`: the worker never says so.
+    pub stop_after_cancel_ms: Option<i64>,
 }
 
 impl Default for Script {
@@ -55,6 +60,7 @@ impl Default for Script {
             hangs: false,
             trace: Vec::new(),
             drafts: Vec::new(),
+            stop_after_cancel_ms: Some(50),
         }
     }
 }
@@ -78,6 +84,8 @@ pub(crate) struct Stored {
     finish: DateTime<Utc>,
     script: Script,
     body: Value,
+    /// When the runner cancelled it, and the status it had then.
+    cancelled: Option<(DateTime<Utc>, &'static str)>,
 }
 
 #[derive(Default)]
@@ -108,6 +116,22 @@ pub struct Mock {
     /// What `GET /v1/personas` says the runtime's own gateway serves (its `gateway` field,
     /// review finding R3); `None` leaves the field out, as a runtime before it did.
     pub gateway: Mutex<Option<Value>>,
+    /// Ids `POST /v1/tasks/{id}/cancel` was called for, in order.
+    pub cancels: Mutex<Vec<String>>,
+    /// `POST /v1/tasks/{id}/cancel` answers this status (and cancels nothing) instead.
+    pub cancel_fails: Option<u16>,
+    /// `POST /v1/tasks/{id}/cancel` never answers.
+    pub cancel_hangs: bool,
+}
+
+impl Stored {
+    /// When the task's worker lets it go after a cancel, if it was working and ever does.
+    fn worker_stops(&self) -> Option<DateTime<Utc>> {
+        match (self.cancelled, self.script.stop_after_cancel_ms) {
+            (Some((at, "working")), Some(ms)) => Some(at + Duration::milliseconds(ms)),
+            _ => None,
+        }
+    }
 }
 
 /// What a production gateway serving `qwen-prod` and `nemo-prod` reports, as the runtime
@@ -160,9 +184,23 @@ fn bearer(headers: &HeaderMap) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The status a task has at `now`, before any cancel.
+fn played_status(st: &Stored, now: DateTime<Utc>) -> &'static str {
+    let s = &st.script;
+    if s.never_claimed || now < st.start {
+        "queued"
+    } else if s.hangs || now < st.finish {
+        "working"
+    } else {
+        s.status
+    }
+}
+
 fn task_json(id: &str, st: &Stored, now: DateTime<Utc>) -> Value {
     let s = &st.script;
-    let (status, updated) = if s.never_claimed || now < st.start {
+    let (status, updated) = if let Some((at, _)) = st.cancelled {
+        ("cancelled", at)
+    } else if s.never_claimed || now < st.start {
         ("queued", st.created)
     } else if s.hangs || now < st.finish {
         ("working", st.start)
@@ -260,7 +298,12 @@ async fn create(
         if let Some(prev) = *last {
             start = start.max(prev);
         }
-        *last = Some(start + Duration::milliseconds(script.work_ms));
+        // A task that hangs holds the one worker until a cancel lets it go (`cancel`).
+        *last = Some(if script.hangs {
+            start + Duration::days(1)
+        } else {
+            start + Duration::milliseconds(script.work_ms)
+        });
     }
     let finish = start + Duration::milliseconds(script.work_ms);
     let id = format!("tsk_{:032x}", m.order.lock().unwrap().len() + 1);
@@ -270,6 +313,7 @@ async fn create(
         finish,
         script,
         body,
+        cancelled: None,
     };
     let out = task_json(&id, &stored, created);
     m.order.lock().unwrap().push(id.clone());
@@ -314,9 +358,66 @@ async fn events(
     let now = Utc::now();
     let s = &st.script;
     let mut out = Vec::new();
-    if s.events && !s.never_claimed && now >= st.start {
+    let claimed_by = st.cancelled.map_or(now, |(at, _)| at);
+    if s.events && !s.never_claimed && claimed_by >= st.start {
         out.push(json!({"at": st.start, "kind": "status", "text": "Working on it"}));
         out.push(json!({"at": st.start + Duration::milliseconds(1), "kind": "milestone", "text": "Searching the support docs"}));
+    }
+    if let Some((at, _)) = st.cancelled {
+        out.push(json!({"at": at, "kind": "status", "text": "cancelled by the benchmark runner"}));
+    }
+    if let Some(stops) = st.worker_stops().filter(|t| now >= *t) {
+        out.push(json!({"at": stops, "kind": "status", "text": WORKER_STOPPED_EVENT}));
+    }
+    Json(out).into_response()
+}
+
+/// `POST /v1/tasks/{id}/cancel` as the runtime serves it to client `evals`: a queued or working
+/// task becomes `cancelled` (else `409`); its worker lets it go `stop_after_cancel_ms` later,
+/// and with `serial` the one worker is free from then.
+async fn cancel(
+    State(m): State<Arc<Mock>>,
+    headers: HeaderMap,
+    UrlPath(id): UrlPath<String>,
+) -> Response {
+    if bearer(&headers).as_deref() != Some(TOKEN) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    m.cancels.lock().unwrap().push(id.clone());
+    if m.cancel_hangs {
+        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+    }
+    if let Some(status) = m.cancel_fails {
+        return (
+            StatusCode::from_u16(status).unwrap(),
+            Json(json!({"error": "the runtime couldn't cancel it"})),
+        )
+            .into_response();
+    }
+    let mut tasks = m.tasks.lock().unwrap();
+    let Some(st) = tasks.get_mut(&id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let now = Utc::now();
+    let was = played_status(st, now);
+    if st.cancelled.is_some() || !matches!(was, "queued" | "working") {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": format!("task {id} is {was}"), "status": was})),
+        )
+            .into_response();
+    }
+    st.cancelled = Some((now, was));
+    let stops = st.worker_stops();
+    let out = task_json(&id, st, now);
+    drop(tasks);
+    if m.serial {
+        // The one worker is free once it lets this task go (never, if it never does).
+        let mut last = m.last_finish.lock().unwrap();
+        let free = stops.unwrap_or(now + Duration::days(1));
+        if was == "working" {
+            *last = Some(free);
+        }
     }
     Json(out).into_response()
 }
@@ -400,6 +501,7 @@ pub async fn spawn(mock: Arc<Mock>) -> String {
         .route("/v1/personas", get(personas))
         .route("/v1/tasks", post(create))
         .route("/v1/tasks/{id}", get(get_task))
+        .route("/v1/tasks/{id}/cancel", post(cancel))
         .route("/v1/tasks/{id}/events", get(events))
         .route("/v1/tasks/{id}/trace", get(trace))
         .route("/v1/tasks/{id}/drafts", get(drafts))

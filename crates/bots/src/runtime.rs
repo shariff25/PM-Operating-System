@@ -27,7 +27,7 @@ use crate::model::{
     self, ApprovalOutcome, ChecklistItem, Draft, Level, MemberSettings, NewNotification,
     Notification, NotificationKind, Routine, Schedule, Sensitivity, SlackRef, Source, Task,
     TaskStatus, TraceKind, Turn, GAVE_UP_REASON, LEASE_SECONDS, MAX_ATTEMPTS, REDACTED_MARKER,
-    RETRY_EVENT,
+    RETRY_EVENT, WORKER_STOPPED_EVENT,
 };
 use crate::people::{self, SnapshotClient};
 use crate::routines::{self, Parsed};
@@ -875,6 +875,36 @@ impl Runtime {
         Ok(task)
     }
 
+    /// [`Self::worker_change`] for a worker call that stops the worker when refused (heartbeat,
+    /// complete, fail). Refused because the task was cancelled, the task gets
+    /// [`WORKER_STOPPED_EVENT`] once, so whoever cancelled it can tell the worker has let it go;
+    /// the refusal itself is returned unchanged.
+    async fn letting_go(&self, id: &str, change: Transition, now: DateTime<Utc>) -> Result<Task> {
+        let result = self.worker_change(id, change, now).await;
+        if let Err(Error::Conflict {
+            status: Some(TaskStatus::Cancelled),
+            ..
+        }) = &result
+        {
+            let told = self
+                .store
+                .events(id)
+                .await
+                .map(|events| events.iter().any(|e| e.text == WORKER_STOPPED_EVENT))
+                .unwrap_or(false);
+            if !told {
+                let note = Transition {
+                    event: Some(("status".into(), WORKER_STOPPED_EVENT.into())),
+                    ..Transition::from(&[TaskStatus::Cancelled])
+                };
+                if let Err(e) = self.store.transition(id, &note, now).await {
+                    tracing::warn!(task = %id, error = %e, "couldn't record that the worker stopped");
+                }
+            }
+        }
+        result
+    }
+
     fn working(worker: Option<&str>) -> Transition {
         Transition {
             worker: worker.map(str::to_string),
@@ -895,7 +925,7 @@ impl Runtime {
             lease: Lease::Until(until),
             ..Self::working(worker)
         };
-        self.worker_change(id, change, now).await?;
+        self.letting_go(id, change, now).await?;
         Ok(until)
     }
 
@@ -991,7 +1021,7 @@ impl Runtime {
             });
             change.approvals = Some(approvals);
         }
-        let task = self.worker_change(id, change, now).await?;
+        let task = self.letting_go(id, change, now).await?;
         tracing::info!(task = %id, status = %task.status, "task finished");
         Ok(task)
     }
@@ -1017,7 +1047,7 @@ impl Runtime {
         change.sensitivity = Some(self.finished_level(id).await);
         change.event = Some(("status".into(), format!("failed: {reason}")));
         change.notify = Some(NewNotification::new(NotificationKind::Failed, &reason));
-        let task = self.worker_change(id, change, now).await?;
+        let task = self.letting_go(id, change, now).await?;
         tracing::info!(task = %id, "task failed");
         Ok(task)
     }

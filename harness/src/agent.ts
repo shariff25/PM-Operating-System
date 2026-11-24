@@ -28,10 +28,13 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
+import type { CallbackManagerForLLMRun } from "@langchain/core/callbacks/manager";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
+import { AIMessage, type AIMessageChunk, type BaseMessage } from "@langchain/core/messages";
+import type { ChatGenerationChunk, ChatResult } from "@langchain/core/outputs";
 import type { StructuredTool, StructuredToolInterface } from "@langchain/core/tools";
 import type { BaseCheckpointSaver } from "@langchain/langgraph";
-import { ChatOpenAI } from "@langchain/openai";
+import { ChatOpenAI, ChatOpenAICompletions } from "@langchain/openai";
 import {
   CompositeBackend,
   FilesystemBackend,
@@ -40,6 +43,7 @@ import {
   createDeepAgent,
 } from "deepagents";
 import { parse as parseYaml } from "yaml";
+import { ModelStreamError, STREAM_IDLE_MS, checkedStreamFetch } from "./model-stream.js";
 import { buildInterruptOn, harnessToolNames, loadToolRegistry } from "./registry.js";
 
 /** Virtual mount point of the content repo inside the agent's filesystem. */
@@ -112,6 +116,67 @@ export interface GatewayModelOptions {
   headers?: Record<string, string>;
   /** Checks every answer's model source (slice H4). */
   sourceGuard?: ModelSourceGuard;
+  /**
+   * Longest silence inside a streamed answer before the call fails as stalled (default
+   * `STREAM_IDLE_MS`, 180 s; `model-stream.ts`).
+   */
+  streamIdleMs?: number;
+}
+
+/**
+ * The Chat Completions half of `ChatOpenAI`, answering every call from a streamed answer
+ * assembled into one message: the same message a whole answer gives (text, tool calls parsed
+ * from their streamed pieces, the finish reason, and the token counts the last event carries).
+ *
+ * `ChatOpenAI({streaming: true})` would stream too, but afterwards estimates token counts with
+ * a tokenizer it downloads from the internet, which a sandbox can't reach (the call then hangs
+ * or fails); this keeps the gateway's own counts and downloads nothing. It is passed to
+ * `ChatOpenAI` as its `completions`, so the copies `bindTools` and `withConfig` make (they
+ * build a plain `ChatOpenAI` from the same fields) keep it: every agent and sub-agent call
+ * streams.
+ */
+export class StreamedCompletions extends ChatOpenAICompletions {
+  override async _generate(
+    messages: BaseMessage[],
+    options: this["ParsedCallOptions"],
+    runManager?: CallbackManagerForLLMRun,
+  ): Promise<ChatResult> {
+    options.signal?.throwIfAborted();
+    let whole: ChatGenerationChunk | undefined;
+    for await (const chunk of this._streamResponseChunks(messages, options, runManager)) {
+      chunk.message.response_metadata = {
+        ...chunk.generationInfo,
+        ...chunk.message.response_metadata,
+      };
+      whole = whole === undefined ? chunk : whole.concat(chunk);
+    }
+    if (whole === undefined) {
+      throw new ModelStreamError("incomplete", "the answer had no parts");
+    }
+    const part = whole.message as AIMessageChunk;
+    const message = new AIMessage({
+      id: part.id,
+      content: part.content,
+      tool_calls: part.tool_calls,
+      invalid_tool_calls: part.invalid_tool_calls,
+      additional_kwargs: part.additional_kwargs,
+      response_metadata: part.response_metadata,
+      usage_metadata: part.usage_metadata,
+    });
+    const usage = part.usage_metadata;
+    return {
+      generations: [{ text: whole.text, message, generationInfo: whole.generationInfo }],
+      llmOutput: usage
+        ? {
+            tokenUsage: {
+              promptTokens: usage.input_tokens,
+              completionTokens: usage.output_tokens,
+              totalTokens: usage.total_tokens,
+            },
+          }
+        : {},
+    };
+  }
 }
 
 export function gatewayModel({
@@ -120,11 +185,15 @@ export function gatewayModel({
   apiKey = "pmos-sandbox-placeholder",
   headers,
   sourceGuard,
+  streamIdleMs = STREAM_IDLE_MS,
 }: GatewayModelOptions): BaseChatModel {
-  return new ChatOpenAI({
+  const fields = {
     model: MODEL_ALIASES[role],
     apiKey,
     temperature: 0,
+    // `streamUsage` asks for the token counts in the last event of a streamed answer
+    // (`stream_options.include_usage`).
+    streamUsage: true,
     // No client-side retries. The gateway already retries 429, 503 and connection failures
     // (3 tries inside a 20 s budget, honouring Retry-After; docs/gateway.md, "Retrying a busy
     // model server"). A LangChain retry here would multiply with it, and a PM would wait far
@@ -133,9 +202,16 @@ export function gatewayModel({
     configuration: {
       baseURL: gatewayUrl,
       defaultHeaders: headers,
-      ...(sourceGuard ? { fetch: sourceGuard.fetch } : {}),
+      // Fails a streamed answer that stalls, ends early or carries an error event, so a
+      // cut-off answer is never taken for a whole one (`model-stream.ts`).
+      fetch: checkedStreamFetch(sourceGuard?.fetch ?? globalThis.fetch, streamIdleMs),
     },
-  });
+  };
+  // Every call asks for a streamed answer (`StreamedCompletions`), so bytes flow while the
+  // model writes: a hop that cuts off a connection silent for minutes (eval run E3: a 502 at
+  // about 300 s) never sees one. The review panel's sub-agents share this model, so they
+  // stream too.
+  return new ChatOpenAI({ ...fields, completions: new StreamedCompletions(fields) });
 }
 
 export interface PmosAgentOptions {
