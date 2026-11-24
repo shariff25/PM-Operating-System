@@ -61,8 +61,9 @@ Not verified: any real MCP server or authorization server; the SPKI pin against 
 (unit-tested on the verifier only); the public-address resolver against real DNS; the 256 KiB cap
 on a plain JSON answer (rmcp parses up to 16 MiB first; streamed events are capped before
 parsing); H-MCP on a real stack (fixture-tested only); the `jira-draft` and `docs-qa` evals with
-the switch on (M9); the policy page's screen (its API carries the data; the page doesn't show it).
-MCP credentials of a deactivated person are refused at use but not deleted after the grace.
+the switch on (M9); the policy page's screen against a real tool server (built on branch
+`build/mcp-admin-screen` and checked on the sample data only; it adds `serving` to the view,
+`docs/policy-admin.md`, "MCP servers"). MCP credentials of a deactivated person are refused at use but not deleted after the grace.
 
 ## Owner's decisions of 2026-11-24
 

@@ -1299,8 +1299,10 @@ async fn protection(
 
 /// The MCP servers this tool server reaches, as Policy Admin shows them: per server its
 /// operator, URL host, auth kind, scopes, data class, systems, approved tools with their class
-/// and digest, and its last `tools/list` check. Metadata only: never a token, and the tool
-/// names the server lists are the server's own words, shown to Admins and Auditors only.
+/// and digest, and its last `tools/list` check; and `serving`, the systems of its record this
+/// tool server routes to it (the rest stay on their built-in connectors). Metadata only: never
+/// a token, and the tool names the server lists are the server's own words, shown to Admins
+/// and Auditors only.
 async fn mcp_servers(
     State(state): State<AppState>,
     Extension(client): Extension<Client>,
@@ -1310,8 +1312,9 @@ async fn mcp_servers(
     if let Err(refused) = viewer(&state, client, q.user.as_deref(), "admin.mcp", &need).await {
         return *refused;
     }
-    Json(json!({ "servers": crate::mcp_client::policy_view(state.svc.mcp_servers()) }))
-        .into_response()
+    let mut servers = crate::mcp_client::policy_view(state.svc.mcp_servers());
+    crate::mcp_client::with_serving(&mut servers, |tool| state.svc.served_by(tool));
+    Json(json!({ "servers": servers })).into_response()
 }
 
 /// `GET /internal/admin/policy/proofs?user=<viewer>`: the newest host proof of each bot

@@ -92,6 +92,45 @@ pub fn policy_view(servers: &[Arc<McpServer>]) -> serde_json::Value {
     serde_json::Value::Array(out)
 }
 
+/// Add each server's `serving` to a [`policy_view`]: the systems in its record that this tool
+/// server actually routes to it (`served_by`, [`crate::ToolService::served_by`], names a server
+/// id for one of the record's tools). A record can list a system the deployment has not
+/// switched onto MCP (`PMOS_MCP_SYSTEMS`); that system stays on its built-in connector and is
+/// left out here. Additive: the view's other fields are unchanged.
+pub fn with_serving(view: &mut serde_json::Value, served_by: impl Fn(&str) -> String) {
+    let Some(servers) = view.as_array_mut() else {
+        return;
+    };
+    for s in servers {
+        let id = s["id"].as_str().unwrap_or_default().to_string();
+        let systems: Vec<String> = s["systems"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let tools: Vec<String> = s["tools"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|t| t["registry"].as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let serving: Vec<String> = systems
+            .into_iter()
+            .filter(|system| {
+                tools.iter().any(|t| {
+                    t.split_once('.').is_some_and(|(sys, _)| sys == system) && served_by(t) == id
+                })
+            })
+            .collect();
+        s["serving"] = serde_json::json!(serving);
+    }
+}
+
 /// `/readyz`'s `mcp` section: per server `ok`, `changed` (an approved tool changed or went
 /// away), `down` (no connection), or `per_user` (checked at each PM's link), and its hosts.
 pub async fn readiness(servers: &[Arc<McpServer>]) -> serde_json::Value {
@@ -284,4 +323,36 @@ pub async fn start_fake(
         },
         fake,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn serving_lists_only_the_systems_routed_to_the_server() {
+        let mut view = json!([
+            {"id": "acme-atlas", "systems": ["jira", "confluence"],
+             "tools": [{"registry": "jira.search"}, {"registry": "confluence.search"}]},
+            {"id": "acme-docs", "systems": ["docs"], "tools": [{"registry": "docs.search"}]},
+            {"id": "acme-idle", "systems": ["slack"], "tools": []},
+        ]);
+        // Jira and the docs are switched onto MCP; Confluence stays built in.
+        with_serving(&mut view, |tool| match tool {
+            "jira.search" => "acme-atlas".into(),
+            "docs.search" => "acme-docs".into(),
+            _ => "builtin".into(),
+        });
+        assert_eq!(view[0]["serving"], json!(["jira"]));
+        assert_eq!(view[1]["serving"], json!(["docs"]));
+        assert_eq!(view[2]["serving"], json!([]));
+        // Additive: the record's own list is untouched.
+        assert_eq!(view[0]["systems"], json!(["jira", "confluence"]));
+        // Another server's id never counts.
+        let mut view =
+            json!([{"id": "a", "systems": ["jira"], "tools": [{"registry": "jira.search"}]}]);
+        with_serving(&mut view, |_| "b".into());
+        assert_eq!(view[0]["serving"], json!([]));
+    }
 }

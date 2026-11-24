@@ -2010,6 +2010,15 @@ summary line.)
 | `protection.admins_enforced` | boolean or `null` | **New.** Whether the rule binds admins too (classic `enforce_admins`, or a ruleset with no bypass actor). `null`: GitHub's answer didn't say (never treated as `true`). |
 | `protection.bypass_allowed` | boolean or `null` | **New.** Whether anyone may merge without the review (classic `bypass_pull_request_allowances`, or a ruleset's `bypass_actors`). `null`: GitHub's answer didn't say (a ruleset's bypass list is shown only to someone who may edit it). |
 | `protection.github` | `"linked"`, `"not_linked"`, `"unavailable"` or `null` | Whether this viewer has linked GitHub (`null` when proposals are off or the tool server didn't answer). |
+| `mcp` | object | The MCP servers the tool server reaches (`docs/mcp-servers-spec.md` §5), from its `GET /internal/admin/mcp`, re-picked field by field. The same for an Admin and an Auditor: metadata only, never a token. |
+| `mcp.available` | boolean | `false`: the tool server didn't answer (`servers` is then empty: show "not known", never "none"). |
+| `mcp.servers[]` | array | One per server in use. Empty: no MCP server is configured and every system uses its built-in connector (the default). |
+| `mcp.servers[].id`, `.operator`, `.host`, `.hosts`, `.auth`, `.scopes`, `.data_class`, `.egress`, `.approved_by`, `.pull` | | From its approved record. `operator`: `system_vendor` (the vendor's hosted server), `pmos` (run by PM OS: self-hosted open-source or built by PM OS), `third_party`. `auth`: `oauth_per_user`, `service_token` or `none`. `host`: the URL's host; `hosts`: every host it may be reached at (with OAuth, the authorization server's too). |
+| `mcp.servers[].systems` | string[] | Every system its record lists. |
+| `mcp.servers[].serving` | string[] or `null` | **New.** The systems this tool server actually routes to it; a listed system not switched on (`PMOS_MCP_SYSTEMS`) stays on its built-in connector. `null` from a tool server too old to send it. |
+| `mcp.servers[].tools[]` | array | Each approved tool: `registry` (PM OS's name), `upstream` (the server's name, its own words), `class` (`read` or `write`), `digest` (`sha256:…` of the approved definition), `approved_by`, and `state`: `approved`, `changed` or `missing` (revoked: unusable until an Admin approves the new definition), or `unchecked`. |
+| `mcp.servers[].last_check` | object | `checked_at` (the last check that passed; a later failure keeps it), `outcome` (`ok`, why the last connection failed, or `null` before any check), `server_name` and `server_version` (what the server calls itself: shown, never trusted). |
+| `mcp.servers[].refused_requests` | integer | Requests the server sent PM OS that were refused. |
 
 **Allowances** (one object per bot):
 

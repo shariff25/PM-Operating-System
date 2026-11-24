@@ -1,6 +1,6 @@
 import { useCallback, useId, useMemo, useState } from 'react';
 import type { KeyboardEvent } from 'react';
-import { canEditPolicy } from '../../admin/access';
+import { canEditContent, canEditPolicy } from '../../admin/access';
 import { usePending, useLeaveGuard } from '../../admin/pending';
 import { destinationOf, handEdits, readsOf, toolSystem } from '../../admin/policyView';
 import { applySpecPatch, parseRawPatch, patchSize, specPatch, splitTools, stableKey } from '../../admin/proposals';
@@ -13,6 +13,7 @@ import { Empty, ErrorNote, Skeleton, systemTone } from '../../components/bits';
 import { Icon } from '../../components/icons';
 import { copy } from '../../copy';
 import type { PolicyPart } from '../../url';
+import { McpSection } from './McpServers';
 import { AdminHead, NoAccess } from './parts';
 import {
   CheckResult,
@@ -910,6 +911,7 @@ function PolicyBody({ data, part }: { data: PolicyView; part: PolicyPart | undef
           )}
           <BotsSection data={data} />
           {!editable && <p className="meta-line"><Icon name="lock" size={15} /><span>{copy.admin.repo.readOnly}</span></p>}
+          <McpSection mcp={data.mcp} editable={canEditContent(me)} />
           <FixedSection data={data} />
           <FilesSection data={data} />
         </>

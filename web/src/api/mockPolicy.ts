@@ -14,6 +14,8 @@ import type {
   FileDiff,
   Harness,
   Issue,
+  McpTool,
+  McpView,
   PolicyBot,
   PolicyFile,
   PolicySpec,
@@ -38,6 +40,8 @@ export interface MockPolicyOptions {
   protection?: MockProtection;
   /** Proposals are off at the tool server. */
   proposalsOff?: boolean;
+  /** MCP servers: `none` configured (the built-in connectors serve everything), or the tool server `unavailable`. */
+  mcp?: 'none' | 'unavailable';
 }
 
 const MIN = 60_000;
@@ -76,6 +80,72 @@ const MOCK_PROVER_NOTES: ProverNotes = {
   view: 'proved on the network view (MCP rules removed, which only widens)',
   not_run_here: 'The prover runs on the pull request (CI check `policy-prover`). Not run here.',
 };
+
+// ---------- MCP servers, as the tool server sees them (docs/mcp-servers-spec.md §5) ----------
+
+/** A fake digest: `sha256:` and 64 hex characters made from a seed. Not a real definition's. */
+const fakeDigest = (seed: string) => {
+  let h = 2166136261;
+  let out = '';
+  while (out.length < 64) {
+    for (const c of seed + out.length) h = Math.imul(h ^ c.charCodeAt(0), 16777619) >>> 0;
+    out += h.toString(16).padStart(8, '0');
+  }
+  return `sha256:${out.slice(0, 64)}`;
+};
+
+/**
+ * One server of each kind the screen must tell apart, with obviously fake names and hosts: a
+ * vendor-hosted server PMs sign in to, one tool changed at the server and one system its record
+ * lists still on the built-in connector; the docs server PM OS runs; a self-hosted server whose
+ * last check failed, with a tool gone from its list.
+ */
+function mockMcp(now: number, mode: MockPolicyOptions['mcp']): McpView {
+  if (mode === 'unavailable') return { available: false, servers: [] };
+  if (mode === 'none') return { available: true, servers: [] };
+  const at = (minutesAgo: number) => new Date(now - minutesAgo * MIN).toISOString();
+  const tool = (registry: string, upstream: string, cls: 'read' | 'write', state: McpTool['state'] = 'approved', by = 'ada'): McpTool => ({
+    registry, upstream, class: cls, digest: fakeDigest(registry), state, approved_by: by,
+  });
+  return {
+    available: true,
+    servers: [
+      {
+        id: 'acme-tracker', operator: 'system_vendor', host: 'mcp.tracker.example.test',
+        hosts: ['mcp.tracker.example.test', 'auth.tracker.example.test'], auth: 'oauth_per_user',
+        scopes: ['issues:read', 'issues:write'], data_class: 'internal', systems: ['jira', 'confluence'], serving: ['jira'], egress: [],
+        approved_by: 'ada', pull: '#31', refused_requests: 0,
+        tools: [
+          tool('jira.search', 'search_issues', 'read'),
+          tool('jira.read', 'get_issue', 'read'),
+          tool('jira.create_issue', 'create_issue', 'write'),
+          tool('jira.update_issue', 'edit_issue', 'write', 'changed'),
+        ],
+        last_check: { checked_at: at(12), outcome: 'ok', server_name: 'tracker-mcp', server_version: '2.3.0' },
+      },
+      {
+        id: 'pmos-docs', operator: 'pmos', host: 'docs.pmos.internal', hosts: ['docs.pmos.internal'], auth: 'service_token',
+        scopes: [], data_class: 'public', systems: ['docs'], serving: ['docs'], egress: ['docs.example.test'],
+        approved_by: 'ada', pull: '#27', refused_requests: 0,
+        tools: [tool('docs.search', 'search', 'read'), tool('docs.read', 'read_page', 'read')],
+        last_check: { checked_at: at(4), outcome: 'ok', server_name: 'pmos-docs', server_version: '0.4.1' },
+      },
+      {
+        id: 'chat-selfhosted', operator: 'pmos', host: 'chat-mcp.pmos.internal', hosts: ['chat-mcp.pmos.internal'], auth: 'service_token',
+        scopes: [], data_class: 'internal', systems: ['slack'], serving: ['slack'], egress: ['chat.example.test'],
+        approved_by: 'ada', pull: '#35', refused_requests: 2,
+        tools: [
+          tool('slack.search', 'search_messages', 'read'),
+          tool('slack.read_thread', 'get_thread', 'read', 'missing'),
+        ],
+        last_check: {
+          checked_at: at(26 * 60), outcome: "couldn't connect: connection refused (chat-mcp.pmos.internal:8790)",
+          server_name: 'chat-mcp', server_version: '0.9.0',
+        },
+      },
+    ],
+  };
+}
 
 // ---------- The spec and the metadata the files carry ----------
 
@@ -824,6 +894,7 @@ export function createMockPolicy(now: number, options: MockPolicyOptions): MockP
         protection: protection(),
         prover_notes: MOCK_PROVER_NOTES,
         sandbox_audit: { available: true, configured: true, receiving: true, silent_since: null, last_gap_at: null },
+        mcp: mockMcp(now, options.mcp),
       };
     },
 

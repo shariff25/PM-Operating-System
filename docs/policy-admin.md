@@ -266,6 +266,23 @@ Built before review (owner's instruction of 2026-11-24); design and status in
   destination class (`pmos service`, `private`, `public`, `always blocked`, `unknown`) and port.
   The card says when the collector is off, silent (no record is not proof of none), or unknown.
 
+## MCP servers
+
+Built before review (owner's instruction of 2026-11-24); design in `docs/mcp-servers-spec.md`
+§5. A read-only section of the overview, after the bot cards, for Admins and Auditors alike
+(the `mcp` field of `GET /api/admin/policy`, metadata only). One card per server in use: the
+systems it serves (and any its record lists that stay on the built-in connector), who runs it
+(the vendor's hosted server, or PM OS, self-hosted: the record does not tell an open-source
+server from one PM OS built), the host it is reached at, how PMs sign in, the data class it may
+receive, the permissions it asks for, its last tool check (passed, failed with the reason, or
+not checked yet) and each approved tool with read or write, a short digest and who approved it.
+A tool changed or gone at the server is flagged as unusable until an Admin approves the new
+definition; a card with a write tool says every write still waits for the PM's approval. With
+no server configured it says that the built-in connectors serve everything; when the tool
+server doesn't answer, that it is not known. It says it cannot show what a server does with
+what it is sent. Nothing here adds or approves a server: that is a content pull request on the
+record (`content/mcp/<server>.yaml`); an Admin gets a link to the Content page.
+
 ## What it is not
 
 - **Not a writer.** It never edits a file on the server, applies a policy to OpenShell
