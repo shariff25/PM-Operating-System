@@ -294,6 +294,8 @@ pub const ADMIN_HTTP_NOT_LOOPBACK: &str = "PMOS_WEB_ADMIN_URL is http on a name 
 pub const ADMIN_TUNNEL_NEEDS_PEER: &str = "PMOS_WEB_ADMIN_URL is http (the tunnel mode): set \
      PMOS_WEB_ADMIN_TUNNEL_PEER to the one address the tunnel arrives from (in the deploy kit, \
      the `pmos` network's gateway, PMOS_NETWORK_GATEWAY, which deploy/compose.yaml passes)";
+/// Logged (a warning, not a refusal: a door nobody can sign in at is shut, not open) when the
+/// admin door offers no sign-in.
 pub const ADMIN_NO_PROVIDER: &str = "the admin door has no sign-in: development sign-in is never \
      served there. Turn on password sign-in (PMOS_WEB_PASSWORD_LOGIN=1), or, with Entra ID \
      sign-in configured, register <PMOS_WEB_ADMIN_URL>/api/auth/callback as a second redirect URI \
@@ -301,7 +303,6 @@ pub const ADMIN_NO_PROVIDER: &str = "the admin door has no sign-in: development 
 
 /// The admin door's settings, or `None` when `PMOS_WEB_ADMIN_BIND` is unset (and no other
 /// `PMOS_WEB_ADMIN_*` setting is either).
-#[allow(clippy::too_many_arguments)]
 fn admin_door(
     set: &dyn Fn(&str) -> Option<String>,
     flag: &dyn Fn(&str) -> Result<bool, String>,
@@ -309,7 +310,6 @@ fn admin_door(
     internal_bind: Option<SocketAddr>,
     public_url: Option<&str>,
     entra_on: bool,
-    password_login: bool,
 ) -> Result<Option<AdminDoor>, String> {
     const OTHERS: [&str; 7] = [
         "PMOS_WEB_ADMIN_URL",
@@ -453,9 +453,8 @@ fn admin_door(
              (PMOS_WEB_ENTRA_*)"
             .into());
     }
-    if !entra && !password_login {
-        return Err(ADMIN_NO_PROVIDER.into());
-    }
+    // With neither, the door offers no sign-in at all (`app::build_server` logs ADMIN_NO_PROVIDER):
+    // shut, not open, so it isn't refused.
     Ok(Some(AdminDoor {
         bind: admin_bind,
         url,
@@ -718,7 +717,6 @@ impl Config {
             internal_bind,
             public_url.as_deref(),
             entra.is_some(),
-            password_login,
         )?;
         let password_clients = match set("PMOS_WEB_PASSWORD_CLIENTS") {
             None => Vec::new(),
@@ -1353,8 +1351,8 @@ mod tests {
             ("PMOS_WEB_ADMIN_URL", "http://pmos-dev.localhost:8772"),
             ("PMOS_WEB_ADMIN_TUNNEL_PEER", "127.0.0.1"),
         ];
-        let err = Config::from_lookup(lookup(&dev)).unwrap_err();
-        assert!(err.contains("the admin door has no sign-in"), "{err}");
+        // Development sign-in only: the admin door starts with no sign-in at all (shut).
+        assert!(Config::from_lookup(lookup(&dev)).unwrap().admin.is_some());
         dev.retain(|(k, _)| !k.starts_with("PMOS_WEB_ADMIN"));
         assert!(Config::from_lookup(lookup(&dev)).unwrap().admin.is_none());
     }

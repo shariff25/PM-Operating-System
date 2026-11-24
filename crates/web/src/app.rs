@@ -352,7 +352,7 @@ pub fn build_server(config: Config, deps: Deps) -> Result<Server, String> {
             admin_providers.push(Arc::new(PasswordProvider));
         }
         if admin_providers.is_empty() {
-            return Err(crate::config::ADMIN_NO_PROVIDER.into());
+            tracing::warn!("{}", crate::config::ADMIN_NO_PROVIDER);
         }
     }
     let admin_hsts = config
