@@ -1620,14 +1620,21 @@ async fn the_gateway_binary_needs_the_remote_key_and_never_logs_it() {
     assert!(!log.contains(REMOTE_KEY), "{log}");
     // V3 (slice H4): no line names the upstream's URL, host, port, path or model id, the
     // start-up lines and the refused connection's warning included.
-    for f in [
-        "secret-path",
-        "remote-model",
-        "http://",
-        &dead_port.to_string(),
-    ] {
+    for f in ["secret-path", "remote-model", "http://"] {
         assert!(!log.contains(f), "the log carries `{f}`: {log}");
     }
+    // The port is a random five-digit number, and the log legitimately holds long runs of
+    // digits (a role's `model_sha256`, timestamps), so it is looked for as a number of its own:
+    // an occurrence inside a longer run of letters or digits is not the port (CI at 943a302
+    // failed when the port's digits happened to occur inside the model hash).
+    let port = dead_port.to_string();
+    let alone = log.match_indices(&port).any(|(at, _)| {
+        let before = log[..at].chars().next_back();
+        let after = log[at + port.len()..].chars().next();
+        !before.is_some_and(|c| c.is_ascii_alphanumeric())
+            && !after.is_some_and(|c| c.is_ascii_alphanumeric())
+    });
+    assert!(!alone, "the log carries the port `{port}`: {log}");
     std::fs::remove_dir_all(&dir).ok();
 }
 
