@@ -335,6 +335,31 @@ async fn main() -> Result<()> {
         switched.extend(served.connectors);
         mcp_servers.extend(served.servers);
     }
+    // Side by side (PMOS_MCP_COMPARE, fake connectors only, so fake data only): each read runs
+    // on the in-process fake and on the fake MCP server, the built-in answer is returned and
+    // the comparison audited (`mcp.compare`). Writes go to the built-in fake only.
+    if !config.mcp_compare.is_empty() {
+        let (shadow, _fake) =
+            pmos_toolserver::mcp_client::start_fake(Some(stores.audit.clone()), cancel.clone())
+                .await
+                .map_err(anyhow::Error::msg)?;
+        for shadow in shadow.connectors {
+            let system = shadow.system().to_string();
+            if !config.mcp_compare.contains(&system) {
+                continue;
+            }
+            if let Some(builtin) = connectors.iter().find(|c| c.system() == system).cloned() {
+                tracing::warn!(system = %system, "PMOS_MCP_COMPARE: reads run on the fake and the fake MCP server, and are compared");
+                switched.push(Arc::new(
+                    pmos_toolserver::mcp_client::compare::SideBySide::new(
+                        builtin,
+                        shadow,
+                        stores.audit.clone(),
+                    ),
+                ));
+            }
+        }
+    }
     for c in switched {
         connectors.retain(|old| old.system() != c.system());
         connectors.push(c);
