@@ -28,12 +28,15 @@ function mockDoor(): 'public' | 'admin' | undefined {
 /**
  * Policy and content admin on the dev server: `?mock_proposal=<error code>` refuses every proposal
  * with that code, `?mock_protection=unverified|no_reviews|not_linked` sets what branch protection
- * reads as, and `?mock_proposals=off` turns proposals off.
+ * reads as, `?mock_proposals=off` turns proposals off, and `?mock_mcp=none|unavailable` shows no
+ * MCP servers configured, or the tool server not answering for them.
  */
 function mockPolicyOptions(): MockPolicyOptions {
   const q = new URLSearchParams(window.location.search);
   const protection = q.get('mock_protection');
+  const mcp = q.get('mock_mcp');
   return {
+    mcp: mcp === 'none' || mcp === 'unavailable' ? mcp : undefined,
     proposalError: q.get('mock_proposal') ?? undefined,
     protection: protection === 'unverified' || protection === 'no_reviews' || protection === 'not_linked' ? protection : undefined,
     proposalsOff: q.get('mock_proposals') === 'off',

@@ -190,6 +190,55 @@ export interface ProverNotes {
   not_run_here: string;
 }
 
+/** One approved tool of an MCP server, and what its last `tools/list` found for it. */
+export interface McpTool {
+  /** PM OS's own registry name, such as `jira.search`. */
+  registry: string;
+  /** The server's own name for it (its words, shown as text). */
+  upstream: string;
+  class: 'read' | 'write';
+  /** `sha256:<hex>` of the approved definition. */
+  digest: string;
+  /** `changed` and `missing` are revoked: unusable until an Admin approves the new definition. */
+  state: 'approved' | 'changed' | 'missing' | 'unchecked';
+  approved_by: string | null;
+}
+
+/** One MCP server the tool server reaches (docs/mcp-servers-spec.md §5). Metadata only. */
+export interface McpServerView {
+  id: string;
+  /** `pmos`: PM OS runs it (self-hosted or built by PM OS); `system_vendor`: the vendor's hosted server. */
+  operator: 'pmos' | 'system_vendor' | 'third_party';
+  host: string;
+  hosts: string[] | null;
+  auth: 'oauth_per_user' | 'service_token' | 'none';
+  scopes: string[] | null;
+  data_class: 'public' | 'internal' | 'restricted';
+  /** Every system its record lists. */
+  systems: string[];
+  /** The systems this tool server routes to it; `null` from an older tool server. */
+  serving: string[] | null;
+  egress: string[] | null;
+  approved_by: string | null;
+  pull: string | null;
+  refused_requests: number | null;
+  tools: McpTool[];
+  last_check: {
+    /** The last check that passed; a failure after it keeps this time. */
+    checked_at: string | null;
+    /** `ok`, or why the last connection failed (text, not trusted). `null`: never checked. */
+    outcome: string | null;
+    server_name: string | null;
+    server_version: string | null;
+  };
+}
+
+export interface McpView {
+  /** `false`: the tool server didn't answer. */
+  available: boolean;
+  servers: McpServerView[];
+}
+
 export interface PolicyFile {
   path: string;
   state: 'same' | 'differs' | 'missing' | 'orphan' | 'unknown';
@@ -212,6 +261,8 @@ export interface PolicyView {
   prover_notes?: ProverNotes;
   /** The sandbox-audit collector's state, for the denials list. */
   sandbox_audit?: SandboxAuditState;
+  /** The MCP servers the tool server reaches; missing from an older server. */
+  mcp?: McpView;
 }
 
 export interface FileDiff {

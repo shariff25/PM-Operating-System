@@ -128,3 +128,36 @@ test('the palette jumps to policy and content', async ({ page }) => {
   await page.getByRole('option', { name: /Content and harness/ }).click();
   await expect(page.getByRole('heading', { level: 1, name: 'Content and harness' })).toBeVisible();
 });
+
+test('the MCP servers on the policy page: every state in words, the same for an auditor, read-only', async ({ page }) => {
+  await signIn(page, 'ada');
+  await go(page, '/admin/policy');
+  const section = page.getByRole('region', { name: /^MCP servers/ });
+  await expect(section.getByText('On the built-in connectors: Confluence.')).toBeVisible();
+  const tracker = section.getByRole('article', { name: 'acme-tracker' });
+  await expect(tracker.getByText('Tools changed')).toBeVisible();
+  await expect(tracker.getByRole('note')).toContainText('jira.update_issue');
+  await expect(tracker.getByText("Changed at the server: can't be used")).toBeVisible();
+  await expect(tracker.getByText('Every write still waits for the PM to approve it before it is sent.')).toBeVisible();
+  await expect(tracker.getByText('Each PM signs in with their own account')).toBeVisible();
+  const chat = section.getByRole('article', { name: 'chat-selfhosted' });
+  await expect(chat.getByText('Check failed').first()).toBeVisible();
+  await expect(chat.getByText(/connection refused/)).toBeVisible();
+  await expect(chat.getByText("Gone from the server: can't be used")).toBeVisible();
+  await expect(section.getByRole('article', { name: 'pmos-docs' }).getByText('Check passed')).toBeVisible();
+  // Read-only: no buttons; a change goes through a content proposal.
+  await expect(section.getByRole('button')).toHaveCount(0);
+  await section.getByRole('link', { name: 'Propose it on the Content page' }).click();
+  await expect(page).toHaveURL(/#\/admin\/content$/);
+
+  await signIn(page, 'audrey');
+  await go(page, '/admin/policy');
+  const seen = page.getByRole('region', { name: /^MCP servers/ });
+  await expect(seen.getByRole('article')).toHaveCount(3);
+  await expect(seen.getByRole('article', { name: 'acme-tracker' }).getByText('mcp.tracker.example.test', { exact: true })).toBeVisible();
+  await expect(seen.getByRole('link', { name: 'Propose it on the Content page' })).toHaveCount(0);
+
+  await signIn(page, 'ada', '?mock_mcp=none');
+  await go(page, '/admin/policy');
+  await expect(page.getByRole('region', { name: /^MCP servers/ }).getByText('No MCP servers are in use. Jira, Confluence, Slack and the docs all go through the built-in connectors.')).toBeVisible();
+});

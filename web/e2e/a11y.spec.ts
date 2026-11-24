@@ -655,6 +655,26 @@ for (const theme of ['light', 'dark'] as const) {
       await scan(page, 'auditor following a link to a locked file');
     });
 
+    test('admin: the MCP servers section in every state, on a desktop and a phone', async ({ page }) => {
+      for (const [search, wait] of [
+        ['', 'acme-tracker'],
+        ['?mock_mcp=none', 'No MCP servers are in use.'],
+        ['?mock_mcp=unavailable', "Not known right now: the tool server didn't answer."],
+      ] as const) {
+        await page.setViewportSize({ width: 1280, height: 844 });
+        await signIn(page, theme, undefined, 'ada', search);
+        await go(page, '/admin/policy');
+        // The admin tools load once per page; on a busy runner that can take a while.
+        await expect(page.getByRole('heading', { name: /^What each bot may do/ })).toBeVisible({ timeout: 20_000 });
+        const section = page.getByRole('region', { name: /^MCP servers/ });
+        await expect(section.getByText(wait).first()).toBeVisible();
+        for (const width of [1280, 390]) {
+          await page.setViewportSize({ width, height: 844 });
+          await scan(page, `MCP servers ${search || 'with servers'} at ${width} px`);
+        }
+      }
+    });
+
     test('admin on a phone: policy and content', async ({ page }) => {
       await page.setViewportSize({ width: 390, height: 844 });
       await signIn(page, theme, undefined, 'ada');

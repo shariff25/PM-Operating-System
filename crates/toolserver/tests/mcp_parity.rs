@@ -337,6 +337,10 @@ async fn readyz_and_policy_admin_show_each_server_and_its_approved_tools() {
         !view.to_string().to_lowercase().contains("token\":"),
         "no token field"
     );
+    // What the Admin view adds: the systems this tool server routes to the server.
+    let mut served = view.clone();
+    pmos_toolserver::mcp_client::with_serving(&mut served, |t| svc.served_by(t));
+    assert_eq!(served[0]["serving"], json!(["jira"]));
     // A changed tool shows on both.
     fake.tricks
         .change_search

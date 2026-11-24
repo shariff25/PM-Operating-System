@@ -165,24 +165,88 @@ async fn read(State(state): State<AppState>, signed: Signed) -> ApiResult {
     let mut body = body?;
     // MCP servers (`docs/mcp-servers-spec.md` §5): the tool server's view, read-only. The
     // sandbox's own egress stays `fixed` above.
-    body["mcp"] = match signed
+    let mcp = signed
         .toolserver(&state)
         .admin(&signed.member.handle, "mcp", &[])
         .await
-    {
-        Ok(v) => {
-            json!({"available": true, "servers": v.get("servers").cloned().unwrap_or(json!([]))})
-        }
-        Err(e) => {
-            tracing::warn!(error = ?e, "the MCP servers' view is unavailable");
-            json!({"available": false, "servers": []})
-        }
-    };
+        .map_err(|e| tracing::warn!(error = ?e, "the MCP servers' view is unavailable"))
+        .ok();
+    body["mcp"] = mcp_view(mcp.as_ref());
     body["proposals_configured"] = json!(configured);
     body["protection"] = protection;
     with_prover(&mut body, proofs.as_ref());
     with_denials(&mut body, sandbox.as_ref());
     Ok(Json(body).into_response())
+}
+
+/// Policy Admin's `mcp` (`docs/web-api.md`, Admin: policy): the tool server's
+/// `GET /internal/admin/mcp`, re-picked field by field so only what the screen shows leaves
+/// `pmos-web` (the same for an Admin and an Auditor: it is metadata only, never a token).
+/// `None` (it didn't answer): `available: false`. `serving` is `null` from a tool server too old
+/// to send it.
+pub(crate) fn mcp_view(answer: Option<&Value>) -> Value {
+    let Some(answer) = answer else {
+        return json!({"available": false, "servers": []});
+    };
+    let pick = |v: &Value, keys: &[&str]| -> Value {
+        Value::Object(
+            keys.iter()
+                .map(|k| (k.to_string(), v.get(*k).cloned().unwrap_or(Value::Null)))
+                .collect(),
+        )
+    };
+    let servers: Vec<Value> = answer
+        .get("servers")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .map(|s| {
+                    let mut out = pick(
+                        s,
+                        &[
+                            "id",
+                            "operator",
+                            "host",
+                            "hosts",
+                            "auth",
+                            "scopes",
+                            "data_class",
+                            "systems",
+                            "serving",
+                            "egress",
+                            "approved_by",
+                            "pull",
+                            "refused_requests",
+                        ],
+                    );
+                    out["tools"] = json!(s
+                        .get("tools")
+                        .and_then(Value::as_array)
+                        .map(|t| t
+                            .iter()
+                            .map(|t| pick(
+                                t,
+                                &[
+                                    "registry",
+                                    "upstream",
+                                    "class",
+                                    "digest",
+                                    "state",
+                                    "approved_by"
+                                ]
+                            ))
+                            .collect::<Vec<_>>())
+                        .unwrap_or_default());
+                    out["last_check"] = pick(
+                        s.get("last_check").unwrap_or(&Value::Null),
+                        &["checked_at", "outcome", "server_name", "server_version"],
+                    );
+                    out
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    json!({"available": true, "servers": servers})
 }
 
 /// The most recent sandbox denials shown per bot.
@@ -409,6 +473,42 @@ mod tests {
         let mut body = json!({"bots": [{"bot": "docs"}]});
         with_denials(&mut body, None);
         assert_eq!(body["sandbox_audit"]["available"], false);
+    }
+
+    #[test]
+    fn the_mcp_view_is_re_picked_and_says_when_the_tool_server_did_not_answer() {
+        let answer = json!({"servers": [{
+            "id": "acme-atlas", "operator": "system_vendor", "host": "mcp.example.test",
+            "hosts": ["mcp.example.test", "auth.example.test"], "auth": "oauth_per_user",
+            "scopes": ["read:jira"], "data_class": "internal", "systems": ["jira", "confluence"],
+            "serving": ["jira"], "egress": [], "approved_by": "ada", "pull": "#14",
+            "refused_requests": 0, "dropped_notifications": 3, "future_field": "x",
+            "tools": [{"registry": "jira.search", "upstream": "search", "class": "read",
+                       "digest": "sha256:ab", "state": "changed", "approved_by": "ada",
+                       "listed_digest": "sha256:cd"}],
+            "last_check": {"checked_at": "2026-11-24T09:00:00Z", "outcome": "ok",
+                           "server_name": "atlas", "server_version": "1.0", "extra": 1}}]});
+        let v = mcp_view(Some(&answer));
+        assert_eq!(v["available"], true);
+        let s = &v["servers"][0];
+        assert_eq!(s["serving"], json!(["jira"]));
+        assert_eq!(s["systems"], json!(["jira", "confluence"]));
+        assert_eq!(s["tools"][0]["state"], "changed");
+        assert_eq!(s["last_check"]["outcome"], "ok");
+        for gone in ["dropped_notifications", "future_field"] {
+            assert!(s.get(gone).is_none(), "{gone} is not passed on");
+        }
+        assert!(s["tools"][0].get("listed_digest").is_none());
+        assert!(s["last_check"].get("extra").is_none());
+        // An older tool server without `serving`: null, never a guess.
+        let old = json!({"servers": [{"id": "a", "systems": ["jira"], "tools": []}]});
+        assert_eq!(mcp_view(Some(&old))["servers"][0]["serving"], Value::Null);
+        // No servers: the built-in connectors serve everything.
+        assert_eq!(
+            mcp_view(Some(&json!({"servers": []}))),
+            json!({"available": true, "servers": []})
+        );
+        assert_eq!(mcp_view(None), json!({"available": false, "servers": []}));
     }
 
     #[test]
