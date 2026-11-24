@@ -739,6 +739,43 @@ impl Drop for StreamEnd {
     }
 }
 
+/// Reads the token counts of a streamed answer as it passes (the `usage` an event carries when
+/// the caller asked for `stream_options.include_usage`), so a streamed call's usage line has
+/// them as a whole answer's does. The bytes themselves are passed on untouched.
+#[derive(Default)]
+struct StreamUsage {
+    pending: Vec<u8>,
+}
+
+impl StreamUsage {
+    /// The latest `(prompt_tokens, completion_tokens)` among the whole lines in `bytes` (with
+    /// what came before), when one of them carried usage.
+    fn feed(&mut self, bytes: &[u8]) -> Option<(Option<u64>, Option<u64>)> {
+        self.pending.extend_from_slice(bytes);
+        let mut found = None;
+        while let Some(end) = self.pending.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.pending.drain(..=end).collect();
+            let Some(data) = line.strip_prefix(b"data:") else {
+                continue;
+            };
+            if !data.windows(7).any(|w| w == b"\"usage\"") {
+                continue;
+            }
+            let Ok(event) = serde_json::from_slice::<Value>(data.trim_ascii()) else {
+                continue;
+            };
+            let usage = &event["usage"];
+            if usage.is_object() {
+                found = Some((
+                    usage["prompt_tokens"].as_u64(),
+                    usage["completion_tokens"].as_u64(),
+                ));
+            }
+        }
+        found
+    }
+}
+
 type Upstream = std::pin::Pin<Box<dyn futures_util::Stream<Item = reqwest::Result<Bytes>> + Send>>;
 
 /// What a stream that runs past its limits ends with, as the caller sees it.
@@ -764,6 +801,7 @@ fn bounded_stream(
         upstream: Upstream,
         end: StreamEnd,
         scanner: Option<StreamScanner>,
+        usage: StreamUsage,
         seen: usize,
         done: bool,
     }
@@ -771,6 +809,7 @@ fn bounded_stream(
         upstream,
         end,
         scanner,
+        usage: StreamUsage::default(),
         seen: 0,
         done: false,
     };
@@ -807,6 +846,10 @@ fn bounded_stream(
                 }
                 if let Some(s) = &mut f.scanner {
                     s.feed(&bytes);
+                }
+                if let Some((prompt, completion)) = f.usage.feed(&bytes) {
+                    f.end.event.prompt_tokens = prompt;
+                    f.end.event.completion_tokens = completion;
                 }
                 Some((Ok(bytes), f))
             }
@@ -1011,6 +1054,19 @@ async fn forward(
         return finish(res);
     }
 
+    // A role whose workarounds need the whole answer (`strip-think`): a streamed call is asked
+    // of the model server whole, the workarounds apply, and the caller gets it as an event
+    // stream ([`anthropic::as_stream`]), so it behaves the same streamed or not. The model
+    // server's hop is then as silent as a call that isn't streamed, under the same limits.
+    let whole_for_stream =
+        stream && workarounds::needs_whole_answer(&role.workarounds, inner.workarounds_on);
+    if whole_for_stream {
+        req["stream"] = json!(false);
+        if let Some(o) = req.as_object_mut() {
+            o.remove("stream_options");
+        }
+    }
+    let upstream_stream = stream && !whole_for_stream;
     let url = format!("{}/{}", role.upstream, endpoint.path());
     let remote = role.kind == UpstreamKind::RemoteOpenAi;
     if remote {
@@ -1032,7 +1088,7 @@ async fn forward(
         attempt += 1;
         // Not streamed: nothing arrives until the answer is whole, so the silence limit
         // would cut off every long generation.
-        let client = if stream {
+        let client = if upstream_stream {
             &inner.http
         } else {
             &inner.whole_http
@@ -1160,7 +1216,7 @@ async fn forward(
         return finish(redirect_refused(&role));
     }
 
-    if stream && status.is_success() {
+    if upstream_stream && status.is_success() {
         let end = StreamEnd {
             usage: inner.usage.clone(),
             event,
@@ -1256,6 +1312,18 @@ async fn forward(
     event.latency_ms = started.elapsed().as_millis() as u64;
     inner.usage.record(event);
     drop(permit);
+    if whole_for_stream {
+        return finish(
+            (
+                [
+                    (header::CONTENT_TYPE, "text/event-stream"),
+                    (header::CACHE_CONTROL, "no-cache"),
+                ],
+                anthropic::as_stream(&answer),
+            )
+                .into_response(),
+        );
+    }
     finish(Json(answer).into_response())
 }
 

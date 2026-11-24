@@ -42,7 +42,8 @@ pub fn chat(body: &Value, model: &str) -> Value {
     })
 }
 
-/// The same answer as server-sent events: one chunk per word, then `[DONE]`.
+/// The same answer as server-sent events: one chunk per word, the finish reason, the usage
+/// when `stream_options.include_usage` asks for it, then `[DONE]`.
 pub fn chat_stream(body: &Value, model: &str) -> String {
     let text = reply_text(body);
     let mut out = String::new();
@@ -66,6 +67,14 @@ pub fn chat_stream(body: &Value, model: &str) -> String {
         ));
     }
     out.push_str(&format!("data: {}\n\n", chunk(json!({}), json!("stop"))));
+    // As an OpenAI-compatible server does when asked to: one last event with the usage and
+    // no choices.
+    if body["stream_options"]["include_usage"] == json!(true) {
+        let usage = json!({"id": "chatcmpl-stub", "object": "chat.completion.chunk",
+            "created": 0, "model": model, "choices": [],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}});
+        out.push_str(&format!("data: {usage}\n\n"));
+    }
     out.push_str("data: [DONE]\n\n");
     out
 }
@@ -95,4 +104,39 @@ pub fn embeddings(body: &Value, model: &str) -> Value {
         .collect();
     json!({"object": "list", "model": model, "data": data,
            "usage": {"prompt_tokens": 0, "total_tokens": 0}})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn events(s: &str) -> Vec<Value> {
+        s.lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter(|d| *d != "[DONE]")
+            .map(|d| serde_json::from_str(d).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_streamed_stub_answer_ends_with_a_finish_reason_and_done_and_usage_when_asked() {
+        let ask = json!({"messages": [{"role": "user", "content": "hi there"}]});
+        let plain = chat_stream(&ask, "m");
+        assert!(plain.ends_with("data: [DONE]\n\n"));
+        let ev = events(&plain);
+        assert_eq!(ev.last().unwrap()["choices"][0]["finish_reason"], "stop");
+        assert!(ev.iter().all(|e| e.get("usage").is_none()));
+        let text: String = ev
+            .iter()
+            .filter_map(|e| e["choices"][0]["delta"]["content"].as_str())
+            .collect();
+        assert_eq!(text, "Stub reply to: hi there");
+
+        let mut with_usage = ask.clone();
+        with_usage["stream_options"] = json!({"include_usage": true});
+        let ev = events(&chat_stream(&with_usage, "m"));
+        let last = ev.last().unwrap();
+        assert_eq!(last["choices"], json!([]));
+        assert_eq!(last["usage"]["total_tokens"], 0);
+    }
 }

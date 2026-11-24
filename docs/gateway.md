@@ -99,9 +99,19 @@ it can be deleted.
 
 | Id | What it does | Delete when |
 | --- | --- | --- |
-| `strip-think` | Moves a `<think>…</think>` block out of the answer into `reasoning_content`, so reasoning never reaches a PM's draft. Non-streaming replies only. | vLLM runs the model with a reasoning parser, and the benchmark passes with workarounds off |
+| `strip-think` | Moves a `<think>…</think>` block out of the answer into `reasoning_content`, so reasoning never reaches a PM's draft. Works on whole answers: a streamed call to a role with it on is asked of the model server whole and replayed as a stream (below). | vLLM runs the model with a reasoning parser, and the benchmark passes with workarounds off |
 
 - **Per role:** a role switches a workaround on in `workarounds:`.
+- **Streamed calls** (2026-11-24, when the harness began streaming): a workaround needs the
+  whole answer, so a `stream: true` call to a role with one on (and workarounds on) is sent to
+  the model server without `stream` and `stream_options`, under the whole-answer time limit
+  (600 s); the workaround applies, and the caller gets the answer as an event stream: one
+  delta with the content (and `reasoning_content` when `strip-think` moved some), then the
+  finish reason with the usage, then `[DONE]` (`as_stream`, the stream the gateway already
+  makes from a whole answer). Its usage line is as a whole answer's (`workarounds`, token counts), with
+  `stream: true`. The model server's hop is then as silent as before; it is a local vLLM on
+  production. Tested in `gateway.rs`,
+  `a_streamed_call_to_a_role_with_a_workaround_gets_the_whole_answer_as_a_stream`.
 - **All off:** `PMOS_GATEWAY_WORKAROUNDS=off` switches every workaround off for the benchmark run that decides whether one can go.
 - **Registry:** `GET /v1/pmos/workarounds` lists the registry, which roles use each workaround, and whether workarounds are on.
 
@@ -326,11 +336,26 @@ moment. The gateway retries these itself, so a brief limit doesn't lose a PM's r
 ## How long a model server may take
 - **A streamed answer** may go silent for at most 120 seconds between bytes; a server silent
   that long is stuck, and the caller gets a `502`.
-- **An answer that isn't streamed** (most of the harness's calls, and every call to the Claude
-  test upstream) sends nothing until it is whole, so it gets 600 seconds from the request to
-  its last byte instead. Before 2026-11-21 it had the 120-second silence limit too, which cut
-  off every non-streamed generation longer than that as a `502` (found in the first eval run,
-  on a remote model writing long Confluence drafts).
+- **An answer that isn't streamed** (the runtime's routine parsing, the benchmark judges, a
+  streamed call to a role with a workaround on, and every call to the Claude test upstream)
+  sends nothing until it is whole, so it gets 600 seconds from the request to its last byte
+  instead. Before 2026-11-21 it had the 120-second silence limit too, which cut off every
+  non-streamed generation longer than that as a `502` (found in the first eval run, on a
+  remote model writing long Confluence drafts).
+- **The harness streams every call** (since 2026-11-24): in eval run E3, 45 attempts were lost
+  to a `502` from a hop beyond the gateway (the provider or an egress proxy) after about 300
+  seconds of a silent non-streamed call. A streamed call sends bytes while the model writes,
+  so no hop sees a silent connection. The harness checks each stream itself
+  (`harness/src/model-stream.ts`): no byte for 180 s, a body that ends before `[DONE]` or
+  without a finish reason, or an event carrying `error` fails the call as a model call
+  failure, never a short answer taken for a whole one. What did not change: the gateway's
+  limits (120 s of silence, `stream-max-secs`, `max-answer-bytes`), its retries (a stream is
+  retried only before its first byte), the label rewriting of streamed events and the
+  tool-call scanner.
+- **Token counts of a streamed answer:** the harness asks for `stream_options.include_usage`,
+  and the gateway reads the `usage` the stream's last event carries into the usage line, as it
+  does from a whole answer (before 2026-11-24 a streamed call's line had none). A stream
+  without one leaves them empty. The stub sends one when asked.
 - Both are `Timeouts` in `crates/gateway/src/app.rs`.
 - **A streamed answer's total time** is at most `limits.stream-max-secs` (default 900), from
   its first byte, however steadily it sends: a stream past it is cut off. Before 2026-11-22 a
@@ -562,7 +587,9 @@ deploy-kit job and a fresh install.
   - sampling parameters are dropped;
   - forced tool choice becomes an instruction;
   - `response_format` asks for JSON only;
-  - a streamed request gets the whole answer as one event stream;
+  - a streamed request gets the whole answer as one event stream (the call to the Messages
+    API itself isn't streamed, so that hop stays silent until the answer is whole, within the
+    600 s limit);
   - refusals reach the caller as `content_filter`.
 - **Limits:** no embeddings.
 - **Per-role setting:** `effort:` (low to max) sets `output_config.effort`.

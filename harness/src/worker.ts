@@ -25,6 +25,7 @@ import {
   gatewayModel,
 } from "./agent.js";
 import { connectMcpTools, type McpToolSet } from "./mcp-tools.js";
+import { ModelStreamError } from "./model-stream.js";
 import { FIRST_MILESTONE, Progress, TaskTracer } from "./progress.js";
 import { harnessToolNames, loadToolRegistry, type ToolKind } from "./registry.js";
 import {
@@ -333,6 +334,14 @@ export function pmReason(error: unknown): string {
     | undefined;
   const name = e?.name ?? "";
   const message = (e?.message ?? String(error)).replace(/\s+/g, " ").trim();
+  if (error instanceof ModelStreamError || name === "ModelStreamError") {
+    // A streamed answer that stalled, ended early or carried an error (`model-stream.ts`):
+    // a failed model call, never a short answer taken for a whole one.
+    const problem = (error as Partial<ModelStreamError>).problem;
+    const what =
+      problem === "stalled" ? "went silent" : problem === "error" ? "reported an error" : "was cut off";
+    return `The model gateway's answer ${what} before it finished. Please try again in a few minutes.`;
+  }
   if (name === "GraphRecursionError" || /recursion limit/i.test(message)) {
     return "I took too many steps without finishing. Try a narrower question, or split it into parts.";
   }
