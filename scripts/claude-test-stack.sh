@@ -612,7 +612,12 @@ fi
 if [ "${PMOS_TEST_WEB:-}" = 1 ]; then
   # Development sign-in: closed to this machine (127.0.0.1) and never for a shared network.
   # PMOS_EXPOSURE=private: this machine only. Every page shows the test-stack banner.
+  # The admin door (slice H10; pmos-web refuses to start without it): this machine only, at a
+  # deployment-unique *.localhost name, the peer being this machine (no tunnel needed here).
+  # It serves no development sign-in: with PMOS_TEST_PASSWORD_LOGIN=1 an Admin signs in there.
   start web env PMOS_WEB_BIND=127.0.0.1:8770 PMOS_WEB_DEV_LOGIN=1 \
+    PMOS_WEB_ADMIN_BIND=127.0.0.1:8772 PMOS_WEB_ADMIN_URL=http://pmos-test.localhost:8772 \
+    PMOS_WEB_ADMIN_TUNNEL_PEER=127.0.0.1 \
     PMOS_EXPOSURE=private PMOS_MODEL_SOURCE="$MODEL_SOURCE" PMOS_CONNECTORS=fake \
     PMOS_WEB_BOTS_TOKEN="$RT_WEB" PMOS_WEB_TOOLSERVER_TOKEN="$TS_WEB" \
     PMOS_ASSERTION_KEYS="$AK_BOTS,$AK_TOOLS" \
@@ -637,6 +642,7 @@ echo "   The Slack bot is off (fake data only, slice H4). Ask the Docs bot and y
 echo "   $BOT_PERSONAL in the web app (PMOS_TEST_WEB=1), or run the benchmarks (PMOS_TEST_EVALS=1)."
 if [ "${PMOS_TEST_WEB:-}" = 1 ]; then
   echo "   Web app: http://127.0.0.1:8770 (sign in as $HANDLE; development sign-in, this machine only)"
+  echo "   Admin door: http://pmos-test.localhost:8772 (Admins and Auditors; password sign-in only)"
 fi
 if [ "${PMOS_TEST_PASSWORD_LOGIN:-}" = 1 ]; then
   # TESTING ONLY: a one-time code for this run's fake account, shown so you can set it up.

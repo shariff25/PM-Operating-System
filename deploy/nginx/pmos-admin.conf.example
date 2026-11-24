@@ -1,0 +1,32 @@
+# PM OS's admin door in the proxy mode (docs/openshell-any-host-spec.md §3.8, slice H10; r7, X6):
+# a TLS terminator on this host's VPN or private address ONLY, in front of the admin door's
+# publish (PMOS_WEB_ADMIN_PUBLISH, here 10.0.0.5, with 8772). deploy/.env then has
+#   PMOS_WEB_ADMIN_URL=https://pmos-admin.corp.example
+#   PMOS_WEB_ADMIN_PUBLISH=10.0.0.5
+#   PMOS_WEB_ADMIN_TRUSTED_PROXIES=10.201.77.1     # the pmos network's gateway: this nginx
+# Never `listen 443` without an address, and never a public address: the host preflight's H-ADMIN
+# reads `nginx -T` and fails a server that forwards to the admin door while listening on one.
+# pmos-web itself answers 404 to a forwarded client outside loopback, RFC 1918, 100.64.0.0/10
+# and IPv6 unique-local, and to any Host but the admin URL's.
+server {
+    listen 10.0.0.5:443 ssl;
+    server_name pmos-admin.corp.example;
+    ssl_certificate     /etc/ssl/pmos/admin-fullchain.pem;
+    ssl_certificate_key /etc/ssl/pmos/admin-privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    client_max_body_size 16m;      # content proposals carry up to 16 MiB
+    client_header_timeout 15s;
+    client_body_timeout   30s;
+
+    location / {
+        proxy_pass http://10.0.0.5:8772;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;                                 # pmos-web checks it
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-User "";
+        proxy_set_header X-Pmos-Proxy-Secret "";
+        proxy_read_timeout 300s;
+    }
+}

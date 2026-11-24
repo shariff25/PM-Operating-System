@@ -114,7 +114,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Scripts parse
-        run: for f in deploy/setup.sh deploy/pmos-admin deploy/postgres-init.sh deploy/preflight.sh deploy/pmos-metadata-block deploy/sandbox-create.sh scripts/claude-test-stack.sh scripts/test-pmos-admin.sh scripts/test-preflight.sh policies/redteam/lib.sh policies/redteam/isolation.sh policies/redteam/exposure.sh policies/redteam/stack.sh scripts/test-redteam.sh; do bash -n "$f"; done
+        run: for f in deploy/setup.sh deploy/pmos-admin deploy/postgres-init.sh deploy/preflight.sh deploy/pmos-metadata-block deploy/sandbox-create.sh scripts/claude-test-stack.sh scripts/test-pmos-admin.sh scripts/test-preflight.sh policies/redteam/lib.sh policies/redteam/isolation.sh policies/redteam/exposure.sh policies/redteam/stack.sh scripts/test-redteam.sh scripts/check-nginx-examples.sh; do bash -n "$f"; done
       - name: pmos-admin checks (the eval gate's arguments; the checkout stays data)
         run: scripts/test-pmos-admin.sh
       # docs/openshell-any-host-spec.md §5 (slice H7): the red-team scripts' dry runs, refusals,
@@ -128,6 +128,8 @@ jobs:
       # and prints its answer (not asserted: it depends on the runner's kernel).
       - name: Host preflight checks (fixtures)
         run: scripts/test-preflight.sh
+      - name: nginx examples (nginx -t, where the runner has nginx; slice H10)
+        run: scripts/check-nginx-examples.sh
       - name: Settings
         # `local` with the stub model (env.example's PMOS_GATEWAY_STUB=1): no GPU and no hosted
         # endpoint here. setup.sh's default, hosted-test, needs a provider's URL and key

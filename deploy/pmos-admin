@@ -406,26 +406,117 @@ password_web_checks() {
   return $bad
 }
 
-# pmos-web refuses PMOS_EXPOSURE=public until the admin listener (slice H10) is built (slice H4),
-# and setup.sh writes public by default (docs/openshell-any-host-spec.md §3.1: the value that
-# allows less). So `up --web` on public refuses here, first, before anything is checked against
-# Docker or started, with what an operator of a private host does instead. The preflight's
-# H-SIGNIN says the same at `up`, `status` and by hand.
-web_exposure_checks() {
-  [ "${PMOS_EXPOSURE:-}" = public ] || return 0
-  {
-    say "pmos-admin up --web: PMOS_EXPOSURE=public in deploy/.env, and the web app (pmos-web) does not"
-    say "run on a public host until the admin listener is built (spec slice H10): it refuses to start."
-    say "Nothing was started."
-    say "- A host reached only from a network the company controls (a VPN, an SSH tunnel, a closed"
-    say "  office or test network): set PMOS_EXPOSURE=private in deploy/.env, then run this again."
-    say "  The host preflight's H-PRIVATE then checks that the host looks private. If it has a public"
-    say "  address or its cloud metadata service answers, and inbound traffic to it is blocked (a"
-    say "  closed test host), record that, which deploy/pmos-admin status then shows every time:"
-    say "    sudo deploy/pmos-admin host acknowledge H-PRIVATE --reason \"<why this host is private>\""
-    say "- Any other host: leave the web app off until slice H10 (deploy/pmos-admin up, without --web)."
-  } >&2
-  return 1
+# The web app's front doors (slice H10, docs/openshell-any-host-spec.md §3.8; decisions D2 (a) and
+# D3 (b)): pmos-web refuses each of these itself, however it is started, and so does the host
+# preflight (H-SIGNIN, H-ADMIN); `up --web` says it first, before anything is checked against
+# Docker or started, with the exact fix.
+#
+# - The admin door on every host: PMOS_WEB_ADMIN_URL set; PMOS_WEB_ADMIN_PUBLISH (where compose
+#   publishes 8772; default 127.0.0.1) an IPv4 loopback, RFC 1918 or 100.64.0.0/10 address (an
+#   IPv6 one is refused here, the stricter reading: compose's short port syntax can't take it
+#   unbracketed); an http admin URL (the tunnel mode) only with a loopback publish, a loopback
+#   name and a port, and no PMOS_WEB_ADMIN_TRUSTED_PROXIES; an https one (the proxy mode) only
+#   with them, and on a host name other than PMOS_WEB_PUBLIC_URL's. A bare localhost or 127.0.0.1
+#   is warned about: use a deployment-unique <deployment>.localhost name.
+# - On PMOS_EXPOSURE=public: no development sign-in, and password sign-in only with
+#   PMOS_WEB_PASSWORD_CLIENTS listing networks no wider than a /16 (IPv4) or a /48 (IPv6).
+web_door_problems() {
+  local url=${PMOS_WEB_ADMIN_URL:-} publish=${PMOS_WEB_ADMIN_PUBLISH:-127.0.0.1}
+  local proxies=${PMOS_WEB_ADMIN_TRUSTED_PROXIES:-} scheme host public_host
+  if [ -z "$url" ]; then
+    echo "PMOS_WEB_ADMIN_URL is blank: the admin routes are served only on the admin door (decision D3 (b)), which needs its own address: http://<deployment>.localhost:8772 through an SSH tunnel, or https://<a private name> through a TLS terminator on a private address (docs/runbooks/install.md, \"The admin door\")"
+  fi
+  case "$(addr_kind "$publish")" in
+    loopback | private) ;;
+    v6) echo "PMOS_WEB_ADMIN_PUBLISH=$publish: use an IPv4 address (127.0.0.1 for a tunnel, or the host's VPN or private address)" ;;
+    *) echo "PMOS_WEB_ADMIN_PUBLISH=$publish: the admin door is published only on loopback, an RFC 1918 or a 100.64.0.0/10 address, never a public one" ;;
+  esac
+  if [ -n "$url" ]; then
+    scheme=${url%%://*}
+    host=${url#*://}
+    host=${host%%/*}
+    case "$scheme" in
+      http)
+        [ "$(addr_kind "$publish")" = loopback ] ||
+          echo "PMOS_WEB_ADMIN_URL is http (the tunnel mode) and PMOS_WEB_ADMIN_PUBLISH=$publish isn't loopback: an http admin door is reached only through an SSH tunnel to 127.0.0.1 (or use https through a TLS terminator)"
+        [ -z "$proxies" ] ||
+          echo "PMOS_WEB_ADMIN_URL is http (the tunnel mode) and PMOS_WEB_ADMIN_TRUSTED_PROXIES is set: a tunnel has no proxy; unset it, or use an https admin URL"
+        case "${host%:*}" in
+          localhost | *.localhost | 127.0.0.1 | '[::1]') ;;
+          *) echo "PMOS_WEB_ADMIN_URL=$url: an http admin URL must be a loopback name (http://<deployment>.localhost:<port>)" ;;
+        esac
+        [[ "$host" == *:* && "$host" != *']' ]] || echo "PMOS_WEB_ADMIN_URL=$url: write the tunnel's port (http://<deployment>.localhost:8772)"
+        ;;
+      https)
+        [ -n "$proxies" ] ||
+          echo "PMOS_WEB_ADMIN_URL is https (the proxy mode): set PMOS_WEB_ADMIN_TRUSTED_PROXIES to the address the TLS terminator reaches the web app from (on this host, the pmos network's gateway, ${PMOS_NETWORK_GATEWAY:-10.201.77.1})"
+        public_host=${PMOS_WEB_PUBLIC_URL#*://}
+        public_host=${public_host%%/*}
+        if [ -n "${PMOS_WEB_PUBLIC_URL:-}" ] && [ "${public_host%:*}" = "${host%:*}" ]; then
+          echo "PMOS_WEB_ADMIN_URL's host is PMOS_WEB_PUBLIC_URL's: cookies are kept by host name, so give the admin door a name of its own"
+        fi
+        ;;
+      *) echo "PMOS_WEB_ADMIN_URL=$url: use http://<deployment>.localhost:<port> or https://<name>" ;;
+    esac
+  fi
+  if [ "${PMOS_EXPOSURE:-}" = public ]; then
+    [ "${PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY:-0}" != 1 ] ||
+      echo "PMOS_EXPOSURE=public with development sign-in (PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=1): anyone who reaches it signs in as anyone; set it to 0"
+    if [ "${PMOS_WEB_PASSWORD_LOGIN:-0}" = 1 ]; then
+      if [ -z "${PMOS_WEB_PASSWORD_CLIENTS:-}" ]; then
+        echo "PMOS_EXPOSURE=public with password sign-in: set PMOS_WEB_PASSWORD_CLIENTS (a VPN or office range), or turn password sign-in off and use Microsoft sign-in (decision D2)"
+      fi
+    fi
+  fi
+  if [ -n "${PMOS_WEB_PASSWORD_CLIENTS:-}" ]; then
+    python3 -I -c '
+import ipaddress, sys
+for e in (x.strip() for x in sys.argv[1].split(",")):
+    if not e:
+        continue
+    try:
+        n = ipaddress.ip_network(e, strict=True)
+    except ValueError:
+        print(f"PMOS_WEB_PASSWORD_CLIENTS: {e!s} is not a network written address/length with no host bits"); continue
+    if "/" not in e:
+        print(f"PMOS_WEB_PASSWORD_CLIENTS: {e} has no /length"); continue
+    mapped = n.version == 6 and n.network_address.ipv4_mapped is not None
+    if (n.version == 4 and n.prefixlen < 16) or (n.version == 6 and n.prefixlen < 48) or (mapped and n.prefixlen < 112):
+        print(f"PMOS_WEB_PASSWORD_CLIENTS: {e} is wider than decision D2 (a) allows (no shorter than /16 for IPv4 or /48 for IPv6)")
+' "$PMOS_WEB_PASSWORD_CLIENTS"
+  fi
+}
+# loopback | private | public | v6 | bad, for an address (IPv4 private: RFC 1918 and 100.64.0.0/10).
+addr_kind() {
+  case "$1" in
+    127.*) echo loopback; return ;;
+    *:*) echo v6; return ;;
+  esac
+  if ipv4_in_subnet "$1" 10.0.0.0/8 || ipv4_in_subnet "$1" 172.16.0.0/12 ||
+    ipv4_in_subnet "$1" 192.168.0.0/16 || ipv4_in_subnet "$1" 100.64.0.0/10; then
+    echo private
+  elif ipv4_number "$1" >/dev/null 2>&1; then
+    echo public
+  else
+    echo bad
+  fi
+}
+web_door_checks() {
+  local problems
+  problems=$(web_door_problems)
+  if [ -n "$problems" ]; then
+    {
+      say "pmos-admin up --web: the web app's doors aren't as decisions D2 and D3 need (docs/openshell-any-host-spec.md §3.8). Nothing was started:"
+      while IFS= read -r p; do say "- $p"; done <<<"$problems"
+    } >&2
+    return 1
+  fi
+  case "${PMOS_WEB_ADMIN_URL:-}" in
+    http://localhost:* | http://127.0.0.1:* | 'http://[::1]:'*)
+      say "WARNING: PMOS_WEB_ADMIN_URL=$PMOS_WEB_ADMIN_URL: every tunnel to a bare localhost shares its cookies (another deployment, a test stack, any local page). Use a deployment-unique name such as http://pmos-prod.localhost:${PMOS_WEB_ADMIN_URL##*:}" >&2
+      ;;
+  esac
+  return 0
 }
 
 # The daily brief's address (PMOS_WEB_BRIEF_URL, which the Slack service gets as PMOS_WEB_URL).
@@ -1699,9 +1790,9 @@ case "$cmd" in
     ;;
 
   up)
-    # The web app on a public host first: nothing else matters while pmos-web would refuse it.
+    # The web app's doors first (slice H10): nothing else matters while pmos-web would refuse them.
     for arg in "$@"; do
-      [ "$arg" != --web ] || web_exposure_checks || exit 2
+      [ "$arg" != --web ] || web_door_checks || exit 2
     done
     brief_url_checks || exit 2
     for arg in "$@"; do
@@ -1818,7 +1909,7 @@ for a in d["attestations"]:
     esac
     case "${PMOS_EXPOSURE:-}" in
       private | public) row exposure ok "PMOS_EXPOSURE=$PMOS_EXPOSURE" ;;
-      *) row exposure FAIL "PMOS_EXPOSURE=$(printf '%q' "${PMOS_EXPOSURE:-}"): run deploy/setup.sh (pmos-web refuses a blank one, and public until slice H10)" ;;
+      *) row exposure FAIL "PMOS_EXPOSURE=$(printf '%q' "${PMOS_EXPOSURE:-}"): run deploy/setup.sh (pmos-web refuses a blank one)" ;;
     esac
     # A bring-up worker running on a stack that could hold real data (slice H4).
     running=$(compose "${ALL_PROFILES[@]}" ps --status running --services 2>/dev/null || true)

@@ -288,14 +288,15 @@ echo "  3. sudo deploy/pmos-admin host-names apply     # the three service names
 echo "     sudo deploy/pmos-admin host-firewall apply  # the metadata block (H-METADATA)"
 echo "  4. deploy/pmos-admin up        # runs the host preflight, then starts the stack;"
 echo "                                 # then deploy/pmos-admin status"
-# pmos-web refuses PMOS_EXPOSURE=public until slice H10 (the admin listener), and public is the
-# default written above (§3.1, the value that allows less), so say so here, not first at `up --web`.
+# The web app's two doors (slice H10): say what `up --web` will ask for, here, not first there.
+echo "  The web app (deploy/pmos-admin up --web) needs its admin door's address, PMOS_WEB_ADMIN_URL"
+echo "  (http://<deployment>.localhost:8772 through an SSH tunnel, or https through a TLS terminator"
+echo "  on a private address: docs/runbooks/install.md, \"The admin door\")."
 if [ "$(env_value PMOS_EXPOSURE)" = public ]; then
-  echo "  The web app (deploy/pmos-admin up --web) can't run here yet: with PMOS_EXPOSURE=public it"
-  echo "  refuses to start until the admin listener is built (spec slice H10), and up --web refuses."
-  echo "  On a host reached only from a network the company controls (a VPN, an SSH tunnel), set"
-  echo "  PMOS_EXPOSURE=private in deploy/.env (or run setup.sh with --exposure private on a new"
-  echo "  install); if the host preflight's H-PRIVATE then fails (a public address, or a metadata"
-  echo "  service that answers) on a closed test host, record it with"
+  echo "  With PMOS_EXPOSURE=public it takes Microsoft sign-in from anywhere, password sign-in only"
+  echo "  from PMOS_WEB_PASSWORD_CLIENTS (a VPN or office range), and never development sign-in"
+  echo "  (decision D2). On a host reached only from a network the company controls, set"
+  echo "  PMOS_EXPOSURE=private in deploy/.env instead; if the host preflight's H-PRIVATE then fails"
+  echo "  on a closed test host, record it with"
   echo "    sudo deploy/pmos-admin host acknowledge H-PRIVATE --reason \"<why this host is private>\""
 fi
