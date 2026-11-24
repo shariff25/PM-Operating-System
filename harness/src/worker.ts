@@ -18,9 +18,11 @@ import type { BaseChatModel } from "@langchain/core/language_models/chat_models"
 import { AIMessage, type BaseMessage, HumanMessage } from "@langchain/core/messages";
 import {
   MODEL_ALIASES,
+  MasterContextAboveCeilingError,
   MissingSkillError,
   type ModelRole,
   ModelSourceGuard,
+  checkMasterContext,
   createPmosAgent,
   gatewayModel,
 } from "./agent.js";
@@ -582,6 +584,25 @@ export function createWorker(config: WorkerConfig): Worker {
       // bot gets the team context only.
       const user =
         bot.scope === "personal" && bot.owner === task.requested_by ? task.requested_by : undefined;
+      // Slice H12 (V11): under a hosted ceiling below `restricted`, master context above it
+      // stops the task before any model call, naming the file and the class, never its text.
+      try {
+        checkMasterContext(config.contentRoot, user, claim.max_data_class);
+      } catch (error) {
+        if (error instanceof MasterContextAboveCeilingError) {
+          log("warn", "master context above the hosted model's data-class ceiling", {
+            task: task.id,
+            file: error.file,
+            data_class: error.dataClass,
+            ceiling: error.ceiling,
+          });
+          throw new PmFacingError(
+            `I can't start: ${error.message}, so it isn't sent to the model. An administrator can mark the file with its class or lower the ceiling.`,
+            { cause: error },
+          );
+        }
+        throw error;
+      }
       const systemPrompt = botSystemPrompt(claim, config.now?.() ?? new Date());
       let agent: ReturnType<typeof createPmosAgent>;
       try {

@@ -67,6 +67,13 @@ export const ClaimSchema = z.object({
     .nullish()
     .catch("restricted"),
   /**
+   * Under `PMOS_MODEL_SOURCE=hosted` (slice H12, r6/r7 V11): the gateway's effective data-class
+   * ceiling. With one below `restricted`, a master-context file above it stops the task
+   * (`checkMasterContext`). Absent under any other source and from an older runtime; an
+   * unknown value reads as `public`, the lowest (fail closed).
+   */
+  max_data_class: z.enum(["public", "internal", "restricted"]).nullish().catch("public"),
+  /**
    * The marketplace bot (persona) this task runs as (docs/bot-marketplace-spec.md §6). Absent
    * (or null) for Nudge and from an older runtime. With one, `role` is the persona's role.
    * `display_name` and `title` are catalog text: the worker checks their shape again before
