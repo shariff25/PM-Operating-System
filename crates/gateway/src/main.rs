@@ -3,7 +3,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use pmos_gateway::config::{Config, Models, UpstreamKind};
 use pmos_gateway::usage::UsageLog;
-use pmos_gateway::{router, GatewayConfig};
+use pmos_gateway::{router_with, GatewayConfig, RouterOptions};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -117,18 +117,36 @@ async fn main() -> Result<()> {
             person_pool_slots = ?p.pool.map(|pool| pool.cap), "client"
         );
     }
-    let app = router(GatewayConfig {
-        models,
-        clients: config.clients.clone(),
-        usage: usage.clone(),
-        stub: config.stub,
-        workarounds_on: config.workarounds_on,
-        anthropic_key: config.anthropic_key.clone(),
-        remote_key: config.remote_key.clone(),
-        retry: config.retry,
-        timeouts: Default::default(),
-        model_source: config.model_source,
-    });
+    // Slice MP2: the upstreams' key files are read afresh on SIGHUP (and on a change of size or
+    // modification time, looked at once a second at most).
+    let keys = std::sync::Arc::new(pmos_gateway::keys::KeyStore::default());
+    #[cfg(unix)]
+    {
+        let keys = keys.clone();
+        let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+            .context("listening for SIGHUP")?;
+        tokio::spawn(async move {
+            while hup.recv().await.is_some() {
+                keys.reload();
+                tracing::info!("SIGHUP: the upstreams' key files will be read afresh");
+            }
+        });
+    }
+    let app = router_with(
+        GatewayConfig {
+            models,
+            clients: config.clients.clone(),
+            usage: usage.clone(),
+            stub: config.stub,
+            workarounds_on: config.workarounds_on,
+            anthropic_key: config.anthropic_key.clone(),
+            remote_key: config.remote_key.clone(),
+            retry: config.retry,
+            timeouts: Default::default(),
+            model_source: config.model_source,
+        },
+        RouterOptions { keys: keys.clone() },
+    );
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .with_context(|| format!("binding {}", config.bind))?;

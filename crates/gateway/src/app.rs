@@ -49,7 +49,8 @@ use serde_json::{json, Value};
 use pmos_contract::model_source::{self as source, ModelSource};
 
 use crate::anthropic;
-use crate::config::{Client, ClientPolicy, GatewayClass, Models, Role, UpstreamKind};
+use crate::config::{Client, ClientPolicy, GatewayClass, Hop, Models, Role, UpstreamKind};
+use crate::keys::{KeyStore, Unusable};
 use crate::remote::{StreamScanner, ToolCallExtras};
 use crate::retry::RetryPolicy;
 use crate::scheduler::{Busy, Owner, Permit, Priority, Scheduler};
@@ -137,6 +138,8 @@ struct Inner {
     remote_key: String,
     /// Remote test upstreams only: tool-call `extra_content` to give back (`remote.rs`).
     extras: Arc<ToolCallExtras>,
+    /// The upstreams' `key-file:` keys (slice MP2).
+    keys: Arc<KeyStore>,
     /// [`Timeouts::ready_cache`].
     ready_cache: Duration,
     /// `GET /readyz`'s last probe. Held across a probe, so callers that arrive while one
@@ -170,7 +173,19 @@ impl Endpoint {
     }
 }
 
-pub fn router(mut cfg: GatewayConfig) -> Router {
+/// What the router takes beside [`GatewayConfig`], each with a default that changes nothing.
+#[derive(Debug, Default, Clone)]
+pub struct RouterOptions {
+    /// The upstreams' keys (`keys.rs`); `main` keeps a handle to reload them on `SIGHUP`.
+    pub keys: Arc<KeyStore>,
+}
+
+pub fn router(cfg: GatewayConfig) -> Router {
+    router_with(cfg, RouterOptions::default())
+}
+
+/// [`router`], with the options of [`RouterOptions`].
+pub fn router_with(mut cfg: GatewayConfig, opts: RouterOptions) -> Router {
     // With the stub model on, the gateway is a `test` one whatever its config says, so a stub
     // run never reports `production` (`Config::served_class`).
     if cfg.stub {
@@ -238,6 +253,7 @@ pub fn router(mut cfg: GatewayConfig) -> Router {
         remote_key: cfg.remote_key,
         retry: cfg.retry,
         extras: Arc::default(),
+        keys: opts.keys,
         ready_cache,
         probe: tokio::sync::Mutex::new(None),
         source: served,
@@ -487,7 +503,8 @@ fn upstream_bases(inner: &Inner) -> Vec<String> {
         .models
         .roles
         .values()
-        .map(|r| r.upstream.clone())
+        .flat_map(Role::hops)
+        .map(|h| h.upstream)
         .collect();
     upstreams.sort();
     upstreams.dedup();
@@ -504,18 +521,24 @@ async fn probe_now(inner: &Inner) -> std::collections::HashMap<String, bool> {
     }
     let mut up_by_base = std::collections::HashMap::new();
     for base in upstream_bases(inner) {
-        let remote = inner
+        let hop = inner
             .models
             .roles
             .values()
-            .any(|r| r.upstream == base && r.kind == UpstreamKind::RemoteOpenAi);
-        let probe = if remote {
-            inner
+            .flat_map(Role::hops)
+            .find(|h| h.upstream == base && h.kind == UpstreamKind::RemoteOpenAi);
+        let remote = hop.is_some();
+        let probe = match hop.map(|h| upstream_key(inner, &h)) {
+            // Its key file can't be used: nothing is sent, and it reads as down.
+            Some(Err(_)) => {
+                up_by_base.insert(base, false);
+                continue;
+            }
+            Some(Ok(key)) => inner
                 .http
                 .get(format!("{base}/models"))
-                .bearer_auth(&inner.remote_key)
-        } else {
-            inner.http.get(format!("{base}/models"))
+                .bearer_auth(key.unwrap_or_default()),
+            None => inner.http.get(format!("{base}/models")),
         };
         let up = tokio::time::timeout(
             Duration::from_secs(if remote { 5 } else { 2 }),
@@ -1069,6 +1092,25 @@ async fn forward(
     let upstream_stream = stream && !whole_for_stream;
     let url = format!("{}/{}", role.upstream, endpoint.path());
     let remote = role.kind == UpstreamKind::RemoteOpenAi;
+    // The upstream's own key (slice MP2): its `key-file:`, else `PMOS_GATEWAY_REMOTE_KEY`. A
+    // key file that can't be used sends nothing.
+    let key = match upstream_key(inner, &role.hops()[0]) {
+        Ok(k) => k.unwrap_or_default(),
+        Err(why) => {
+            tracing::warn!(
+                role = %role.alias(), upstream = role.upstream_kind_label(), reason = why.as_str(),
+                "the upstream's key file can't be used; nothing was sent"
+            );
+            event.status = 502;
+            event.latency_ms = started.elapsed().as_millis() as u64;
+            inner.usage.record(event);
+            return finish(error(
+                StatusCode::BAD_GATEWAY,
+                "upstream_error",
+                format!("the `{}` model server is unavailable", role.name),
+            ));
+        }
+    };
     if remote {
         let restored = inner.extras.restore(&role.upstream, &mut req);
         if restored > 0 {
@@ -1095,11 +1137,7 @@ async fn forward(
         };
         let post = client.post(&url);
         // The client's own gateway token never goes upstream; the remote key does.
-        let post = if remote {
-            post.bearer_auth(&inner.remote_key)
-        } else {
-            post
-        };
+        let post = if remote { post.bearer_auth(&key) } else { post };
         let this = match post.json(&req).send().await {
             Ok(r) if !crate::retry::is_retryable_status(r.status().as_u16()) => Attempt::Live(r),
             Ok(r) => {
@@ -1356,10 +1394,28 @@ async fn claude(
             return error(StatusCode::BAD_REQUEST, "invalid_request_error", m);
         }
     };
+    let key = match upstream_key(inner, &role.hops()[0]) {
+        Ok(k) => k.unwrap_or_default(),
+        Err(why) => {
+            tracing::warn!(
+                role = %role.alias(), upstream = role.upstream_kind_label(), reason = why.as_str(),
+                "the upstream's key file can't be used; nothing was sent"
+            );
+            event.status = 502;
+            return error(
+                StatusCode::BAD_GATEWAY,
+                "upstream_error",
+                format!(
+                    "the `{}` model (Claude test upstream) is unavailable",
+                    role.name
+                ),
+            );
+        }
+    };
     let res = inner
         .whole_http
         .post(format!("{}/v1/messages", role.upstream))
-        .header("x-api-key", &inner.anthropic_key)
+        .header("x-api-key", &key)
         .header("anthropic-version", anthropic::API_VERSION)
         .header("anthropic-beta", anthropic::FALLBACK_BETA)
         .json(&body)
@@ -1434,6 +1490,20 @@ async fn claude(
     } else {
         Json(answer).into_response()
     }
+}
+
+/// The key a hop's upstream is sent (slice MP2, §4.11): the one in its `key-file:`, else the
+/// environment's key for its kind (`PMOS_GATEWAY_REMOTE_KEY`, `PMOS_GATEWAY_ANTHROPIC_KEY`), or
+/// none for a local model server. `Err`: its key file can't be used, so nothing may be sent.
+fn upstream_key(inner: &Inner, hop: &Hop) -> Result<Option<String>, Unusable> {
+    if let Some(path) = &hop.key_file {
+        return inner.keys.get(path).map(Some);
+    }
+    Ok(match hop.kind {
+        UpstreamKind::RemoteOpenAi => Some(inner.remote_key.clone()),
+        UpstreamKind::ClaudeTest => Some(inner.anthropic_key.clone()),
+        UpstreamKind::OpenAi => None,
+    })
 }
 
 /// A transport error as the logs and callers see it (V3, slice H4): its kind only, never its
