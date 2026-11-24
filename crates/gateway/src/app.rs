@@ -1370,6 +1370,20 @@ async fn forward(
         .await;
     }
 
+    // §4.11 (slice MP8): a one-hop role whose model is disabled has no model left.
+    if disabled(inner, &role.hops()[0]) {
+        event.status = 503;
+        event.attempts = 0;
+        event.skipped = vec![crate::usage::Skipped {
+            label: role.reported_model().to_string(),
+            why: "disabled",
+        }];
+        event.latency_ms = started.elapsed().as_millis() as u64;
+        inner.usage.record(event);
+        drop(permit);
+        return finish(no_model_available(1));
+    }
+
     if role.kind == UpstreamKind::ClaudeTest {
         let res = claude(inner, &role, endpoint, &req, stream, &mut event).await;
         event.latency_ms = started.elapsed().as_millis() as u64;
@@ -1761,6 +1775,14 @@ async fn forward_routed(inner: &Inner, call: Routed) -> Response {
     for i in candidates {
         let hop = &hops[i];
         let label = hop.reported_model().to_string();
+        // §4.11 (slice MP8): `route disable` takes a model out of every route at once.
+        if disabled(inner, hop) {
+            skipped.push(crate::usage::Skipped {
+                label,
+                why: "disabled",
+            });
+            continue;
+        }
         if !crate::fallback::serves(
             hop,
             endpoint == Endpoint::Embeddings,

@@ -193,13 +193,16 @@ services:
       PMOS_MODEL_SOURCE: ${PMOS_MODEL_SOURCE:?run deploy/setup.sh first}
       PMOS_GATEWAY_CLOUD_TEST: ${PMOS_GATEWAY_CLOUD_TEST:-0}
       PMOS_GATEWAY_REMOTE_KEY: ${PMOS_GATEWAY_REMOTE_KEY:-}
-      PMOS_GATEWAY_TOKENS: runtime=${PMOS_GW_RUNTIME_TOKEN:?},evals=${PMOS_GW_EVALS_TOKEN:?},bot-docs=${PMOS_GW_DOCS_BOT_TOKEN:?},${PMOS_GW_BOT_TOKENS:-}
+      PMOS_GATEWAY_TOKENS: runtime=${PMOS_GW_RUNTIME_TOKEN:?},evals=${PMOS_GW_EVALS_TOKEN:?},bot-docs=${PMOS_GW_DOCS_BOT_TOKEN:?},${PMOS_GW_ADMIN_TOKEN:+admin=${PMOS_GW_ADMIN_TOKEN},}${PMOS_GW_BOT_TOKENS:-}
+      # Slice MP8: `pmos-admin route disable` writes here; read before every call.
+      PMOS_GATEWAY_ROUTE_CONTROL: /var/lib/pmos/route-control
       PMOS_GATEWAY_USAGE_LOG: /var/lib/pmos/usage/usage.jsonl
       # 1 until the model servers are up: answers with the stub model.
       PMOS_GATEWAY_STUB: ${PMOS_GATEWAY_STUB:-0}
     volumes:
       - ./gateway.yaml:/etc/pmos/gateway.yaml:ro
       - ${PMOS_STATE_DIR}/usage:/var/lib/pmos/usage
+      - ${PMOS_STATE_DIR}/route-control:/var/lib/pmos/route-control:ro
     healthcheck:
       <<: *health
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8740/healthz"]
@@ -218,6 +221,9 @@ services:
       # only for the database's held_real_data marker.
       PMOS_MODEL_SOURCE: ${PMOS_MODEL_SOURCE:?run deploy/setup.sh first}
       PMOS_CONNECTORS: ${PMOS_CONNECTORS:-fake}
+      # docs/model-providers-spec.md §4.10: a benchmarked bot answered by a fallback model is
+      # marked (mark, the default) or pinned to the primary (refuse).
+      PMOS_FALLBACK_FOR_BENCHMARKED: ${PMOS_FALLBACK_FOR_BENCHMARKED:-mark}
       # The console's and the web app's tokens are listed only when set.
       PMOS_BOTS_TOKENS: "slack=${PMOS_RT_SLACK_TOKEN:?},${PMOS_RT_CONSOLE_TOKEN:+console=${PMOS_RT_CONSOLE_TOKEN},}${PMOS_RT_WEB_TOKEN:+web=${PMOS_RT_WEB_TOKEN},}evals=${PMOS_RT_EVALS_TOKEN:?},worker-docs=${PMOS_RT_DOCS_WORKER_TOKEN:?},${PMOS_RT_WORKER_TOKENS:-}"
       PMOS_CONTENT_ROOT: /srv/content-repo/content

@@ -1802,6 +1802,27 @@ pub fn check_config(
     let models = Models::parse(&text, config.cloud_test)?;
     config.check_keys(&models)?;
     config.check_source(&models)?;
+    // §4.11: only the gateway reaches a provider, through the egress proxy; an upstream whose
+    // host NO_PROXY names would bypass it.
+    let no_proxy = get("NO_PROXY")
+        .or_else(|| get("no_proxy"))
+        .unwrap_or_default();
+    for r in models.roles.values() {
+        for h in r.hops().iter().filter(|h| h.kind.is_cloud_test()) {
+            let host = reqwest::Url::parse(&h.upstream)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+                .unwrap_or_default();
+            if no_proxy_matches(&no_proxy, &host) {
+                return Err(format!(
+                    "gateway config: role `{}`, model `{}`: its upstream's host is in NO_PROXY, \
+                     so its calls would bypass the egress proxy",
+                    r.name,
+                    h.reported_model()
+                ));
+            }
+        }
+    }
     let mut out = vec![format!(
         "ok: class {}, model source {}",
         models.class.as_str(),
@@ -1821,6 +1842,20 @@ pub fn check_config(
         ));
     }
     Ok(out.join("\n"))
+}
+
+/// Whether a `NO_PROXY` list (comma-separated: `*`, a host, or a domain with or without a
+/// leading `.`) covers `host`.
+pub fn no_proxy_matches(list: &str, host: &str) -> bool {
+    !host.is_empty()
+        && list
+            .split(',')
+            .map(|e| e.trim().to_ascii_lowercase())
+            .filter(|e| !e.is_empty())
+            .any(|e| {
+                let bare = e.trim_start_matches('.');
+                e == "*" || host == bare || host.ends_with(&format!(".{bare}"))
+            })
 }
 
 /// What a gateway reports as its source: `stub` with the stub on, else `source`.

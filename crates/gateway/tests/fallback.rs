@@ -983,3 +983,134 @@ async fn a_primary_only_client_never_falls_back() {
     assert_eq!(res.status(), 503);
     assert_eq!(gw.mocks[1].calls(), 0);
 }
+
+// Slice MP8 (§4.11, MP-14): `route disable` acts on the next call, without a restart.
+
+#[tokio::test]
+async fn a_disabled_model_leaves_every_route_on_the_next_call_and_comes_back_when_enabled() {
+    let gw = gateway(&[FULL, FULL], "").await;
+    let dir = gw.options.route_control.clone().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let off = dir.join("disabled-hosted-model-a");
+    std::fs::write(&off, "at=2026-11-24T00:00:00Z by=test reason=testing\n").unwrap();
+    let res = ask(&gw, hello(false)).send().await.unwrap();
+    assert_eq!(header(res.headers(), "x-pmos-model"), "hosted-model-b");
+    assert_eq!(gw.mocks[0].calls(), 0, "a disabled model is sent nothing");
+    let line = gw.usage.recent().last().unwrap().clone();
+    assert_eq!(line.skipped[0].why, "disabled");
+    let ready: Value = reqwest::get(format!("{}/readyz", gw.base))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(ready["upstreams"]["default"]["hops_usable"], 1);
+    let v: Value = routes(&gw, ADMIN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["roles"][0]["hops"][0]["disabled"], true);
+    // The last model of the role too: 503, nothing sent anywhere.
+    std::fs::write(dir.join("disabled-hosted-model-b"), "x\n").unwrap();
+    let before = gw.mocks[1].calls();
+    let res = ask(&gw, hello(false)).send().await.unwrap();
+    assert_eq!(res.status(), 503);
+    assert_eq!(gw.mocks[1].calls(), before);
+    // Enabled again: the primary answers.
+    std::fs::remove_file(&off).unwrap();
+    std::fs::remove_file(dir.join("disabled-hosted-model-b")).unwrap();
+    let res = ask(&gw, hello(false)).send().await.unwrap();
+    assert_eq!(header(res.headers(), "x-pmos-model"), "hosted-model-a");
+}
+
+#[tokio::test]
+async fn a_one_hop_roles_disabled_label_answers_503_and_sends_nothing() {
+    let (url, m) = start_mock().await;
+    let dir = std::env::temp_dir().join(format!("pmos-fallback-one-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("route-control")).unwrap();
+    let yaml = format!(
+        "upstreams: {{x: '{url}'}}\nroles: {{default: {{upstream: x, model: id-a, label: hosted-model-a}}}}\n"
+    );
+    let usage = Arc::new(UsageLog::new(None).unwrap());
+    let (base, _stop) = serve(router_with(
+        GatewayConfig {
+            models: Models::parse(&yaml, false).unwrap(),
+            clients: vec![Client {
+                name: "runtime".into(),
+                token: TOKEN.into(),
+            }],
+            usage: usage.clone(),
+            stub: false,
+            workarounds_on: true,
+            anthropic_key: String::new(),
+            remote_key: String::new(),
+            retry: Default::default(),
+            timeouts: Default::default(),
+            model_source: ModelSource::Local,
+        },
+        RouterOptions {
+            route_control: Some(dir.join("route-control")),
+            ..Default::default()
+        },
+    ))
+    .await;
+    let call = || {
+        reqwest::Client::new()
+            .post(format!("{base}/v1/chat/completions"))
+            .bearer_auth(TOKEN)
+            .header("x-pmos-model-source", "local")
+            .json(&hello(false))
+            .send()
+    };
+    assert_eq!(call().await.unwrap().status(), 200);
+    std::fs::write(dir.join("route-control/disabled-hosted-model-a"), "x\n").unwrap();
+    let res = call().await.unwrap();
+    assert_eq!(res.status(), 503);
+    let v: Value = res.json().await.unwrap();
+    assert_eq!(v["error"]["type"], "no_model_available");
+    assert_eq!(m.calls(), 1);
+}
+
+#[test]
+fn check_config_refuses_an_upstream_that_would_bypass_the_egress_proxy() {
+    use pmos_gateway::config::{check_config, no_proxy_matches};
+    assert!(no_proxy_matches(
+        "localhost,.example.invalid",
+        "a.example.invalid"
+    ));
+    assert!(no_proxy_matches("example.invalid", "a.example.invalid"));
+    assert!(no_proxy_matches("*", "anything"));
+    assert!(!no_proxy_matches(
+        "localhost,127.0.0.1,.pmos.internal",
+        "a.example.invalid"
+    ));
+    let dir = std::env::temp_dir().join(format!("pmos-check-np-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("gateway.yaml");
+    std::fs::write(
+        &path,
+        "class: test\nupstreams:\n  up-a: {url: 'openai+https://a.example.invalid/v1', key-file: /k/a}\n  \
+         up-b: {url: 'openai+https://b.example.invalid/v1', key-file: /k/b}\n\
+         models:\n  hosted-model-a: {upstream: up-a, model: id-a}\n  hosted-model-b: {upstream: up-b, model: id-b}\n\
+         roles:\n  default: {route: [hosted-model-a, hosted-model-b]}\n",
+    )
+    .unwrap();
+    let env = |np: &'static str| {
+        move |k: &str| match k {
+            "PMOS_MODEL_SOURCE" => Some("hosted-test".to_string()),
+            "PMOS_GATEWAY_CLOUD_TEST" => Some("1".to_string()),
+            "NO_PROXY" => Some(np.to_string()),
+            _ => None,
+        }
+    };
+    assert!(check_config(env("localhost,.pmos.internal"), Some(path.clone())).is_ok());
+    let err = check_config(env("localhost,b.example.invalid"), Some(path)).unwrap_err();
+    assert!(
+        err.contains("hosted-model-b") && err.contains("NO_PROXY"),
+        "{err}"
+    );
+    assert!(!err.contains("b.example.invalid"), "{err}");
+}

@@ -67,6 +67,105 @@ that call, and neither its body nor its `Location` reaches the caller.
 **Readiness of a remote test upstream.** `/readyz`'s probe of a testing-only upstream (it carries
 the provider's key) is reused for at least 30 seconds, however many callers ask.
 
+## Routes: switching and automatic fallback (requirement i)
+
+Slices MP1 to MP8 of `docs/model-providers-spec.md`, **built before review** (owner's
+instruction of 2026-11-24). A role may name an ordered **route** of labelled models: the
+**primary** first, then **fallbacks**, tried only when an earlier one fails on the upstream's
+side. A role in the one-hop form (`{upstream, model, label, workarounds}`) is unchanged: its
+retries are still `PMOS_GATEWAY_RETRY_*`, it has no circuit, its errors are returned as before.
+
+```yaml
+class: test                      # hosted-test; written outside the repo ($PMOS_STATE_DIR)
+upstreams:
+  up-a: {url: "openai+https://<host>/<base>", key-file: /run/secrets/pmos-upstream-up-a.key,
+         max-in-flight: 4}
+  up-b: {url: "openai+https://<host>/<base>", key-file: /run/secrets/pmos-upstream-up-b.key}
+models:
+  hosted-model-a: {upstream: up-a, model: "<id>", features: [tools, stream, json],
+                   context-tokens: 200000, workarounds: []}
+  hosted-model-b: {upstream: up-b, model: "<id>", features: [tools, stream, json],
+                   context-tokens: 128000}
+roles:
+  default:   {route: [hosted-model-a, hosted-model-b], requires: [tools, stream],
+              allow-smaller-context: true}
+  extraction: {route: [hosted-model-b], requires: [json]}
+routing:                         # all optional; these are the defaults
+  same-hop-attempts: 2
+  budget-secs: 30
+  first-token-secs: 60
+  short-retry-after-secs: 5
+  circuit: {failures: 3, cool-down-secs: 30, max-cool-down-secs: 300}
+  sticky-per-run: true
+clients:
+  evals: {route: pin}            # fallback (default), primary-only or pin
+```
+
+- **Start-up refusals** (by role and label, never a URL, host, upstream key or model id): an
+  unknown or repeated label, an empty route, both forms on one role, a label that is a role's
+  name or another one-hop role's label, a model lacking a `requires:` feature, a fallback with a
+  smaller (or no) `context-tokens` than the primary without `allow-smaller-context`, an unknown
+  feature, and **every hop must pass the source's own rules**: under `local` only the two pinned
+  model servers (a remote or unpinned fallback refuses to start); under `hosted-test` https and a
+  label. A fallback therefore never crosses a source, an approval or a data class. `hosted`
+  routes wait for slice H12 (MP9, MP10). `pmos-gateway --check-config [path]` runs every check
+  against this environment (and refuses a remote upstream whose host `NO_PROXY` names) and prints
+  labels only.
+- **Keys** (MP2): `key-file:` per upstream, read by the gateway only, re-read on a change of size
+  or modification time (once a second at most) and on `SIGHUP`; a missing, empty, unreadable or
+  group/other-readable file sends that upstream nothing. `PMOS_GATEWAY_REMOTE_KEY` stays for one
+  remote upstream and is refused beside two or more, or beside a `key-file:`. A local model
+  server takes no key file.
+- **What moves to the next hop** (MP3): a connect failure or timeout, `429`/`503`/`529` (a short
+  `Retry-After` is waited for on the same hop; a longer one, a missing one after
+  `same-hop-attempts`, or an unrecoverable quota moves on), other `5xx`, `404` or a `400`/`422`
+  saying the model is not found or retired, `401`/`403`, a `3xx`, a `200` that isn't JSON, and a
+  stream with no first content within `first-token-secs` (or 64 KiB). **Never:** a client's own
+  `4xx` and a refusal (`content_filter`), which are answers. Each hop gets `same-hop-attempts`;
+  nothing starts after `budget-secs`. Nothing left: `503 no_model_available` (naming no hop) with
+  `Retry-After` the soonest cool-down's end.
+- **Streams commit at their first content** (a non-empty `content`, `reasoning_content` or
+  `tool_calls` delta, or a finish reason). Events before it are held, not sent; after it nothing
+  is repeated or continued by another model: a break ends the stream with an error.
+- **Every answer** says who answered: `x-pmos-model` (the answering label),
+  `x-pmos-model-sha256`, `x-pmos-route-hop` (1-based) and `x-pmos-fallback` (`0`/`1`); a one-hop
+  role's are always hop 1. Error bodies are the neutral ones. Each upstream gets only its own key
+  and its own tool-call `extra_content`.
+- **Circuits** (MP4), routed roles only: per model and per upstream, closed → open after
+  `failures` in a row (or at once for a long `Retry-After`, a quota, a key refused, a redirect, a
+  model unavailable) → half-open after the cool-down (doubling up to the maximum), one real call
+  at a time. No synthetic probes; in memory only.
+- **Capacity** (MP5): `upstreams.<u>.max-in-flight` is waited for like a slot; busy never
+  changes the model. With `sticky-per-run`, a run (`X-Pmos-Run`) keeps for 15 minutes to the hop
+  that answered it.
+- **Who may fall back** (MP6): `clients.<…>.route`. Only a `pin` client may send
+  `X-Pmos-Route-Model: <label>` (any other: `403`, nothing sent); any client may send
+  `X-Pmos-Fallback: off` to keep the primary. The evals client is `pin` in every shipped config;
+  judges send `X-Pmos-Fallback: off`, and the runtime pins every eval task's calls the same way.
+  A report records which labels answered (`route`); one with a fallback answer, or a label that
+  is no primary's, counts for no bar (`docs/evals.md`, "Which runs count").
+- **The mark** (MP7): the harness reads the three headers on every answer and reports
+  `models_used` and `fallback_used` with the task; the web app (the reply and the thread's draft
+  cards) and Slack (the reply and each draft card) show "Answered by a fallback model: not
+  benchmarked for this bot". `PMOS_FALLBACK_FOR_BENCHMARKED=refuse` (runtime) pins a benchmarked
+  bot's calls to the primary instead (default `mark`; Preview bots and Nudge are always `mark`).
+- **Operation** (MP8): `pmos-admin route disable <label> --reason <text>` (and `route enable`)
+  writes `$PMOS_STATE_DIR/route-control/disabled-<label>`, looked at before every call
+  (`PMOS_GATEWAY_ROUTE_CONTROL`); a role with no model left answers `503`. `pmos-admin routes`
+  reads `GET /v1/pmos/routes` with the read-only `admin` client (`PMOS_GW_ADMIN_TOKEN`), which
+  the gateway refuses on every model route. `pmos-admin status` shows each role `ok`, `degraded
+  (on fallback)` or `DOWN`. `pmos-admin usage --by-label` sums tokens per label, priced from
+  `$PMOS_STATE_DIR/prices.yaml`. `pmos-admin upstream-key set <u>` reads a key from standard
+  input into `deploy/secrets/upstream-<u>.key` (mounted by a Compose secret into the gateway
+  only). With `PMOS_HOSTED_TEST_ROUTES=1` the operator writes the route config at
+  `$PMOS_STATE_DIR/gateway.hosted-test.yaml` and `up` checks it with `--check-config` first.
+- **Usage log**: one line per attempt with `hop`, `fallback`, `reason` (failed attempts),
+  `skipped` (final line) and, under `hosted-test`, `upstream_sha256`.
+
+Not verified: a stack run with two mock or real test upstreams (no Docker here), whether real
+providers accept each other's tool-call ids in history, and that the gateway container's user can
+read a key file mounted with mode 600.
+
 ## Swapping a model (D11)
 Edit `config/gateway.yaml` and restart the gateway.
 
@@ -380,6 +479,7 @@ moment. The gateway retries these itself, so a brief limit doesn't lose a PM's r
 | `GET /v1/models` | client token | The role aliases |
 | `GET /v1/pmos/workarounds` | client token | The workaround registry |
 | `GET /v1/pmos/roles` | client token | The gateway's `class` (`production` or `test`), each role's model id (its `label` when it has one, with `model_sha256` beside it) and upstream kind (`local`, `claude-test` or `remote-test`; never an address), and whether the stub, a testing-only upstream and the workarounds are on. The bot runtime passes it to the benchmark runner (`GET /v1/personas`, client `evals`), which records it in each report (`docs/evals.md`). |
+| `GET /v1/pmos/routes` | the `admin` client only | Each role's hops: label, `model_sha256`, kind, circuit (`closed`, `open` with `open_secs`, `half-open`; `none` for a one-hop role), `disabled`, `stopped`, last probe. Never an address, upstream key or model id. |
 | `GET /healthz` | none | Liveness |
 | `GET /readyz` | none | `200` when every model server answers `/models` within 2 seconds; `503` when one doesn't. `upstreams` is keyed by role, each with its upstream's kind label (`local`, `claude-test`, `remote-test`, as in `GET /v1/pmos/roles`) and `ok` or `down`: `{"default": {"upstream": "local", "status": "ok"}, …}`. Labels only, never an address, host name, URL or key (review at 6bb806f: before, the keys were the model servers' base URLs, so this unauthenticated route named their hosts and a remote test upstream's provider). Every answer also has `class` (as served: `test` with the stub on) and `stub` (G2); with the stub on it is always `200`, has no `upstreams`, and asks no model server. `deploy/pmos-admin status` shows a `WARN` line for the gateway when `stub` is true or `class` isn't `production`. Docker's health check uses `/healthz`, so neither changes whether the stack starts. |
 
@@ -508,7 +608,8 @@ It never holds prompts or answers. Events go to the service log, and with `PMOS_
 | `PMOS_GATEWAY_RETRY_BASE_MS` | `1000` | First backoff when there is no `Retry-After`; doubles each try |
 | `PMOS_GATEWAY_CLOUD_TEST` | off | **Testing only.** `1` accepts the Claude test upstream and remote test upstreams (below) |
 | `PMOS_GATEWAY_ANTHROPIC_KEY` | none | **Testing only.** The Claude API key for the Claude test upstream |
-| `PMOS_GATEWAY_REMOTE_KEY` | none | **Testing only.** The API key for remote test upstreams (`openai+https://…`), sent as `Authorization: Bearer`. Never logged. |
+| `PMOS_GATEWAY_REMOTE_KEY` | none | **Testing only.** The API key for remote test upstreams (`openai+https://…`), sent as `Authorization: Bearer`. Never logged. Refused beside two or more remote upstreams, or beside a `key-file:` ("Routes"). |
+| `PMOS_GATEWAY_ROUTE_CONTROL` | none | The directory `pmos-admin route disable` writes `disabled-<label>` files in ("Routes") |
 
 **In the config file** (`limits:` and `clients:`; every setting is optional, and the defaults
 bound every client, wait, stream and answer):
