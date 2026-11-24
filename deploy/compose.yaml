@@ -147,6 +147,10 @@ services:
       PMOS_AUDIT_RETENTION_DAYS: ${PMOS_AUDIT_RETENTION_DAYS:-90}
       # Deactivations the web app and Slack may make in an hour (1 to 10); past it, host only.
       PMOS_USERS_DEACTIVATIONS_PER_HOUR: ${PMOS_USERS_DEACTIVATIONS_PER_HOUR:-3}
+      # The sandbox-audit collector's own token (docs/openshell-prover-and-sandbox-audit-spec.md
+      # §B.2): it may append sandbox decisions and nothing else. Blank (the default): off, its
+      # routes answer 404. `deploy/pmos-admin sandbox-audit configure` sets it.
+      PMOS_SANDBOX_AUDIT_TOKEN: ${PMOS_SANDBOX_AUDIT_TOKEN:-}
     volumes:
       # The content checkout: the tool server pulls it (content sync), the others read it.
       - ${PMOS_CONTENT_CHECKOUT:?}:/srv/content-repo
@@ -171,6 +175,36 @@ services:
     restart: "no"
     networks: !override [pmos]
     ports: !reset []
+
+  # OpenShell's own record of each sandbox's decisions, into the audit log (profile
+  # `sandbox-audit`, off unless configured: docs/openshell-prover-and-sandbox-audit-spec.md
+  # Part B). A push receiver, not a reader: OpenShell's OTLP log export posts to it on the
+  # host's 127.0.0.1:8780 with the header token in the headers file below; it posts batches to
+  # the tool server with its own append-only token. Its own uid (10002, made in the image), no
+  # Docker socket, no OpenShell configuration, no `openshell` command, no pinned address, on no
+  # sandbox policy (a sandbox never reaches loopback). `deploy/pmos-admin sandbox-audit
+  # configure` makes both tokens and prints OpenShell's settings; `check` verifies them.
+  # Verify on a real host (slice B6): that OpenShell's supervisors reach 127.0.0.1:8780.
+  sandbox-audit:
+    <<: *service
+    command: ["pmos-sandbox-audit"]
+    profiles: [sandbox-audit]
+    user: "10002:${PMOS_GID:-10001}"
+    ports: ["127.0.0.1:${PMOS_SANDBOX_AUDIT_PORT:-8780}:8780"]
+    environment:
+      PMOS_SANDBOX_AUDIT_BIND: 0.0.0.0:8780
+      PMOS_SANDBOX_AUDIT_TOKEN: ${PMOS_SANDBOX_AUDIT_TOKEN:-}
+      PMOS_SANDBOX_AUDIT_OTLP_TOKEN_FILE: /run/pmos-sandbox-audit/otlp-ocsf.headers
+      PMOS_TOOLSERVER_URL: http://toolserver.pmos.internal:8710
+      PMOS_SANDBOX_AUDIT_SPOOL: /var/lib/pmos-sandbox-audit/spool
+      # The OpenShell version the record format was last verified on (deploy/openshell-prover.lock,
+      # OPENSHELL_FORMAT_VERIFIED): any other is reported once as "format unverified".
+      PMOS_SANDBOX_AUDIT_FORMAT_VERIFIED: ${PMOS_SANDBOX_AUDIT_FORMAT_VERIFIED:-}
+    volumes:
+      - ${PMOS_STATE_DIR:?}/secrets/otlp-ocsf.headers:/run/pmos-sandbox-audit/otlp-ocsf.headers:ro
+      - sandbox-audit-spool:/var/lib/pmos-sandbox-audit
+    depends_on:
+      toolserver: { condition: service_healthy }
 
   gateway:
     <<: *service
@@ -567,3 +601,5 @@ networks:
 volumes:
   pgdata: {}
   hf-cache: {}
+  # The sandbox-audit collector's spool (64 MiB at most), owned by its uid in the image.
+  sandbox-audit-spool: {}

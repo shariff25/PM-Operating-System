@@ -28,6 +28,9 @@
 #   pmos-admin policy prove <bot> | --all
 #                                     OpenShell's pinned policy prover on each sandbox's effective
 #                                     policy, recorded for Policy Admin (as the gateway's user)
+#   pmos-admin sandbox-audit configure|check|up
+#                                     OpenShell's own sandbox decisions into the audit log: the
+#                                     collector's tokens, OpenShell's export settings, the service
 #   pmos-admin pause <bot> / resume <bot>
 #                                     stop or restart a bot's sandbox and its worker unit
 #   pmos-admin host-names apply       (with sudo) write the managed block in /etc/hosts that maps
@@ -1036,7 +1039,7 @@ uid_checks() {
 # is refused. `status`, `smoke`, `reindex`, `revoke`, `ledger` and the eval stack call these.
 port_checks() {
   local k d v
-  for k in TOOLSERVER:8710 GATEWAY:8740 BOTS:8750 CONSOLE:8760 WEB:8770; do
+  for k in TOOLSERVER:8710 GATEWAY:8740 BOTS:8750 CONSOLE:8760 WEB:8770 SANDBOX_AUDIT:8780; do
     d=${k#*:}
     k=PMOS_${k%%:*}_PORT
     v=${!k:-}
@@ -2563,6 +2566,102 @@ for g in s["groups"]:
     done
     [ "$failed" = 0 ] && say "every bot proved" || say "not every bot is proved: only \`proved\` passes (Policy Admin shows each result)" >&2
     exit "$failed"
+    ;;
+
+  sandbox-audit)
+    # OpenShell's own sandbox decisions into the audit log (slice B3;
+    # docs/openshell-prover-and-sandbox-audit-spec.md Part B). Off unless configured.
+    #   configure  make the collector's tool-server token (PMOS_SANDBOX_AUDIT_TOKEN in
+    #              deploy/.env) and OpenShell's header token (the headers file, mode 640), and
+    #              print the gateway.toml lines; no token is printed
+    #   check      the tokens are there and OpenShell's gateway.toml has every line, and no trace
+    #              export; exits 1 naming each problem
+    #   up         after check: (re)start the tool server with the token and the collector
+    # Verify on a real host (slice B6): the gateway.toml path (PMOS_OPENSHELL_GATEWAY_TOML, else
+    # ~/.config/openshell/gateway.toml), and that OpenShell reads `headers_file` as written here.
+    audit_usage() { say "usage: pmos-admin sandbox-audit configure|check|up" >&2; exit 2; }
+    [ $# -eq 1 ] || audit_usage
+    headers="${PMOS_STATE_DIR:?run deploy/setup.sh first}/secrets/otlp-ocsf.headers"
+    port=${PMOS_SANDBOX_AUDIT_PORT:-8780}
+    toml=${PMOS_OPENSHELL_GATEWAY_TOML:-${XDG_CONFIG_HOME:-$HOME/.config}/openshell/gateway.toml}
+    expected_lines() {
+      printf '%s\n' '[openshell.gateway.otlp.ocsf]' 'enabled = true' \
+        "endpoint = \"http://127.0.0.1:$port\"" 'protocol = "http/protobuf"' \
+        "headers_file = \"$headers\""
+    }
+    audit_problems() {
+      local probs=() line section
+      is_set PMOS_SANDBOX_AUDIT_TOKEN && token_ok PMOS_SANDBOX_AUDIT_TOKEN 2>/dev/null ||
+        probs+=("PMOS_SANDBOX_AUDIT_TOKEN isn't set in deploy/.env: run deploy/pmos-admin sandbox-audit configure")
+      if [ ! -f "$headers" ]; then
+        probs+=("no headers file at $headers: run deploy/pmos-admin sandbox-audit configure")
+      else
+        case "$(stat -c %a "$headers")" in 600 | 640 | 400 | 440) ;; *) probs+=("$headers must be mode 640 or stricter (it holds OpenShell's header token)") ;; esac
+        grep -qE '^authorization=Bearer [0-9a-f]{48}$' "$headers" || probs+=("$headers isn't one line authorization=Bearer <token>")
+      fi
+      if [ ! -f "$toml" ]; then
+        probs+=("no OpenShell gateway configuration at $toml (set PMOS_OPENSHELL_GATEWAY_TOML)")
+      else
+        # The section's own lines, as data: from its header to the next section.
+        section=$(awk '/^[[:space:]]*\[/ { on = ($0 ~ /^[[:space:]]*\[openshell\.gateway\.otlp\.ocsf\][[:space:]]*$/) } on { sub(/[[:space:]]*#.*/, ""); gsub(/^[[:space:]]+|[[:space:]]+$/, ""); gsub(/[[:space:]]*=[[:space:]]*/, " = "); if ($0 != "") print }' "$toml")
+        while IFS= read -r line; do
+          grep -qxF -- "$line" <<<"$section" || probs+=("$toml lacks: $line")
+        done < <(expected_lines)
+        # No trace or agent-trace export: [openshell.gateway.otlp] with an endpoint.
+        if awk '/^[[:space:]]*\[/ { on = ($0 ~ /^[[:space:]]*\[openshell\.gateway\.otlp\][[:space:]]*$/) } on && /^[[:space:]]*endpoint[[:space:]]*=/ { f = 1 } END { exit !f }' "$toml"; then
+          probs+=("$toml sets [openshell.gateway.otlp] endpoint: no traces may be exported, only [openshell.gateway.otlp.ocsf]")
+        fi
+      fi
+      [ ${#probs[@]} -eq 0 ] || { printf '%s\n' "${probs[@]}"; return 1; }
+    }
+    case "$1" in
+      configure)
+        if is_set PMOS_SANDBOX_AUDIT_TOKEN; then
+          say "PMOS_SANDBOX_AUDIT_TOKEN in deploy/.env is kept"
+        else
+          set_env PMOS_SANDBOX_AUDIT_TOKEN "$(openssl rand -hex 24)"
+          say "wrote PMOS_SANDBOX_AUDIT_TOKEN to deploy/.env (the collector's own token; not shown)"
+        fi
+        if [ -f "$headers" ] && grep -qE '^authorization=Bearer [0-9a-f]{48}$' "$headers"; then
+          say "$headers is kept"
+        else
+          mkdir -p "$(dirname "$headers")"
+          if ! (umask 027 && printf 'authorization=Bearer %s\n' "$(openssl rand -hex 24)" >"$headers.new" &&
+            chmod 640 "$headers.new" && mv -f "$headers.new" "$headers"); then
+            rm -f "$headers.new"
+            say "couldn't write $headers" >&2
+            exit 1
+          fi
+          say "wrote $headers (OpenShell's header token, mode 640; not shown)"
+        fi
+        # The collector reads it as group ${PMOS_GID:-10001}; OpenShell's gateway as its owner.
+        chgrp "${PMOS_GID:-10001}" "$headers" 2>/dev/null ||
+          say "couldn't give $headers to group ${PMOS_GID:-10001}: run sudo chgrp ${PMOS_GID:-10001} '$headers'" >&2
+        say ""
+        say "Add this to OpenShell's gateway configuration ($toml), with no [openshell.gateway.otlp]"
+        say "endpoint (no traces), then restart OpenShell's gateway and run deploy/pmos-admin sandbox-audit check:"
+        say ""
+        expected_lines
+        ;;
+      check)
+        if ! problems=$(audit_problems); then
+          say "pmos-admin sandbox-audit check: OpenShell's export to the collector isn't set up:" >&2
+          sed 's/^/  /' <<<"$problems" >&2
+          exit 1
+        fi
+        say "sandbox-audit: the tokens are set and $toml exports OCSF records (and only them) to 127.0.0.1:$port"
+        ;;
+      up)
+        if ! problems=$(audit_problems); then
+          say "pmos-admin sandbox-audit up: refused, the check fails:" >&2
+          sed 's/^/  /' <<<"$problems" >&2
+          exit 1
+        fi
+        compose --profile sandbox-audit up -d toolserver sandbox-audit
+        say "the collector is up on 127.0.0.1:$port; the tool server accepts its token"
+        ;;
+      *) audit_usage ;;
+    esac
     ;;
 
   host-names)
