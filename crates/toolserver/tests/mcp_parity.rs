@@ -247,6 +247,7 @@ async fn the_fake_mcp_mode_serves_jira_through_the_tool_server_as_the_fakes_do()
         pmos_toolserver::mcp_client::start_fake(Some(stores.audit.clone()), cancel.clone())
             .await
             .unwrap();
+    let jira = jira.connectors;
     assert_eq!(jira[0].mode(), "fake-mcp");
     let catalog =
         pmos_toolserver::catalog::Catalog::load(root, chrono::Utc::now().date_naive()).unwrap();

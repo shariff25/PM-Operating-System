@@ -519,6 +519,11 @@ pub struct ToolService {
     /// tool call (`crate::model_source`). `main` always sets it; `None` (tests that run no
     /// gateway) checks nothing.
     model_source: Option<Arc<crate::model_source::SourceGuard>>,
+    /// Per-PM OAuth to MCP servers (`crate::mcp_client::oauth`), with live connectors and at
+    /// least one `oauth_per_user` record. `None`: its routes answer 404.
+    mcp_oauth: Option<Arc<crate::mcp_client::oauth::McpOAuth>>,
+    /// The MCP servers in use, for Policy Admin's view.
+    mcp_servers: Vec<Arc<crate::mcp_client::McpServer>>,
 }
 
 /// The most (kind, person) marks [`ToolService::first_in_window`] keeps.
@@ -578,7 +583,29 @@ impl ToolService {
             team_changes: Mutex::default(),
             quiet_marks: Mutex::default(),
             model_source: None,
+            mcp_oauth: None,
+            mcp_servers: Vec::new(),
         })
+    }
+
+    /// Per-PM OAuth to MCP servers.
+    pub fn with_mcp_oauth(mut self, oauth: Arc<crate::mcp_client::oauth::McpOAuth>) -> Self {
+        self.mcp_oauth = Some(oauth);
+        self
+    }
+
+    pub fn mcp_oauth(&self) -> Option<&Arc<crate::mcp_client::oauth::McpOAuth>> {
+        self.mcp_oauth.as_ref()
+    }
+
+    /// The MCP servers this tool server reaches, for Policy Admin's view.
+    pub fn with_mcp_servers(mut self, servers: Vec<Arc<crate::mcp_client::McpServer>>) -> Self {
+        self.mcp_servers = servers;
+        self
+    }
+
+    pub fn mcp_servers(&self) -> &[Arc<crate::mcp_client::McpServer>] {
+        &self.mcp_servers
     }
 
     /// Check the model gateway's source at every session open and tool call (slice H4).

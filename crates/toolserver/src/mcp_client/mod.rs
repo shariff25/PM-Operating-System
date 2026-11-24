@@ -130,7 +130,7 @@ pub fn connectors_for(
     tokens: Option<Arc<dyn UserTokens>>,
     audit: Option<Arc<dyn AuditSink>>,
     routes: &transport::TestRoutes,
-) -> Result<Vec<Arc<dyn Connector>>, String> {
+) -> Result<Served, String> {
     let mut out: Vec<Arc<dyn Connector>> = Vec::new();
     let mut servers: Vec<Arc<McpServer>> = Vec::new();
     for system in systems {
@@ -161,7 +161,16 @@ pub fn connectors_for(
         };
         out.push(Arc::new(McpConnector::new(system, server, "mcp")?));
     }
-    Ok(out)
+    Ok(Served {
+        connectors: out,
+        servers,
+    })
+}
+
+/// Connectors served over MCP, and the servers behind them (for Policy Admin's view).
+pub struct Served {
+    pub connectors: Vec<Arc<dyn Connector>>,
+    pub servers: Vec<Arc<McpServer>>,
 }
 
 /// `PMOS_CONNECTORS=fake-mcp`: the fake server in this process on a loopback port, with a fresh
@@ -170,7 +179,7 @@ pub fn connectors_for(
 pub async fn start_fake(
     audit: Option<Arc<dyn AuditSink>>,
     cancel: tokio_util::sync::CancellationToken,
-) -> Result<(Vec<Arc<dyn Connector>>, fake::FakeMcp), String> {
+) -> Result<(Served, fake::FakeMcp), String> {
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes).map_err(|e| format!("random token: {e}"))?;
     let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
@@ -195,6 +204,13 @@ pub async fn start_fake(
         audit,
         &transport::TestRoutes::default(),
     )?);
-    let connector: Arc<dyn Connector> = Arc::new(McpConnector::new("jira", server, "fake-mcp")?);
-    Ok((vec![connector], fake))
+    let connector: Arc<dyn Connector> =
+        Arc::new(McpConnector::new("jira", server.clone(), "fake-mcp")?);
+    Ok((
+        Served {
+            connectors: vec![connector],
+            servers: vec![server],
+        },
+        fake,
+    ))
 }

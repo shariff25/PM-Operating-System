@@ -51,6 +51,12 @@ type Client = RunningService<RoleClient, RefusingHandler>;
 #[async_trait]
 pub trait UserTokens: Send + Sync {
     async fn token(&self, user: &str, server: &str) -> Result<Secret, ConnectorError>;
+
+    /// The scopes `user`'s grant at `server` gave, when known.
+    async fn granted(&self, user: &str, server: &str) -> Option<Vec<String>> {
+        let _ = (user, server);
+        None
+    }
 }
 
 /// How the tool server authenticates to a server.
@@ -296,6 +302,17 @@ impl McpServer {
         args: Map<String, Value>,
         kind: CallKind,
     ) -> Result<Value, ConnectorError> {
+        // A tool that needs a scope the grant didn't give: "reconnect", nothing sent.
+        if let ServerAuth::PerUser(tokens) = &self.auth {
+            if let Some(granted) = tokens.granted(reader, &self.record.id).await {
+                if let Some(missing) = mapping.scopes.iter().find(|s| !granted.contains(s)) {
+                    return Err(ConnectorError::Reconnect(format!(
+                        "reconnect your {} account in PM OS: it doesn't allow `{missing}`, which {} needs",
+                        self.record.id, mapping.registry
+                    )));
+                }
+            }
+        }
         self.call_upstream(
             reader,
             &mapping.upstream,

@@ -275,6 +275,10 @@ pub fn router_full(
         .route("/call", post(call_tool))
         .route("/ledger", get(ledger))
         .route("/oauth/{provider}/start", get(oauth_start))
+        // Per-PM OAuth to MCP servers (`docs/mcp-servers-spec.md` §2.7): the same clients and
+        // rules as linking any account.
+        .route("/mcp/oauth/{server}/start", get(mcp_oauth_start))
+        .route("/mcp/links", get(mcp_links))
         .route("/memory/repo", post(set_memory_repo).get(get_memory_repo))
         .route(
             "/members/requests",
@@ -330,6 +334,7 @@ pub fn router_full(
         .route("/readyz", get(readyz))
         // Public: the PM's browser lands here from Atlassian or Slack.
         .route("/oauth/{provider}/callback", get(oauth_callback))
+        .route("/oauth/mcp/{server}/callback", get(mcp_oauth_callback))
         .nest("/internal", internal)
         .nest("/mcp", mcp)
         .with_state(state)
@@ -1564,6 +1569,136 @@ async fn oauth_callback(
         }
         Err(e) => {
             tracing::warn!(provider = %provider, error = %e, "account linking failed");
+            page(
+                StatusCode::BAD_GATEWAY,
+                "Not connected",
+                "PM OS couldn't finish connecting. Try again, or ask a platform owner.",
+            )
+        }
+    }
+}
+
+/// Per-PM OAuth to MCP servers, if on here.
+fn mcp_linking(state: &AppState) -> Option<Arc<crate::mcp_client::oauth::McpOAuth>> {
+    state.svc.mcp_oauth().cloned()
+}
+
+fn mcp_linking_off() -> Response {
+    error(
+        StatusCode::NOT_FOUND,
+        "no MCP server here takes per-user accounts",
+    )
+}
+
+/// The URL to send a PM to so they can link their account at an MCP server: the same
+/// clients and limits as [`oauth_start`].
+async fn mcp_oauth_start(
+    State(state): State<AppState>,
+    Extension(client): Extension<Client>,
+    Path(server): Path<String>,
+    Query(q): Query<UserQuery>,
+) -> Response {
+    use crate::mcp_client::oauth::McpOAuthError;
+    if client != Client::Orchestrator {
+        if q.user.starts_with(BOT_IDENTITY_PREFIX) {
+            return error(
+                StatusCode::FORBIDDEN,
+                "only a platform owner links a team bot's account",
+            );
+        }
+        match state.svc.people().allows(&q.user).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return error(
+                    StatusCode::FORBIDDEN,
+                    "this token may get link URLs for team members only",
+                )
+            }
+            Err(e) => return unavailable(e),
+        }
+    }
+    let Some(oauth) = mcp_linking(&state) else {
+        return mcp_linking_off();
+    };
+    match oauth.authorize_url(&q.user, &server, Utc::now()).await {
+        Ok(url) => Json(json!({ "url": url })).into_response(),
+        Err(e @ McpOAuthError::NotConfigured(_)) => error(StatusCode::NOT_FOUND, e.to_string()),
+        Err(e @ McpOAuthError::Metadata(_)) => {
+            tracing::error!(server = %server, error = %e, "MCP server metadata refused");
+            error(StatusCode::BAD_GATEWAY, e.to_string())
+        }
+        Err(McpOAuthError::Store(e)) => unavailable(StoreError(e)),
+        Err(e) => error(StatusCode::BAD_REQUEST, e.to_string()),
+    }
+}
+
+/// A PM's links to MCP servers: linked or not, the account, scopes the grant lacks.
+async fn mcp_links(
+    State(state): State<AppState>,
+    Extension(client): Extension<Client>,
+    Query(q): Query<UserQuery>,
+) -> Response {
+    if client != Client::Orchestrator {
+        match state.svc.people().allows(&q.user).await {
+            Ok(true) => {}
+            Ok(false) => return error(StatusCode::FORBIDDEN, "team members only"),
+            Err(e) => return unavailable(e),
+        }
+    }
+    let Some(oauth) = state.svc.mcp_oauth().cloned() else {
+        return Json(json!({ "links": [] })).into_response();
+    };
+    match oauth.links(&q.user).await {
+        Ok(links) => Json(json!({ "links": links })).into_response(),
+        Err(e) => error(StatusCode::SERVICE_UNAVAILABLE, e.to_string()),
+    }
+}
+
+/// Where an MCP server's authorization server sends the PM back. Public: it says little.
+async fn mcp_oauth_callback(
+    State(state): State<AppState>,
+    Path(server): Path<String>,
+    Query(q): Query<CallbackQuery>,
+) -> Response {
+    use crate::mcp_client::oauth::McpOAuthError;
+    let Some(oauth) = mcp_linking(&state) else {
+        return mcp_linking_off();
+    };
+    if q.error.is_some() {
+        return page(
+            StatusCode::BAD_REQUEST,
+            "Not connected",
+            "The connection was cancelled. You can close this tab and start again from PM OS.",
+        );
+    }
+    let (Some(code), Some(st)) = (q.code, q.state) else {
+        return page(
+            StatusCode::BAD_REQUEST,
+            "Not connected",
+            "This link is incomplete.",
+        );
+    };
+    match oauth.complete(&server, &code, &st, Utc::now()).await {
+        Ok(_) => page(
+            StatusCode::OK,
+            "Connected",
+            "PM OS will act as you, with your own permissions. You can close this tab.",
+        ),
+        Err(McpOAuthError::BadState) => page(
+            StatusCode::BAD_REQUEST,
+            "Link expired",
+            "This sign-in link is invalid or has expired. Start again from PM OS.",
+        ),
+        Err(e @ McpOAuthError::WrongAccount(_)) => {
+            tracing::warn!(server = %server, error = %e, "MCP account linking refused");
+            page(
+                StatusCode::FORBIDDEN,
+                "Not connected",
+                "That account isn't yours in PM OS. Sign in with your own account and try again.",
+            )
+        }
+        Err(e) => {
+            tracing::warn!(server = %server, error = %e, "MCP account linking failed");
             page(
                 StatusCode::BAD_GATEWAY,
                 "Not connected",
