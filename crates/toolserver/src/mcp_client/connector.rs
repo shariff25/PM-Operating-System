@@ -22,6 +22,10 @@ use crate::connectors::{
     rollup, Caller, Connector, ConnectorError, Item, Route, SourceRef, TeamBot,
 };
 
+/// What a team bot's Slack search asks the server for: results outside its channels are
+/// dropped afterwards, then the search is cut to the limit the bot asked for.
+const SCOPED_SEARCH_LIMIT: u64 = 50;
+
 /// One system, served by one server's record.
 pub struct McpConnector {
     system: String,
@@ -93,6 +97,12 @@ impl McpConnector {
                 bot.confluence_spaces()?;
             }
             ("slack", "read_thread") => bot.check_channel(arg(&args, "channel")?)?,
+            ("slack", "search") => {
+                bot.slack_channels()?;
+                // Results outside the scope are dropped after the call, so ask for the most
+                // and cut to the limit asked for after dropping them (`read`).
+                args["limit"] = json!(SCOPED_SEARCH_LIMIT);
+            }
             ("slack", _) => {
                 bot.slack_channels()?;
             }
@@ -231,6 +241,7 @@ impl Connector for McpConnector {
         args: &Value,
     ) -> Result<Vec<Item>, ConnectorError> {
         let mapping = self.mapping(action, ToolClass::Read)?;
+        let original = args;
         let args = match caller.team_bot {
             Some(bot) => self.scope_args(bot, action, args)?,
             None => args.clone(),
@@ -248,10 +259,16 @@ impl Connector for McpConnector {
             return Ok(items);
         };
         if action == "search" {
-            // Results outside the scope are dropped after the call.
+            // Results outside the scope are dropped after the call; a widened Slack search is
+            // cut back to the limit asked for (default 10, as the built-in connector).
+            let limit = match self.system.as_str() {
+                "slack" => crate::connectors::http::limit(original, 10, 50) as usize,
+                _ => usize::MAX,
+            };
             Ok(items
                 .into_iter()
                 .filter(|i| self.item_in_scope(bot, i).is_ok())
+                .take(limit)
                 .collect())
         } else {
             // A read outside the scope is refused, checked again on what came back.

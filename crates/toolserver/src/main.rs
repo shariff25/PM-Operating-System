@@ -59,6 +59,18 @@ async fn main() -> Result<()> {
     }
     let catalog =
         Catalog::load(&config.content_root, Utc::now().date_naive()).context("loading content")?;
+    // MCP server records (docs/mcp-servers-spec.md §2.2): every record in the content checkout is
+    // checked at start, whether or not a system is switched onto it.
+    let mcp_records = load_mcp_records(&config.content_root)?;
+    let mut refusals = pmos_toolserver::mcp_client::startup_refusals(&mcp_records);
+    if fake_only {
+        refusals.extend(pmos_toolserver::mcp_client::fake_data_refusals(
+            &mcp_records,
+        ));
+    }
+    if !refusals.is_empty() {
+        anyhow::bail!(refusals.join("\n"));
+    }
     let cancel = CancellationToken::new();
 
     let mut stores = match &config.database_url {
@@ -150,7 +162,7 @@ async fn main() -> Result<()> {
 
     let mut github_setup = None;
     let mut proposals = None;
-    let (connectors, oauth): (Vec<Arc<dyn Connector>>, Option<Arc<OAuth>>) = match &config
+    let (mut connectors, oauth): (Vec<Arc<dyn Connector>>, Option<Arc<OAuth>>) = match &config
         .connectors
     {
         Connectors::Fake => {
@@ -238,6 +250,54 @@ async fn main() -> Result<()> {
             )
         }
     };
+
+    let mcp_tokens: Option<Arc<dyn pmos_toolserver::mcp_client::UserTokens>> = None;
+    // Systems switched onto MCP (PMOS_MCP_SYSTEMS; default none, the quick way back): with
+    // fake connectors Jira goes through the fake MCP server in this process; every other
+    // system named is served by its approved record, which an active Admin must have approved.
+    let mut switched: Vec<Arc<dyn Connector>> = Vec::new();
+    if config.fake_mcp {
+        let (jira, _fake) =
+            pmos_toolserver::mcp_client::start_fake(Some(stores.audit.clone()), cancel.clone())
+                .await
+                .map_err(anyhow::Error::msg)?;
+        tracing::warn!("PMOS_MCP_SYSTEMS=jira with fake connectors: Jira is served by the fake MCP server (fixtures)");
+        switched.extend(jira);
+    }
+    let from_records: Vec<String> = config
+        .mcp_systems
+        .iter()
+        .filter(|s| !(config.fake_mcp && s.as_str() == "jira"))
+        .cloned()
+        .collect();
+    if !from_records.is_empty() {
+        let dir = stores.users.directory(Utc::now()).await.map_err(|e| {
+            anyhow::anyhow!("the user database can't be read to check MCP approvals: {e}")
+        })?;
+        pmos_toolserver::mcp_client::check_approvals(&mcp_records, &dir)
+            .map_err(|e| anyhow::anyhow!(e.join("\n")))?;
+        let tokens = mcp_tokens.clone();
+        let served = pmos_toolserver::mcp_client::connectors_for(
+            &mcp_records,
+            &from_records,
+            |k| std::env::var(k).ok(),
+            tokens,
+            Some(stores.audit.clone()),
+            &pmos_toolserver::mcp_client::transport::TestRoutes::default(),
+        )
+        .map_err(anyhow::Error::msg)?;
+        for c in &served {
+            tracing::info!(
+                system = c.system(),
+                "served through its approved MCP server record"
+            );
+        }
+        switched.extend(served);
+    }
+    for c in switched {
+        connectors.retain(|old| old.system() != c.system());
+        connectors.push(c);
+    }
 
     for skill in &config.bot_skills {
         if catalog.skill(skill).is_none() {
@@ -511,6 +571,18 @@ fn spawn_deactivation_sweeper(svc: Arc<ToolService>, cancel: CancellationToken) 
             }
         }
     });
+}
+
+/// Every record in `<content>/mcp/`, checked against the registry; none when there is no such
+/// directory.
+fn load_mcp_records(
+    content_root: &std::path::Path,
+) -> Result<Vec<pmos_contract::mcp::ServerRecord>> {
+    let registry = pmos_contract::ToolRegistry::from_yaml(
+        &std::fs::read_to_string(content_root.join("tools.yaml")).context("reading tools.yaml")?,
+    )
+    .context("parsing tools.yaml")?;
+    pmos_contract::mcp::load(content_root, &registry).map_err(|e| anyhow::anyhow!(e.join("\n")))
 }
 
 /// The key that signs OAuth `state`, derived from the service token so there is one fewer

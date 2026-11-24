@@ -1660,4 +1660,51 @@ mod tests {
         ))
         .is_ok());
     }
+
+    #[test]
+    fn mcp_switches_are_off_by_default_and_checked() {
+        let base = [
+            ("PMOS_SERVICE_TOKEN", TOKEN),
+            ("PMOS_DEV", "1"),
+            ("PMOS_CONNECTORS", "fake"),
+        ];
+        let with = |extra: &[(&str, &str)]| {
+            let mut pairs = base.to_vec();
+            pairs.extend_from_slice(extra);
+            cfg(&pairs)
+        };
+        let off = with(&[]).unwrap();
+        assert!(off.mcp_systems.is_empty() && off.mcp_compare.is_empty() && !off.fake_mcp);
+        // Fake connectors: Jira through the fake MCP server.
+        let on = with(&[("PMOS_MCP_SYSTEMS", "jira")]).unwrap();
+        assert!(on.fake_mcp);
+        assert_eq!(on.mcp_systems, vec!["jira"]);
+        assert!(with(&[("PMOS_MCP_SYSTEMS", "docs")]).is_ok());
+        for refused in ["confluence", "slack"] {
+            assert!(with(&[("PMOS_MCP_SYSTEMS", refused)])
+                .unwrap_err()
+                .contains("slice M8"));
+        }
+        assert!(with(&[("PMOS_MCP_SYSTEMS", "github")]).is_err());
+        // The comparison: fake data, Jira, not also switched.
+        assert_eq!(
+            with(&[("PMOS_MCP_COMPARE", "jira")]).unwrap().mcp_compare,
+            vec!["jira"]
+        );
+        assert!(with(&[("PMOS_MCP_COMPARE", "confluence")]).is_err());
+        assert!(with(&[("PMOS_MCP_COMPARE", "jira"), ("PMOS_MCP_SYSTEMS", "jira")]).is_err());
+        // PMOS_CONNECTORS keeps its two values (the runtime and pmos-web read it too).
+        assert!(cfg(&[
+            ("PMOS_SERVICE_TOKEN", TOKEN),
+            ("PMOS_DEV", "1"),
+            ("PMOS_CONNECTORS", "fake-mcp")
+        ])
+        .is_err());
+        // Fake-data mode still allows the fake MCP server.
+        assert!(with(&[
+            ("PMOS_MODEL_SOURCE", "hosted-test"),
+            ("PMOS_MCP_SYSTEMS", "jira")
+        ])
+        .is_ok());
+    }
 }
