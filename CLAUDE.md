@@ -169,6 +169,15 @@ follow-up tracking.
   review" in its spec's status note, and all of it goes to the reviewer afterwards; the gate
   (no open High or Critical) still applies before real data or a pilot.
 
+- **Commits credited to the owner, and history rewritten (owner, 2026-11-24):** "I want all the
+  code pushed to github under my activity." New commits are authored as the owner's GitHub
+  account (its noreply address), with Claude as co-author in the message. The 405 commits then
+  on `claude/web-app` were rewritten the same day: author changed, the vendor's two strings
+  removed from old file versions and messages, dates and content unchanged, the final tree
+  identical; the branch was force-pushed. Every commit id quoted before that date is an old id:
+  `docs/history/commit-map-2026-11-24.txt` maps old to new. The owner merges pull request #10
+  with a normal merge; GitHub shows the activity only once it is on `main`.
+
 ## Where the build stands (2026-11-23)
 
 - Pushed and checked: `claude/web-app` (draft pull request #10).
