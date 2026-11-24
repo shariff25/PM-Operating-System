@@ -2439,6 +2439,190 @@ FAKE_DOCKER_FAIL=1 run_stack up >/dev/null 2>&1 || code=$?
 rm -rf "$WORK/stack/deploy/secrets" "$WORK/state/compose.upstream-keys.yaml" "$WORK/state/usage" "$WORK/state/gateway.hosted-test.yaml"
 echo "model routes checked"
 
+# --- Slice H12: PMOS_MODEL_SOURCE=hosted ------------------------------------------------------
+# The stack copy is a git checkout with a "merged branch" (a bare repo as origin/main), so `build`
+# and `status` compare against it. With the shipped (empty) list, hosted is refused before
+# anything starts; with a fixture entry, up checks the URL, the model ids, the key file, the stop
+# file and NO_PROXY; `hosted-key set` reads standard input only; `hosted stop|start` and
+# `acknowledge-switch` need sudo and a reason; `build` refuses a list or gateway code that differs
+# from the merged branch, and a failed fetch without --use-last-fetch; `status` and `up` compare
+# the running gateway's list digest with the merged branch's.
+H12_LIST="$WORK/stack/crates/gateway/approved-hosted.yaml"
+mkdir -p "$(dirname "$H12_LIST")"
+cp "$ROOT_SRC/crates/gateway/approved-hosted.yaml" "$H12_LIST"
+! grep -q '^- ' "$H12_LIST" || fail "the shipped approved list has an entry"
+h12=("PMOS_STATE_DIR=$WORK/state" "PMOS_MODEL_SOURCE=hosted"
+  "PMOS_GATEWAY_HOSTED_URL=https://models.hosted-mock.test/v1" "PMOS_GATEWAY_HOSTED_MODELS=main=fake-model-1")
+# stack_env makes the fixture host afresh ($PFROOT), so the stop file's directory, as
+# `hosted init` makes it, is made again after it where a case needs it.
+h12_dir() { mkdir -p "$PFROOT/var/lib/pmos/hosted-control" && chmod 755 "$PFROOT/var/lib/pmos/hosted-control"; }
+stack_env require "${h12[@]}"
+code=0
+out=$(run_stack up 2>&1) || code=$?
+[ "$code" = 2 ] && [[ "$out" == *"no approved entry on the gateway's list"* ]] || fail "hosted with the shipped list exits $code: $out"
+! grep -q ' up -d' "$DOCKER_LOG" || fail "hosted with the shipped list started something"
+# A fixture entry (digests of nothing real) in the copy's checkout.
+printf -- '- name: owner-hosted\n  url_sha256: "%s"\n  model_sha256: ["%s"]\n  record_sha256: "%s"\n  pull: 9\n' \
+  "$(printf 'x' | sha256sum | cut -d' ' -f1)" "$(printf 'y' | sha256sum | cut -d' ' -f1)" "$(printf 'z' | sha256sum | cut -d' ' -f1)" >"$H12_LIST"
+git -C "$WORK/stack" init -q -b work
+git -C "$WORK/stack" -c user.email=t@example.test -c user.name=t add crates
+git -C "$WORK/stack" -c user.email=t@example.test -c user.name=t commit -qm "the merged list"
+git clone -q --bare "$WORK/stack" "$WORK/origin.git"
+git -C "$WORK/origin.git" branch -q -m work main
+git -C "$WORK/stack" remote add origin "$WORK/origin.git"
+# The key: from standard input only, mode 600, never printed.
+out=$(printf 'hosted-key-marker-0000\n' | run_stack hosted-key set 2>&1) || fail "hosted-key set failed: $out"
+[[ "$out" != *hosted-key-marker* ]] || fail "hosted-key set printed the key"
+[ "$(stat -c %a "$WORK/stack/deploy/secrets/hosted-model.key")" = 600 ] && [ "$(stat -c %a "$WORK/stack/deploy/secrets")" = 700 ] ||
+  fail "the key file or its directory has the wrong mode"
+grep -qx hosted-key-marker-0000 "$WORK/stack/deploy/secrets/hosted-model.key" || fail "hosted-key set wrote something else"
+! grep -rq hosted-key-marker "$DOCKER_LOG" "$CURL_LOG" "$ARGV_LOG" || fail "the key reached a command's arguments"
+code=0
+printf 'a key with spaces\n' | run_stack hosted-key set >/dev/null 2>&1 || code=$?
+[ "$code" = 2 ] && grep -qx hosted-key-marker-0000 "$WORK/stack/deploy/secrets/hosted-model.key" || fail "a bad key exits $code or replaced the key"
+code=0
+run_stack hosted-key set extra </dev/null >/dev/null 2>&1 || code=$?
+[ "$code" = 2 ] || fail "hosted-key with an argument exits $code"
+# The stop file's directory: made by `hosted init`, with sudo only.
+code=0
+run_fw hosted init >/dev/null 2>&1 || code=$?
+[ "$code" = 1 ] && [ ! -d "$PFROOT/var/lib/pmos/hosted-control" ] || fail "hosted init without sudo exits $code or made the directory"
+code=0
+out=$(run_stack up 2>&1) || code=$?
+[ "$code" = 2 ] && [[ "$out" == *"sudo deploy/pmos-admin hosted init"* ]] || fail "hosted without the stop file's directory exits $code: $out"
+FAKE_UID=0 run_fw hosted init >/dev/null 2>&1 || fail "hosted init failed"
+[ "$(stat -c %a "$PFROOT/var/lib/pmos/hosted-control")" = 755 ] || fail "the stop file's directory isn't mode 755"
+# Each unmet condition stops `up` before anything starts.
+for broken in "PMOS_GATEWAY_HOSTED_URL=" "PMOS_GATEWAY_HOSTED_URL=http://models.hosted-mock.test/v1" \
+  "PMOS_GATEWAY_HOSTED_MODELS=" "PMOS_GATEWAY_HOSTED_MODELS=main" "PMOS_GATEWAY_HOSTED_MODELS=main=a b" \
+  "HTTPS_PROXY=http://proxy.example.test:3128
+NO_PROXY=.hosted-mock.test"; do
+  stack_env require "${h12[@]}" "$broken"
+  h12_dir
+  code=0
+  run_stack up >/dev/null 2>&1 || code=$?
+  [ "$code" = 2 ] || fail "hosted with $broken exits $code, not 2"
+  ! grep -q ' up -d' "$DOCKER_LOG" || fail "hosted with $broken started something"
+done
+chmod 644 "$WORK/stack/deploy/secrets/hosted-model.key"
+stack_env require "${h12[@]}"
+h12_dir
+code=0
+run_stack up >/dev/null 2>&1 || code=$?
+[ "$code" = 2 ] || fail "hosted with a key readable by others exits $code"
+chmod 600 "$WORK/stack/deploy/secrets/hosted-model.key"
+# Everything in place: up adds the hosted overlay, and compares the running gateway's list.
+merged_sha=$(sha256sum <"$H12_LIST" | cut -d' ' -f1)
+ready_ok="{\"ready\":true,\"class\":\"production\",\"stub\":false,\"model_source\":\"hosted:owner-hosted\",\"approved_list\":\"release\",\"approved_list_sha256\":\"$merged_sha\",\"max_data_class\":\"restricted\"}"
+stack_env require "${h12[@]}"
+h12_dir
+out=$(FAKE_GW_READYZ="$ready_ok" run_stack up 2>&1) || fail "up with hosted failed: $out"
+grep -q 'args=compose .*-f [^ ]*/compose.yaml -f [^ ]*/compose.hosted.yaml .* up -d' "$DOCKER_LOG" ||
+  fail "up with hosted didn't add the overlay: $(cat "$DOCKER_LOG")"
+[[ "$out" == *"approved list is origin/main's"* ]] || fail "up doesn't say the list matches: $out"
+! grep -q 'kill gateway' "$DOCKER_LOG" || fail "up killed a gateway whose list matches"
+# A gateway whose list differs from the merged branch's is killed by up, and fails status.
+ready_other=${ready_ok/$merged_sha/$(printf 'other' | sha256sum | cut -d' ' -f1)}
+stack_env require "${h12[@]}"
+h12_dir
+code=0
+out=$(FAKE_GW_READYZ="$ready_other" run_stack up 2>&1) || code=$?
+[ "$code" = 1 ] && [[ "$out" == *"approved list differs from origin/main"* ]] || fail "up with a differing list exits $code: $out"
+grep -q 'kill gateway' "$DOCKER_LOG" || fail "up didn't kill the gateway whose list differs"
+code=0
+out=$(FAKE_GW_READYZ="$ready_other" run_stack status 2>&1) || code=$?
+[ "$code" = 1 ] && [[ "$out" == *"list"*"FAIL"*"differs"* ]] || fail "status with a differing list exits $code: $out"
+out=$(FAKE_GW_READYZ="$ready_ok" run_stack status 2>&1) || fail "status with a matching list failed: $out"
+[[ "$out" == *"hosted:owner-hosted"* && "$out" == *"ceiling restricted"* ]] || fail "status doesn't show the entry and the ceiling: $out"
+[[ "$out" != *hosted-key-marker* && "$out" != *models.hosted-mock.test* && "$out" != *fake-model-1* ]] || fail "status printed the key, the URL or a model id"
+# build: the commit and the merged commit as build arguments, by name; refused when the list or
+# the gateway's code differs from the merged branch, or the fetch fails without --use-last-fetch.
+: >"$DOCKER_LOG"
+: >"$DOCKER_ENV_LOG"
+run_stack build >/dev/null 2>&1 || fail "build under hosted failed: $(cat "$DOCKER_LOG")"
+grep -q -- '--build-arg PMOS_BUILD_COMMIT --build-arg PMOS_BUILD_MERGED_COMMIT' "$DOCKER_LOG" || fail "build doesn't pass the commits: $(cat "$DOCKER_LOG")"
+printf '# a local edit\n' >>"$H12_LIST"
+code=0
+out=$(run_stack build 2>&1) || code=$?
+[ "$code" = 2 ] && [[ "$out" == *"uncommitted or untracked"* ]] || fail "build with an edited list exits $code: $out"
+git -C "$WORK/stack" -c user.email=t@example.test -c user.name=t commit -qam "a local commit"
+code=0
+out=$(run_stack build 2>&1) || code=$?
+[ "$code" = 2 ] && [[ "$out" == *"differs from the merged branch"* ]] || fail "build with a locally committed list exits $code: $out"
+git -C "$WORK/stack" reset -q --hard HEAD~1
+printf '// local\n' >"$WORK/stack/crates/gateway/extra.rs"
+code=0
+run_stack build >/dev/null 2>&1 || code=$?
+[ "$code" = 2 ] || fail "build with an untracked file under crates/gateway/ exits $code"
+rm -f "$WORK/stack/crates/gateway/extra.rs"
+git -C "$WORK/stack" remote set-url origin "$WORK/no-such-origin.git"
+code=0
+out=$(run_stack build 2>&1) || code=$?
+[ "$code" = 2 ] && [[ "$out" == *"--use-last-fetch"* ]] || fail "build offline exits $code: $out"
+out=$(run_stack build --use-last-fetch 2>&1) || fail "build --use-last-fetch failed: $out"
+[[ "$out" == *"offline: checking against refs/remotes/origin/main"* ]] || fail "build --use-last-fetch doesn't say what it checked: $out"
+git -C "$WORK/stack" remote set-url origin "$WORK/origin.git"
+# The kill switch: sudo and a reason; the stop file first, then the gateway killed; up and a
+# gateway restart refused while it is there; start removes it.
+stack_env require "${h12[@]}"
+h12_dir
+code=0
+run_fw hosted stop --reason "test stop" >/dev/null 2>&1 || code=$?
+[ "$code" = 1 ] && [ ! -e "$PFROOT/var/lib/pmos/hosted-control/stopped" ] || fail "hosted stop without sudo exits $code or stopped"
+code=0
+SUDO_USER=ana FAKE_UID=0 run_fw hosted stop >/dev/null 2>&1 || code=$?
+[ "$code" = 2 ] || fail "hosted stop without a reason exits $code"
+: >"$DOCKER_LOG"
+SUDO_USER=ana FAKE_UID=0 run_fw hosted stop --reason "suspected leak" >/dev/null 2>&1 || fail "hosted stop failed"
+grep -q 'suspected leak' "$PFROOT/var/lib/pmos/hosted-control/stopped" || fail "the stop file doesn't say why"
+grep -q 'kill gateway' "$DOCKER_LOG" || fail "hosted stop didn't kill the gateway"
+grep -q $'\thosted\tstop\t' "$ACKLOG" || fail "hosted stop wasn't logged"
+code=0
+out=$(run_stack up 2>&1) || code=$?
+[ "$code" = 2 ] && [[ "$out" == *"stopped"* ]] || fail "up while stopped exits $code: $out"
+code=0
+run_stack restart gateway >/dev/null 2>&1 || code=$?
+[ "$code" = 2 ] || fail "restart gateway while stopped exits $code"
+out=$(FAKE_GW_READYZ="$ready_ok" run_stack status 2>&1) || true
+[[ "$out" == *"hosted"*"STOPPED"*"suspected leak"* ]] || fail "status doesn't show the stop: $out"
+code=0
+run_fw hosted start --reason "rotated" >/dev/null 2>&1 || code=$?
+[ "$code" = 1 ] && [ -e "$PFROOT/var/lib/pmos/hosted-control/stopped" ] || fail "hosted start without sudo exits $code or started"
+FAKE_GW_READYZ="$ready_ok" SUDO_USER=ana FAKE_UID=0 run_fw hosted start --reason "rotated" >/dev/null 2>&1 || fail "hosted start failed"
+[ ! -e "$PFROOT/var/lib/pmos/hosted-control/stopped" ] || fail "hosted start left the stop file"
+# restart gateway --signal HUP: the key files read afresh.
+: >"$DOCKER_LOG"
+run_stack restart gateway --signal HUP >/dev/null 2>&1 || fail "restart gateway --signal HUP failed"
+grep -q 'kill -s HUP gateway' "$DOCKER_LOG" || fail "restart --signal HUP didn't signal the gateway"
+# acknowledge-switch: sudo, a reason, and only what the gateway reports now; the tool server
+# gets it with the service token (by --config -), and the log line is written.
+stack_env require "${h12[@]}" "PMOS_SERVICE_TOKEN=svc-0123456789abcdef0123456789abcdef"
+h12_dir
+for args in "--to hosted:owner-hosted" "--reason x" "--to hosted:other --reason x" "--to local --reason x" "--to hosted:stack-test --reason x"; do
+  code=0
+  # shellcheck disable=SC2086
+  FAKE_GW_READYZ="$ready_ok" SUDO_USER=ana FAKE_UID=0 run_fw hosted acknowledge-switch $args >/dev/null 2>&1 || code=$?
+  [ "$code" = 2 ] || fail "acknowledge-switch $args exits $code, not 2"
+done
+FAKE_GW_READYZ="$ready_ok" SUDO_USER=ana FAKE_UID=0 run_fw hosted acknowledge-switch --to hosted:owner-hosted --reason "owner approved" >/dev/null 2>&1 ||
+  fail "acknowledge-switch failed"
+grep -q 'model-source-acknowledgement' "$CURL_LOG" || fail "acknowledge-switch didn't call the tool server"
+grep -q '"to": "hosted:owner-hosted"' "$CURL_BODY_LOG" && grep -q '"by": "ana"' "$CURL_BODY_LOG" || fail "acknowledge-switch sent the wrong body: $(cat "$CURL_BODY_LOG")"
+! grep -q svc-0123456789 "$CURL_LOG" || fail "the service token reached curl's arguments"
+grep -q $'\thosted\tacknowledge-switch\thosted:owner-hosted\t' "$ACKLOG" || fail "acknowledge-switch wasn't logged"
+# hosted digest --record: the record's digest, and nothing else.
+printf 'a record kept outside the repository\n' >"$WORK/record.md"
+out=$(run_stack hosted digest --record "$WORK/record.md" 2>&1) || fail "hosted digest --record failed: $out"
+[ "$out" = "$(sha256sum <"$WORK/record.md" | cut -d' ' -f1)" ] || fail "hosted digest --record printed $out"
+: >"$DOCKER_LOG"
+printf 'https://models.hosted-mock.test/v1\n' | run_stack hosted digest >/dev/null 2>&1 || true
+grep -q 'run --rm --no-deps -T gateway pmos-gateway --digest-from-stdin' "$DOCKER_LOG" || fail "hosted digest doesn't use the gateway's own normalisation"
+! grep -q hosted-mock "$DOCKER_LOG" || fail "the URL reached docker's arguments"
+# The backup never holds the key.
+! grep -n 'secrets' <(sed -n '/^  backup)/,/^    ;;/p' "$SRC") || fail "backup touches deploy/secrets"
+rm -rf "$WORK/stack/.git" "$WORK/stack/crates" "$WORK/stack/deploy/secrets" "$PFROOT/var/lib/pmos/hosted-control"
+echo "hosted model source checked"
+
 # --- compose renders (C9, C14): without docker compose, say so and skip ---------------------
 if docker compose version >/dev/null 2>&1; then
   mkdir -p "$WORK/checkout" "$WORK/state"

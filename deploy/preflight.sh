@@ -28,7 +28,9 @@
 # The model source and the exposure come from the flags, else deploy/.env. Since slice H4 a blank
 # one is refused by deploy/pmos-admin, by deploy/compose.yaml (`:?`) and by every service, so at
 # the run stage a blank PMOS_MODEL_SOURCE or PMOS_EXPOSURE is a fail (H-SETTINGS), and `hosted`
-# (an approved provider, slice H12, not built) at every stage. At the install stage a blank one is
+# at every stage while the checkout's approved list (crates/gateway/approved-hosted.yaml, compiled
+# into the gateway) has no entry: it ships empty (slice H12), and the first entry is the owner's
+# slice H13. At the install stage a blank one is
 # what setup.sh is about to fill in (deploy/env.example ships them blank; setup.sh writes
 # hosted-test and public unless told otherwise, §3.1, and passes its choice here), so it passes,
 # saying so. Either way the
@@ -279,16 +281,24 @@ listeners() {
 # deploy/compose.yaml and every service since slice H4, so at the run stage it fails here too;
 # at install it is what setup.sh fills in. The checks that depend on one read a blank the
 # stricter way either way (local, public).
+# Slice H12: whether the checkout's approved hosted list (compiled into the gateway) has an
+# entry. It ships empty, so `hosted` fails here until the owner's slice H13 adds one; the
+# gateway checks the entry's digests itself at start.
+approved_list_has_entry() {
+  local list="$DEPLOY/../crates/gateway/approved-hosted.yaml"
+  [ -f "$list" ] && grep -q '^- ' "$list"
+}
 c_settings() {
-  local probs=() fill=()
+  local probs=() fill=() ms=$MS_SET
   if [ -z "$MS_SET" ]; then
     if [ "$STAGE" = install ]; then
       fill+=("PMOS_MODEL_SOURCE blank: setup.sh writes hosted-test unless --model-source local")
     else
-      probs+=("PMOS_MODEL_SOURCE is blank (use local or hosted-test; hosted isn't built yet, slice H12)")
+      probs+=("PMOS_MODEL_SOURCE is blank (use local or hosted-test; hosted needs an approved entry on the gateway's list)")
     fi
-  elif [ "$MS_SET" = hosted ]; then
-    probs+=("PMOS_MODEL_SOURCE=hosted, an approved provider, isn't built yet (slice H12): every service refuses it (use local or hosted-test)")
+  fi
+  if [ "$ms" = hosted ] && ! approved_list_has_entry; then
+    probs+=("PMOS_MODEL_SOURCE=hosted: there is no approved entry on the gateway's compiled list (crates/gateway/approved-hosted.yaml ships empty; the first entry is the owner's slice H13), so the gateway refuses it (use local, or hosted-test with fake data)")
   fi
   if [ -z "$EXPOSURE_SET" ]; then
     if [ "$STAGE" = install ]; then
@@ -298,7 +308,7 @@ c_settings() {
     fi
   fi
   if [ ${#probs[@]} -gt 0 ]; then
-    res H-SETTINGS fail "$(join_sc "${probs[@]}")" "PMOS_MODEL_SOURCE local or hosted-test, PMOS_EXPOSURE public or private" "set them in deploy/.env (deploy/setup.sh writes them: --model-source hosted-test|local, --exposure public|private); deploy/pmos-admin and every service refuse a blank one, which is never read as another value. The checks below read a blank source as local and a blank exposure as public"
+    res H-SETTINGS fail "$(join_sc "${probs[@]}")" "PMOS_MODEL_SOURCE local, hosted (with an approved entry) or hosted-test, PMOS_EXPOSURE public or private" "set them in deploy/.env (deploy/setup.sh writes them: --model-source hosted-test|local|hosted, --exposure public|private); deploy/pmos-admin and every service refuse a blank one, which is never read as another value. The checks below read a blank source as local and a blank exposure as public"
   elif [ ${#fill[@]} -gt 0 ]; then
     res H-SETTINGS pass "$(join_sc "${fill[@]}"); checked as PMOS_MODEL_SOURCE=$MS, PMOS_EXPOSURE=$EXPOSURE" "PMOS_MODEL_SOURCE local or hosted-test, PMOS_EXPOSURE public or private"
   else

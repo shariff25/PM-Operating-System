@@ -816,11 +816,29 @@ expect H-SETTINGS fail 1 "both blank at run"
 # A flag stands in for a blank setting (by hand); pmos-admin never passes one at run.
 pf --model-source hosted-test --exposure private
 expect H-SETTINGS pass 0 "flags at run"
+# Slice H12: `hosted` fails at every stage while the checkout's approved list has no entry; the
+# shipped list is empty.
+! grep -q '^- ' "$REPO/crates/gateway/approved-hosted.yaml" || fail "the shipped approved list has an entry"
 env_lines PMOS_MODEL_SOURCE=hosted
 pf
-expect H-SETTINGS fail 1 "hosted (not built) at run"
+expect H-SETTINGS fail 1 "hosted with the shipped (empty) list at run"
+[[ "$(field H-SETTINGS measured)" == *"no approved entry on the gateway's compiled list"* ]] || fail "H-SETTINGS doesn't say why hosted fails: $(field H-SETTINGS measured)"
 pf --stage install --model-source hosted
-expect H-SETTINGS fail 1 "hosted (not built) at install"
+expect H-SETTINGS fail 1 "hosted with the shipped (empty) list at install"
+# Beside a list with an entry (a copy of the preflight in a fixture checkout) it passes: the
+# gateway checks the entry's digests itself.
+mkdir -p "$WORK/listed/deploy" "$WORK/listed/crates/gateway"
+cp "$PF" "$REPO/deploy/sandbox-create.sh" "$WORK/listed/deploy/"
+printf -- '- name: owner-hosted\n  url_sha256: "x"\n' >"$WORK/listed/crates/gateway/approved-hosted.yaml"
+CODE=0
+OUT=$("$WORK/listed/deploy/preflight.sh" --root "$R" --env-file "$ENVF" --json 2>"$WORK/stderr") || CODE=$?
+n_cases=$((n_cases + 1))
+[ "$(field H-SETTINGS status)" = pass ] || fail "hosted beside a listed entry: H-SETTINGS $(field H-SETTINGS status): $(field H-SETTINGS measured)"
+printf '[]\n' >"$WORK/listed/crates/gateway/approved-hosted.yaml"
+CODE=0
+OUT=$("$WORK/listed/deploy/preflight.sh" --root "$R" --env-file "$ENVF" --json 2>"$WORK/stderr") || CODE=$?
+n_cases=$((n_cases + 1))
+[ "$(field H-SETTINGS status)" = fail ] || fail "hosted beside an empty list passes H-SETTINGS"
 # At install with no deploy/.env, the preflight reads deploy/env.example, which ships both blank:
 # what setup.sh is about to fill in (hosted-test and public unless told otherwise), so it passes,
 # saying so, and the source-dependent checks read it as local (the stricter reading).

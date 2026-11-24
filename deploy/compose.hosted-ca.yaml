@@ -1,0 +1,12 @@
+# PMOS_MODEL_SOURCE=hosted behind an outbound proxy that re-signs TLS (slice H12; spec §3.6,
+# "Which roots the hosted client trusts", and §3.9 condition 5). deploy/pmos-admin adds this file
+# only with hosted and PMOS_GATEWAY_CA_FILE set. The gateway adds exactly this bundle to its
+# compiled-in roots, and only when the approved entry says `tls_interception: allowed`: with
+# `refused` it refuses to start. Never SSL_CERT_FILE or SSL_CERT_DIR, which the gateway refuses
+# under hosted.
+services:
+  gateway:
+    environment:
+      PMOS_GATEWAY_CA_FILE: /etc/pmos/hosted-ca.pem
+    volumes:
+      - ${PMOS_GATEWAY_CA_FILE:?}:/etc/pmos/hosted-ca.pem:ro
