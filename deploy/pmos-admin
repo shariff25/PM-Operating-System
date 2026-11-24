@@ -2684,7 +2684,25 @@ for g in s["groups"]:
     unit=$(worker_unit "$bot")
     # Uploads come from the generated spec: `from` is relative to the content root.
     uploads=()
+    # Slice H12 (spec §3.6, V11): under hosted with a data-class ceiling below restricted, master
+    # context counts as restricted unless its first line is a sensitivity marker, and a file
+    # above the ceiling isn't uploaded (named with its class, never its text).
+    ceiling=""
+    if [ "${PMOS_MODEL_SOURCE:-}" = hosted ]; then
+      ceiling=${PMOS_HOSTED_MAX_DATA_CLASS:-$(sed -n 's/^[[:space:]]*max_data_class:[[:space:]]*"\{0,1\}\([a-z]*\).*/\1/p' "$ROOT/$APPROVED_LIST" 2>/dev/null | head -1)}
+    fi
     while read -r from to; do
+      if [ -n "$ceiling" ] && [ "$ceiling" != restricted ] && [[ "$from" == master/* ]]; then
+        cls=restricted
+        case "$(head -n 1 "$PMOS_CONTENT_CHECKOUT/content/$from" 2>/dev/null)" in
+          '<!-- sensitivity: public -->') cls=public ;;
+          '<!-- sensitivity: internal -->') cls=internal ;;
+        esac
+        if [ "$cls" = restricted ] || { [ "$cls" = internal ] && [ "$ceiling" = public ]; }; then
+          say "pmos-admin sandbox: content/$from counts as $cls data, above the hosted model's data-class ceiling ($ceiling); nothing was uploaded. If it holds less, mark its first line <!-- sensitivity: public --> or <!-- sensitivity: internal -->" >&2
+          exit 2
+        fi
+      fi
       uploads+=(--upload "$PMOS_CONTENT_CHECKOUT/content/$from:$to")
     done < <(awk '/^  - from: /{f=$3} /^    to: /{print f, $2}' "$spec")
     pmos_sandbox_create_cmd "$sandbox" "${PMOS_VERSION:-local}" "$policy" \

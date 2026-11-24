@@ -431,6 +431,14 @@ buttons with `edit-policies` (**Admin: policy**); show the content and harness s
 harness**). An older server leaves `permissions` out: treat that as `[]`. An auditor's is
 `["view-audit-log", "export-audit", "view-content", "view-policies"]`; an admin's has all 21.
 
+
+**`model`** (slice H12): where prompts go, from the runtime's view of the gateway
+(`GET /v1/model-source`), labels only, never a host: `{"source": "hosted", "name":
+"<entry>", "fake_data": false, "switch_pending": false}`, or `"local"`, `"hosted-test"`,
+`"stub"`, or `"unknown"` when the runtime can't say. `fake_data` is true for `hosted-test` and the
+test-only list; `switch_pending` while a switch to a hosted entry waits for an administrator. The
+app shows "Model: hosted (<name>)", "Model: local" or "Model: test endpoint (fake data only)" on
+every page.
 ## Drafts
 
 A draft is a pending write (a Confluence page, a Jira issue, a Slack reply or message) that a

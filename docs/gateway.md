@@ -27,7 +27,7 @@ default: a blank value is refused, never read as `local`.
 | --- | --- | --- | --- |
 | `local` | `production` only (`deploy/gateway.yaml`), never with `PMOS_GATEWAY_CLOUD_TEST=1` | the two model servers, `vllm-default.pmos.internal` and `vllm-extraction.pmos.internal`, and no other name | real data, after Gate 1 |
 | `hosted-test` | `test` only (`deploy/gateway.hosted-test.yaml` is an example; `deploy/pmos-admin` writes the real one outside the repo), with `PMOS_GATEWAY_CLOUD_TEST=1` unless the stub is on, and a `label:` on every role | a remote test upstream (`openai+https://…`) | **fake data only** |
-| `hosted` | (slice H12) | | refused: not built |
+| `hosted` | `production` only (`deploy/gateway.hosted.yaml`), never with `PMOS_GATEWAY_CLOUD_TEST=1` | one `hosted:<name>` upstream, `<name>` an entry on the approved list compiled into the gateway (which ships **empty**, so `hosted` is refused until the owner's slice H13); every role `host:<ref>` with a role label | real data, after Gate 1 and the conditions of the spec's §3.9 |
 
 The stub may be on under either source (a first install); the gateway then reports the source
 `stub`, which sends nothing anywhere and which every caller accepts in place of its own.
@@ -66,6 +66,58 @@ that call, and neither its body nor its `Location` reaches the caller.
 
 **Readiness of a remote test upstream.** `/readyz`'s probe of a testing-only upstream (it carries
 the provider's key) is reused for at least 30 seconds, however many callers ask.
+
+## The approved hosted model (slice H12)
+
+`PMOS_MODEL_SOURCE=hosted` serves one owner-approved hosted model (`docs/openshell-any-host-spec.md`
+§3.6, "The hosted model as a production source"; `crates/gateway/src/hosted.rs`).
+
+- **The approved list** is `crates/gateway/approved-hosted.yaml`, compiled in with `include_str!`:
+  names, digests (`url_sha256`, `model_sha256`, `record_sha256`) and the pull request number only,
+  never a host, URL, model id, vendor's name or key; at most one entry. It ships **empty**: a
+  gateway built from a fresh checkout refuses `hosted` at start ("no approved entry"). Only the
+  owner may change it (CODEOWNERS, `.github/owner-handle`; the lint
+  `codeowners_hosted_list_is_owner_only`), and its own test fails on any entry until those files
+  hold the owner-only lines. The provider record it pins is kept outside the repository
+  (`docs/model-providers/README.md`).
+- **The URL and the model ids** come from the host, `PMOS_GATEWAY_HOSTED_URL` and
+  `PMOS_GATEWAY_HOSTED_MODELS` (`<ref>=<model id>`, for each role's `host:<ref>`). At start the
+  gateway normalises the URL once (`https`, lowercase ASCII host without a trailing dot, the port
+  only when not 443, the path without a trailing `/`; user information, a query, a fragment and an
+  IP-literal host refused), hashes it and each role's id, and refuses to start unless they are the
+  entry's; every request is built from the checked values. It also refuses: a `test` class, a
+  role without a role label or one equal to an entry name, `PMOS_GATEWAY_CLOUD_TEST=1`, a missing,
+  empty or group-readable key file (`PMOS_GATEWAY_HOSTED_KEY_FILE`), `SSL_CERT_FILE` or
+  `SSL_CERT_DIR`, a run-time CA (`PMOS_GATEWAY_CA_FILE`) unless the entry says
+  `tls_interception: allowed`, the stop file present or its directory not mounted, a
+  `PMOS_HOSTED_MAX_DATA_CLASS` above the entry's, and a binary built without the commit and the
+  merged branch's commit (`pmos-admin build`). Each message names the setting, never the URL or
+  an id. `pmos-gateway --digest-from-stdin` and `--model-digest-from-stdin` print a digest the
+  same way (`pmos-admin hosted digest`).
+- **The hosted client** trusts only Mozilla's roots compiled in (`webpki-root-certs`), plus the
+  mounted bundle with `tls_interception: allowed`; follows no redirect; and resolves the hosted
+  host itself at every connection, refusing any answer that isn't a public unicast address
+  (loopback, private, link-local, shared, metadata, `pmos` addresses and the like). Behind
+  `HTTPS_PROXY` the proxy resolves it, and is then part of the data path.
+- **Before every hosted call** the gateway looks for the stop file (`/run/pmos-hosted-control/stopped`,
+  the host's `/var/lib/pmos/hosted-control`, read-only): there, `503 hosted_stopped` and nothing
+  is sent. The key file is re-read on a change (once a second at most) and on `SIGHUP`; empty or
+  unreadable, `503 hosted_key_missing`. Every upstream error body is replaced (V3).
+- **Under `local` and `hosted`** a chat or embeddings call without `X-Pmos-Run` is refused `400
+  run_required`, so each usage line (which now carries `model_source`) joins the audit log on the
+  task id; the runtime's routine parsing sends `routine-<id>`.
+- **What it reports:** `x-pmos-model-source: hosted:<name>`; `/readyz` has `hosted_name`,
+  `hosted` (`ok`, `down`, `no key`, `stopped`), `max_data_class`, `tls_interception` (with
+  `ca_bundle_sha256` when allowed), and under every source `approved_list` (`release`, or
+  `stack-test` for the test-only build), `approved_list_sha256`, `commit` and `merged_commit`;
+  `GET /v1/pmos/roles` has `hosted_name` and the upstream kind `hosted`. The usage log names the
+  upstream `hosted:<name>`, and a remote test upstream `remote-test`, never a host.
+- **The test-only list** (`approved-hosted.stack-test.yaml`, one entry `stack-test` naming only a
+  mock) is compiled in instead of the release list only with the `stack-test-list` feature, built
+  only by `deploy/test/Dockerfile.gateway-stack-test`; every service treats `hosted:stack-test` as
+  fake-data mode, and a test fails if a release build could enable it.
+- **Routes** across the entry's models (requirement i's slice MP9) are not built: a hosted role
+  has one model.
 
 ## Routes: switching and automatic fallback (requirement i)
 
