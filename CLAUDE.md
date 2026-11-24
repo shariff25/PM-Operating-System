@@ -148,6 +148,16 @@ follow-up tracking.
   requirements for phase 2 (`docs/improvement-loop-phase2-requirements.md`). The improver bot
   itself waits for the pilot's real labels; training stays last.
 
+## Owner's decisions of 2026-11-24
+
+- **"Build everything end-to-end based on PRD - run eval."** Taken as the go-ahead for
+  requirement i and for the MCP, prover and sandbox-audit work. Each is still a spec first,
+  read by the reviewer before code: `docs/model-providers-spec.md`,
+  `docs/mcp-servers-spec.md`, `docs/openshell-prover-and-sandbox-audit-spec.md`.
+- **MCP servers:** all three kinds are supported (the vendor's hosted server, a self-hosted
+  open-source one, one PM OS builds), chosen per deployment; an Admin approves a server and a
+  tool; removing each built-in connector needs the owner's explicit go-ahead.
+
 ## Where the build stands (2026-11-23)
 
 - Pushed and checked: `claude/web-app` (draft pull request #10).

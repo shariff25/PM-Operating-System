@@ -12,6 +12,28 @@ spec. Which MCP servers the pilot uses is still the owner's choice (§10).
 Line numbers are not cited; file paths are. Where this spec is unsure of a fact it says
 "to be confirmed".
 
+## Owner's decisions of 2026-11-24
+
+These answer open questions 1, 2 and 6 of §10. Where the text below differs, these decide; the
+sections they change are to be revised before the build, and the reviewer has not yet read
+them.
+
+- **Which servers (question 1): all three kinds.** The design must support, for each of Jira,
+  Confluence and Slack, the vendor's own hosted server, a self-hosted open-source server and a
+  server PM OS builds. Which kind a deployment uses for a system is chosen per deployment in
+  the server's record, not fixed in code. The product facts in §10's comparison are still to be
+  confirmed for each server before it is used.
+- **Who approves (question 2): an Admin.** A server and each of its tools are approved by a
+  user with the Admin role. The record still reaches the content repository through a pull
+  request, as every content change does. Whether that pull request also needs a second
+  reviewer, as §2 proposes, is for the reviewer to weigh and the owner to confirm.
+- **Removal (question 6): each connector's removal needs the owner's explicit go-ahead,** in
+  addition to the tests, the comparison and the eval run.
+- **Still open (question 5):** whether the side-by-side comparison may run on real data, and
+  for how long. The conductor's recommendation: fake data first; then real data, reads only,
+  for two weeks, and only for a server the owner has approved for real data.
+
+
 ## 0. Summary
 
 - The tool server (`crates/toolserver`) stays the only thing a sandboxed bot talks to. It
