@@ -358,6 +358,15 @@ fn recorded_title(item: &Item) -> Option<(String, String)> {
     Some((format!("{system}:{id}"), source_title(raw)?))
 }
 
+/// A write's `started` detail, with the hash of what it sends upstream when an MCP server
+/// serves it (slice M8). A built-in connector's write keeps its detail as it was.
+fn with_upstream(detail: &str, upstream: &Option<String>) -> String {
+    match upstream {
+        Some(h) => format!("{detail}; upstream args sha256:{h}"),
+        None => detail.to_string(),
+    }
+}
+
 /// The data class a connector read counts as: the public support docs are `public`;
 /// Jira, Confluence, Slack and anything else are `internal`.
 fn connector_class(system: &str) -> Sensitivity {
@@ -1010,11 +1019,7 @@ impl ToolService {
             return "builtin".into();
         };
         match self.connectors.get(system) {
-            Some(c) => match c.route(action) {
-                Some(r) => r.server,
-                None if c.mode() == "fake" => "fake".into(),
-                None => "builtin".into(),
-            },
+            Some(c) => c.served_by(action),
             None => "builtin".into(),
         }
     }
@@ -1832,9 +1837,11 @@ impl ToolService {
         let (granted_args, args) = (args, &noted);
         if granted {
             // Fail closed: the write runs only once the audit log has recorded it starting.
+            let upstream =
+                self.upstream_hash(Caller::new(&session.user, &session.run_id), spec, args);
             let started = AuditEvent {
                 outcome: Outcome::Started,
-                detail: Some("approved in the harness; writing".into()),
+                detail: Some(with_upstream("approved in the harness; writing", &upstream)),
                 ..event.clone()
             };
             if let Err(e) = self.stores.audit.record(self.with_route(started)).await {
@@ -1913,6 +1920,15 @@ impl ToolService {
         } else {
             self.stores.approvals.create(new, now).await?
         };
+        // The ledger's `served_by` (slice M8): metadata, never a reason to fail the draft.
+        if let Err(e) = self
+            .stores
+            .approvals
+            .note_served_by(&item.id, &self.served_by(&spec.name))
+            .await
+        {
+            tracing::warn!(item = %item.id, error = %e, "the ledger's served_by wasn't stored");
+        }
         if SLACK_DRAFT_TOOLS.contains(&spec.name.as_str()) {
             self.note_target(&item, now).await;
         }
@@ -2005,6 +2021,16 @@ impl ToolService {
             Some(notice) => with_draft_notice(&item.tool, args, &notice),
             None => args.clone(),
         }
+    }
+
+    /// The hash of what `spec`'s write sends upstream for `args` when an MCP server serves it
+    /// (slice M8): computed as [`ToolService::execute_write`] sends it, source markers removed.
+    fn upstream_hash(&self, caller: Caller<'_>, spec: &ToolSpec, args: &Value) -> Option<String> {
+        let stripped = pmos_contract::cite::strip_json(args);
+        self.connectors
+            .get(&spec.system)?
+            .upstream_args(caller, spec.action(), &stripped)
+            .map(|m| crate::approvals::args_hash(&Value::Object(m)))
     }
 
     /// Run an approved write as `caller`'s PM: through its connector, or, for the bets
@@ -3209,10 +3235,21 @@ impl ToolService {
                 return Err(e);
             }
         };
+        // The draft notice stored on the item survives an edit that dropped it, and a persona
+        // file that is gone.
+        let args = self.with_item_notice(&item, &item.args);
+        // What leaves PM OS when an MCP server serves the write (slice M8): its hash, on the
+        // item and in the audit, before anything is sent.
+        let upstream = self.upstream_hash(Caller::new(&item.user, &item.run_id), &spec, &args);
+        if let Some(h) = &upstream {
+            if let Err(e) = self.stores.approvals.note_upstream(&item.id, h).await {
+                tracing::warn!(item = %item.id, error = %e, "the upstream arguments' hash wasn't stored on the item");
+            }
+        }
         // Fail closed: no write runs unless the audit log has recorded that it is starting.
         let started = AuditEvent {
             outcome: Outcome::Started,
-            detail: Some("approved in the inbox; writing".into()),
+            detail: Some(with_upstream("approved in the inbox; writing", &upstream)),
             ..event.clone()
         };
         if let Err(e) = self.stores.audit.record(self.with_route(started)).await {
@@ -3225,9 +3262,6 @@ impl ToolService {
         // counts as restricted, as the audience check counts it.
         let writer = item.bot.as_deref().or(item.skill.as_deref());
         let sensitivity = item.sources_sensitivity.unwrap_or(Sensitivity::Restricted);
-        // The draft notice stored on the item survives an edit that dropped it, and a persona
-        // file that is gone.
-        let args = self.with_item_notice(&item, &item.args);
         let result = self
             .execute_write(
                 Caller::new(&item.user, &item.run_id),

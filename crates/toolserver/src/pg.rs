@@ -626,13 +626,14 @@ fn item_from_row(r: &PgRow) -> StoreResult<ApprovalItem> {
         target_conversation: r
             .try_get::<Option<Value>, _>("target_conversation")?
             .and_then(|v| serde_json::from_value::<TargetConversation>(v).ok()),
+        upstream_args_hash: r.try_get("upstream_args_hash")?,
     })
 }
 
 const ITEM_COLUMNS: &str = "id, user_handle, skill, bot, run_id, tool, args, args_hash, status, \
                             created_at, decided_at, decided_by, result, sources_sensitivity, \
                             redacted_at, drafted_args, edited_at, target_conversation, revision, \
-                            persona, draft_notice";
+                            persona, draft_notice, upstream_args_hash";
 
 const REC_COLUMNS: &str = "id, approval_id, reviewer, verdict, note, note_removed_at, \
                            draft_revision, draft_sha256, created_at, withdrawn_at";
@@ -743,11 +744,30 @@ fn ledger_from_row(r: &PgRow) -> StoreResult<LedgerRow> {
         created_at: r.try_get("created_at")?,
         decided_at: r.try_get("decided_at")?,
         decided_by: r.try_get("decided_by")?,
+        served_by: r.try_get("served_by")?,
     })
 }
 
 #[async_trait]
 impl ApprovalRepo for PgStore {
+    async fn note_served_by(&self, id: &str, served_by: &str) -> StoreResult<()> {
+        sqlx::query("UPDATE approvals SET served_by = $2 WHERE id = $1")
+            .bind(id)
+            .bind(served_by)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn note_upstream(&self, id: &str, upstream_args_hash: &str) -> StoreResult<()> {
+        sqlx::query("UPDATE approvals SET upstream_args_hash = $2 WHERE id = $1")
+            .bind(id)
+            .bind(upstream_args_hash)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     async fn add_grant(
         &self,
         session_key: &str,
@@ -1216,6 +1236,7 @@ impl ApprovalRepo for PgStore {
                         CASE WHEN outcome = 'pending' AND decided_at IS NULL AND created_at < $1
                              THEN 'expired' ELSE outcome END AS outcome,
                         edit_distance, reason, created_at, decided_at, decided_by,
+                        (SELECT a.served_by FROM approvals a WHERE a.id = ledger.id) AS served_by,
                         COALESCE(decided_at, created_at) AS activity_at
                  FROM ledger
                  WHERE ($2::timestamptz IS NULL OR COALESCE(decided_at, created_at) >= $2)

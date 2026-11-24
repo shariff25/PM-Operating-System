@@ -57,6 +57,51 @@ macro_rules! both {
     };
 }
 
+/// Slice M8: the cases again with Slack served over MCP. `mcp`: the record approves the
+/// audience checks (posts, the audience check and the target label over MCP).
+/// `mcp_reads_only`: the record lacks them (reads over MCP; posts, the audience check and the
+/// label on the built-in connector). Two cases compare an audit event's detail text exactly,
+/// which over MCP also names the server and the tool's digest; their rules are checked over
+/// MCP by `mcp_already_drafted_and_external_confirmation_over_mcp`.
+macro_rules! over_mcp {
+    ($($case:ident),* $(,)?) => {
+        mod mcp {
+            $(
+                #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+                async fn $case() {
+                    let (f, _fake) = crate::common::reply_fixture_mcp(true).await;
+                    super::$case(&f).await;
+                }
+            )*
+        }
+        mod mcp_reads_only {
+            $(
+                #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+                async fn $case() {
+                    let (f, _fake) = crate::common::reply_fixture_mcp(false).await;
+                    super::$case(&f).await;
+                }
+            )*
+        }
+    };
+}
+
+over_mcp!(
+    duplicate_drafts_race_to_one,
+    sources_sensitivity_is_recorded_from_reads,
+    restricted_drafts_never_reach_outsiders,
+    failed_channel_calls_fail_closed,
+    undecided_drafts_expire_and_lose_their_text,
+    decided_drafts_lose_their_text_a_day_later,
+    an_overdue_draft_expires_when_decided,
+    a_tagged_reply_is_one_draft_per_message,
+    a_tagged_message_id_is_kept_and_never_sent,
+    the_pending_list_is_oldest_first_and_capped,
+    a_restricted_note_keeps_later_drafts_from_outsiders,
+    a_follow_up_starts_at_its_historys_level,
+    a_drafts_target_names_its_channel,
+);
+
 both!(
     one_draft_per_thread,
     duplicate_drafts_race_to_one,
@@ -1746,4 +1791,256 @@ async fn the_bot_lists_a_members_pending_approvals_over_http() {
     // ...and may list anyone's.
     let (status, _) = get(SERVICE_TOKEN, "?user=eve".into()).await;
     assert_eq!(status, 200);
+}
+
+// ----- slice M8: Slack over MCP --------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mcp_a_post_carries_the_marker_never_the_message_ts_and_acts_as_the_pm() {
+    let (f, fake) = common::reply_fixture_mcp(true).await;
+    let args = tagged(
+        SLACK_ALL_TEAM,
+        "1731600000.000100",
+        "1731600300.000200",
+        "Posted text.",
+    );
+    let id = internal_draft(&f, "tsk_m1", args).await;
+    decide(&f, &id, Decision::Approve, None, false, now())
+        .await
+        .unwrap();
+    // Exactly what left PM OS: the approved words plus Slack's marker, no message_ts.
+    let sent: Vec<_> = fake
+        .received()
+        .into_iter()
+        .filter(|(t, _)| t == "slack_reply")
+        .collect();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        sent[0].1,
+        json!({"channel": SLACK_ALL_TEAM, "thread_ts": "1731600000.000100", "text": "Posted text.\n\n_Drafted with PM OS_"})
+    );
+    // As the PM, with the PM's own token; the audience was read the same way.
+    for (tool, account) in fake.callers() {
+        assert_eq!(account.as_deref(), Some(SLACK_PM), "{tool}");
+    }
+    assert!(fake
+        .calls()
+        .contains(&"tools/call:slack_conversation_members".to_string()));
+    assert_eq!(f.slack.writes()[0].user, SLACK_PM);
+    // The audit names the server for the post; Slack reads never record titles.
+    let posted = events_for(&f, &id);
+    assert!(posted.iter().any(|e| e
+        .detail
+        .as_deref()
+        .unwrap_or_default()
+        .contains("via mcp server fake-slack")));
+    assert_eq!(f.svc.served_by("slack.post_reply"), "fake-slack");
+    let s = session(&f, "tsk_m1b").await;
+    f.svc
+        .call(&s, "slack_search", json!({"query": "SAML"}), now())
+        .await
+        .unwrap();
+    let read = last_event(&f);
+    assert_eq!(read.tool, "slack.search");
+    assert!(!read.sources.is_empty() && read.source_titles.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mcp_already_drafted_and_external_confirmation_over_mcp() {
+    let (f, fake) = common::reply_fixture_mcp(true).await;
+    // One draft per thread.
+    let s = session(&f, "tsk_md1").await;
+    let first = draft_at(
+        &f,
+        &s,
+        reply(SLACK_ALL_TEAM, "1731600000.000100", "Yes: SAML 2.0."),
+        now(),
+    )
+    .await;
+    let id = first["approval_id"].as_str().unwrap().to_string();
+    let other = session(&f, "tsk_md2").await;
+    let again = draft_at(
+        &f,
+        &other,
+        reply(SLACK_ALL_TEAM, "1731600000.000100", "Different words."),
+        now(),
+    )
+    .await;
+    assert_eq!(again["status"], "already_drafted");
+    assert_eq!(again["approval_id"], json!(id));
+    let e = last_event(&f);
+    assert_eq!(
+        (e.tool.as_str(), e.outcome),
+        ("slack.post_reply", Outcome::Ok)
+    );
+    assert!(e
+        .detail
+        .unwrap()
+        .starts_with("already drafted (via mcp server fake-slack, tool sha256:"));
+    // A Slack Connect channel needs a second confirmation, from the audience read over MCP.
+    let id = internal_draft(
+        &f,
+        "tsk_md3",
+        reply(
+            SLACK_CONNECT,
+            "1731601500.000700",
+            "Yes, a new key version.",
+        ),
+    )
+    .await;
+    let err = decide(&f, &id, Decision::Approve, None, false, now())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        DecisionError::NeedsExternalConfirm(AudienceSummary {
+            members: 3,
+            outsiders: 1,
+            external: true
+        })
+    );
+    assert!(f.slack.writes().is_empty());
+    assert!(last_event(&f)
+        .detail
+        .unwrap()
+        .starts_with("needs_external_confirm (via mcp server fake-slack"));
+    let posted = decide(&f, &id, Decision::Approve, None, true, now())
+        .await
+        .unwrap();
+    assert_eq!(posted.status, Status::Approved);
+    assert_eq!(f.slack.writes().len(), 1);
+    assert!(fake
+        .calls()
+        .contains(&"tools/call:slack_conversation_info".to_string()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mcp_a_changed_members_tool_fails_the_audience_check_closed() {
+    let (f, fake) = common::reply_fixture_mcp(true).await;
+    fake.tricks
+        .change_members
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let id = internal_draft(
+        &f,
+        "tsk_m2",
+        reply(SLACK_ALL_TEAM, "1731600000.000100", "Hello"),
+    )
+    .await;
+    let err = decide(&f, &id, Decision::Approve, None, false, now())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, DecisionError::AudienceUnavailable(why) if why.contains("tool_changed")),
+        "{err:?}"
+    );
+    assert_eq!(item(&f, &id).await.status, Status::Pending);
+    assert!(f.slack.writes().is_empty());
+    assert!(!fake
+        .calls()
+        .iter()
+        .any(|c| c == "tools/call:slack_conversation_members" || c == "tools/call:slack_reply"));
+    assert!(f.audit.events().iter().any(|e| e.tool == "mcp.tool_changed"
+        && e.detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("slack_conversation_members")));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mcp_a_member_list_with_anything_but_member_ids_fails_closed() {
+    let (f, fake) = common::reply_fixture_mcp(true).await;
+    fake.tricks
+        .bad_member
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let id = internal_draft(
+        &f,
+        "tsk_m3",
+        reply(SLACK_ALL_TEAM, "1731600000.000100", "Hello"),
+    )
+    .await;
+    let err = decide(&f, &id, Decision::Approve, None, false, now())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DecisionError::AudienceUnavailable(_)),
+        "{err:?}"
+    );
+    assert!(f.slack.writes().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mcp_without_the_audience_checks_reads_move_and_posts_stay_built_in() {
+    let (f, fake) = common::reply_fixture_mcp(false).await;
+    let id = internal_draft(
+        &f,
+        "tsk_m4",
+        reply(SLACK_ALL_TEAM, "1731600000.000100", "Hello"),
+    )
+    .await;
+    let s = session(&f, "tsk_m4b").await;
+    let found = f
+        .svc
+        .call(&s, "slack_search", json!({"query": "<@U0EVALS>"}), now())
+        .await
+        .unwrap();
+    assert_eq!(found["results"].as_array().unwrap().len(), 7);
+    decide(&f, &id, Decision::Approve, None, false, now())
+        .await
+        .unwrap();
+    // The post and its audience check went to the built-in connector.
+    assert_eq!(f.slack.writes().len(), 1);
+    assert_eq!(
+        f.slack.writes()[0].args,
+        json!({"channel": SLACK_ALL_TEAM, "thread_ts": "1731600000.000100", "text": "Hello"})
+    );
+    let calls = fake.calls();
+    assert!(calls.contains(&"tools/call:slack_search_messages".to_string()));
+    assert!(!calls.iter().any(|c| c.contains("slack_reply")
+        || c.contains("slack_send")
+        || c.contains("conversation")));
+    assert_eq!(f.svc.served_by("slack.search"), "fake-slack");
+    assert_eq!(f.svc.served_by("slack.read_thread"), "fake-slack");
+    assert_eq!(f.svc.served_by("slack.post_reply"), "fake");
+    assert!(!events_for(&f, &id).iter().any(|e| e
+        .detail
+        .as_deref()
+        .unwrap_or_default()
+        .contains("via mcp")));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mcp_audiences_are_the_same_through_the_checks() {
+    use pmos_toolserver::connectors::{Caller, Connector};
+    let (_f, _fake, slack) = common::reply_fixture_mcp_with(true).await;
+    let builtin = pmos_toolserver::connectors::fake::FakeConnector::slack();
+    let caller = Caller::new(SLACK_PM, "r1");
+    for channel in [
+        SLACK_ALL_TEAM,
+        SLACK_WITH_OUTSIDER,
+        SLACK_CONNECT,
+        SLACK_DM,
+        "C0NOWHERE",
+    ] {
+        let (a, b) = (
+            slack.audience(caller, channel).await,
+            builtin.audience(caller, channel).await,
+        );
+        match (a, b) {
+            (Ok(a), Ok(b)) => assert_eq!(a, b, "{channel}"),
+            (Err(_), Err(_)) => {}
+            (a, b) => panic!("{channel}: {a:?} vs {b:?}"),
+        }
+        assert_eq!(
+            slack.conversation(caller, channel).await.ok(),
+            builtin.conversation(caller, channel).await.ok(),
+            "{channel}"
+        );
+    }
+    // Someone with no linked account: "connect first", never another PM's token.
+    assert!(matches!(
+        slack
+            .audience(Caller::new("eve", "r1"), SLACK_ALL_TEAM)
+            .await,
+        Err(pmos_toolserver::connectors::ConnectorError::NotConnected(_))
+    ));
 }

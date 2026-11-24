@@ -319,19 +319,31 @@ async fn main() -> Result<()> {
     // system named is served by its approved record, which an active Admin must have approved.
     let mut switched: Vec<Arc<dyn Connector>> = Vec::new();
     let mut mcp_servers = Vec::new();
-    if config.fake_mcp {
-        let (jira, _fake) =
-            pmos_toolserver::mcp_client::start_fake(Some(stores.audit.clone()), cancel.clone())
-                .await
-                .map_err(anyhow::Error::msg)?;
-        tracing::warn!("PMOS_MCP_SYSTEMS=jira with fake connectors: Jira is served by the fake MCP server (fixtures)");
-        switched.extend(jira.connectors);
-        mcp_servers.extend(jira.servers);
+    let fake_systems: Vec<String> = config
+        .mcp_systems
+        .iter()
+        .filter(|s| {
+            config.fake_mcp && pmos_toolserver::mcp_client::FAKE_SYSTEMS.contains(&s.as_str())
+        })
+        .cloned()
+        .collect();
+    if !fake_systems.is_empty() {
+        let (served, _fake) = pmos_toolserver::mcp_client::start_fake_for(
+            &fake_systems,
+            pmos_toolserver::mcp_client::fake::FakeMcp::new(),
+            Some(stores.audit.clone()),
+            cancel.clone(),
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        tracing::warn!(systems = ?fake_systems, "PMOS_MCP_SYSTEMS with fake connectors: these systems are served by the fake MCP server (fixtures)");
+        switched.extend(served.over(&connectors).map_err(anyhow::Error::msg)?);
+        mcp_servers.extend(served.servers);
     }
     let from_records: Vec<String> = config
         .mcp_systems
         .iter()
-        .filter(|s| !(config.fake_mcp && s.as_str() == "jira"))
+        .filter(|s| !fake_systems.contains(s))
         .cloned()
         .collect();
     if !from_records.is_empty() {
@@ -355,17 +367,27 @@ async fn main() -> Result<()> {
                 "served through its approved MCP server record"
             );
         }
-        switched.extend(served.connectors);
+        for c in &served.reads_only {
+            tracing::warn!(
+                system = c.system(),
+                "its record doesn't approve the audience checks: reads are served over MCP, posts stay on the built-in connector"
+            );
+        }
+        switched.extend(served.over(&connectors).map_err(anyhow::Error::msg)?);
         mcp_servers.extend(served.servers);
     }
     // Side by side (PMOS_MCP_COMPARE, fake connectors only, so fake data only): each read runs
     // on the in-process fake and on the fake MCP server, the built-in answer is returned and
     // the comparison audited (`mcp.compare`). Writes go to the built-in fake only.
     if !config.mcp_compare.is_empty() {
-        let (shadow, _fake) =
-            pmos_toolserver::mcp_client::start_fake(Some(stores.audit.clone()), cancel.clone())
-                .await
-                .map_err(anyhow::Error::msg)?;
+        let (shadow, _fake) = pmos_toolserver::mcp_client::start_fake_for(
+            &config.mcp_compare,
+            pmos_toolserver::mcp_client::fake::FakeMcp::new(),
+            Some(stores.audit.clone()),
+            cancel.clone(),
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
         for shadow in shadow.connectors {
             let system = shadow.system().to_string();
             if !config.mcp_compare.contains(&system) {

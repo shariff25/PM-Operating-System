@@ -394,6 +394,119 @@ pub async fn reply_fixture(postgres: bool) -> Option<(Fixture, Option<TestPg>)> 
     }
 }
 
+/// The Slack MCP server's host in [`reply_fixture_mcp`]: routed to the fake on loopback.
+pub const SLACK_MCP_HOST: &str = "slack-mcp.example.test";
+
+/// Each team member's own token at the Slack MCP server: never another's, never PM OS's.
+struct TeamTokens;
+
+#[async_trait::async_trait]
+impl pmos_toolserver::mcp_client::UserTokens for TeamTokens {
+    async fn token(
+        &self,
+        user: &str,
+        _server: &str,
+    ) -> Result<pmos_toolserver::vault::Secret, pmos_toolserver::connectors::ConnectorError> {
+        pmos_toolserver::connectors::fake::SLACK_TEAM
+            .iter()
+            .find(|(h, _)| *h == user)
+            .map(|(h, _)| pmos_toolserver::vault::Secret::new(team_token(h)))
+            .ok_or_else(|| {
+                pmos_toolserver::connectors::ConnectorError::NotConnected(
+                    "connect Slack in PM OS first".into(),
+                )
+            })
+    }
+}
+
+/// `handle`'s token at the Slack MCP server in [`reply_fixture_mcp`].
+pub fn team_token(handle: &str) -> String {
+    format!("slack-mcp-token-{handle}-0123456789abcdef")
+}
+
+/// [`reply_fixture`] (in memory) with Slack served over MCP (slice M8): the fake MCP server over
+/// the fixture's own fakes (so `f.slack` sees what is written), behind a per-PM record like a
+/// vendor's (each PM's own token; the fake writes as the token's account). With
+/// `audience_checks` the record approves the conversation and members checks and Slack posts
+/// go to the server; without, the record serves reads only and posts, the audience check and
+/// the target label stay on the built-in connector.
+pub async fn reply_fixture_mcp(
+    audience_checks: bool,
+) -> (Fixture, pmos_toolserver::mcp_client::fake::FakeMcp) {
+    let (f, fake, _) = reply_fixture_mcp_with(audience_checks).await;
+    (f, fake)
+}
+
+/// [`reply_fixture_mcp`], with the Slack connector the service uses.
+pub async fn reply_fixture_mcp_with(
+    audience_checks: bool,
+) -> (
+    Fixture,
+    pmos_toolserver::mcp_client::fake::FakeMcp,
+    Arc<dyn Connector>,
+) {
+    use pmos_toolserver::mcp_client::fake::{self, FakeMcp};
+    use pmos_toolserver::mcp_client::transport::TestRoutes;
+    use pmos_toolserver::mcp_client::{McpConnector, McpServer, ServerAuth};
+    let (mut f, _) = reply_fixture(false).await.unwrap();
+    let fake =
+        FakeMcp::new().with_connectors(f.jira.clone(), f.confluence.clone(), f.slack.clone());
+    for (handle, _) in pmos_toolserver::connectors::fake::SLACK_TEAM {
+        fake.add_account(&team_token(handle), handle);
+    }
+    // The server lives as long as the test's runtime.
+    let addr = fake::serve(
+        fake.clone(),
+        vec![SLACK_MCP_HOST.into()],
+        None,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let mut record = fake::fake_records(addr)
+        .into_iter()
+        .find(|r| r.id == "fake-slack")
+        .unwrap();
+    record.url = format!("https://{SLACK_MCP_HOST}/mcp");
+    record.identity = pmos_contract::mcp::Identity {
+        host: Some(SLACK_MCP_HOST.into()),
+        ..Default::default()
+    };
+    record.auth = pmos_contract::mcp::AuthKind::OauthPerUser;
+    record.secret_env = None;
+    if !audience_checks {
+        record.checks.clear();
+        record
+            .tools
+            .retain(|t| t.class() == pmos_contract::mcp::ToolClass::Read);
+    }
+    let server = Arc::new(
+        McpServer::new(
+            record,
+            ServerAuth::PerUser(Arc::new(TeamTokens)),
+            Some(f.stores.audit.clone()),
+            &TestRoutes::default().route(SLACK_MCP_HOST, addr),
+        )
+        .unwrap(),
+    );
+    let mcp = Arc::new(McpConnector::new("slack", server, "fake-mcp").unwrap());
+    assert_eq!(mcp.posts_on_mcp(), audience_checks);
+    let slack: Arc<dyn Connector> = if audience_checks {
+        mcp
+    } else {
+        Arc::new(pmos_toolserver::mcp_client::split::ReadsOnly::new(mcp, f.slack.clone()).unwrap())
+    };
+    let catalog = Catalog::load(&f.root, now().date_naive()).expect("fixture content lints");
+    let connectors: Vec<Arc<dyn Connector>> = vec![
+        f.jira.clone(),
+        f.confluence.clone(),
+        slack.clone(),
+        Arc::new(FakeConnector::docs()),
+    ];
+    f.svc = Arc::new(ToolService::new(catalog, f.stores.clone(), connectors).unwrap());
+    (f, fake, slack)
+}
+
 /// The user database seeded with `members` and their roles; every store in memory, or with
 /// `postgres` in Postgres (`None` when no test database is set). The audit log is read back
 /// from the backend under test.

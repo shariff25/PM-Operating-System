@@ -664,8 +664,8 @@ impl McpServer {
     }
 }
 
-/// Every upstream tool the record approves, with its digest: the mapped tools and the identity
-/// check.
+/// Every upstream tool the record approves, with its digest: the mapped tools, the identity
+/// check and the check tools (slice M8).
 pub fn approved_tools(record: &ServerRecord) -> impl Iterator<Item = (&str, &str)> {
     record
         .tools
@@ -676,5 +676,11 @@ pub fn approved_tools(record: &ServerRecord) -> impl Iterator<Item = (&str, &str
                 .identity_check
                 .iter()
                 .map(|c| (c.tool.as_str(), c.digest.as_str())),
+        )
+        .chain(
+            record
+                .checks
+                .iter()
+                .map(|c| (c.upstream.as_str(), c.digest.as_str())),
         )
 }

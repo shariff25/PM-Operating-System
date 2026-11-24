@@ -225,6 +225,10 @@ pub struct ApprovalItem {
     /// `ToolService::approval_json`, only while it is for the channel the item names.
     #[serde(skip)]
     pub target_conversation: Option<TargetConversation>,
+    /// For a write sent to an MCP server: the hash of the upstream arguments, what left PM OS
+    /// (`docs/mcp-servers-spec.md` §2.6, slice M8). `None` for a built-in connector's write.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_args_hash: Option<String>,
 }
 
 /// What the tool server last read of a Slack draft's channel: metadata only.
@@ -387,6 +391,7 @@ impl NewItem<'_> {
             created_at: item.created_at,
             decided_at: None,
             decided_by: None,
+            served_by: None,
         }
     }
 
@@ -413,6 +418,7 @@ impl NewItem<'_> {
             drafted_args: None,
             edited_at: None,
             target_conversation: None,
+            upstream_args_hash: None,
         }
     }
 }
@@ -487,6 +493,14 @@ pub trait ApprovalRepo: Send + Sync {
     ) -> StoreResult<Drafted>;
 
     async fn get(&self, id: &str) -> StoreResult<Option<ApprovalItem>>;
+
+    /// Record which backend serves item `id`'s write (`served_by`: `builtin`, `fake` or an MCP
+    /// server's id; slice M8). Kept on the item; its ledger row reads it from there.
+    async fn note_served_by(&self, id: &str, served_by: &str) -> StoreResult<()>;
+
+    /// Record on item `id` the hash of the upstream arguments its write sends to an MCP server
+    /// (slice M8): written before the call.
+    async fn note_upstream(&self, id: &str, upstream_args_hash: &str) -> StoreResult<()>;
 
     /// `user`'s items, optionally only those with `status`: newest first (ties by id), at
     /// most [`LIST_LIMIT`]. An inbox that must show every pending item reads
@@ -857,6 +871,22 @@ impl ApprovalRepo for MemoryApprovals {
             .items
             .get(id)
             .cloned())
+    }
+
+    async fn note_served_by(&self, id: &str, served_by: &str) -> StoreResult<()> {
+        let mut state = self.state.lock().expect("approvals lock");
+        if let Some(l) = state.ledger.get_mut(id) {
+            l.row.served_by = Some(served_by.to_string());
+        }
+        Ok(())
+    }
+
+    async fn note_upstream(&self, id: &str, upstream_args_hash: &str) -> StoreResult<()> {
+        let mut state = self.state.lock().expect("approvals lock");
+        if let Some(item) = state.items.get_mut(id) {
+            item.upstream_args_hash = Some(upstream_args_hash.to_string());
+        }
+        Ok(())
     }
 
     async fn list(&self, user: &str, status: Option<Status>) -> StoreResult<Vec<ApprovalItem>> {

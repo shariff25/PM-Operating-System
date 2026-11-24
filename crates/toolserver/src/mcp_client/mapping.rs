@@ -11,7 +11,9 @@
 
 use std::collections::BTreeSet;
 
-use pmos_contract::mcp::{ArgsMap, ContentMap, ErrorKind, ErrorMap, ResultMap, ToolMapping};
+use pmos_contract::mcp::{
+    Adapter, ArgsMap, ContentMap, ErrorKind, ErrorMap, ResultMap, ToolMapping,
+};
 use serde_json::{Map, Value};
 
 use crate::connectors::{clip, ConnectorError, Item, SourceRef, DRAFTED_MARKER, MAX_BODY_CHARS};
@@ -158,6 +160,43 @@ pub fn upstream_args(
                 "the marker can't be set on `{field}`"
             )));
         }
+    }
+    Ok(out)
+}
+
+/// The upstream arguments of a write mapped by `tool`: [`upstream_args`], except that an
+/// adapter's write gets the marker exactly as the built-in connector adds it (slice M8):
+/// Confluence storage, HTML-escaped, with its footer; Slack's text with its marker. Still a
+/// pure function of the approved arguments and the run id.
+pub fn write_args(
+    tool: &ToolMapping,
+    args: &Value,
+    run_id: &str,
+) -> Result<Map<String, Value>, ConnectorError> {
+    let style = match tool.adapter {
+        Some(a @ (Adapter::ConfluenceStorage | Adapter::SlackText)) => a,
+        _ => return upstream_args(&tool.args, args, run_id),
+    };
+    let field = tool.args.marker.as_deref().ok_or_else(|| {
+        ConnectorError::BadArgs("the record names no marker argument for this write".into())
+    })?;
+    let plain = ArgsMap {
+        marker: None,
+        ..tool.args.clone()
+    };
+    let mut out = upstream_args(&plain, args, run_id)?;
+    let text = get_path(&Value::Object(out.clone()), field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| ConnectorError::BadArgs(format!("`{field}` is required")))?
+        .to_string();
+    let marked = match style {
+        Adapter::ConfluenceStorage => crate::connectors::atlassian::storage_body(&text, run_id),
+        _ => crate::connectors::slack::with_marker(&text),
+    };
+    if !set_path(&mut out, field, Value::String(marked)) {
+        return Err(ConnectorError::BadArgs(format!(
+            "the marker can't be set on `{field}`"
+        )));
     }
     Ok(out)
 }
@@ -316,11 +355,30 @@ pub fn items(map: &ResultMap, system: &str, result: &Value) -> Result<Vec<Item>,
     Ok(out)
 }
 
+/// The id the in-process fakes give what they write (`JIRA-W1`, `CONFLUENCE-W2`, `SLACK-W3`):
+/// accepted from the fake MCP server only (`fake_ids`), never from a server's record.
+fn fake_written_id(system: &str, raw: &Value) -> Option<String> {
+    let id = raw.as_str()?;
+    let n = id.strip_prefix(&format!("{}-W", system.to_uppercase()))?;
+    ((1..=6).contains(&n.len()) && n.chars().all(|c| c.is_ascii_digit())).then(|| id.to_string())
+}
+
 /// What a write points to.
 pub fn source_ref(
     map: &ResultMap,
     system: &str,
     result: &Value,
+) -> Result<SourceRef, ConnectorError> {
+    written_ref(map, system, result, false)
+}
+
+/// [`source_ref`]; with `fake_ids` (the fake MCP server, fake data only) the in-process fakes'
+/// written ids are accepted too, so both routes return the same reference.
+pub fn written_ref(
+    map: &ResultMap,
+    system: &str,
+    result: &Value,
+    fake_ids: bool,
 ) -> Result<SourceRef, ConnectorError> {
     let raw = raw_items(map, result)?
         .into_iter()
@@ -330,7 +388,9 @@ pub fn source_ref(
         .id
         .as_deref()
         .and_then(|p| get_path(raw, p))
-        .and_then(|v| checked_id(system, v))
+        .and_then(|v| {
+            checked_id(system, v).or_else(|| fake_ids.then(|| fake_written_id(system, v)).flatten())
+        })
         .ok_or_else(|| {
             ConnectorError::Unavailable(
                 "the server's answer names no valid id; the write may or may not have happened"
@@ -436,6 +496,86 @@ mod tests {
         let map = args_map("{pass: [description], marker: description}");
         let out = upstream_args(&map, &json!({"description": "Body"}), "r9").unwrap();
         assert_eq!(out["description"], "Body\n\nDrafted with PM OS · run r9");
+    }
+
+    #[test]
+    fn confluence_and_slack_writes_get_the_built_in_connectors_marker() {
+        let tool = |adapter: Adapter, args: &str| ToolMapping {
+            registry: "x".into(),
+            upstream: "u".into(),
+            digest: String::new(),
+            class: None,
+            approved_by: "ana".into(),
+            scopes: vec![],
+            args: args_map(args),
+            result: Default::default(),
+            errors: Default::default(),
+            adapter: Some(adapter),
+        };
+        let page = tool(
+            Adapter::ConfluenceStorage,
+            "{pass: [title, body], rename: {space: space_key}, marker: body}",
+        );
+        let args = json!({"space": "PM", "title": "T", "body": "<b>x</b> & y"});
+        let out = write_args(&page, &args, "r<1>").unwrap();
+        assert_eq!(
+            Value::Object(out.clone()),
+            json!({
+                "space_key": "PM",
+                "title": "T",
+                "body": crate::connectors::atlassian::storage_body("<b>x</b> & y", "r<1>"),
+            })
+        );
+        let body = out["body"].as_str().unwrap();
+        assert!(body.contains("&lt;b&gt;x&lt;/b&gt; &amp; y"), "{body}");
+        assert!(body.ends_with("<p><em>Drafted with PM OS · run r&lt;1&gt;</em></p>"));
+        assert_eq!(write_args(&page, &args, "r<1>").unwrap(), out, "pure");
+        let post = tool(
+            Adapter::SlackText,
+            "{pass: [channel, thread_ts, text], drop: [message_ts], marker: text}",
+        );
+        let out = write_args(
+            &post,
+            &json!({"channel": "C1", "thread_ts": "1.2", "message_ts": "1.3", "text": "Yes\n"}),
+            "r1",
+        )
+        .unwrap();
+        assert_eq!(
+            Value::Object(out),
+            json!({"channel": "C1", "thread_ts": "1.2", "text": "Yes\n\n_Drafted with PM OS_"})
+        );
+        // No text, no write.
+        assert!(matches!(
+            write_args(&post, &json!({"channel": "C1", "thread_ts": "1.2"}), "r1"),
+            Err(ConnectorError::BadArgs(_))
+        ));
+    }
+
+    #[test]
+    fn the_fakes_written_ids_are_accepted_from_the_fake_server_only() {
+        let map = result_map("{id: id, url: url}");
+        let fake = json!({"id": "CONFLUENCE-W1", "url": "https://confluence.fake.pmos.internal/CONFLUENCE-W1"});
+        assert!(matches!(
+            source_ref(&map, "confluence", &fake),
+            Err(ConnectorError::Unavailable(_))
+        ));
+        assert_eq!(
+            written_ref(&map, "confluence", &fake, true).unwrap().id,
+            "CONFLUENCE-W1"
+        );
+        assert!(written_ref(&map, "confluence", &json!({"id": "SLACK-W1"}), true).is_err());
+        assert_eq!(
+            source_ref(&map, "confluence", &json!({"id": "12345"}))
+                .unwrap()
+                .id,
+            "12345"
+        );
+        assert_eq!(
+            source_ref(&map, "slack", &json!({"id": "C0PMTEAM:1731600000.000100"}))
+                .unwrap()
+                .id,
+            "C0PMTEAM:1731600000.000100"
+        );
     }
 
     #[test]

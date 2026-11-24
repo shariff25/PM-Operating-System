@@ -243,6 +243,122 @@ pub struct ErrorMap {
 pub enum Adapter {
     /// `jira.rollup` computed by PM OS over the mapped search, following pages.
     JiraRollup,
+    /// A Confluence write (slice M8): the marker argument (the page body) is sent as Confluence
+    /// storage, its markdown converted and HTML-escaped by PM OS, with the "Drafted with PM OS"
+    /// footer the built-in connector adds. Required on `confluence.create_draft` and
+    /// `confluence.update_page`.
+    ConfluenceStorage,
+    /// A Slack post (slice M8): the marker argument (the text) gets the marker the built-in
+    /// connector adds (SLK-7). Required on `slack.post_reply` and `slack.send_message`.
+    SlackText,
+}
+
+impl Adapter {
+    /// The registry tools this adapter may serve, and that must use it.
+    pub fn tools(self) -> &'static [&'static str] {
+        match self {
+            Self::JiraRollup => &["jira.rollup"],
+            Self::ConfluenceStorage => &["confluence.create_draft", "confluence.update_page"],
+            Self::SlackText => &["slack.post_reply", "slack.send_message"],
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::JiraRollup => "jira_rollup",
+            Self::ConfluenceStorage => "confluence_storage",
+            Self::SlackText => "slack_text",
+        }
+    }
+}
+
+/// What a check tool tells PM OS (slice M8). A check is never listed to a bot and has no
+/// registry name: the tool server calls it itself, with the PM's own token, for a rule it
+/// enforces (Slack's audience check before a post, `docs/slack-reply-spec.md` §3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckRole {
+    /// A Slack conversation's kind, name and sharing (as `conversations.info`).
+    SlackConversation,
+    /// A Slack conversation's members (as `conversations.members`), page by page.
+    SlackMembers,
+}
+
+impl CheckRole {
+    pub const ALL: [CheckRole; 2] = [Self::SlackConversation, Self::SlackMembers];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SlackConversation => "slack_conversation",
+            Self::SlackMembers => "slack_members",
+        }
+    }
+
+    /// The registry system it serves.
+    pub fn system(self) -> &'static str {
+        "slack"
+    }
+
+    /// The arguments PM OS gives it, each to be passed, renamed or dropped by the record.
+    /// `channel` is always sent.
+    pub fn args(self) -> &'static [&'static str] {
+        match self {
+            Self::SlackConversation => &["channel"],
+            Self::SlackMembers => &["channel", "limit", "cursor"],
+        }
+    }
+
+    /// The fields of `result.content` a conversation check names (paths inside its item): the
+    /// first three are required, so a channel's sharing is never guessed.
+    pub const CONVERSATION_FIELDS: [&'static str; 7] = [
+        "external", "shared", "im", "mpim", "private", "name", "user",
+    ];
+    pub const CONVERSATION_REQUIRED: [&'static str; 3] = ["external", "shared", "im"];
+}
+
+/// An approved check tool on a server (slice M8): the same approval as a mapped tool (exact
+/// name, digest, its own `approved_by`, explicitly `class: read`), but no registry name.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckTool {
+    pub role: CheckRole,
+    /// The upstream tool's exact name.
+    pub upstream: String,
+    /// `sha256:<hex>` of the upstream definition's canonical JSON.
+    pub digest: String,
+    /// Must be `read`: absent would mean write, and a check never writes.
+    #[serde(default)]
+    pub class: Option<ToolClass>,
+    pub approved_by: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    #[serde(default)]
+    pub args: ArgsMap,
+    /// Conversation: `item` (the conversation object) and `content` (field → path in it).
+    /// Members: `items` (the member ids) and `next_token` (the next page's cursor).
+    #[serde(default)]
+    pub result: ResultMap,
+    #[serde(default)]
+    pub errors: ErrorMap,
+}
+
+impl CheckTool {
+    /// The check as a mapping, for the client's call path (its `registry` is a label only:
+    /// `check:<role>`, which no registry name can be).
+    pub fn as_mapping(&self) -> ToolMapping {
+        ToolMapping {
+            registry: format!("check:{}", self.role.as_str()),
+            upstream: self.upstream.clone(),
+            digest: self.digest.clone(),
+            class: self.class,
+            approved_by: self.approved_by.clone(),
+            scopes: self.scopes.clone(),
+            args: self.args.clone(),
+            result: self.result.clone(),
+            errors: self.errors.clone(),
+            adapter: None,
+        }
+    }
 }
 
 /// One approved tool: a registry tool mapped to one upstream tool.
@@ -305,6 +421,9 @@ pub struct ServerRecord {
     /// Registry systems it serves.
     pub systems: Vec<String>,
     pub tools: Vec<ToolMapping>,
+    /// Approved check tools PM OS calls itself, never listed to a bot (slice M8).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<CheckTool>,
     /// The Admin who approved the server.
     pub approved_by: String,
     /// The pull request that added it.
@@ -324,6 +443,26 @@ pub struct ServerRecord {
 impl ServerRecord {
     pub fn tool(&self, registry: &str) -> Option<&ToolMapping> {
         self.tools.iter().find(|t| t.registry == registry)
+    }
+
+    /// The approved check for `role`, if the record has one.
+    pub fn check(&self, role: CheckRole) -> Option<&CheckTool> {
+        self.checks.iter().find(|c| c.role == role)
+    }
+
+    /// The check for `role` only if it is explicitly `class: read`: the lint refuses any
+    /// other, and the tool server never calls one that isn't (a check never writes).
+    pub fn approved_check(&self, role: CheckRole) -> Option<&CheckTool> {
+        self.check(role)
+            .filter(|c| c.class == Some(ToolClass::Read))
+    }
+
+    /// Does the record approve everything Slack's audience check needs (a conversation's
+    /// sharing and its members), each as a read? Without both, Slack posts stay on the
+    /// built-in connector.
+    pub fn slack_audience(&self) -> bool {
+        self.approved_check(CheckRole::SlackConversation).is_some()
+            && self.approved_check(CheckRole::SlackMembers).is_some()
     }
 
     /// Is this a server PM OS runs on its own network (`http://<name>.pmos.internal`)?
@@ -603,6 +742,11 @@ pub fn validate(record: &ServerRecord, stem: &str, registry: &ToolRegistry) -> V
         .tools
         .iter()
         .flat_map(|t| t.scopes.iter().map(String::as_str))
+        .chain(
+            r.checks
+                .iter()
+                .flat_map(|c| c.scopes.iter().map(String::as_str)),
+        )
         .collect();
     match (r.auth, &r.oauth) {
         (AuthKind::OauthPerUser, None) => out.push(problem(
@@ -839,10 +983,48 @@ pub fn validate(record: &ServerRecord, stem: &str, registry: &ToolRegistry) -> V
                 }
             }
         }
-        if t.adapter == Some(Adapter::JiraRollup) && t.registry != "jira.rollup" {
+        if let Some(a) = t.adapter {
+            if !a.tools().contains(&t.registry.as_str()) {
+                out.push(problem(
+                    "mcp-tool",
+                    format!(
+                        "{at}: the {} adapter is only for {}",
+                        a.as_str(),
+                        a.tools().join(" and ")
+                    ),
+                ));
+            }
+        }
+        // Slice M8: a Confluence or Slack write needs its adapter, so PM OS's own rules (HTML
+        // escaping and the footer; Slack's marker) run on what is sent.
+        for a in [Adapter::ConfluenceStorage, Adapter::SlackText] {
+            if a.tools().contains(&t.registry.as_str()) && t.adapter != Some(a) {
+                out.push(problem(
+                    "mcp-tool",
+                    format!("{at} needs `adapter: {}`", a.as_str()),
+                ));
+            }
+        }
+        if t.registry == "slack.post_reply" && !t.args.drop.iter().any(|d| d == "message_ts") {
             out.push(problem(
                 "mcp-tool",
-                format!("{at}: the jira_rollup adapter is only for jira.rollup"),
+                format!("{at} must drop `message_ts`: it is PM OS's own bookkeeping and never leaves PM OS"),
+            ));
+        }
+        if t.registry == "confluence.update_page" && r.tool("confluence.read").is_none() {
+            out.push(problem(
+                "mcp-tool",
+                format!("{at} needs confluence.read on the same server: PM OS checks the page's version with it before the update"),
+            ));
+        }
+        if matches!(
+            t.registry.as_str(),
+            "slack.post_reply" | "slack.send_message"
+        ) && !r.slack_audience()
+        {
+            out.push(problem(
+                "mcp-slack-audience",
+                format!("{at}: a Slack post needs the audience check, so the record must approve both checks (slack_conversation and slack_members); without them Slack posts stay on the built-in connector"),
             ));
         }
         if t.class() == ToolClass::Write && t.args.marker.is_none() {
@@ -909,6 +1091,151 @@ pub fn validate(record: &ServerRecord, stem: &str, registry: &ToolRegistry) -> V
                 "mcp-tool",
                 format!("{at}: result.id must say where an item's id is"),
             ));
+        }
+    }
+    out.extend(validate_checks(r));
+    out
+}
+
+/// The record's check tools (slice M8).
+fn validate_checks(r: &ServerRecord) -> Vec<Problem> {
+    let mut out = Vec::new();
+    let mut roles = BTreeSet::new();
+    for c in &r.checks {
+        let at = format!("check `{}`", c.role.as_str());
+        if !roles.insert(c.role.as_str()) {
+            out.push(problem("mcp-check", format!("{at} is listed twice")));
+        }
+        if !r.systems.iter().any(|s| s == c.role.system()) {
+            out.push(problem(
+                "mcp-check",
+                format!(
+                    "{at} is for `{}`, which `systems` doesn't list",
+                    c.role.system()
+                ),
+            ));
+        }
+        if c.class != Some(ToolClass::Read) {
+            out.push(problem(
+                "mcp-check",
+                format!("{at} must be `class: read` (unclassified is a write, and a check never writes)"),
+            ));
+        }
+        if !valid_upstream(&c.upstream) {
+            out.push(problem(
+                "mcp-check",
+                format!("{at}: `{}` is not an upstream tool name", c.upstream),
+            ));
+        }
+        if !valid_digest(&c.digest) {
+            out.push(problem(
+                "mcp-digest",
+                format!("{at}: digest must be `sha256:` and 64 lowercase hex digits"),
+            ));
+        }
+        if !valid_handle(&c.approved_by) {
+            out.push(problem(
+                "mcp-approval",
+                format!("{at}: approved_by must name the Admin who approved the tool"),
+            ));
+        }
+        if c.args.marker.is_some() {
+            out.push(problem(
+                "mcp-check",
+                format!("{at}: a check carries no marker"),
+            ));
+        }
+        // Every argument PM OS gives it is passed, renamed or dropped, once; `channel` is sent.
+        let a = &c.args;
+        let named: Vec<&str> = a
+            .pass
+            .iter()
+            .map(String::as_str)
+            .chain(a.rename.keys().map(String::as_str))
+            .chain(a.drop.iter().map(String::as_str))
+            .collect();
+        let mut seen = BTreeSet::new();
+        for n in &named {
+            if !c.role.args().contains(n) || !seen.insert(*n) {
+                out.push(problem(
+                    "mcp-check",
+                    format!("{at}: argument `{n}` is unknown or named twice"),
+                ));
+            }
+        }
+        if let Some(missing) = c.role.args().iter().find(|n| !seen.contains(*n)) {
+            out.push(problem(
+                "mcp-check",
+                format!("{at} doesn't say what happens to argument `{missing}`"),
+            ));
+        }
+        if a.drop.iter().any(|d| d == "channel") {
+            out.push(problem("mcp-check", format!("{at} must send `channel`")));
+        }
+        let paths = a
+            .rename
+            .values()
+            .map(String::as_str)
+            .chain(a.fixed.keys().map(String::as_str))
+            .chain(a.pass.iter().map(String::as_str))
+            .chain(
+                [
+                    &c.result.items,
+                    &c.result.item,
+                    &c.result.next_token,
+                    &c.errors.code,
+                    &c.errors.message,
+                ]
+                .into_iter()
+                .filter_map(|p| p.as_deref()),
+            );
+        if let Some(p) = paths.into_iter().find(|p| !valid_path(p)) {
+            out.push(problem(
+                "mcp-check",
+                format!("{at}: `{p}` is not a dotted path"),
+            ));
+        }
+        match c.role {
+            CheckRole::SlackConversation => {
+                let fields = match &c.result.content {
+                    Some(ContentMap::Fields(m)) => Some(m),
+                    _ => None,
+                };
+                match fields {
+                    None => out.push(problem(
+                        "mcp-check",
+                        format!("{at}: result.content must name where each of the conversation's fields is"),
+                    )),
+                    Some(m) => {
+                        for (k, p) in m {
+                            if !CheckRole::CONVERSATION_FIELDS.contains(&k.as_str())
+                                || !valid_path(p)
+                            {
+                                out.push(problem(
+                                    "mcp-check",
+                                    format!("{at}: `{k}: {p}` is not a conversation field and path"),
+                                ));
+                            }
+                        }
+                        for k in CheckRole::CONVERSATION_REQUIRED {
+                            if !m.contains_key(k) {
+                                out.push(problem(
+                                    "mcp-check",
+                                    format!("{at}: result.content must say where `{k}` is: a channel's sharing is never guessed"),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            CheckRole::SlackMembers => {
+                if c.result.items.is_none() {
+                    out.push(problem(
+                        "mcp-check",
+                        format!("{at}: result.items must say where the member ids are"),
+                    ));
+                }
+            }
         }
     }
     out
@@ -1249,6 +1576,156 @@ tools: []
         let problems = cross_check(&[&a, &b]);
         assert!(problems.iter().any(|p| p.code == "mcp-shadow"));
         assert!(cross_check(&[&a, &a]).iter().any(|p| p.code == "mcp-id"));
+    }
+
+    fn m8_registry() -> ToolRegistry {
+        ToolRegistry::from_yaml(
+            "tools:\n  - {name: confluence.search, system: confluence, kind: read}\n  - {name: confluence.read, system: confluence, kind: read}\n  - {name: confluence.create_draft, system: confluence, kind: write}\n  - {name: confluence.update_page, system: confluence, kind: write}\n  - {name: slack.search, system: slack, kind: read}\n  - {name: slack.read_thread, system: slack, kind: read}\n  - {name: slack.post_reply, system: slack, kind: write}\n  - {name: slack.send_message, system: slack, kind: write}\n",
+        )
+        .unwrap()
+    }
+
+    /// A self-hosted Confluence and Slack server PM OS runs (slice M8).
+    fn m8() -> String {
+        format!(
+            r##"
+id: team-mcp
+operator: pmos
+transport: streamable_http
+url: http://team-mcp.pmos.internal:8800/mcp
+identity: {{address: 172.28.0.40}}
+auth: service_token
+secret_env: PMOS_MCP_TOKEN_TEAM
+systems: [confluence, slack]
+approved_by: ana
+pull: "#14"
+tools:
+  - registry: confluence.read
+    upstream: get_page
+    digest: "{DIGEST}"
+    class: read
+    approved_by: ana
+    args: {{pass: [page_id]}}
+    result: {{item: page, id: id, title: title, content: content}}
+  - registry: confluence.update_page
+    upstream: update_page
+    digest: "{DIGEST}"
+    approved_by: ana
+    adapter: confluence_storage
+    args: {{pass: [page_id, version, body, version_comment], marker: body}}
+    result: {{id: id, url: url}}
+  - registry: slack.post_reply
+    upstream: reply
+    digest: "{DIGEST}"
+    approved_by: ana
+    adapter: slack_text
+    args: {{pass: [channel, thread_ts, text], drop: [message_ts], marker: text}}
+    result: {{id: id, url: url}}
+checks:
+  - role: slack_conversation
+    upstream: conversation_info
+    digest: "{DIGEST}"
+    class: read
+    approved_by: ana
+    args: {{pass: [channel]}}
+    result: {{item: channel, content: {{external: is_ext_shared, shared: is_shared, im: is_im, name: name}}}}
+  - role: slack_members
+    upstream: conversation_members
+    digest: "{DIGEST}"
+    class: read
+    approved_by: ana
+    args: {{pass: [channel, limit, cursor]}}
+    result: {{items: members, next_token: next_cursor}}
+"##
+        )
+    }
+
+    fn m8_codes(text: &str) -> Vec<&'static str> {
+        let r = parse(text).unwrap();
+        validate(&r, &r.id.clone(), &m8_registry())
+            .into_iter()
+            .map(|p| p.code)
+            .collect()
+    }
+
+    #[test]
+    fn confluence_and_slack_writes_carry_their_rules() {
+        assert_eq!(m8_codes(&m8()), Vec::<&str>::new());
+        let r = parse(&m8()).unwrap();
+        assert!(r.slack_audience());
+        // Each write needs its adapter, and an adapter serves only its own tools.
+        assert!(
+            m8_codes(&m8().replace("    adapter: confluence_storage\n", "")).contains(&"mcp-tool")
+        );
+        assert!(
+            m8_codes(&m8().replace("adapter: slack_text", "adapter: confluence_storage"))
+                .contains(&"mcp-tool")
+        );
+        // A reply's message_ts never leaves PM OS.
+        assert!(m8_codes(&m8().replace(
+            "{pass: [channel, thread_ts, text], drop: [message_ts], marker: text}",
+            "{pass: [channel, thread_ts, text, message_ts], marker: text}"
+        ))
+        .contains(&"mcp-tool"));
+        // The version check needs the page read on the same server.
+        let no_read = m8().replacen(
+            "  - registry: confluence.read\n",
+            "  - registry: confluence.search\n",
+            1,
+        );
+        assert!(m8_codes(&no_read).contains(&"mcp-tool"));
+        // A Slack post without both audience checks is refused.
+        let without = m8().split("checks:\n").next().unwrap().to_string();
+        assert!(m8_codes(&without).contains(&"mcp-slack-audience"));
+        let one = m8().replace(
+            "  - role: slack_members\n",
+            "  - role: slack_conversation\n",
+        );
+        let codes = m8_codes(&one);
+        assert!(
+            codes.contains(&"mcp-check") && codes.contains(&"mcp-slack-audience"),
+            "{codes:?}"
+        );
+    }
+
+    #[test]
+    fn checks_are_explicit_reads_with_every_argument_said() {
+        // Unclassified is a write; a check never writes.
+        assert!(m8_codes(&m8().replacen(
+            "    class: read\n    approved_by: ana\n    args: {pass: [channel]}",
+            "    approved_by: ana\n    args: {pass: [channel]}",
+            1
+        ))
+        .contains(&"mcp-check"));
+        // Every argument named; channel always sent.
+        assert!(m8_codes(&m8().replace(
+            "{pass: [channel, limit, cursor]}",
+            "{pass: [channel, limit]}"
+        ))
+        .contains(&"mcp-check"));
+        assert!(m8_codes(&m8().replace(
+            "{pass: [channel, limit, cursor]}",
+            "{pass: [limit, cursor], drop: [channel]}"
+        ))
+        .contains(&"mcp-check"));
+        // A channel's sharing is never guessed.
+        assert!(m8_codes(&m8().replace("external: is_ext_shared, ", "")).contains(&"mcp-check"));
+        assert!(
+            m8_codes(&m8().replace("name: name}", "name: name, colour: c}")).contains(&"mcp-check")
+        );
+        // A check is approved like a tool, and only for a system the record serves.
+        assert!(m8_codes(&m8().replacen(&format!("digest: \"{DIGEST}\"\n    class: read\n    approved_by: ana\n    args: {{pass: [channel]}}"), "digest: sha256:00\n    class: read\n    approved_by: ana\n    args: {pass: [channel]}", 1))
+            .contains(&"mcp-digest"));
+        let r = parse(&m8()).unwrap();
+        let mut confluence_only = r.clone();
+        confluence_only.systems = vec!["confluence".into()];
+        confluence_only
+            .tools
+            .retain(|t| t.registry.starts_with("confluence."));
+        assert!(validate(&confluence_only, "team-mcp", &m8_registry())
+            .iter()
+            .any(|p| p.code == "mcp-check"));
+        assert!(parse(&m8().replace("role: slack_members", "role: anything")).is_err());
     }
 
     #[test]

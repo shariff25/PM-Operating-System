@@ -266,6 +266,29 @@ pub trait Connector: Send + Sync {
         None
     }
 
+    /// For a write sent to an MCP server: the arguments it would send upstream for `args`
+    /// (after mapping, the marker and any escaping), so their hash can be kept (slice M8).
+    /// `None` for a built-in connector.
+    fn upstream_args(
+        &self,
+        caller: Caller<'_>,
+        action: &str,
+        args: &Value,
+    ) -> Option<serde_json::Map<String, Value>> {
+        let _ = (caller, action, args);
+        None
+    }
+
+    /// Which backend serves `action`: the MCP server's id, `fake`, or `builtin` (the ledger's
+    /// `served_by`, `docs/mcp-servers-spec.md` §2.9).
+    fn served_by(&self, action: &str) -> String {
+        match self.route(action) {
+            Some(r) => r.server,
+            None if self.mode() == "fake" => "fake".into(),
+            None => "builtin".into(),
+        }
+    }
+
     /// Run a read action (the part of the tool name after the system).
     async fn read(
         &self,
