@@ -145,6 +145,10 @@ struct Inner {
     health: Arc<Health>,
     /// [`RouterOptions::route_control`].
     route_control: Option<std::path::PathBuf>,
+    /// `upstreams.<u>.max-in-flight`, by upstream key (§4.7).
+    upstream_caps: std::collections::HashMap<String, Arc<tokio::sync::Semaphore>>,
+    /// The hop that last answered each (role, run), and when (§4.3, step 3).
+    sticky: std::sync::Mutex<std::collections::HashMap<(String, String), (usize, Instant)>>,
     /// [`Timeouts::ready_cache`].
     ready_cache: Duration,
     /// `GET /readyz`'s last probe. Held across a probe, so callers that arrive while one
@@ -271,6 +275,12 @@ pub fn router_with(mut cfg: GatewayConfig, opts: RouterOptions) -> Router {
         }
     }
     let health = Health::new(cfg.models.routing.circuit, names);
+    let upstream_caps = cfg
+        .models
+        .upstream_caps
+        .iter()
+        .map(|(id, cap)| (id.clone(), Arc::new(tokio::sync::Semaphore::new(*cap))))
+        .collect();
     let state = AppState(Arc::new(Inner {
         models: cfg.models,
         clients: cfg.clients,
@@ -287,6 +297,8 @@ pub fn router_with(mut cfg: GatewayConfig, opts: RouterOptions) -> Router {
         keys: opts.keys,
         health,
         route_control: opts.route_control,
+        upstream_caps,
+        sticky: Default::default(),
         ready_cache,
         probe: tokio::sync::Mutex::new(None),
         source: served,
@@ -927,6 +939,8 @@ struct StreamEnd {
     /// A routed hop's model circuit: a stream cut off after its commit point counts against
     /// it (§4.4, the last rows). `None` for a one-hop role.
     circuit: Option<(Arc<Health>, HealthKey)>,
+    /// The upstream's own cap (`upstreams.<u>.max-in-flight`, §4.7), held as long as the slot.
+    _upstream: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl Drop for StreamEnd {
@@ -1341,6 +1355,16 @@ async fn forward(
     // slot is given back while waiting so retries don't hold up the queue; the same priority
     // takes it again afterwards. A streamed answer is only ever retried here, before any byte
     // of it has gone to the caller.
+    // §4.7: the upstream's own cap, if it has one, waited for like a slot.
+    let upstream_permit = match upstream_slot(inner, &role.upstream_id).await {
+        Ok(u) => u,
+        Err(why) => {
+            event.status = why.status().as_u16();
+            event.latency_ms = started.elapsed().as_millis() as u64;
+            inner.usage.record(event);
+            return busy(why);
+        }
+    };
     let mut permit = Some(permit);
     let first_attempt = Instant::now();
     let mut attempt = 0u32;
@@ -1479,6 +1503,7 @@ async fn forward(
             started,
             _permit: permit,
             circuit: None,
+            _upstream: upstream_permit,
         };
         // Remote test upstreams: remember tool-call extra_content as it passes (`remote.rs`).
         let scanner = remote.then(|| StreamScanner::new(inner.extras.clone(), &role.upstream));
@@ -1682,6 +1707,16 @@ async fn forward_routed(inner: &Inner, call: Routed) -> Response {
         }
         plan.push(i);
     }
+    // §4.3 step 3: a hop that answered this run in the last 15 minutes goes first, so one
+    // task doesn't alternate between models after one fallback.
+    if let (true, None, Some(run)) = (routing.sticky_per_run, only, &event.run) {
+        if let Some(i) = sticky_hop(inner, &role.name, run) {
+            if let Some(pos) = plan.iter().position(|p| *p == i) {
+                let h = plan.remove(pos);
+                plan.insert(0, h);
+            }
+        }
+    }
     let deadline = Instant::now() + routing.budget();
     let mut soonest: Option<Instant> = None;
     let mut permit = Some(permit);
@@ -1729,6 +1764,19 @@ async fn forward_routed(inner: &Inner, call: Routed) -> Response {
             first = false;
             same += 1;
             attempts += 1;
+            // §4.7: an upstream at its own cap is waited for, within queue-wait-secs, like a
+            // slot; busy is never a reason to switch model.
+            let upstream = match upstream_slot(inner, &hop.upstream_id).await {
+                Ok(u) => u,
+                Err(why) => {
+                    drop(trial);
+                    event.status = why.status().as_u16();
+                    event.attempts = attempts - 1;
+                    event.latency_ms = started.elapsed().as_millis() as u64;
+                    inner.usage.record(event);
+                    return busy(why);
+                }
+            };
             let outcome =
                 attempt_hop(inner, &role, hop, endpoint, &req, stream, key.as_deref()).await;
             let mut line = hop_line(inner, &event, hop, i);
@@ -1740,8 +1788,12 @@ async fn forward_routed(inner: &Inner, call: Routed) -> Response {
                     drop(trial);
                     line.skipped = skipped;
                     let permit = permit.take().expect("a committed hop holds its slot");
+                    if let (true, Some(run)) = (routing.sticky_per_run, &event.run) {
+                        remember_hop(inner, &role.name, run, i);
+                    }
                     return committed(
-                        inner, hop, i, endpoint, stream, c, line, permit, started, attempts,
+                        inner, hop, i, endpoint, stream, c, line, permit, upstream, started,
+                        attempts,
                     );
                 }
                 HopOutcome::Final {
@@ -1829,6 +1881,45 @@ async fn forward_routed(inner: &Inner, call: Routed) -> Response {
     no_model_available(secs)
 }
 
+/// How long a run keeps to the hop that answered it (§4.3, step 3).
+const STICKY_FOR: Duration = Duration::from_secs(15 * 60);
+/// The most runs remembered; past it, the oldest are forgotten.
+const STICKY_KEEP: usize = 10_000;
+
+fn sticky_hop(inner: &Inner, role: &str, run: &str) -> Option<usize> {
+    let map = inner.sticky.lock().expect("sticky lock");
+    map.get(&(role.to_string(), run.to_string()))
+        .filter(|(_, at)| at.elapsed() < STICKY_FOR)
+        .map(|(i, _)| *i)
+}
+
+fn remember_hop(inner: &Inner, role: &str, run: &str, i: usize) {
+    let mut map = inner.sticky.lock().expect("sticky lock");
+    if map.len() >= STICKY_KEEP {
+        map.retain(|_, (_, at)| at.elapsed() < STICKY_FOR);
+        if map.len() >= STICKY_KEEP {
+            map.clear();
+        }
+    }
+    map.insert((role.to_string(), run.to_string()), (i, Instant::now()));
+}
+
+/// A place under an upstream's own cap (§4.7), waited for within `limits.queue-wait-secs`.
+/// `Ok(None)`: the upstream has no cap of its own (`limits.max-in-flight` bounds it).
+async fn upstream_slot(
+    inner: &Inner,
+    upstream_id: &str,
+) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, NoSlot> {
+    let Some(sem) = inner.upstream_caps.get(upstream_id) else {
+        return Ok(None);
+    };
+    let wait = Duration::from_secs(inner.models.limits.queue_wait_secs);
+    match tokio::time::timeout(wait, sem.clone().acquire_owned()).await {
+        Ok(Ok(p)) => Ok(Some(p)),
+        _ => Err(NoSlot::TimedOut),
+    }
+}
+
 /// `503 no_model_available` (§4.3, step 5), with `Retry-After` (at least a second).
 fn no_model_available(retry_after_secs: u64) -> Response {
     let mut res = (
@@ -1886,6 +1977,7 @@ fn committed(
     c: Committed,
     mut event: UsageEvent,
     permit: Permit,
+    upstream: Option<tokio::sync::OwnedSemaphorePermit>,
     started: Instant,
     attempts: u32,
 ) -> Response {
@@ -1902,6 +1994,7 @@ fn committed(
                     inner.health.clone(),
                     HealthKey::Model(hop.reported_model().to_string()),
                 )),
+                _upstream: upstream,
             };
             let scanner = remote.then(|| StreamScanner::new(inner.extras.clone(), &hop.upstream));
             let limits = inner.models.limits;
@@ -1938,6 +2031,7 @@ fn committed(
             event.latency_ms = started.elapsed().as_millis() as u64;
             inner.usage.record(event);
             drop(permit);
+            drop(upstream);
             let res = if stream {
                 (
                     [

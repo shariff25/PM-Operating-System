@@ -47,6 +47,8 @@ pub enum Step {
     BreaksAfterContent,
     /// A whole answer with a tool call carrying `extra_content`.
     ToolCall,
+    /// [`Step::Answer`] after a pause.
+    Slow(u64, &'static str),
 }
 
 #[derive(Default)]
@@ -100,6 +102,13 @@ async fn mock_chat(State(m): State<Arc<Mock>>, headers: HeaderMap, body: Bytes) 
         .unwrap_or(Step::Answer("ok"));
     let stream = body["stream"] == json!(true);
     let model = body["model"].clone();
+    let step = match step {
+        Step::Slow(ms, text) => {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            Step::Answer(text)
+        }
+        other => other,
+    };
     match step {
         Step::Answer(text) if stream => (
             [("content-type", "text/event-stream")],
@@ -158,6 +167,7 @@ async fn mock_chat(State(m): State<Arc<Mock>>, headers: HeaderMap, body: Bytes) 
             sse(&[json!({"model": model, "choices": [{"index": 0, "delta": {"role": "assistant"}}]})]),
         )
             .into_response(),
+        Step::Slow(..) => unreachable!(),
         Step::BreaksAfterContent => {
             let first = sse(&[
                 json!({"model": model, "choices": [{"index": 0, "delta": {"content": "partial-from-a"}}]}),
@@ -781,4 +791,114 @@ async fn only_the_admin_client_reads_the_routes_and_it_makes_no_model_call() {
     assert_eq!(v["roles"][0]["model"], "hosted-model-a");
     assert_eq!(v["roles"][0]["route"][1]["label"], "hosted-model-b");
     assert!(!v.to_string().contains("id-b"));
+}
+
+// Slice MP5 (§4.7, §4.3 step 3): capacity never changes the model; a run keeps to its hop.
+
+#[tokio::test]
+async fn a_busy_upstream_is_waited_for_and_never_a_reason_to_switch_model() {
+    let gw = gateway_capped().await;
+    gw.mocks[0].always(Step::Slow(300, "slow-a"));
+    let started = std::time::Instant::now();
+    let (a, b, c) = tokio::join!(
+        ask(&gw, hello(false)).send(),
+        ask(&gw, hello(false)).send(),
+        ask(&gw, hello(false)).send()
+    );
+    for r in [a, b, c] {
+        let r = r.unwrap();
+        assert_eq!(r.status(), 200);
+        assert_eq!(header(r.headers(), "x-pmos-model"), "hosted-model-a");
+    }
+    assert_eq!(gw.mocks[0].calls(), 3);
+    assert_eq!(
+        gw.mocks[1].calls(),
+        0,
+        "busy never moves a call to another model"
+    );
+    // One at a time on the capped upstream: the three took at least three answers' time.
+    assert!(
+        started.elapsed() >= Duration::from_millis(850),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+/// [`gateway`], with `max-in-flight: 1` on the primary's upstream.
+async fn gateway_capped() -> Gw {
+    // The helper writes the upstreams itself; a cap is one more setting on up-a, so build the
+    // config by hand here from two fresh mocks.
+    let (url_a, a) = start_mock().await;
+    let (url_b, b) = start_mock().await;
+    let dir = std::env::temp_dir().join(format!("pmos-fallback-cap-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for l in ["a", "b"] {
+        let k = dir.join(format!("upstream-{l}.key"));
+        std::fs::write(&k, format!("key-{l}-0123\n")).unwrap();
+        std::fs::set_permissions(&k, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let yaml = format!(
+        "class: test\nupstreams:\n  up-a: {{url: 'openai+{url_a}', key-file: '{d}/upstream-a.key', max-in-flight: 1}}\n  \
+         up-b: {{url: 'openai+{url_b}', key-file: '{d}/upstream-b.key'}}\n\
+         models:\n  hosted-model-a: {{upstream: up-a, model: id-a, features: [{FULL}]}}\n  \
+         hosted-model-b: {{upstream: up-b, model: id-b, features: [{FULL}]}}\n\
+         roles:\n  default: {{route: [hosted-model-a, hosted-model-b]}}\n\
+         limits: {{max-in-flight: 8, per-user: 8, per-client: 8}}\n",
+        d = dir.display()
+    );
+    let usage = Arc::new(UsageLog::new(None).unwrap());
+    let (base, _stop) = serve(router_with(
+        GatewayConfig {
+            models: Models::parse(&yaml, true).unwrap(),
+            clients: vec![Client {
+                name: "runtime".into(),
+                token: TOKEN.into(),
+            }],
+            usage: usage.clone(),
+            stub: false,
+            workarounds_on: true,
+            anthropic_key: String::new(),
+            remote_key: String::new(),
+            retry: Default::default(),
+            timeouts: Default::default(),
+            model_source: ModelSource::HostedTest,
+        },
+        RouterOptions::default(),
+    ))
+    .await;
+    Gw {
+        base,
+        usage,
+        mocks: vec![a, b],
+        dir,
+        options: RouterOptions::default(),
+    }
+}
+
+#[tokio::test]
+async fn one_run_stays_on_the_model_that_answered_it() {
+    let gw = gateway(&[FULL, FULL], "").await;
+    gw.mocks[0].script(vec![Step::Status(500, None, "once")]);
+    let run = |id: &'static str| ask(&gw, hello(false)).header("x-pmos-run", id).send();
+    let r = run("run-1").await.unwrap();
+    assert_eq!(header(r.headers(), "x-pmos-model"), "hosted-model-b");
+    // The primary is healthy again, but run-1 keeps to the model that answered it...
+    let r = run("run-1").await.unwrap();
+    assert_eq!(header(r.headers(), "x-pmos-model"), "hosted-model-b");
+    assert_eq!(gw.mocks[0].calls(), 1);
+    // ...while another run starts on the primary.
+    let r = run("run-2").await.unwrap();
+    assert_eq!(header(r.headers(), "x-pmos-model"), "hosted-model-a");
+    // With sticky-per-run off, run-1 goes back to the primary.
+    let gw = gateway(&[FULL, FULL], "routing: {sticky-per-run: false}\n").await;
+    gw.mocks[0].script(vec![Step::Status(500, None, "once")]);
+    let ask1 = || ask(&gw, hello(false)).header("x-pmos-run", "run-1").send();
+    assert_eq!(
+        header(ask1().await.unwrap().headers(), "x-pmos-model"),
+        "hosted-model-b"
+    );
+    assert_eq!(
+        header(ask1().await.unwrap().headers(), "x-pmos-model"),
+        "hosted-model-a"
+    );
 }
