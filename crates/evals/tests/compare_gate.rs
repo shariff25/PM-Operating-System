@@ -16,6 +16,7 @@ fn line(id: &str, repeat: u32, passed: bool, cluster: Option<&str>) -> TaskRepor
         regression: false,
         turns: Vec::new(),
         failed_turn: None,
+        cancel: None,
         task_id: Some(format!("tsk_{id}_{repeat}")),
         status: Some("done".into()),
         passed,

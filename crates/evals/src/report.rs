@@ -221,6 +221,43 @@ impl GatewayModels {
     }
 }
 
+/// What the runner did about a task it timed out: it cancels the task on the runtime and waits
+/// a while for the task's worker to let it go, so the next attempt on that lane doesn't wait
+/// behind it (`docs/evals.md`, "Timeouts").
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Cancel {
+    /// The runtime cancelled the task. `false`: the cancel failed (`error` says why), or the
+    /// task had settled in the meantime.
+    pub cancelled: bool,
+    /// The runtime said the task's worker let it go within the wait. `None`: not waited for
+    /// (the task was still queued when last seen, or wasn't cancelled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_stopped: Option<bool>,
+    /// Seconds from the timeout to the end of the cancel and the wait.
+    pub secs: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl Cancel {
+    /// One line for the report.
+    pub fn describe(&self) -> String {
+        let what = match (self.cancelled, self.worker_stopped) {
+            (false, _) => format!(
+                "the runner timed out and couldn't cancel it ({})",
+                self.error.as_deref().unwrap_or("no reason given")
+            ),
+            (true, None) => "the runner timed out and cancelled it (it was still queued)".into(),
+            (true, Some(true)) => "the runner timed out and cancelled it; its worker stopped".into(),
+            (true, Some(false)) => {
+                "the runner timed out and cancelled it; its worker hadn't said it stopped when the runner went on"
+                    .into()
+            }
+        };
+        format!("{what} ({:.1} s)", self.secs)
+    }
+}
+
 /// One turn of a thread attempt. The report keeps no answer text.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TurnReport {
@@ -239,6 +276,9 @@ pub struct TurnReport {
     pub tag: Option<Tagged>,
     pub queue_secs: Option<f64>,
     pub total_secs: Option<f64>,
+    /// The turn timed out: what the runner did about it ([`Cancel`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel: Option<Cancel>,
 }
 
 impl TurnReport {
@@ -290,6 +330,10 @@ pub struct TaskReport {
     /// A thread task that failed: the first turn that failed, from 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed_turn: Option<u32>,
+    /// The attempt (for a thread, the turn that timed out) timed out: what the runner did
+    /// about it ([`Cancel`]). Reports from before 2026-11-24 have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel: Option<Cancel>,
 }
 
 /// The sub-tag of an attempt lost to the model provider or the infrastructure: the model
@@ -777,6 +821,9 @@ impl Report {
                 let _ = writeln!(s, "- **Asked:** {}", t.ask);
                 if let Some(id) = &t.task_id {
                     let _ = writeln!(s, "- **Task:** `{id}` (attempts: {})", t.attempts);
+                }
+                if let Some(c) = &t.cancel {
+                    let _ = writeln!(s, "- **Timed out:** {}", cell(&c.describe()));
                 }
                 if let Some(tagged) = &t.tag {
                     let _ = writeln!(

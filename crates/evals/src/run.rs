@@ -9,12 +9,12 @@ use chrono::{DateTime, NaiveDate, Utc};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-use crate::client::{status, Runtime, RuntimeTask, TraceEntry};
+use crate::client::{status, Runtime, RuntimeTask, TraceEntry, WORKER_STOPPED_EVENT};
 use crate::grade::{draft_text, grade, Check, Grade};
 use crate::isolate::Isolation;
 use crate::judge::{Gateway, Human, Judge, JudgeStatus, JudgeVerdict, Label, Reply};
 use crate::outcome::Outcome;
-use crate::report::{Report, TaskReport, TurnReport};
+use crate::report::{Cancel, Report, TaskReport, TurnReport};
 use crate::spec::{resolve_bot, Category, EvalTask, Expect};
 use crate::tag::{tag_failure, Tagged};
 
@@ -23,10 +23,92 @@ use crate::tag::{tag_failure, Tagged};
 pub struct Follow {
     pub poll: Duration,
     pub timeout: Duration,
+    /// After timing a task out and cancelling it, how long to wait for the runtime to say its
+    /// worker let it go ([`WORKER_STOPPED_EVENT`]) before going on: [`CANCEL_WAIT`] in a run.
+    pub cancel_wait: Duration,
 }
 
 /// Polls in a row that may fail before the task is given up on.
 const POLL_RETRIES: u32 = 3;
+
+/// How long a run waits for a cancelled task's worker to let it go: the harness worker
+/// heartbeats every 30 s and stops at the first heartbeat after the cancel, so 45 s covers one
+/// heartbeat with room to spare.
+pub const CANCEL_WAIT: Duration = Duration::from_secs(45);
+
+/// The event the runtime records for the runner's cancel ("cancelled by <who>").
+const CANCELLED_BY_RUNNER: &str = "cancelled by the benchmark runner";
+
+/// The longest the cancel call itself may take, so a runtime that doesn't answer can't hang
+/// the run.
+const CANCEL_CALL: Duration = Duration::from_secs(15);
+
+/// Cancel a task the runner timed out, then, if a worker had it (`last` wasn't `queued`), wait
+/// up to `follow.cancel_wait` for the runtime to say the worker let it go, so the next attempt
+/// on this lane starts on a free worker. Never fails and never waits past its bounds: a failed
+/// cancel or a silent worker is recorded, and the run goes on.
+async fn cancel_timed_out(rt: &Runtime, last: &RuntimeTask, follow: &Follow) -> Cancel {
+    let started = tokio::time::Instant::now();
+    let secs = |s: tokio::time::Instant| s.elapsed().as_secs_f64();
+    let error = match tokio::time::timeout(CANCEL_CALL, rt.cancel(&last.id)).await {
+        Ok(Ok(_)) => None,
+        // The task settled between the last poll and the cancel: nothing is left running.
+        Ok(Err(crate::client::ApiError::Status { status: 409, .. })) => {
+            Some("it had already finished".to_string())
+        }
+        Ok(Err(e)) => Some(e.to_string()),
+        Err(_) => Some(format!(
+            "the runtime didn't answer the cancel in {} s",
+            CANCEL_CALL.as_secs()
+        )),
+    };
+    if let Some(error) = error {
+        eprintln!("warning: task {}: couldn't cancel it: {error}", last.id);
+        return Cancel {
+            cancelled: false,
+            worker_stopped: None,
+            secs: secs(started),
+            error: Some(error),
+        };
+    }
+    if last.status == status::QUEUED {
+        return Cancel {
+            cancelled: true,
+            worker_stopped: None,
+            secs: secs(started),
+            error: None,
+        };
+    }
+    let until = started + follow.cancel_wait;
+    let stopped = loop {
+        if let Ok(events) = rt.events(&last.id).await {
+            if events
+                .iter()
+                .any(|e| e.text.as_deref() == Some(WORKER_STOPPED_EVENT))
+            {
+                break true;
+            }
+        }
+        let now = tokio::time::Instant::now();
+        if now >= until {
+            break false;
+        }
+        tokio::time::sleep(follow.poll.min(until - now)).await;
+    };
+    if !stopped {
+        eprintln!(
+            "warning: task {}: cancelled, but its worker hadn't stopped after {} s; going on",
+            last.id,
+            follow.cancel_wait.as_secs()
+        );
+    }
+    Cancel {
+        cancelled: true,
+        worker_stopped: Some(stopped),
+        secs: secs(started),
+        error: None,
+    }
+}
 
 /// Create a task (at `level`, when the category has one) and poll it until it settles or
 /// `follow.timeout` passes. Fills the events and the timings; the trace is read later, only
@@ -124,7 +206,22 @@ pub async fn follow_turn(
             }
         }
     }
+    // Given up on: cancel it on the runtime, so its worker stops, and wait briefly for that
+    // before this lane's next attempt (`last` keeps the status seen before the timeout).
+    let cancel = if timed_out {
+        Some(cancel_timed_out(rt, &last, follow).await)
+    } else {
+        None
+    };
     let events = match rt.events(&last.id).await {
+        // The runner's own cancel left two events; tagging reads what the task did before it.
+        Ok(e) if cancel.is_some() => e
+            .into_iter()
+            .filter(|e| {
+                let t = e.text.as_deref().unwrap_or_default();
+                t != WORKER_STOPPED_EVENT && t != CANCELLED_BY_RUNNER
+            })
+            .collect(),
         Ok(e) => e,
         Err(e) => {
             eprintln!("warning: task {}: {e}; tagging without events", last.id);
@@ -155,6 +252,7 @@ pub async fn follow_turn(
         drafts_error: None,
         queue_secs: claimed.map(secs),
         total_secs: (!timed_out).then(|| secs(last.updated_at)),
+        cancel,
     }
 }
 
@@ -458,6 +556,7 @@ async fn attempt(
         judges: r.verdicts,
         turns: Vec::new(),
         failed_turn: None,
+        cancel: r.outcome.cancel,
     }
 }
 
@@ -502,6 +601,7 @@ async fn attempt_thread(
     );
     let mut trace_read = false;
     let mut stopped = false;
+    let mut cancel = None;
     for (i, turn) in task.thread.iter().enumerate() {
         let n = i as u32 + 1;
         if stopped {
@@ -517,6 +617,7 @@ async fn attempt_thread(
                 tag: None,
                 queue_secs: None,
                 total_secs: None,
+                cancel: None,
             });
             continue;
         }
@@ -566,7 +667,12 @@ async fn attempt_thread(
             tag,
             queue_secs: r.outcome.queue_secs,
             total_secs: r.outcome.total_secs,
+            cancel: r.outcome.cancel.clone(),
         });
+        // A turn that timed out ends the thread; its cancel is the thread's.
+        if r.outcome.cancel.is_some() {
+            cancel = r.outcome.cancel;
+        }
         judges = r.verdicts;
     }
     let passed = first_failure.is_none();
@@ -592,6 +698,7 @@ async fn attempt_thread(
         judges,
         turns,
         failed_turn,
+        cancel,
     }
 }
 
@@ -625,6 +732,7 @@ fn not_started(task: &EvalTask, repeat: u32, error: String) -> TaskReport {
         judges: Vec::new(),
         turns: Vec::new(),
         failed_turn: None,
+        cancel: None,
     }
 }
 

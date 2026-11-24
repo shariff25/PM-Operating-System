@@ -28,6 +28,7 @@ fn line(id: &str, failure: Option<(Tag, &str, Check)>) -> TaskReport {
         regression: false,
         turns: Vec::new(),
         failed_turn: None,
+        cancel: None,
         judges: Vec::new(),
         task_id: Some(format!("tsk_{id}")),
         status: Some(if passed { "done" } else { "failed" }.into()),

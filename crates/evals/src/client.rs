@@ -51,6 +51,9 @@ impl RuntimeTask {
     }
 }
 
+/// The event the runtime adds to a cancelled task once its worker has been told and let it go.
+pub use pmos_contract::bots::WORKER_STOPPED_EVENT;
+
 /// A task event: `GET /v1/tasks/{id}/events`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Event {
@@ -242,6 +245,16 @@ impl Runtime {
         let path = format!("/v1/tasks/{id}");
         let v = self.send("GET", &path, &self.token, None).await?;
         Self::decode("GET", &path, v)
+    }
+
+    /// `POST /v1/tasks/{id}/cancel`: an eval task the runner gave up on. The runtime tells its
+    /// worker on the worker's next heartbeat, and records [`WORKER_STOPPED_EVENT`] when it has.
+    pub async fn cancel(&self, id: &str) -> Result<RuntimeTask, ApiError> {
+        let path = format!("/v1/tasks/{id}/cancel");
+        let v = self
+            .send("POST", &path, &self.token, Some(json!({})))
+            .await?;
+        Self::decode("POST", &path, v)
     }
 
     /// `GET /v1/tasks/{id}/events`.

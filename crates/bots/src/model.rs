@@ -14,6 +14,11 @@ pub const MAX_ATTEMPTS: i32 = 2;
 
 pub const RETRY_EVENT: &str = "interrupted by a restart; retrying";
 pub const GAVE_UP_REASON: &str = "interrupted twice by restarts; ask again";
+/// The event a cancelled task gets when its worker's next heartbeat, completion or failure is
+/// refused: the worker has been told, and lets the task go at once (the harness aborts its run
+/// on that `409`). A client that cancelled a running task waits for it to know the worker is
+/// free (the benchmark runner, `docs/evals.md`).
+pub const WORKER_STOPPED_EVENT: &str = pmos_contract::bots::WORKER_STOPPED_EVENT;
 
 /// Now, to the microsecond: Postgres keeps microseconds, so the memory store does too and
 /// both stores answer the same.

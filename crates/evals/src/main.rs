@@ -18,7 +18,7 @@ use pmos_evals::isolate::Isolation;
 use pmos_evals::judge::{self, load_calibration, load_judges, load_labels, Gateway};
 use pmos_evals::load::run_load;
 use pmos_evals::report::Report;
-use pmos_evals::run::{run_category, Follow, JudgeRun, RunOptions};
+use pmos_evals::run::{run_category, Follow, JudgeRun, RunOptions, CANCEL_WAIT};
 use pmos_evals::spec::{category_names, check_draft_tools, load_category, resolve_bot};
 use pmos_evals::stats::compare;
 use pmos_evals::taxonomy::Taxonomy;
@@ -312,6 +312,7 @@ fn resolve(conn: &Conn, config: &Config, trace_token: Option<&str>) -> Result<Re
             conn.timeout_secs
                 .unwrap_or(config.runner.task_timeout_seconds),
         ),
+        cancel_wait: CANCEL_WAIT,
     };
     Ok(Resolved {
         rt: Runtime::new(&url, token, trace_token),

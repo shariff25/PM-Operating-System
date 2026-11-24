@@ -26,6 +26,7 @@ fn opts() -> RunOptions {
         follow: Follow {
             poll: Duration::from_millis(10),
             timeout: Duration::from_millis(2000),
+            cancel_wait: Duration::from_secs(1),
         },
         concurrency: 4,
         date: NaiveDate::from_ymd_opt(2026, 11, 16).unwrap(),

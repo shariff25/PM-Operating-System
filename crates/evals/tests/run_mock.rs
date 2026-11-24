@@ -120,6 +120,7 @@ fn opts(timeout_ms: u64) -> RunOptions {
         follow: Follow {
             poll: Duration::from_millis(10),
             timeout: Duration::from_millis(timeout_ms),
+            cancel_wait: Duration::from_secs(1),
         },
         concurrency: 8,
         date: NaiveDate::from_ymd_opt(2026, 11, 9).unwrap(),
@@ -286,6 +287,7 @@ async fn load_test_reports_percentiles_against_targets() {
     let follow = Follow {
         poll: Duration::from_millis(10),
         timeout: Duration::from_secs(5),
+        cancel_wait: Duration::from_secs(1),
     };
     let result = run_load(
         &rt,
@@ -355,6 +357,7 @@ async fn load_test_counts_unfinished_tasks() {
     let follow = Follow {
         poll: Duration::from_millis(10),
         timeout: Duration::from_millis(200),
+        cancel_wait: Duration::from_secs(1),
     };
     let result = run_load(
         &rt,

@@ -464,7 +464,83 @@ both_envs!(
     a_bots_own_worker_touches_only_that_bots_tasks,
     drafts_are_read_from_the_tool_server_for_console_and_evals,
     eval_tasks_run_as_the_benchmark_member_and_never_reach_slack,
+    the_benchmark_runner_cancels_its_own_tasks_and_sees_the_worker_stop,
 );
+
+/// The benchmark runner cancels an eval task it gave up on (docs/evals.md), never anyone
+/// else's, and the task's events say when the worker let it go: once, on the first worker call
+/// the cancel refused.
+async fn the_benchmark_runner_cancels_its_own_tasks_and_sees_the_worker_stop(env: &Env) {
+    let slack = env.ask("a PM's").await;
+    let (status, _) = env
+        .post(
+            &format!("/v1/tasks/{}/cancel", id(&slack)),
+            "evals",
+            None,
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, 404, "a PM's task is no task for evals");
+
+    let new = json!({"bot": "docs", "requested_by": "ben", "text": "Q", "source": "eval"});
+    let (_, task) = env.post("/v1/tasks", "evals", None, new.clone()).await;
+    let tid = id(&task);
+    // Claim it (the Slack task is older, so claim until this one is ours).
+    let mut ours = false;
+    for _ in 0..2 {
+        let (status, c) = env.claim().await;
+        assert_eq!(status, 200);
+        ours |= c["task"]["id"] == tid.as_str();
+    }
+    assert!(ours);
+    let (status, t) = env
+        .post(&format!("/v1/tasks/{tid}/cancel"), "evals", None, json!({}))
+        .await;
+    assert_eq!(status, 200, "{t}");
+    assert_eq!(t["status"], "cancelled");
+    let stopped = |events: &Value| {
+        events
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["text"] == pmos_bots::model::WORKER_STOPPED_EVENT)
+            .count()
+    };
+    let path = format!("/v1/tasks/{tid}/events");
+    let (_, events) = env.get(&path, "evals", None).await;
+    assert!(events
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["text"] == "cancelled by the benchmark runner"));
+    assert_eq!(stopped(&events), 0, "the worker hasn't been told yet");
+    let w = |p: &str| format!("/v1/worker/tasks/{tid}/{p}");
+    let (status, body) = env.post(&w("heartbeat"), "worker", None, json!({})).await;
+    assert_eq!((status, body["status"].as_str()), (409, Some("cancelled")));
+    let (_, events) = env.get(&path, "evals", None).await;
+    assert_eq!(stopped(&events), 1);
+    // A late completion is refused too, and recorded no second time.
+    let (status, _) = env
+        .post(&w("complete"), "worker", None, json!({"result": "late"}))
+        .await;
+    assert_eq!(status, 409);
+    let (_, events) = env.get(&path, "evals", None).await;
+    assert_eq!(stopped(&events), 1);
+    let (_, t) = env.get(&format!("/v1/tasks/{tid}"), "evals", None).await;
+    assert_eq!(t["status"], "cancelled");
+
+    // A queued eval task, cancelled before any worker had it: no worker to stop.
+    let (_, queued) = env.post("/v1/tasks", "evals", None, new).await;
+    let qid = id(&queued);
+    let (status, _) = env
+        .post(&format!("/v1/tasks/{qid}/cancel"), "evals", None, json!({}))
+        .await;
+    assert_eq!(status, 200);
+    let (_, events) = env
+        .get(&format!("/v1/tasks/{qid}/events"), "evals", None)
+        .await;
+    assert_eq!(stopped(&events), 0);
+}
 
 /// The evals client (spec §3, S3): only as a handle in `PMOS_EVALS_AS` (ben, in these
 /// tests), with no Slack target, and nothing it does reaches the Slack feed.
@@ -1529,12 +1605,13 @@ async fn every_endpoint_checks_the_client() {
             &["slack", "web", "console"],
         ),
         // The console cancels only signed for a viewer (R1): unsigned, as here, it is `403`.
-        // `tests/assertion.rs` checks it signed.
+        // `tests/assertion.rs` checks it signed. Evals may cancel, but only eval tasks: this
+        // Slack one is a 404 for it.
         (
             Method::POST,
             format!("/v1/tasks/{tid}/cancel"),
             json!({}),
-            &["slack", "web"],
+            &["slack", "web", "evals"],
         ),
     ];
     for (method, path, body, allowed) in &rows {

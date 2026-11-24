@@ -28,6 +28,9 @@ pub struct Outcome {
     pub queue_secs: Option<f64>,
     /// From creation until the task settled, in seconds.
     pub total_secs: Option<f64>,
+    /// Timed out: the cancel and the wait for the worker ([`crate::report::Cancel`]). `status`
+    /// stays the last one seen before the timeout, so tagging reads the timeout, not the cancel.
+    pub cancel: Option<crate::report::Cancel>,
 }
 
 impl Outcome {

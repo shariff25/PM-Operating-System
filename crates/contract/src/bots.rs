@@ -16,6 +16,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{ModelRole, Sensitivity};
 
+/// The event the bot runtime adds to a cancelled task once its worker has been told and let
+/// it go (its first heartbeat, completion or failure after the cancel is refused). The
+/// benchmark runner waits for it after cancelling a task it timed out, so the next attempt on
+/// that lane doesn't wait behind the old one (`docs/bots-runtime.md`, `docs/evals.md`).
+pub const WORKER_STOPPED_EVENT: &str = "the worker stopped after the cancel";
+
 /// What happens when a bot uses an outbound (write) tool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

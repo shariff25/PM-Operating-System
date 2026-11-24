@@ -155,7 +155,7 @@ it may do. Anything else is `403`.
 | `web` | the web app's backend: what `slack` may do for its PM except the notification feed. It creates tasks with source `web` only, and reads its PM's own tasks and events, cancels them, manages their routines, reads the bot list, and reads and sets their member settings. A `web` task has no Slack thread and writes no notifications |
 | `worker` | claim, heartbeat, events, trace, complete, fail |
 | `console` | read everything, including traces and drafts; pause, resume and delete routines; cancel tasks |
-| `evals` | create tasks with `source: "eval"`, and read eval tasks, their events and their drafts |
+| `evals` | create tasks with `source: "eval"`, and read eval tasks, their events and their drafts, and cancel them |
 
 - **The Slack and web clients act for one PM per call**, named in `X-Pmos-User` (a PM OS handle). The
   call is `400` without it. Another PM's task or routine answers `404`, the same as one that
@@ -296,6 +296,12 @@ queued ──claim──► working ──complete──► done
   - Each may carry `"worker": "<name>"`; if it does, that worker must hold the claim.
   - A task that is no longer `working` (cancelled, recovered, finished) answers `409` with
     `{"status": …}`. That is the worker's signal to stop.
+  - **Cancel stops the worker:** a cancelled task's worker learns of it on its next heartbeat
+    (at most 30 s later, the harness's interval) and aborts the run at once, model call
+    included. The first heartbeat, complete or fail refused because the task was cancelled
+    adds the event `the worker stopped after the cancel` (`WORKER_STOPPED_EVENT`), once, so a
+    client that cancelled a running task can tell when the worker is free. The benchmark
+    runner waits for it before it gives the lane to the next attempt (`docs/evals.md`).
   - Trace entries are accepted for any claimed task, even after it finished.
 - **Events** (`status`, `checklist`, `milestone`): all are kept, and each milestone is also a
   notification.
