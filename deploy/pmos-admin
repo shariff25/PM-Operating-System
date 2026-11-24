@@ -406,6 +406,54 @@ password_web_checks() {
   return $bad
 }
 
+# pmos-web refuses PMOS_EXPOSURE=public until the admin listener (slice H10) is built (slice H4),
+# and setup.sh writes public by default (docs/openshell-any-host-spec.md §3.1: the value that
+# allows less). So `up --web` on public refuses here, first, before anything is checked against
+# Docker or started, with what an operator of a private host does instead. The preflight's
+# H-SIGNIN says the same at `up`, `status` and by hand.
+web_exposure_checks() {
+  [ "${PMOS_EXPOSURE:-}" = public ] || return 0
+  {
+    say "pmos-admin up --web: PMOS_EXPOSURE=public in deploy/.env, and the web app (pmos-web) does not"
+    say "run on a public host until the admin listener is built (spec slice H10): it refuses to start."
+    say "Nothing was started."
+    say "- A host reached only from a network the company controls (a VPN, an SSH tunnel, a closed"
+    say "  office or test network): set PMOS_EXPOSURE=private in deploy/.env, then run this again."
+    say "  The host preflight's H-PRIVATE then checks that the host looks private. If it has a public"
+    say "  address or its cloud metadata service answers, and inbound traffic to it is blocked (a"
+    say "  closed test host), record that, which deploy/pmos-admin status then shows every time:"
+    say "    sudo deploy/pmos-admin host acknowledge H-PRIVATE --reason \"<why this host is private>\""
+    say "- Any other host: leave the web app off until slice H10 (deploy/pmos-admin up, without --web)."
+  } >&2
+  return 1
+}
+
+# The daily brief's address (PMOS_WEB_BRIEF_URL, which the Slack service gets as PMOS_WEB_URL).
+# Since slice H9 the route it calls, PUT /internal/brief/{handle}, is served only on the web app's
+# internal listener, 8771 (PMOS_WEB_INTERNAL_BIND in deploy/compose.yaml), over plain http on the
+# `pmos` network; the browser-facing 8770 answers 404 for it, so a value left from before H9
+# (…:8770) would send no brief and say nothing. Blank is off (the Slack service sends nothing).
+# Anything else but http://<name>:8771 is refused, the stale port with its own message: the
+# stricter reading, since no other address in this kit serves the route.
+brief_url_checks() {
+  local url=${PMOS_WEB_BRIEF_URL:-} port
+  if [ -z "$url" ]; then
+    if [ "${PMOS_WEB_BRIEF:-0}" = 1 ]; then
+      say "note: PMOS_WEB_BRIEF=1 with PMOS_WEB_BRIEF_URL blank: the web app shows the brief panels, but the Slack service sends nothing to fill them (set PMOS_WEB_BRIEF_URL=http://web.pmos.internal:8771)" >&2
+    fi
+    return 0
+  fi
+  [[ "$url" =~ ^http://[A-Za-z0-9.-]+:8771/?$ ]] && return 0
+  port=""
+  [[ "$url" =~ ^[A-Za-z][A-Za-z0-9+.-]*://[^/:]+:([0-9]+)(/.*)?$ ]] && port=${BASH_REMATCH[1]}
+  if [ "$port" = 8770 ] || { [ -n "$port" ] && [ "$port" = "${PMOS_WEB_PORT:-8770}" ]; }; then
+    say "PMOS_WEB_BRIEF_URL=$(printf '%q' "$url") in deploy/.env is the web app's browser-facing port, which answers 404 for the brief's route since slice H9: no daily brief would reach the web app. Set PMOS_WEB_BRIEF_URL=http://web.pmos.internal:8771 (the web app's internal listener, on the pmos network only), or leave it blank to send none." >&2
+  else
+    say "PMOS_WEB_BRIEF_URL=$(printf '%q' "$url") in deploy/.env: the brief's route is served only on the web app's internal listener. Set PMOS_WEB_BRIEF_URL=http://web.pmos.internal:8771, or leave it blank to send none." >&2
+  fi
+  return 1
+}
+
 # Is the web app's Entra sign-in fully set in deploy/.env? (pmos-web itself refuses a partial
 # one at start-up, naming what is missing.)
 entra_configured() {
@@ -1651,6 +1699,11 @@ case "$cmd" in
     ;;
 
   up)
+    # The web app on a public host first: nothing else matters while pmos-web would refuse it.
+    for arg in "$@"; do
+      [ "$arg" != --web ] || web_exposure_checks || exit 2
+    done
+    brief_url_checks || exit 2
     for arg in "$@"; do
       if [ "$arg" = --console ]; then
         console_checks || exit 2

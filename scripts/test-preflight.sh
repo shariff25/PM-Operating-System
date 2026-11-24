@@ -27,7 +27,9 @@ host() { # [overlay…]
   for o in "$@"; do cp -a "$FIX/$o/." "$R/"; done
 }
 ENVF="$WORK/env"
-env_lines() { printf '%s\n' "PMOS_VLLM_IMAGE=example.test/vllm:1" "$@" >"$ENVF"; }
+# Slice H4: the two host settings are required at the run stage (H-SETTINGS), so every fixture
+# names them; a later line for the same key (an argument here) wins, as in deploy/.env.
+env_lines() { printf '%s\n' "PMOS_VLLM_IMAGE=example.test/vllm:1" PMOS_MODEL_SOURCE=local PMOS_EXPOSURE=public "$@" >"$ENVF"; }
 setcmd() { printf '%s\n' "$2" >"$R/cmd/$1"; } # id output
 OUT="" CODE=0
 pf() { # preflight arguments…
@@ -75,7 +77,7 @@ host
 env_lines
 pf
 [ "$CODE" = 0 ] || fail "the Ubuntu host fails: $OUT"
-for id in H-ARCH H-OS H-GLIBC H-KERNEL H-LSM H-LANDLOCK H-SECCOMP H-CGROUP H-DOCKER H-DOCKER-SECCOMP H-NVIDIA \
+for id in H-SETTINGS H-ARCH H-OS H-GLIBC H-KERNEL H-LSM H-LANDLOCK H-SECCOMP H-CGROUP H-DOCKER H-DOCKER-SECCOMP H-NVIDIA \
   H-PORTS H-SUBNET H-NAMES H-METADATA H-EXPOSURE H-DEVLOGIN H-SIGNIN H-ASSERT H-LOCAL; do
   expect "$id" pass 0 "ubuntu"
 done
@@ -205,7 +207,7 @@ env_lines "PMOS_MODEL_SOURCE=hosted-test"
 pf
 expect H-NVIDIA skip 0 "hosted-test from deploy/.env"
 host
-printf 'PMOS_VLLM_IMAGE=\n' >"$ENVF"
+printf 'PMOS_VLLM_IMAGE=\nPMOS_MODEL_SOURCE=local\nPMOS_EXPOSURE=public\n' >"$ENVF"
 pf
 expect H-NVIDIA fail 1 "local with PMOS_VLLM_IMAGE empty"
 env_lines
@@ -478,6 +480,7 @@ env_lines
 pf --web
 expect H-SIGNIN fail 1 "the web app on public before H10"
 [[ "$(field H-SIGNIN hint)" == *"does not serve a public host yet (spec slice H10)"* ]] || fail "H-SIGNIN's message"
+[[ "$(field H-SIGNIN hint)" == *"set PMOS_EXPOSURE=private in deploy/.env"*"host acknowledge H-PRIVATE"* ]] || fail "H-SIGNIN doesn't say what a private host's operator does: $(field H-SIGNIN hint)"
 expect H-ADMIN warn 1 "the web app on: H-ADMIN not built"
 pf --web --exposure private
 expect H-SIGNIN pass 0 "the web app on private"
@@ -657,6 +660,66 @@ expect H-LOCAL skip 0 "hosted-test isn't checked"
 env_lines PMOS_CONNECTORS=fake
 pf
 expect H-LOCAL pass 0 "local with fake connectors"
+env_lines
+
+# --- H-SETTINGS: a blank source or exposure (slice H4) -------------------------------------------
+# At the run stage a blank PMOS_MODEL_SOURCE or PMOS_EXPOSURE fails, naming the setting and the
+# values; the checks that depend on it still run the stricter way (local: H-NVIDIA; public).
+host
+printf 'PMOS_VLLM_IMAGE=example.test/vllm:1\nPMOS_EXPOSURE=public\n' >"$ENVF"
+pf
+expect H-SETTINGS fail 1 "a blank source at run"
+[[ "$(field H-SETTINGS measured)" == *"PMOS_MODEL_SOURCE is blank (use local or hosted-test"* ]] || fail "H-SETTINGS doesn't name the source: $(field H-SETTINGS measured)"
+expect H-NVIDIA pass 1 "a blank source is checked as local"
+python3 -I -c 'import json,sys; d=json.loads(sys.stdin.read()); assert d["model_source"] == "local", d' <<<"$OUT" || fail "a blank source isn't read as local for the checks"
+txt=$("$PF" --root "$R" --env-file "$ENVF" 2>/dev/null) || true
+[[ "$txt" == *"PMOS_MODEL_SOURCE=(blank; checked as local)"* ]] || fail "the text form hides a blank source: $txt"
+printf 'PMOS_VLLM_IMAGE=example.test/vllm:1\nPMOS_MODEL_SOURCE=local\n' >"$ENVF"
+pf
+expect H-SETTINGS fail 1 "a blank exposure at run"
+[[ "$(field H-SETTINGS measured)" == *"PMOS_EXPOSURE is blank (use public or private)"* ]] || fail "H-SETTINGS doesn't name the exposure"
+pf --web
+expect H-SIGNIN fail 1 "a blank exposure is checked as public"
+printf 'PMOS_VLLM_IMAGE=example.test/vllm:1\n' >"$ENVF"
+pf
+expect H-SETTINGS fail 1 "both blank at run"
+[[ "$(field H-SETTINGS measured)" == *PMOS_MODEL_SOURCE*PMOS_EXPOSURE* ]] || fail "H-SETTINGS doesn't name both"
+# A flag stands in for a blank setting (by hand); pmos-admin never passes one at run.
+pf --model-source hosted-test --exposure private
+expect H-SETTINGS pass 0 "flags at run"
+env_lines PMOS_MODEL_SOURCE=hosted
+pf
+expect H-SETTINGS fail 1 "hosted (not built) at run"
+pf --stage install --model-source hosted
+expect H-SETTINGS fail 1 "hosted (not built) at install"
+# At install with no deploy/.env, the preflight reads deploy/env.example, which ships both blank:
+# what setup.sh is about to fill in (hosted-test and public unless told otherwise), so it passes,
+# saying so, and the source-dependent checks read it as local (the stricter reading).
+grep -qx 'PMOS_MODEL_SOURCE=' "$REPO/deploy/env.example" && grep -qx 'PMOS_EXPOSURE=' "$REPO/deploy/env.example" ||
+  fail "env.example no longer ships the host settings blank: revisit the install reading"
+mkdir -p "$WORK/ex/deploy"
+cp "$PF" "$REPO/deploy/sandbox-create.sh" "$REPO/deploy/env.example" "$WORK/ex/deploy/"
+CODE=0
+OUT=$("$WORK/ex/deploy/preflight.sh" --root "$R" --env-file "$WORK/ex/deploy/.env" --json --stage install 2>"$WORK/stderr") || CODE=$?
+n_cases=$((n_cases + 1))
+expect H-SETTINGS pass 0 "install from env.example"
+[[ "$(field H-SETTINGS measured)" == *"setup.sh writes hosted-test"*"setup.sh writes public"*"checked as PMOS_MODEL_SOURCE=local, PMOS_EXPOSURE=public"* ]] ||
+  fail "install from env.example doesn't say what setup.sh fills in: $(field H-SETTINGS measured)"
+# env.example ships the stub model on, so H-NVIDIA is skipped for the stub, not for the source.
+[ "$(field H-NVIDIA measured)" = "PMOS_GATEWAY_STUB=1" ] || fail "install from env.example doesn't read a blank source as local: $(field H-NVIDIA measured)"
+CODE=0
+OUT=$("$WORK/ex/deploy/preflight.sh" --root "$R" --env-file "$WORK/ex/deploy/.env" --json --stage install --model-source hosted-test --exposure public 2>"$WORK/stderr") || CODE=$?
+n_cases=$((n_cases + 1))
+expect H-SETTINGS pass 0 "install with setup.sh's flags"
+# Run stage with that same blank file as deploy/.env: a fail.
+cp "$REPO/deploy/env.example" "$WORK/ex/deploy/.env"
+CODE=0
+OUT=$("$WORK/ex/deploy/preflight.sh" --root "$R" --env-file "$WORK/ex/deploy/.env" --json 2>"$WORK/stderr") || CODE=$?
+n_cases=$((n_cases + 1))
+expect H-SETTINGS fail 1 "run with env.example's blanks"
+# The quick stage reads no settings and has no H-SETTINGS.
+pf --stage quick
+[ -z "$(field H-SETTINGS status)" ] || fail "quick runs H-SETTINGS"
 env_lines
 
 # --- OpenShell (--openshell): the CLI, the gateway, lingering, the two canaries -------------------

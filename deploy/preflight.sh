@@ -25,11 +25,15 @@
 #                     command's output, <dir>/bin/openshell for OpenShell's CLI
 #   --only <ids>      run only these checks (diagnosis and tests); pmos-admin never passes it
 #
-# The model source and the exposure come from the flags, else deploy/.env, else: PMOS_EXPOSURE
-# `public` (the value that allows less, §3.1) and PMOS_MODEL_SOURCE `local`. Since slice H4 a
-# blank source is refused by deploy/pmos-admin and by every service (setup.sh writes hosted-test
-# unless told otherwise, and passes its choice here at install); this script reads a blank one as
-# `local` only because that is the reading under which the most is checked (H-NVIDIA, H-LOCAL).
+# The model source and the exposure come from the flags, else deploy/.env. Since slice H4 a blank
+# one is refused by deploy/pmos-admin, by deploy/compose.yaml (`:?`) and by every service, so at
+# the run stage a blank PMOS_MODEL_SOURCE or PMOS_EXPOSURE is a fail (H-SETTINGS), and `hosted`
+# (an approved provider, slice H12, not built) at every stage. At the install stage a blank one is
+# what setup.sh is about to fill in (deploy/env.example ships them blank; setup.sh writes
+# hosted-test and public unless told otherwise, §3.1, and passes its choice here), so it passes,
+# saying so. Either way the
+# checks that depend on a blank setting read it the stricter way: the source as `local` (H-NVIDIA,
+# H-LOCAL: the most checked) and the exposure as `public` (the value that allows less, §3.1).
 #
 # Exit status: 0 every check passes (warnings allowed), 1 any fails, 2 the script couldn't run.
 # --json prints {"checks": [{"id", "status", "measured", "expected", "hint"}, …],
@@ -141,8 +145,12 @@ is_set() { [ -n "${E[$1]:-}" ] && [ "${E[$1]}" != generated ]; }
 if [ "$STAGE" = install ] && [ ! -e "$ENV_FILE" ] && [ -f "$DEPLOY/env.example" ]; then ENV_FILE="$DEPLOY/env.example"; fi
 [ "$STAGE" = quick ] && [ -z "$FINGERPRINT" ] || read_env
 
-MS=${MS_FLAG:-${E[PMOS_MODEL_SOURCE]:-local}}
-EXPOSURE=${EXP_FLAG:-${E[PMOS_EXPOSURE]:-public}}
+# What the settings say (a flag, else deploy/.env; blank when neither), and the reading the
+# checks use (a blank one the stricter way, above).
+MS_SET=${MS_FLAG:-${E[PMOS_MODEL_SOURCE]:-}}
+EXPOSURE_SET=${EXP_FLAG:-${E[PMOS_EXPOSURE]:-}}
+MS=${MS_SET:-local}
+EXPOSURE=${EXPOSURE_SET:-public}
 case "$MS" in local | hosted | hosted-test) ;; *) die "PMOS_MODEL_SOURCE=$(printf '%q' "$MS"): use local, hosted or hosted-test" ;; esac
 case "$EXPOSURE" in private | public) ;; *) die "PMOS_EXPOSURE=$(printf '%q' "$EXPOSURE"): use private or public" ;; esac
 
@@ -267,6 +275,36 @@ listeners() {
 }
 
 # --- The checks -----------------------------------------------------------------------------------
+# The two host settings the stack starts from (§3.1). A blank one is refused by pmos-admin,
+# deploy/compose.yaml and every service since slice H4, so at the run stage it fails here too;
+# at install it is what setup.sh fills in. The checks that depend on one read a blank the
+# stricter way either way (local, public).
+c_settings() {
+  local probs=() fill=()
+  if [ -z "$MS_SET" ]; then
+    if [ "$STAGE" = install ]; then
+      fill+=("PMOS_MODEL_SOURCE blank: setup.sh writes hosted-test unless --model-source local")
+    else
+      probs+=("PMOS_MODEL_SOURCE is blank (use local or hosted-test; hosted isn't built yet, slice H12)")
+    fi
+  elif [ "$MS_SET" = hosted ]; then
+    probs+=("PMOS_MODEL_SOURCE=hosted, an approved provider, isn't built yet (slice H12): every service refuses it (use local or hosted-test)")
+  fi
+  if [ -z "$EXPOSURE_SET" ]; then
+    if [ "$STAGE" = install ]; then
+      fill+=("PMOS_EXPOSURE blank: setup.sh writes public unless --exposure private")
+    else
+      probs+=("PMOS_EXPOSURE is blank (use public or private)")
+    fi
+  fi
+  if [ ${#probs[@]} -gt 0 ]; then
+    res H-SETTINGS fail "$(join_sc "${probs[@]}")" "PMOS_MODEL_SOURCE local or hosted-test, PMOS_EXPOSURE public or private" "set them in deploy/.env (deploy/setup.sh writes them: --model-source hosted-test|local, --exposure public|private); deploy/pmos-admin and every service refuse a blank one, which is never read as another value. The checks below read a blank source as local and a blank exposure as public"
+  elif [ ${#fill[@]} -gt 0 ]; then
+    res H-SETTINGS pass "$(join_sc "${fill[@]}"); checked as PMOS_MODEL_SOURCE=$MS, PMOS_EXPOSURE=$EXPOSURE" "PMOS_MODEL_SOURCE local or hosted-test, PMOS_EXPOSURE public or private"
+  else
+    res H-SETTINGS pass "PMOS_MODEL_SOURCE=$MS_SET, PMOS_EXPOSURE=$EXPOSURE_SET" "PMOS_MODEL_SOURCE local or hosted-test, PMOS_EXPOSURE public or private"
+  fi
+}
 c_arch() {
   local m
   m=$(cmd_out uname-m uname -m) || { res H-ARCH fail "uname -m failed" "x86_64 or aarch64"; return; }
@@ -856,7 +894,7 @@ c_signin() {
   if ! web_on; then
     res H-SIGNIN pass "the web app is off" "sign-in as decision D2 (a) says"
   elif [ "$EXPOSURE" = public ]; then
-    res H-SIGNIN fail "the web app on, PMOS_EXPOSURE=public" "sign-in as decision D2 (a) says" "pmos-web does not serve a public host yet (spec slice H10): reach it over a VPN or an SSH tunnel with PMOS_EXPOSURE=private, or leave the web app off"
+    res H-SIGNIN fail "the web app on, PMOS_EXPOSURE=public" "sign-in as decision D2 (a) says" "pmos-web does not serve a public host yet (spec slice H10), and refuses to start on one. A host reached only from a network the company controls (a VPN, an SSH tunnel): set PMOS_EXPOSURE=private in deploy/.env; H-PRIVATE then checks the host looks private, and a closed test host with a public address needs sudo deploy/pmos-admin host acknowledge H-PRIVATE --reason \"…\". Any other host: leave the web app off until H10"
   else
     res H-SIGNIN pass "the web app on, PMOS_EXPOSURE=private" "sign-in as decision D2 (a) says" "the password allow-list rules come with slice H10"
   fi
@@ -1221,6 +1259,7 @@ if [ "$STAGE" = quick ]; then
   run_check H-NAMES c_names
   run_check O-GATEWAY c_ogateway
 else
+  run_check H-SETTINGS c_settings
   run_check H-ARCH c_arch
   run_check H-OS c_os
   run_check H-GLIBC c_glibc
@@ -1287,7 +1326,8 @@ print(json.dumps({"stage": os.environ["STAGE"], "model_source": os.environ["MS"]
                   "attestations": recs(os.environ["ATTS"], "attestation")}, indent=1))
 '
 else
-  printf 'PM OS host preflight: stage %s, PMOS_MODEL_SOURCE=%s, PMOS_EXPOSURE=%s\n' "$STAGE" "$MS" "$EXPOSURE"
+  printf 'PM OS host preflight: stage %s, PMOS_MODEL_SOURCE=%s, PMOS_EXPOSURE=%s\n' "$STAGE" \
+    "${MS_SET:-(blank; checked as $MS)}" "${EXPOSURE_SET:-(blank; checked as $EXPOSURE)}"
   for i in "${!R_ID[@]}"; do
     printf '  %-17s %-5s %s (expected: %s)\n' "${R_ID[$i]}" "${R_ST[$i]}" "${R_MEAS[$i]}" "${R_EXP[$i]}"
     [ -z "${R_HINT[$i]}" ] || [ "${R_ST[$i]}" = pass ] || printf '  %-17s       %s\n' "" "${R_HINT[$i]}"

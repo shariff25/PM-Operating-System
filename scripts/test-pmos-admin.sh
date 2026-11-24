@@ -505,6 +505,54 @@ for bad in "PMOS_MODEL_SOURCE=" "PMOS_EXPOSURE=" "PMOS_EXPOSURE=intranet" "PMOS_
   [[ "$out" == *"${bad%%=*}"* ]] || fail "up with $bad doesn't say why: $out"
   ! grep -q ' up -d' "$DOCKER_LOG" || fail "up with $bad started something"
 done
+# PMOS_EXPOSURE=public (setup.sh's default, §3.1): pmos-web refuses it until slice H10, so
+# `up --web` refuses first, before any other check or a docker call, saying what an operator of a
+# private host does (PMOS_EXPOSURE=private, and the H-PRIVATE acknowledgement); `up` without the
+# web app is unaffected.
+stack_env require PMOS_EXPOSURE=public
+code=0
+out=$(run_stack up --web 2>&1) || code=$?
+[ "$code" = 2 ] || fail "up --web on public exits $code, not 2: $out"
+[[ "$out" == *"does not"*"run on a public host until the admin listener is built (spec slice H10)"* ]] || fail "up --web on public doesn't say why: $out"
+[[ "$out" == *"set PMOS_EXPOSURE=private in deploy/.env"* && "$out" == *"sudo deploy/pmos-admin host acknowledge H-PRIVATE --reason"* ]] ||
+  fail "up --web on public doesn't say what a private host's operator does: $out"
+[ ! -s "$DOCKER_LOG" ] || fail "up --web on public called docker: $(cat "$DOCKER_LOG")"
+[ ! -s "$PF_LOG" ] || fail "up --web on public got as far as the preflight"
+# (Development sign-in off: H-DEVLOGIN refuses it on public, as it should.)
+stack_env require PMOS_EXPOSURE=public PMOS_WEB_ENABLE_DEV_LOGIN_CLOSED_TEST_NETWORK_ONLY=0
+out=$(run_stack up 2>&1) || fail "up (no web app) on public was refused: $out"
+grep -q ' up -d' "$DOCKER_LOG" || fail "up (no web app) on public didn't start"
+# The daily brief's address (slice H9 moved the route to 8771): a value left on the browser port
+# (8770, or PMOS_WEB_PORT) is refused at every `up`, naming the setting and the fix, before
+# anything starts; any other address but http://<name>:8771 too; blank is off and accepted.
+for bad in "http://web.pmos.internal:8770" "http://web.pmos.internal:8770/" "http://127.0.0.1:8770" \
+  "http://web.pmos.internal:18770|PMOS_WEB_PORT=18770"; do
+  extra=()
+  [[ "$bad" != *'|'* ]] || { extra=("${bad#*|}"); bad=${bad%%|*}; }
+  stack_env require "PMOS_WEB_BRIEF_URL=$bad" "${extra[@]}"
+  code=0
+  out=$(run_stack up 2>&1) || code=$?
+  [ "$code" = 2 ] || fail "up with PMOS_WEB_BRIEF_URL=$bad exits $code, not 2: $out"
+  [[ "$out" == *"PMOS_WEB_BRIEF_URL="*"browser-facing port"*"PMOS_WEB_BRIEF_URL=http://web.pmos.internal:8771"* ]] ||
+    fail "up with PMOS_WEB_BRIEF_URL=$bad doesn't name the setting and the fix: $out"
+  [ ! -s "$DOCKER_LOG" ] || fail "up with PMOS_WEB_BRIEF_URL=$bad called docker"
+done
+for bad in "https://web.pmos.internal:8771" "http://web.pmos.internal" "http://web.pmos.internal:8771/brief" "web.pmos.internal:8771"; do
+  stack_env require "PMOS_WEB_BRIEF_URL=$bad"
+  code=0
+  out=$(run_stack up 2>&1) || code=$?
+  [ "$code" = 2 ] || fail "up with PMOS_WEB_BRIEF_URL=$bad exits $code, not 2: $out"
+  [[ "$out" == *"PMOS_WEB_BRIEF_URL=http://web.pmos.internal:8771"* ]] || fail "up with PMOS_WEB_BRIEF_URL=$bad doesn't give the fix: $out"
+  [ ! -s "$DOCKER_LOG" ] || fail "up with PMOS_WEB_BRIEF_URL=$bad called docker"
+done
+for good in "http://web.pmos.internal:8771" "http://web.pmos.internal:8771/" "http://web:8771" ""; do
+  stack_env require "PMOS_WEB_BRIEF_URL=$good"
+  out=$(run_stack up --web 2>&1) || fail "up --web with PMOS_WEB_BRIEF_URL=$good was refused: $out"
+  grep -q ' up -d' "$DOCKER_LOG" || fail "up --web with PMOS_WEB_BRIEF_URL=$good didn't start"
+done
+stack_env require PMOS_WEB_BRIEF=1 PMOS_WEB_BRIEF_URL=
+out=$(run_stack up --web 2>&1) || fail "up --web with the brief on and no URL was refused: $out"
+[[ "$out" == *"PMOS_WEB_BRIEF=1 with PMOS_WEB_BRIEF_URL blank"* ]] || fail "up doesn't note a brief nothing fills: $out"
 # `local` with the model servers on adds compose.local.yaml (PMOS_VLLM_IMAGE required); with the
 # stub on, or under hosted-test, it doesn't.
 stack_env require
@@ -844,6 +892,11 @@ cmp -s "$WORK/setup-env.old" "$WORK/setup-env.copy" && [ "$(stat -c %h "$senv")"
   fail "setup.sh rewrote deploy/.env in place, not by a rename"
 grep -qE '^PMOS_SERVICE_TOKEN=[0-9a-f]{48}$' "$senv" || fail "setup.sh didn't fill a generated value again"
 grep -qx PMOS_MODEL_SOURCE=hosted-test "$senv" || fail "setup.sh changed the model source on a second run"
+# With PMOS_EXPOSURE=public (the default), the closing list says the web app can't run yet and
+# what a private host's operator does.
+out=$(setup_run 2>&1) || fail "setup.sh failed a third time"
+[[ "$out" == *"up --web) can't run here yet"*"spec slice H10"*"PMOS_EXPOSURE=private in deploy/.env"*"host acknowledge H-PRIVATE"* ]] ||
+  fail "setup.sh's Next list doesn't explain the web app on public: $out"
 [ "$(grep '^PMOS_VAULT_KEY=' "$senv")" = "$kept" ] || fail "setup.sh replaced a real value"
 [ "$(stat -c %a "$senv")" = 600 ] || fail "setup.sh's deploy/.env isn't 0600 after a fill"
 [ -z "$(find "$WORK/setup/deploy" -maxdepth 1 -name '.env.??????')" ] || fail "setup.sh left a temporary file"
