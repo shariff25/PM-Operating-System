@@ -141,6 +141,36 @@ Where G3a differs from the text below:
   Ledger's network listener and the bound on recorded refusals (GR-20), case folding for
   systems that need it. All G3b.
 
+**G3b: plan, and one decision that departs from the proposal (conductor, 2026-11-26).**
+Nothing of G3b is built.
+
+- **PM OS's MCP client layer is not moved into a shared crate.** The proposal, and §5.3 and
+  §9 below, said it would be. Measured before starting: it is 5,800 lines in
+  `crates/toolserver/src/mcp_client/`, and it is bound to the tool server's own connectors,
+  audit log, vault and user directory. It is also a different thing from what a gate needs.
+  PM OS's layer makes one approved server look like a built-in connector, with per-person
+  sign-in and a mapping of results. A gate in the path is a plain forwarder of the protocol's
+  messages that records each tool call. Moving the layer would be a large change to PM OS for
+  code the gate would mostly not use, and it would make Governance depend on PM OS's shapes.
+  So the gate gets its own small forwarder, and the dependency rule stays without exceptions:
+  no `gov-*` crate depends on a `pmos-*` crate. The one idea worth sharing, a digest over a
+  tool's name, description and input schema that pins it, is a few dozen lines and is written
+  again in `gov-core`. In the "both together" install the tool server still loads the gate
+  as a library (G7); that needs nothing from this.
+- **Order of G3b:** (1) the connector map in the signed bundle: per upstream tool, its pinned
+  digest and its system, operation, kind, reversal class, `outward` flag, how the resource is
+  built from the arguments, and whether identifiers fold case; (2) the forwarder: the gate as
+  an MCP server to the agent and an MCP client to one upstream server, in observe mode, on
+  the fake Jira MCP server; (3) the shim; (4) the Ledger's listener, with the bound on
+  recorded refusals (GR-20), and the gate reading checkpoints from the witness itself.
+- **To settle in (1), before code:** what the gate records for a tool the map does not know.
+  Observe mode exists to show a customer what its agents do before any policy is written, so
+  an unmapped call must still leave a receipt; but a receipt's `kind` and `operation` are
+  meant to come from the signed map, never from the tool's own description. Proposed: an
+  unmapped call is recorded with the operation named after the tool, a kind of `unknown`
+  (a new value, valid only in observe and shadow receipts and refused in enforce), and the
+  server as its resource. Policy drafted from such receipts must be completed by a person.
+
 ## Security review of 2026-11-26 (first read; the gate did not pass)
 
 An independent reviewer session read this spec, G1 and G2 at `2d08d15`, read-only, and ran
