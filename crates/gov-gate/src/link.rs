@@ -6,6 +6,8 @@ use serde_json::{json, Value};
 
 use crate::{LedgerLink, LinkAnswer};
 
+const MAX_ANSWER: usize = 64 * 1024;
+
 /// Ships to a Ledger's listener at a fixed address.
 pub struct HttpLedgerLink {
     url: String,
@@ -40,7 +42,17 @@ impl LedgerLink for HttpLedgerLink {
         if !status.is_success() {
             return Err(format!("the Ledger answered {}", status.as_u16()));
         }
-        let body: Value = response.json().await.map_err(|e| e.to_string())?;
+        // The answer is an acknowledgement and a word of refusal: read no more than that
+        // could ever need (review finding GR-78).
+        let mut response = response;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+            if bytes.len() + chunk.len() > MAX_ANSWER {
+                return Err("the Ledger's answer is larger than an answer can be".into());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let body: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
         let ack = serde_json::from_value(body.get("ack").cloned().unwrap_or(Value::Null))
             .map_err(|_| "the Ledger's answer holds no acknowledgement".to_string())?;
         Ok(LinkAnswer {

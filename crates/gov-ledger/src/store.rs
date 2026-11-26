@@ -35,7 +35,12 @@ pub struct StoredReceipt {
 /// One thing intake refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refusal {
+    /// When it was first refused.
     pub at: i64,
+    /// How many times the same envelope arrived and was refused for the same reason, and
+    /// when last. A refusal is stored once (review finding GR-74).
+    pub seen: u64,
+    pub last_at: i64,
     pub kid: Id,
     pub code: String,
     /// The receipt was taken into the chain all the same; this row is a note about it, not a
@@ -240,11 +245,18 @@ impl Store for MemoryStore {
     }
 
     async fn record_refusal(&self, scope: &Scope, refusal: &Refusal) -> StoreResult<()> {
-        self.0
-            .lock()
-            .unwrap()
-            .refusals
-            .push((k(scope), refusal.clone()));
+        let mut s = self.0.lock().unwrap();
+        let key = k(scope);
+        let again = s.refusals.iter_mut().find(|(at, r)| {
+            *at == key && r.envelope_hash == refusal.envelope_hash && r.code == refusal.code
+        });
+        match again {
+            Some((_, r)) => {
+                r.seen += 1;
+                r.last_at = refusal.at;
+            }
+            None => s.refusals.push((key, refusal.clone())),
+        }
         Ok(())
     }
 

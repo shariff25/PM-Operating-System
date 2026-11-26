@@ -278,6 +278,35 @@ impl Stack {
     }
 }
 
+/// A file's text, and with it the text of everything in it that is base64: a receipt's body
+/// is carried encoded, so a search of the raw file alone would miss what is inside it.
+fn laid_bare(bytes: &[u8]) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    fn strings(value: &Value, out: &mut Vec<String>) {
+        match value {
+            Value::String(s) => out.push(s.clone()),
+            Value::Array(items) => items.iter().for_each(|v| strings(v, out)),
+            Value::Object(map) => map.values().for_each(|v| strings(v, out)),
+            _ => {}
+        }
+    }
+    let mut text = String::from_utf8_lossy(bytes).into_owned();
+    if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
+        let mut found = Vec::new();
+        strings(&value, &mut found);
+        for s in found {
+            if let Ok(decoded) = URL_SAFE_NO_PAD.decode(&s) {
+                if std::str::from_utf8(&decoded).is_ok() {
+                    text.push('\n');
+                    text.push_str(&laid_bare(&decoded));
+                }
+            }
+        }
+    }
+    text
+}
+
 struct InProcess(Ledger<MemoryStore>);
 #[async_trait]
 impl LedgerLink for InProcess {
@@ -428,11 +457,19 @@ async fn every_tool_call_through_the_gate_leaves_receipts_and_is_changed_by_noth
 
     // Nothing the agent sent or the server answered is on the gate's disk: not the
     // credential, not an argument value, not the reply.
+    let mut spooled = String::new();
     for entry in std::fs::read_dir(s.dir.path().join("spool")).unwrap() {
-        let text = std::fs::read_to_string(entry.unwrap().path()).unwrap();
-        for secret in ["agent-jira-token", "Refund flow", "4411", "no such issue"] {
-            assert!(!text.contains(secret), "{secret} is in the spool");
-        }
+        spooled.push_str(&laid_bare(&std::fs::read(entry.unwrap().path()).unwrap()));
+    }
+    // The search reaches inside the receipts: what a receipt does hold is found.
+    assert!(spooled.contains("triage-bot") && spooled.contains("issue.update"));
+    for secret in [
+        "agent-jira-token",
+        "Refund flow",
+        "customer 4411",
+        "no such issue",
+    ] {
+        assert!(!spooled.contains(secret), "{secret} is in the spool");
     }
 
     // And the chain it wrote is one an auditor can check from files alone.
@@ -810,5 +847,77 @@ async fn a_slow_ledger_holds_up_no_call() {
     assert_eq!(
         s.forwarder.ship(&link.inner).await.unwrap(),
         Shipped::Advanced(2)
+    );
+}
+
+/// A link that takes its time.
+struct Slow(InProcess);
+#[async_trait]
+impl LedgerLink for Slow {
+    async fn ship(&self, request: &Envelope, batch: &[Envelope]) -> Result<LinkAnswer, String> {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        self.0.ship(request, batch).await
+    }
+}
+
+/// One round of shipping at a time (review finding GR-79): two rounds started together do
+/// not send the same batch twice.
+#[tokio::test]
+async fn two_rounds_of_shipping_do_not_send_the_same_batch() {
+    let s = stack(100).await;
+    s.list().await;
+    s.send(update(2, "PAY-1"), Some(SECRET), &[]).await;
+    let ledger = Ledger::new(MemoryStore::default(), scope());
+    ledger
+        .enrol_gate_key(&id("gate-1"), &gate_key().public())
+        .await
+        .unwrap();
+    let link = Slow(InProcess(ledger));
+    let (a, b) = tokio::join!(s.forwarder.ship(&link), s.forwarder.ship(&link));
+    let mut both = vec![a.unwrap(), b.unwrap()];
+    both.sort_by_key(|x| matches!(x, Shipped::NothingToSend));
+    assert_eq!(both, vec![Shipped::Advanced(2), Shipped::NothingToSend]);
+    assert_eq!(
+        s.forwarder
+            .counters
+            .ship_no_progress
+            .load(Ordering::Relaxed),
+        0
+    );
+}
+
+/// When the table of sessions is full, the one seen longest ago is forgotten and no other
+/// (review finding GR-76): a client making up session ids cannot wipe every session's
+/// listing at a stroke.
+#[tokio::test]
+async fn a_flood_of_sessions_forgets_only_the_oldest() {
+    let s = stack(100_000).await;
+    let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string();
+    s.send(list.clone(), Some(SECRET), &[("mcp-session-id", "first")])
+        .await;
+    s.send(list.clone(), Some(SECRET), &[("mcp-session-id", "second")])
+        .await;
+    for n in 0..gov_gate::forward::MAX_SESSIONS - 1 {
+        let session = format!("flood-{n}");
+        s.send(list.clone(), Some(SECRET), &[("mcp-session-id", &session)])
+            .await;
+    }
+    // "first" was pushed out; "second", listed just after it, was not.
+    s.send(
+        update(2, "PAY-1"),
+        Some(SECRET),
+        &[("mcp-session-id", "first")],
+    )
+    .await;
+    s.send(
+        update(3, "PAY-1"),
+        Some(SECRET),
+        &[("mcp-session-id", "second")],
+    )
+    .await;
+    let r = s.receipts();
+    assert_eq!(
+        (r[0].action.kind, r[2].action.kind),
+        (Kind::Unknown, Kind::Write)
     );
 }

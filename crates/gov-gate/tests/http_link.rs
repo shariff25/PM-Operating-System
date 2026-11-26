@@ -187,3 +187,29 @@ async fn a_gate_ships_over_http_and_the_ledger_answers_only_a_gate_it_knows() {
     // The gate itself carries on.
     assert_eq!(g.ship(&link).await.unwrap(), Shipped::Advanced(2));
 }
+
+/// The Ledger's answer is an acknowledgement and a word: the gate reads no more than that
+/// could need, whatever is sent (review finding GR-78).
+#[tokio::test]
+async fn an_answer_too_large_to_be_an_answer_is_not_read() {
+    let big = axum::Router::new().route(
+        "/v1/receipts",
+        axum::routing::post(|| async {
+            format!(
+                "{{\"ack\":null,\"refused\":\"{}\"}}",
+                "x".repeat(1024 * 1024)
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, big).await.unwrap() });
+    let dir = tempfile::tempdir().unwrap();
+    let mut g = gate(dir.path());
+    call(&mut g, 1);
+    let link = HttpLedgerLink::new(&format!("http://{addr}")).unwrap();
+    match g.ship(&link).await {
+        Err(GateError::Link(why)) => assert!(why.contains("larger than an answer"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+}

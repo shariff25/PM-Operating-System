@@ -33,9 +33,42 @@ use crate::{Gate, GateError, LedgerLink, Observed, Shipped, Spool};
 
 /// The largest request, or answer the gate must read, that it will hold.
 const MAX_BODY: usize = 4 * 1024 * 1024;
-/// The most sessions whose tool listings are remembered. Past it the memory is emptied: a
+/// The most sessions whose tool listings are remembered. Past it the oldest is forgotten: a
 /// forgotten listing only makes a tool `unknown` until it is listed again.
-const MAX_SESSIONS: usize = 4096;
+pub const MAX_SESSIONS: usize = 4096;
+
+/// For each MCP session, the digest of each tool's definition as the server last listed it
+/// there, and the order the sessions were first seen in.
+#[derive(Default)]
+struct Listings {
+    sessions: BTreeMap<String, (u64, BTreeMap<String, Digest>)>,
+    next: u64,
+}
+
+impl Listings {
+    /// The listing for `session`. When the table is full the session seen longest ago is
+    /// forgotten, and only that one: a client that makes up session ids cannot make every
+    /// other session's tools `unknown` at a stroke (review finding GR-76).
+    fn entry(&mut self, session: String) -> &mut BTreeMap<String, Digest> {
+        if self.sessions.len() >= MAX_SESSIONS && !self.sessions.contains_key(&session) {
+            let oldest = self
+                .sessions
+                .iter()
+                .min_by_key(|(_, (seen, _))| *seen)
+                .map(|(name, _)| name.clone());
+            if let Some(oldest) = oldest {
+                self.sessions.remove(&oldest);
+            }
+        }
+        self.next += 1;
+        let stamp = self.next;
+        &mut self
+            .sessions
+            .entry(session)
+            .or_insert((stamp, BTreeMap::new()))
+            .1
+    }
+}
 
 /// What an operator must be able to see (spec §3.4: observe mode protects nothing, and what
 /// it failed to record must not be silent). `not_recorded` is also kept in the spool's state,
@@ -66,7 +99,9 @@ pub struct Forwarder<S> {
     http: reqwest::Client,
     /// For each MCP session, the digest of each tool's definition as the server last listed
     /// it there. One session's listing never stands in for another's.
-    listed: Mutex<BTreeMap<String, BTreeMap<String, Digest>>>,
+    listed: Mutex<Listings>,
+    /// One round of shipping at a time (review finding GR-79).
+    shipping: AsyncMutex<()>,
     clock: fn() -> i64,
     pub counters: Counters,
 }
@@ -97,7 +132,8 @@ impl<S: Spool + 'static> Forwarder<S> {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|e| GateError::Link(e.to_string()))?,
-            listed: Mutex::new(BTreeMap::new()),
+            listed: Mutex::new(Listings::default()),
+            shipping: AsyncMutex::new(()),
             clock: wall_clock,
             counters: Counters::default(),
         }))
@@ -113,6 +149,9 @@ impl<S: Spool + 'static> Forwarder<S> {
     /// to apply the answer, never while the Ledger is being waited for, so a slow Ledger does
     /// not hold up a single call (review finding GR-67).
     pub async fn ship(&self, link: &dyn LedgerLink) -> Result<Shipped, GateError> {
+        // Two rounds at once would prepare the same batch. This is not the gate's lock:
+        // calls go on while a round waits here.
+        let _round = self.shipping.lock().await;
         let Some(shipment) = self.gate().await.prepare_shipment()? else {
             return Ok(Shipped::NothingToSend);
         };
@@ -353,10 +392,7 @@ async fn list<S: Spool + 'static>(
         }
     }
     let mut listed = f.listed.lock().expect("the tool list's lock");
-    if listed.len() >= MAX_SESSIONS && !listed.contains_key(&session) {
-        listed.clear();
-    }
-    let entry = listed.entry(session).or_default();
+    let entry = listed.entry(session);
     // A first page replaces what was remembered, so a tool the server has dropped is
     // forgotten; a later page adds to it.
     if !continued {
@@ -407,8 +443,9 @@ async fn call<S: Spool + 'static>(
         .listed
         .lock()
         .expect("the tool list's lock")
+        .sessions
         .get(&session)
-        .and_then(|tools| tools.get(tool))
+        .and_then(|(_, tools)| tools.get(tool))
         .cloned();
     // With no shim the gate draws the salt itself, fresh for this call (spec §4.3). Mapping
     // never fails, so there is always something to record (GR-61).

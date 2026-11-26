@@ -27,6 +27,7 @@ serde_json.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+base64.workspace = true
 sqlx.workspace = true
 tempfile.workspace = true
 uuid.workspace = true

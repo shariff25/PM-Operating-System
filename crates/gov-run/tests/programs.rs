@@ -234,6 +234,35 @@ async fn call(gate: &str, n: u64, key: &str) -> u16 {
         .as_u16()
 }
 
+/// A file's text, and with it the text of everything in it that is base64: a receipt's body
+/// is carried encoded, so a search of the raw file alone would miss what is inside it.
+fn laid_bare(bytes: &[u8]) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    fn strings(value: &Value, out: &mut Vec<String>) {
+        match value {
+            Value::String(s) => out.push(s.clone()),
+            Value::Array(items) => items.iter().for_each(|v| strings(v, out)),
+            Value::Object(map) => map.values().for_each(|v| strings(v, out)),
+            _ => {}
+        }
+    }
+    let mut text = String::from_utf8_lossy(bytes).into_owned();
+    if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
+        let mut found = Vec::new();
+        strings(&value, &mut found);
+        for s in found {
+            if let Ok(decoded) = URL_SAFE_NO_PAD.decode(&s) {
+                if std::str::from_utf8(&decoded).is_ok() {
+                    text.push('\n');
+                    text.push_str(&laid_bare(&decoded));
+                }
+            }
+        }
+    }
+    text
+}
+
 fn mode(path: &Path) -> u32 {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path).unwrap().permissions().mode() & 0o777
@@ -372,11 +401,20 @@ async fn a_gate_and_a_ledger_run_as_programs_leave_a_record_an_auditor_can_check
             files.push(entry.unwrap().path());
         }
     }
+    let mut written = String::new();
     for file in files.iter().filter(|f| f.is_file()) {
-        let text = String::from_utf8_lossy(&std::fs::read(file).unwrap()).into_owned();
-        for secret in ["agent-jira-token", "Refund flow", "4411"] {
-            assert!(!text.contains(secret), "{secret} is in {}", file.display());
+        // A file may be renamed away between the listing and the read; the export is not.
+        if let Ok(bytes) = std::fs::read(file) {
+            written.push_str(&laid_bare(&bytes));
         }
+    }
+    // The search reaches inside the receipts: what a receipt does hold is found.
+    assert!(written.contains("triage-bot") && written.contains("issue.update"));
+    for secret in ["agent-jira-token", "Refund flow", "customer 4411"] {
+        assert!(
+            !written.contains(secret),
+            "{secret} is in a file the programs wrote"
+        );
     }
 
     drop(gate);
