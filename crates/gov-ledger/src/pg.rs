@@ -9,7 +9,14 @@ use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::types::Json;
 use sqlx::Row;
 
-use crate::store::{Refusal, Store, StoreError, StoreResult, StoredReceipt};
+use crate::store::{ChainKind, Refusal, Store, StoreError, StoreResult, StoredReceipt};
+
+fn kind_text(kind: ChainKind) -> &'static str {
+    match kind {
+        ChainKind::Receipt => "receipt",
+        ChainKind::Admin => "admin",
+    }
+}
 
 impl From<sqlx::Error> for StoreError {
     fn from(e: sqlx::Error) -> Self {
@@ -74,20 +81,70 @@ impl PgStore {
 
 #[async_trait]
 impl Store for PgStore {
-    async fn add_gate_key(&self, scope: &Scope, gate: &Id, key: &PublicKey) -> StoreResult<()> {
+    async fn add_key(
+        &self,
+        scope: &Scope,
+        gate: &Id,
+        kind: ChainKind,
+        key: &PublicKey,
+    ) -> StoreResult<()> {
         key.enrolable()
             .map_err(|e| StoreError::Other(e.to_string()))?;
+        // The row goes in only if the chain has no key of the other kind. Enrolments for one
+        // chain take turns, so two at once cannot give it a key of each kind.
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1 || '/' || $2 || '/' || $3))")
+            .bind(scope.tenant.as_str())
+            .bind(scope.env.as_str())
+            .bind(gate.as_str())
+            .execute(&mut *tx)
+            .await?;
+        let other: Option<i32> = sqlx::query_scalar(
+            "SELECT 1 FROM gate_keys \
+             WHERE tenant = $1 AND env = $2 AND gate = $3 AND kind <> $4 LIMIT 1",
+        )
+        .bind(scope.tenant.as_str())
+        .bind(scope.env.as_str())
+        .bind(gate.as_str())
+        .bind(kind_text(kind))
+        .fetch_optional(&mut *tx)
+        .await?;
+        if other.is_some() {
+            return Err(StoreError::Other(
+                "that chain holds the other kind of document".into(),
+            ));
+        }
         sqlx::query(
-            "INSERT INTO gate_keys (tenant, env, kid, gate, key) VALUES ($1, $2, $3, $4, $5)",
+            "INSERT INTO gate_keys (tenant, env, kid, gate, key, kind) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(scope.tenant.as_str())
         .bind(scope.env.as_str())
         .bind(key.kid.as_str())
         .bind(gate.as_str())
         .bind(Json(key))
-        .execute(&self.pool)
+        .bind(kind_text(kind))
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
+    }
+
+    async fn chain_kind(&self, scope: &Scope, chain: &Id) -> StoreResult<Option<ChainKind>> {
+        let kind: Option<String> = sqlx::query_scalar(
+            "SELECT kind FROM gate_keys WHERE tenant = $1 AND env = $2 AND gate = $3 LIMIT 1",
+        )
+        .bind(scope.tenant.as_str())
+        .bind(scope.env.as_str())
+        .bind(chain.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match kind.as_deref() {
+            None => None,
+            Some("receipt") => Some(ChainKind::Receipt),
+            Some("admin") => Some(ChainKind::Admin),
+            Some(_) => return Err(bad("chain kind")),
+        })
     }
 
     async fn gate_key(&self, scope: &Scope, kid: &Id) -> StoreResult<Option<(Id, PublicKey)>> {

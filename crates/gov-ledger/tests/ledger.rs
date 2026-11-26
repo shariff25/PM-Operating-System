@@ -1137,3 +1137,159 @@ both_stores!(
     a_refusal_is_stored_once_however_often_it_arrives,
     refusals_once
 );
+
+// ----- chains of two kinds (slice G4a, review finding GR-108) ----------------------------
+
+fn admin_record(seq: u64, prev: Option<gov_core::Digest>, at: i64) -> gov_core::admin::AdminRecord {
+    use gov_core::admin::{Actor, AdminAction, AdminRecord, Subject, SubjectKind};
+    AdminRecord {
+        v: 1,
+        tenant: id("acme"),
+        env: id("prod"),
+        authority: id("authority"),
+        seq,
+        prev,
+        at,
+        actor: Actor {
+            id: id("ana"),
+            verified: false,
+        },
+        action: AdminAction::GateRegistered,
+        subject: Subject {
+            kind: SubjectKind::Gate,
+            id: id(&format!("gate-{seq}")),
+        },
+        about: None,
+        value: None,
+    }
+}
+
+/// `n` admin records in a chain, signed by `key`.
+fn admin_chain(key: &SigningKey, n: u64, at: i64) -> Vec<Envelope> {
+    use gov_core::admin::AdminRecord;
+    let keys = gov_core::KeySet::new([key.public()]);
+    let mut out: Vec<Envelope> = Vec::new();
+    let mut prev = None;
+    for seq in 1..=n {
+        let env = seal(&admin_record(seq, prev.clone(), at + seq as i64), key).unwrap();
+        prev = Some(
+            gov_core::open::<AdminRecord>(&env, &keys, &scope())
+                .unwrap()
+                .hash,
+        );
+        out.push(env);
+    }
+    out
+}
+
+async fn two_kinds<S: Store>(store: S) {
+    let ledger = ledger_with_gate_1(store).await;
+    let (g1, admin) = (key("gate-1-key", 20), key("authority-admin-1", 60));
+    let witness_dir = tempfile::tempdir().unwrap();
+    let witness = DirWitness::new(witness_dir.path());
+    ledger
+        .enrol_admin_key(&id("authority"), &admin.public())
+        .await
+        .unwrap();
+
+    // A chain is of one kind: a gate's chain takes no admin key, an Authority's no gate key.
+    assert!(ledger
+        .enrol_admin_key(&id("gate-1"), &key("sneak-1", 61).public())
+        .await
+        .is_err());
+    assert!(ledger
+        .enrol_gate_key(&id("authority"), &key("sneak-2", 62).public())
+        .await
+        .is_err());
+
+    // Each chain takes its own kind of document.
+    let records = admin_chain(&admin, 3, T0);
+    for env in &records {
+        assert_eq!(ledger.ingest(env, T0).await.unwrap(), Ingested::Added);
+    }
+    let receipts = chain("gate-1", &g1, 2, T0, 10);
+    for env in &receipts {
+        assert_eq!(ledger.ingest(env, T0).await.unwrap(), Ingested::Added);
+    }
+    // A receipt signed by the Authority's key is not a receipt here, and an admin record
+    // signed by a gate's key is not an admin record: each key is read as its own kind only.
+    let receipt_by_admin = seal(&receipt("authority", 4, None, T0), &admin).unwrap();
+    assert!(ledger.ingest(&receipt_by_admin, T0).await.is_err());
+    let record_by_gate = seal(&admin_record(3, None, T0), &g1).unwrap();
+    assert!(ledger.ingest(&record_by_gate, T0).await.is_err());
+    // A gap, a fork and a record for another Authority are refused like a receipt's.
+    let gap = seal(
+        &admin_record(5, Some(gov_core::Digest::of(&[b"not the head"])), T0),
+        &admin,
+    )
+    .unwrap();
+    assert_eq!(refused(ledger.ingest(&gap, T0).await), "broken_chain");
+    let fork = seal(&admin_record(2, None, T0 + 99), &admin).unwrap();
+    assert_eq!(refused(ledger.ingest(&fork, T0).await), "fork");
+    let mut elsewhere = admin_record(4, None, T0);
+    elsewhere.authority = id("another-authority");
+    assert_eq!(
+        refused(ledger.ingest(&seal(&elsewhere, &admin).unwrap(), T0).await),
+        "wrong_gate"
+    );
+    assert_eq!(
+        ledger.ingest(&records[1], T0).await.unwrap(),
+        Ingested::AlreadyHeld
+    );
+    let heads = ledger.store().heads(&scope()).await.unwrap();
+    assert_eq!(
+        heads
+            .iter()
+            .map(|(g, h)| (g.as_str(), h.seq))
+            .collect::<Vec<_>>(),
+        vec![("authority", 3), ("gate-1", 2)]
+    );
+
+    // Both chains are witnessed by the same checkpoint and checked by the same verifier.
+    ledger
+        .checkpoint(&ledger_key(), &id("ledger"), T0 + 60, &witness)
+        .await
+        .unwrap();
+    let export = ledger.export().await.unwrap();
+    let keys = ledger.keys(&ledger_key()).await.unwrap();
+    assert_eq!(keys.authorities.len(), 1);
+    assert!(!keys.gates.contains_key(&id("authority")));
+    let cps = witness.all().unwrap();
+    let report = check(&keys, &export, &cps, Some(T0 + 61));
+    assert!(report.ok(), "{:?}", report.findings);
+    assert_eq!(report.receipts_verified, 5);
+    // The export and the keys survive a trip through JSON with their kinds.
+    let export2: Export = serde_json::from_str(&serde_json::to_string(&export).unwrap()).unwrap();
+    let keys2: TrustedKeys = serde_json::from_str(&serde_json::to_string(&keys).unwrap()).unwrap();
+    assert_eq!((&export2, &keys2), (&export, &keys));
+
+    // A verifier that trusts the Authority's key as a gate's does not accept the chain: a
+    // key is trusted for one kind of document.
+    let mut mixed = keys.clone();
+    let moved = mixed.authorities.remove(&id("authority")).unwrap();
+    mixed.gates.insert(id("authority"), moved);
+    assert!(!check(&mixed, &export, &cps, Some(T0 + 61)).ok());
+    // An export that calls the admin chain a gate's fails on every record.
+    let mut relabelled = export.clone();
+    for g in &mut relabelled.gates {
+        g.kind = gov_ledger::ChainKind::Receipt;
+    }
+    assert!(!check(&mixed, &relabelled, &cps, Some(T0 + 61)).ok());
+    // An admin record removed or altered is reported, as a receipt is.
+    let mut removed = export.clone();
+    removed.gates[0].receipts.remove(1);
+    let report = check(&keys, &removed, &cps, Some(T0 + 61));
+    let found = problems(&report);
+    assert!(found
+        .iter()
+        .any(|(p, g, _)| *p == Problem::BrokenChain && *g == Some("authority")));
+    // An Authority the verifier trusts and the export leaves out is reported.
+    let mut hidden = export.clone();
+    hidden.gates.retain(|g| g.gate != id("authority"));
+    let report = check(&keys, &hidden, &cps, Some(T0 + 61));
+    let found = problems(&report);
+    assert!(found
+        .iter()
+        .any(|(p, g, _)| *p == Problem::GateMissing && *g == Some("authority")));
+}
+both_stores!(a_chain_holds_one_kind_of_document, two_kinds);

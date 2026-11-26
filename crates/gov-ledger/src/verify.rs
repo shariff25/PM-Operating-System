@@ -7,11 +7,59 @@
 
 use std::collections::BTreeMap;
 
+use gov_core::admin::AdminRecord;
+use gov_core::envelope::Opened;
 use gov_core::lease::{Checkpoint, Pruned};
 use gov_core::receipt::{follow, ChainHead, Receipt};
 use gov_core::{open, Digest, Envelope, Id, KeySet, Scope};
 
 use crate::export::{Export, TrustedKeys};
+use crate::store::ChainKind;
+
+/// One document of a chain, of whichever kind the chain holds.
+enum Link {
+    Receipt(Opened<Receipt>),
+    Admin(Opened<AdminRecord>),
+}
+
+impl Link {
+    /// Open `envelope` as the kind of document the chain holds, under the chain's keys, and
+    /// check it names the chain. The error is the code a finding carries.
+    fn open(
+        kind: ChainKind,
+        envelope: &Envelope,
+        keys: &KeySet,
+        scope: &Scope,
+        chain: &Id,
+    ) -> Result<Self, &'static str> {
+        match kind {
+            ChainKind::Receipt => match open::<Receipt>(envelope, keys, scope) {
+                Ok(o) if &o.doc.gate == chain => Ok(Link::Receipt(o)),
+                Ok(_) => Err("wrong_gate"),
+                Err(e) => Err(e.code()),
+            },
+            ChainKind::Admin => match open::<AdminRecord>(envelope, keys, scope) {
+                Ok(o) if &o.doc.authority == chain => Ok(Link::Admin(o)),
+                Ok(_) => Err("wrong_gate"),
+                Err(e) => Err(e.code()),
+            },
+        }
+    }
+
+    fn follow(&self, head: Option<&ChainHead>) -> gov_core::Result<ChainHead> {
+        match self {
+            Link::Receipt(o) => follow(head, o),
+            Link::Admin(o) => gov_core::admin::follow(head, o),
+        }
+    }
+
+    fn at(&self) -> i64 {
+        match self {
+            Link::Receipt(o) => o.doc.at,
+            Link::Admin(o) => o.doc.at,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Problem {
@@ -152,7 +200,7 @@ pub fn verify(check: &Check<'_>) -> Report {
     if check.export.tenant != check.scope.tenant || check.export.env != check.scope.env {
         find(Problem::BadExport("wrong_tenant"), None, None);
     }
-    for gate in check.keys.gates.keys() {
+    for gate in check.keys.gates.keys().chain(check.keys.authorities.keys()) {
         if !check.export.gates.iter().any(|g| &g.gate == gate) {
             find(Problem::GateMissing, Some(gate), None);
         }
@@ -167,7 +215,14 @@ pub fn verify(check: &Check<'_>) -> Report {
             );
             continue;
         }
-        let Some(gate_keys) = check.keys.gates.get(&gate.gate) else {
+        // The keys for the kind of chain the export says this is. A gate's chain passed
+        // off as an Authority's, or the other way round, finds no keys: a key is trusted for
+        // one kind of document only.
+        let trusted = match gate.kind {
+            ChainKind::Receipt => &check.keys.gates,
+            ChainKind::Admin => &check.keys.authorities,
+        };
+        let Some(gate_keys) = trusted.get(&gate.gate) else {
             find(Problem::UnknownGate, Some(&gate.gate), None);
             continue;
         };
@@ -203,26 +258,14 @@ pub fn verify(check: &Check<'_>) -> Report {
         }
         for envelope in &gate.receipts {
             let expected = head.as_ref().map_or(1, |h| h.seq.saturating_add(1));
-            let opened = match open::<Receipt>(envelope, &keys, check.scope) {
-                Ok(o) if o.doc.gate == gate.gate => o,
-                Ok(_) => {
-                    find(
-                        Problem::BadReceipt("wrong_gate"),
-                        Some(&gate.gate),
-                        Some(expected),
-                    );
-                    break;
-                }
-                Err(e) => {
-                    find(
-                        Problem::BadReceipt(e.code()),
-                        Some(&gate.gate),
-                        Some(expected),
-                    );
+            let link = match Link::open(gate.kind, envelope, &keys, check.scope, &gate.gate) {
+                Ok(link) => link,
+                Err(code) => {
+                    find(Problem::BadReceipt(code), Some(&gate.gate), Some(expected));
                     break;
                 }
             };
-            match follow(head.as_ref(), &opened) {
+            match link.follow(head.as_ref()) {
                 Ok(h) => {
                     if chain.pruned_hash.is_some()
                         && h.seq == chain.pruned_through.saturating_add(1)
@@ -233,7 +276,7 @@ pub fn verify(check: &Check<'_>) -> Report {
                         .times
                         .values()
                         .next_back()
-                        .is_some_and(|last| opened.doc.at < *last);
+                        .is_some_and(|last| link.at() < *last);
                     if went_back {
                         find(
                             Problem::BadReceipt("time_went_back"),
@@ -244,30 +287,32 @@ pub fn verify(check: &Check<'_>) -> Report {
                     // An outcome answers one intent of this chain, for the same action, and an
                     // intent has at most one outcome (finding GR-46). An intent from before
                     // the pruned stretch cannot be checked.
-                    match (opened.doc.phase, opened.doc.intent) {
-                        (gov_core::receipt::Phase::Intent, _) => {
-                            chain
-                                .intents
-                                .insert(h.seq, (opened.doc.action.digest.clone(), false));
-                        }
-                        (_, Some(n)) if n > chain.pruned_through => {
-                            let fits =
-                                chain.intents.get_mut(&n).is_some_and(|(digest, answered)| {
-                                    let ok = !*answered && *digest == opened.doc.action.digest;
-                                    *answered = true;
-                                    ok
-                                });
-                            if !fits {
-                                find(
-                                    Problem::BadReceipt("outcome_without_intent"),
-                                    Some(&gate.gate),
-                                    Some(h.seq),
-                                );
+                    if let Link::Receipt(opened) = &link {
+                        match (opened.doc.phase, opened.doc.intent) {
+                            (gov_core::receipt::Phase::Intent, _) => {
+                                chain
+                                    .intents
+                                    .insert(h.seq, (opened.doc.action.digest.clone(), false));
                             }
+                            (_, Some(n)) if n > chain.pruned_through => {
+                                let fits =
+                                    chain.intents.get_mut(&n).is_some_and(|(digest, answered)| {
+                                        let ok = !*answered && *digest == opened.doc.action.digest;
+                                        *answered = true;
+                                        ok
+                                    });
+                                if !fits {
+                                    find(
+                                        Problem::BadReceipt("outcome_without_intent"),
+                                        Some(&gate.gate),
+                                        Some(h.seq),
+                                    );
+                                }
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
-                    chain.times.insert(h.seq, opened.doc.at);
+                    chain.times.insert(h.seq, link.at());
                     chain.hashes.insert(h.seq, h.hash.clone());
                     head = Some(h);
                     receipts_verified += 1;

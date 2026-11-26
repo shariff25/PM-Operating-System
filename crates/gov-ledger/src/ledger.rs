@@ -1,5 +1,6 @@
 //! Intake, checkpoints, pruning and export (spec §6).
 
+use gov_core::admin::AdminRecord;
 use gov_core::lease::{batch_digest, Checkpoint, GateHead, IntakeAck, Pruned, ShipRequest};
 use gov_core::receipt::{follow, Phase, Receipt};
 use gov_core::{
@@ -7,7 +8,7 @@ use gov_core::{
 };
 
 use crate::export::{Export, GateExport, TrustedKeys};
-use crate::store::{Refusal, Store, StoreError, StoredReceipt};
+use crate::store::{ChainKind, Refusal, Store, StoreError, StoredReceipt};
 use crate::witness::{Witness, WitnessError};
 
 #[derive(Debug, thiserror::Error)]
@@ -57,6 +58,20 @@ impl<S: Store> Ledger<S> {
         Ok(())
     }
 
+    /// Enrol an Authority's key for its admin records. The same rules as for a gate's key,
+    /// and the chain it names must not be a gate's.
+    pub async fn enrol_admin_key(
+        &self,
+        authority: &Id,
+        key: &PublicKey,
+    ) -> Result<(), LedgerError> {
+        key.enrolable()?;
+        self.store
+            .add_key(&self.scope, authority, ChainKind::Admin, key)
+            .await?;
+        Ok(())
+    }
+
     async fn refuse(
         &self,
         envelope: &Envelope,
@@ -91,6 +106,12 @@ impl<S: Store> Ledger<S> {
             return self.refuse(envelope, "unknown_key", false, now).await;
         };
         let keys = KeySet::new([key]);
+        // A chain holds one kind of document, and a key is enrolled for one kind. A key
+        // enrolled for admin records is read as an admin record or refused, never as a
+        // receipt; a gate's key, below, never as an admin record (review finding GR-108).
+        if self.store.chain_kind(&self.scope, &gate).await? == Some(ChainKind::Admin) {
+            return self.ingest_admin(envelope, &gate, &keys, now).await;
+        }
         let opened = match open::<Receipt>(envelope, &keys, &self.scope) {
             Ok(opened) => opened,
             Err(e) => return self.refuse(envelope, e.code(), false, now).await,
@@ -177,6 +198,62 @@ impl<S: Store> Ledger<S> {
                     }
                     return Ok(Ingested::Added);
                 }
+                Err(StoreError::HeadMoved) => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err(StoreError::HeadMoved.into())
+    }
+
+    /// Take in one of an Authority's admin records: signed by a key enrolled for admin
+    /// records, naming that key's Authority, keeping a record's own rules, and following
+    /// the chain's head exactly.
+    async fn ingest_admin(
+        &self,
+        envelope: &Envelope,
+        authority: &Id,
+        keys: &KeySet,
+        now: i64,
+    ) -> Result<Ingested, LedgerError> {
+        let opened = match open::<AdminRecord>(envelope, keys, &self.scope) {
+            Ok(opened) => opened,
+            Err(e) => return self.refuse(envelope, e.code(), false, now).await,
+        };
+        if &opened.doc.authority != authority {
+            return self.refuse(envelope, "wrong_gate", true, now).await;
+        }
+        for _ in 0..2 {
+            let head = self.store.head(&self.scope, authority).await?;
+            if let Some(h) = &head {
+                if opened.doc.seq <= h.seq {
+                    let held = self
+                        .store
+                        .receipt(&self.scope, authority, opened.doc.seq)
+                        .await?;
+                    return match held {
+                        Some(r) if r.hash == opened.hash => Ok(Ingested::AlreadyHeld),
+                        Some(_) => self.refuse(envelope, "fork", true, now).await,
+                        None => self.refuse(envelope, "already_pruned", true, now).await,
+                    };
+                }
+            }
+            let new_head = match gov_core::admin::follow(head.as_ref(), &opened) {
+                Ok(h) => h,
+                Err(e) => return self.refuse(envelope, e.code(), true, now).await,
+            };
+            let stored = StoredReceipt {
+                seq: new_head.seq,
+                hash: new_head.hash,
+                at: opened.doc.at,
+                received_at: now,
+                envelope: envelope.clone(),
+            };
+            match self
+                .store
+                .append(&self.scope, authority, head.map_or(0, |h| h.seq), &stored)
+                .await
+            {
+                Ok(()) => return Ok(Ingested::Added),
                 Err(StoreError::HeadMoved) => continue,
                 Err(e) => return Err(e.into()),
             }
@@ -375,8 +452,14 @@ impl<S: Store> Ledger<S> {
         for gate in self.store.gate_keys(&self.scope).await?.into_keys() {
             let receipts = self.store.receipts(&self.scope, &gate).await?;
             let pruned = self.store.pruned(&self.scope, &gate).await?;
+            let kind = self
+                .store
+                .chain_kind(&self.scope, &gate)
+                .await?
+                .unwrap_or_default();
             gates.push(GateExport {
                 gate,
+                kind,
                 pruned: pruned.map(|(_, envelope)| envelope),
                 receipts: receipts.into_iter().map(|r| r.envelope).collect(),
             });
@@ -392,9 +475,16 @@ impl<S: Store> Ledger<S> {
     /// The gate keys the Ledger holds, with `ledger` as its own. A convenience for tests and
     /// for setting up a stack; an auditor's trusted keys come from the customer's own record.
     pub async fn keys(&self, ledger: &SigningKey) -> Result<TrustedKeys, LedgerError> {
-        Ok(TrustedKeys {
+        let mut keys = TrustedKeys {
             ledger: vec![ledger.public()],
-            gates: self.store.gate_keys(&self.scope).await?,
-        })
+            ..TrustedKeys::default()
+        };
+        for (chain, held) in self.store.gate_keys(&self.scope).await? {
+            match self.store.chain_kind(&self.scope, &chain).await? {
+                Some(ChainKind::Admin) => keys.authorities.insert(chain, held),
+                _ => keys.gates.insert(chain, held),
+            };
+        }
+        Ok(keys)
     }
 }
