@@ -29,7 +29,9 @@ use gov_core::{Digest, Id};
 use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::{Gate, GateError, LedgerLink, Observed, Shipped, Spool};
+use crate::{
+    Gate, GateError, LedgerLink, Observed, Shipped, Spool, Trimmed, WitnessRead, WitnessReader,
+};
 
 /// The largest request, or answer the gate must read, that it will hold.
 const MAX_BODY: usize = 4 * 1024 * 1024;
@@ -42,10 +44,40 @@ pub const MAX_SESSIONS: usize = 4096;
 #[derive(Default)]
 struct Listings {
     sessions: BTreeMap<String, (u64, BTreeMap<String, Digest>)>,
+    /// The session ids the server itself has issued, and when. A listing is remembered only
+    /// for one of these, or for no session at all: a client cannot invent the id that pushes
+    /// another session's listing out (review finding GR-76).
+    issued: BTreeMap<String, u64>,
     next: u64,
 }
 
 impl Listings {
+    /// The server named a session in an answer.
+    fn issue(&mut self, session: &str) {
+        if self.issued.contains_key(session) {
+            return;
+        }
+        if self.issued.len() >= MAX_SESSIONS {
+            let oldest = self
+                .issued
+                .iter()
+                .min_by_key(|(_, seen)| **seen)
+                .map(|(name, _)| name.clone());
+            if let Some(oldest) = oldest {
+                self.issued.remove(&oldest);
+                self.sessions.remove(&oldest);
+            }
+        }
+        self.next += 1;
+        self.issued.insert(session.to_string(), self.next);
+    }
+
+    /// Whether a listing made under `session` is kept: the server issued that id, or the
+    /// client named none.
+    fn known(&self, session: &str) -> bool {
+        session.is_empty() || self.issued.contains_key(session)
+    }
+
     /// The listing for `session`. When the table is full the session seen longest ago is
     /// forgotten, and only that one: a client that makes up session ids cannot make every
     /// other session's tools `unknown` at a stroke (review finding GR-76).
@@ -94,7 +126,7 @@ pub struct ForwarderConfig {
 }
 
 pub struct Forwarder<S> {
-    gate: AsyncMutex<Gate<S>>,
+    gate: Arc<AsyncMutex<Gate<S>>>,
     config: ForwarderConfig,
     http: reqwest::Client,
     /// For each MCP session, the digest of each tool's definition as the server last listed
@@ -125,7 +157,7 @@ impl<S: Spool + 'static> Forwarder<S> {
     pub fn new(gate: Gate<S>, config: ForwarderConfig) -> Result<Arc<Self>, GateError> {
         config.map.validate()?;
         Ok(Arc::new(Forwarder {
-            gate: AsyncMutex::new(gate),
+            gate: Arc::new(AsyncMutex::new(gate)),
             config,
             // The upstream is one fixed address: no redirect is followed.
             http: reqwest::Client::builder()
@@ -145,6 +177,29 @@ impl<S: Spool + 'static> Forwarder<S> {
         self.gate.lock().await
     }
 
+    /// Do something with the gate on a thread that may block. Every receipt is a file
+    /// written and synced; that work does not belong on the threads that serve requests
+    /// (review finding GR-82).
+    async fn with_gate<R: Send + 'static>(
+        &self,
+        work: impl FnOnce(&mut Gate<S>) -> R + Send + 'static,
+    ) -> R {
+        let gate = self.gate.clone();
+        tokio::task::spawn_blocking(move || work(&mut gate.blocking_lock()))
+            .await
+            .expect("the gate's work does not panic")
+    }
+
+    /// Read the witness and trim the spool to what it covers. The witness is read before
+    /// the gate is taken, on a thread that may block, so no call waits for it.
+    pub async fn trim(&self, witness: Arc<dyn WitnessReader>) -> Result<Trimmed, GateError> {
+        let read = tokio::task::spawn_blocking(move || WitnessRead::from(&*witness))
+            .await
+            .expect("reading the witness does not panic")
+            .map_err(GateError::Witness)?;
+        self.with_gate(move |gate| gate.trim_on(&read)).await
+    }
+
     /// One round of shipping to the Ledger. The gate is held only to collect the batch and
     /// to apply the answer, never while the Ledger is being waited for, so a slow Ledger does
     /// not hold up a single call (review finding GR-67).
@@ -152,7 +207,7 @@ impl<S: Spool + 'static> Forwarder<S> {
         // Two rounds at once would prepare the same batch. This is not the gate's lock:
         // calls go on while a round waits here.
         let _round = self.shipping.lock().await;
-        let Some(shipment) = self.gate().await.prepare_shipment()? else {
+        let Some(shipment) = self.with_gate(|gate| gate.prepare_shipment()).await? else {
             return Ok(Shipped::NothingToSend);
         };
         let answer = tokio::time::timeout(
@@ -162,7 +217,9 @@ impl<S: Spool + 'static> Forwarder<S> {
         .await
         .map_err(|_| GateError::Link("the Ledger did not answer in time".into()))?
         .map_err(GateError::Link)?;
-        let shipped = self.gate().await.apply_answer(&shipment, answer)?;
+        let shipped = self
+            .with_gate(move |gate| gate.apply_answer(&shipment, answer))
+            .await?;
         if matches!(shipped, Shipped::NoProgress { .. }) {
             self.counters
                 .ship_no_progress
@@ -204,6 +261,12 @@ impl<S: Spool + 'static> Forwarder<S> {
             if status.is_redirection() {
                 return Err(());
             }
+            if let Some(session) = head.get("mcp-session-id").and_then(|v| v.to_str().ok()) {
+                self.listed
+                    .lock()
+                    .expect("the tool list's lock")
+                    .issue(session);
+            }
             // Read with a running cap: a hostile server cannot make the gate hold more
             // than this (GR-67).
             let mut body = Vec::new();
@@ -227,7 +290,7 @@ impl<S: Spool + 'static> Forwarder<S> {
     async fn not_recorded(&self) {
         self.counters.not_recorded.fetch_add(1, Ordering::Relaxed);
         // Best effort: if even this cannot be written, the counter in memory still shows it.
-        let _ = self.gate().await.note_not_recorded();
+        let _ = self.with_gate(|gate| gate.note_not_recorded()).await;
     }
 }
 
@@ -392,6 +455,11 @@ async fn list<S: Spool + 'static>(
         }
     }
     let mut listed = f.listed.lock().expect("the tool list's lock");
+    if !listed.known(&session) {
+        // A session id the server never issued: forwarded, and nothing remembered for it.
+        drop(listed);
+        return answer(a.status, &a.headers, Body::from(a.body));
+    }
     let entry = listed.entry(session);
     // A first page replaces what was remembered, so a tool the server has dropped is
     // forgotten; a later page adds to it.
@@ -455,16 +523,20 @@ async fn call<S: Spool + 'static>(
             if !mapped.known {
                 f.counters.unmapped.fetch_add(1, Ordering::Relaxed);
             }
-            let observed = Observed {
-                agent: &agent,
-                // A stock client only says who it is. Proven comes with the shim.
-                proof: Proof::Claimed,
-                action: &mapped.action,
-                reversal: mapped.reversal,
-                // The agent holds its own credential; the gate is only in the path.
-                coverage: Coverage::InLine,
-            };
-            f.gate().await.begin(&observed, (f.clock)())
+            let now = (f.clock)();
+            f.with_gate(move |gate| {
+                let observed = Observed {
+                    agent: &agent,
+                    // A stock client only says who it is. Proven comes with the shim.
+                    proof: Proof::Claimed,
+                    action: &mapped.action,
+                    reversal: mapped.reversal,
+                    // The agent holds its own credential; the gate is only in the path.
+                    coverage: Coverage::InLine,
+                };
+                gate.begin(&observed, now)
+            })
+            .await
         }
         Err(e) => Err(GateError::from(e)),
     };
@@ -503,7 +575,10 @@ async fn call<S: Spool + 'static>(
                 }
             };
             if let Some(seq) = intent {
-                let finished = f.gate().await.finish(seq, status, None, (f.clock)());
+                let now = (f.clock)();
+                let finished = f
+                    .with_gate(move |gate| gate.finish(seq, status, None, now))
+                    .await;
                 match finished {
                     Ok(_) => {
                         f.counters.recorded.fetch_add(1, Ordering::Relaxed);

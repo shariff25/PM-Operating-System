@@ -92,6 +92,12 @@ async fn fake_jira(State(seen): State<Arc<Upstream>>, headers: HeaderMap, body: 
         _ => json!({}),
     };
     let reply = json!({"jsonrpc": "2.0", "id": rpc_id, "result": result});
+    // The session id this server issues: the one a test asks for, or its usual one.
+    let issued = headers
+        .get("x-fake-issue")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("s-77")
+        .to_string();
     let key = msg["params"]["arguments"]["key"]
         .as_str()
         .unwrap_or_default();
@@ -133,8 +139,8 @@ async fn fake_jira(State(seen): State<Arc<Upstream>>, headers: HeaderMap, body: 
         let sse = format!("event: message\ndata: {reply}\n\n");
         return (
             [
-                ("content-type", "text/event-stream"),
-                ("mcp-session-id", "s-77"),
+                ("content-type", "text/event-stream".to_string()),
+                ("mcp-session-id", issued),
             ],
             sse,
         )
@@ -142,8 +148,8 @@ async fn fake_jira(State(seen): State<Arc<Upstream>>, headers: HeaderMap, body: 
     }
     (
         [
-            ("content-type", "application/json"),
-            ("mcp-session-id", "s-77"),
+            ("content-type", "application/json".to_string()),
+            ("mcp-session-id", issued),
         ],
         reply.to_string(),
     )
@@ -768,6 +774,11 @@ async fn one_sessions_listing_is_not_anothers_and_a_dropped_tool_is_forgotten() 
     let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string();
     let kind = |i: usize| s.receipts()[i].action.kind;
 
+    for session in ["a", "b"] {
+        let init = json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {}});
+        s.send(init.to_string(), Some(SECRET), &[("x-fake-issue", session)])
+            .await;
+    }
     // Listed in session a; called in session b, where the server may have shown another
     // definition, or none.
     s.send(list.clone(), Some(SECRET), &[("mcp-session-id", "a")])
@@ -886,38 +897,51 @@ async fn two_rounds_of_shipping_do_not_send_the_same_batch() {
     );
 }
 
-/// When the table of sessions is full, the one seen longest ago is forgotten and no other
-/// (review finding GR-76): a client making up session ids cannot wipe every session's
-/// listing at a stroke.
+/// A listing is remembered only for a session id the server itself issued (review finding
+/// GR-76), so a client making up session ids pushes nobody's listing out; and when the
+/// server has issued more than the table holds, only the oldest is forgotten.
 #[tokio::test]
-async fn a_flood_of_sessions_forgets_only_the_oldest() {
+async fn made_up_sessions_push_nobody_out_and_a_full_table_forgets_only_the_oldest() {
     let s = stack(100_000).await;
     let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string();
-    s.send(list.clone(), Some(SECRET), &[("mcp-session-id", "first")])
-        .await;
-    s.send(list.clone(), Some(SECRET), &[("mcp-session-id", "second")])
-        .await;
-    for n in 0..gov_gate::forward::MAX_SESSIONS - 1 {
-        let session = format!("flood-{n}");
+    let init = json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {}}).to_string();
+    // The server issues three sessions, and each lists the tools.
+    for session in ["first", "second", "third"] {
+        s.send(init.clone(), Some(SECRET), &[("x-fake-issue", session)])
+            .await;
+        s.send(list.clone(), Some(SECRET), &[("mcp-session-id", session)])
+            .await;
+    }
+    // A client lists under more made-up ids than the table holds.
+    for n in 0..gov_gate::forward::MAX_SESSIONS + 10 {
+        let session = format!("made-up-{n}");
         s.send(list.clone(), Some(SECRET), &[("mcp-session-id", &session)])
             .await;
     }
-    // "first" was pushed out; "second", listed just after it, was not.
-    s.send(
-        update(2, "PAY-1"),
-        Some(SECRET),
-        &[("mcp-session-id", "first")],
-    )
-    .await;
-    s.send(
-        update(3, "PAY-1"),
-        Some(SECRET),
-        &[("mcp-session-id", "second")],
-    )
-    .await;
-    let r = s.receipts();
-    assert_eq!(
-        (r[0].action.kind, r[2].action.kind),
-        (Kind::Unknown, Kind::Write)
-    );
+    let kind_in = |session: &'static str, n: u64| {
+        let s = &s;
+        async move {
+            s.send(
+                update(n, "PAY-1"),
+                Some(SECRET),
+                &[("mcp-session-id", session)],
+            )
+            .await;
+            s.receipts().last().unwrap().action.kind
+        }
+    };
+    // Nothing was remembered for a made-up id, and nobody was pushed out.
+    assert_eq!(kind_in("made-up-7", 2).await, Kind::Unknown);
+    assert_eq!(kind_in("first", 3).await, Kind::Write);
+
+    // Four sessions are issued so far: the three above, and the one this server names when
+    // it is not asked for another. It now issues as many more as fill the table and one over.
+    for n in 0..gov_gate::forward::MAX_SESSIONS - 3 {
+        let session = format!("issued-{n}");
+        s.send(init.clone(), Some(SECRET), &[("x-fake-issue", &session)])
+            .await;
+    }
+    // "first" was the oldest and is forgotten; "second", issued just after it, is not.
+    assert_eq!(kind_in("first", 4).await, Kind::Unknown);
+    assert_eq!(kind_in("second", 5).await, Kind::Write);
 }

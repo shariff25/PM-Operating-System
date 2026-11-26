@@ -462,13 +462,13 @@ checks in the tests were read and found sound.
 
 | Finding | Severity | What it said | What is done |
 |---|---|---|---|
-| GR-76 | Low, partly closed | Evicting the oldest session one at a time still lets 4,096 made-up ids push every real session out | To fix on `build/gov-review-10`: remember only session ids the upstream itself issued |
-| GR-82 | Medium | Every receipt written reads every file in the spool under the gate's one lock, and the trim reads the whole, ever-growing witness under it; a mode that must block nothing slows to a stop when the Ledger is down | To fix on `build/gov-review-10`, before G3b is called done |
-| GR-83 | Low | The gate's counters are served where agents can read them, so an agent learns when it is unrecorded | To fix: a separate operator address |
-| GR-84 | Low | The keys file `gov-ledger export` writes comes from the Ledger being audited | To fix: the command says so in words; a condition on G4 |
+| GR-76 | Low, partly closed | Evicting the oldest session one at a time still lets 4,096 made-up ids push every real session out | A listing is remembered only for a session id the server itself issued, or for no session at all |
+| GR-82 | Medium | Every receipt written reads every file in the spool under the gate's one lock, and the trim reads the whole, ever-growing witness under it; a mode that must block nothing slows to a stop when the Ledger is down | The gate keeps an index of its spool in memory and reads one file per receipt it needs; the spool is read whole once, when the gate opens. A trim reads the newest 16 checkpoints, before the gate is taken. The forwarder does the gate's file work on threads that may block |
+| GR-83 | Low | The gate's counters are served where agents can read them, so an agent learns when it is unrecorded | The counters are on a separate operator address (`--operator-listen`); the agents' address has no such route |
+| GR-84 | Low | The keys file `gov-ledger export` writes comes from the Ledger being audited | The command says so in words; the real answer is a condition on G4 |
 | GR-85 | Low | The serving database role also runs migrations | Open: a separate role when the stack file is written (G8) |
-| GR-86 | Low | The name `localhost` is trusted without being resolved | To fix: a literal loopback address only |
-| GR-87 | Low | A checkpoint or shipment that keeps failing shows only on standard error | To fix: the Ledger's health route shows it; the rest with G8 |
+| GR-86 | Low | The name `localhost` is trusted without being resolved | A literal loopback address only |
+| GR-87 | Low | A checkpoint or shipment that keeps failing shows only on standard error | The Ledger's health route answers 503 while checkpoints are failing, with the count; the rest with G8 |
 
 **The shim's design (§5.3.1): may be built once four things in the text change** (all
 Medium), which they now have, below in §5.3.1:

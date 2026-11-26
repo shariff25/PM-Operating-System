@@ -6,6 +6,7 @@
 //! line, where every account on the machine could read its password.
 
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -142,6 +143,7 @@ async fn main() -> anyhow::Result<()> {
             std::fs::create_dir_all(&witness)?;
             let witness = DirWitness::new(&witness);
             let listener = Arc::new(Listener {
+                health: Default::default(),
                 ledger: ledger(&which).await?,
                 key,
                 issuer,
@@ -156,12 +158,23 @@ async fn main() -> anyhow::Result<()> {
                     tick.tick().await;
                     // A checkpoint that fails is said out loud and tried again: an auditor's
                     // `gov verify` reports a Ledger that has gone silent.
-                    if let Err(e) = timer
+                    let at = now();
+                    match timer
                         .ledger
-                        .checkpoint(&timer.key, &timer.issuer, now(), &witness)
+                        .checkpoint(&timer.key, &timer.issuer, at, &witness)
                         .await
                     {
-                        eprintln!("checkpoint not published: {e}");
+                        Ok(_) => {
+                            timer.health.checkpoint_failures.store(0, Ordering::Relaxed);
+                            timer.health.last_checkpoint_at.store(at, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            timer
+                                .health
+                                .checkpoint_failures
+                                .fetch_add(1, Ordering::Relaxed);
+                            eprintln!("checkpoint not published: {e}");
+                        }
                     }
                 }
             });
@@ -183,6 +196,11 @@ async fn main() -> anyhow::Result<()> {
             std::fs::write(&out, serde_json::to_vec(&export)?)?;
             std::fs::write(&keys_out, serde_json::to_vec(&keys)?)?;
             println!("wrote {} and {}", out.display(), keys_out.display());
+            // The keys file comes from the Ledger being audited (review finding GR-84).
+            println!(
+                "{} lists the keys THIS Ledger says it trusts. It is a convenience, not evidence: an auditor checks an export against the customer's own record of the keys that were enrolled.",
+                keys_out.display()
+            );
         }
     }
     Ok(())

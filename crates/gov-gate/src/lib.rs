@@ -11,6 +11,8 @@ pub mod forward;
 pub mod link;
 pub mod spool;
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use async_trait::async_trait;
 use gov_core::action::{CanonicalAction, Reversal};
 use gov_core::lease::{batch_digest, Checkpoint, IntakeAck, ShipRequest};
@@ -18,10 +20,12 @@ use gov_core::receipt::{
     ChainHead, Coverage, Decision, DecisionKind, Mode, Outcome, OutcomeStatus, Phase, Proof,
     Reason, Receipt, ReceiptAction, ReceiptAgent,
 };
-use gov_core::{open, random_id, seal, Envelope, Error, Id, KeySet, Scope, SigningKey, VERSION};
+use gov_core::{
+    open, random_id, seal, Digest, Envelope, Error, Id, KeySet, Scope, SigningKey, VERSION,
+};
 
 pub use spool::{
-    DirWitnessReader, FileSpool, Spool, SpoolError, SpoolState, Spooled, WitnessReader,
+    DirWitnessReader, FileSpool, Spool, SpoolError, SpoolState, Spooled, WitnessRead, WitnessReader,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -127,6 +131,11 @@ pub struct Gate<S> {
     key: SigningKey,
     spool: S,
     state: SpoolState,
+    /// The number and hash of every receipt held, and which intents are still open. Built
+    /// once when the gate opens and kept in step with the spool, so that no call has to
+    /// read the spool to learn what is in it (review finding GR-82).
+    index: BTreeMap<u64, Digest>,
+    open_intents: BTreeSet<u64>,
 }
 
 impl<S: Spool> Gate<S> {
@@ -169,6 +178,12 @@ impl<S: Spool> Gate<S> {
             key,
             spool,
             state,
+            index: held.iter().map(|r| (r.seq, r.hash.clone())).collect(),
+            open_intents: held
+                .iter()
+                .filter(|r| r.open_intent)
+                .map(|r| r.seq)
+                .collect(),
         };
         gate.spool.set_state(&gate.state)?;
         for (r, intent) in held.iter().zip(&docs).filter(|(r, _)| r.open_intent) {
@@ -180,6 +195,7 @@ impl<S: Spool> Gate<S> {
                 .any(|d| d.phase == Phase::Outcome && d.intent == Some(r.seq));
             if answered {
                 gate.spool.close_intent(r.seq)?;
+                gate.open_intents.remove(&r.seq);
             } else {
                 gate.write_outcome(intent, OutcomeStatus::Unknown, None, now)?;
             }
@@ -193,7 +209,7 @@ impl<S: Spool> Gate<S> {
 
     /// Receipts no witnessed checkpoint covers yet.
     pub fn uncovered(&self) -> Result<usize, GateError> {
-        Ok(self.spool.held()?.len())
+        Ok(self.index.len())
     }
 
     /// A call passed through with no receipt. Counted where it outlives a restart.
@@ -213,9 +229,7 @@ impl<S: Spool> Gate<S> {
         // The limit is checked when a call begins, with room kept for the outcome of every
         // call in flight: an outcome is never the receipt that does not fit.
         if open_intent {
-            let held = self.spool.held()?;
-            let in_flight = held.iter().filter(|r| r.open_intent).count();
-            if held.len() + in_flight + 2 > self.config.spool_limit {
+            if self.index.len() + self.open_intents.len() + 2 > self.config.spool_limit {
                 return Err(GateError::SpoolFull);
             }
         }
@@ -235,7 +249,7 @@ impl<S: Spool> Gate<S> {
         self.spool.append(
             &Spooled {
                 seq,
-                hash,
+                hash: hash.clone(),
                 at: receipt.at,
                 open_intent,
                 envelope,
@@ -243,6 +257,10 @@ impl<S: Spool> Gate<S> {
             &state,
         )?;
         self.state = state;
+        self.index.insert(seq, hash);
+        if open_intent {
+            self.open_intents.insert(seq);
+        }
         Ok(seq)
     }
 
@@ -292,11 +310,12 @@ impl<S: Spool> Gate<S> {
         upstream_ref: Option<Id>,
         now: i64,
     ) -> Result<u64, GateError> {
+        if !self.open_intents.contains(&intent) {
+            return Err(GateError::NoSuchIntent(intent));
+        }
         let held = self
             .spool
-            .held()?
-            .into_iter()
-            .find(|r| r.seq == intent && r.open_intent)
+            .get(intent)?
             .ok_or(GateError::NoSuchIntent(intent))?;
         let keys = KeySet::new([self.key.public()]);
         let doc = open::<Receipt>(&held.envelope, &keys, &self.config.scope)?.doc;
@@ -328,6 +347,7 @@ impl<S: Spool> Gate<S> {
         };
         let seq = self.append(receipt, false)?;
         self.spool.close_intent(intent.seq)?;
+        self.open_intents.remove(&intent.seq);
         Ok(seq)
     }
 
@@ -352,14 +372,17 @@ impl<S: Spool> Gate<S> {
     /// Ledger answers this gate and nobody else (review finding GR-55). `None` when the
     /// Ledger has acknowledged everything held.
     pub fn prepare_shipment(&mut self) -> Result<Option<Shipment>, GateError> {
-        let batch: Vec<Envelope> = self
-            .spool
-            .held()?
-            .iter()
-            .filter(|r| r.seq > self.state.acked_through)
+        let mut batch = Vec::new();
+        let next = self.state.acked_through.saturating_add(1);
+        for seq in self
+            .index
+            .range(next..)
+            .map(|(seq, _)| *seq)
             .take(self.config.batch)
-            .map(|r| r.envelope.clone())
-            .collect();
+        {
+            let held = self.spool.get(seq)?.ok_or(SpoolError::Corrupt)?;
+            batch.push(held.envelope);
+        }
         if batch.is_empty() {
             return Ok(None);
         }
@@ -389,7 +412,6 @@ impl<S: Spool> Gate<S> {
         shipment: &Shipment,
         answer: LinkAnswer,
     ) -> Result<Shipped, GateError> {
-        let held = self.spool.held()?;
         let nonce = &shipment.nonce;
         let ack = open::<IntakeAck>(&answer.ack, &self.config.ledger_keys, &self.config.scope)?.doc;
         if ack.gate != self.config.gate {
@@ -405,8 +427,8 @@ impl<S: Spool> Gate<S> {
         // already trimmed, in the checkpoint the spool was trimmed on (GR-58).
         let agrees = if ack.seq == 0 {
             ack.hash.is_none()
-        } else if let Some(mine) = held.iter().find(|r| r.seq == ack.seq) {
-            Some(&mine.hash) == ack.hash.as_ref()
+        } else if let Some(mine) = self.index.get(&ack.seq) {
+            Some(mine) == ack.hash.as_ref()
         } else if ack.seq <= self.state.covered_through {
             match self.kept_head()? {
                 Some((seq, hash)) if seq == ack.seq => Some(&hash) == ack.hash.as_ref(),
@@ -474,7 +496,14 @@ impl<S: Spool> Gate<S> {
     /// gate's receipts, or that leaves out or shortens a chain an earlier checkpoint covered,
     /// is an alarm, and nothing is trimmed (GR-56).
     pub fn trim_to_witness(&mut self, witness: &dyn WitnessReader) -> Result<Trimmed, GateError> {
-        let all = witness.checkpoints().map_err(GateError::Witness)?;
+        let read = WitnessRead::from(witness).map_err(GateError::Witness)?;
+        self.trim_on(&read)
+    }
+
+    /// Trim on what was read from the witness. A front door reads the witness first, without
+    /// holding the gate, and calls this with the result (review finding GR-82).
+    pub fn trim_on(&mut self, read: &WitnessRead) -> Result<Trimmed, GateError> {
+        let all = &read.0;
         let mut bad_checkpoints = Vec::new();
         let mut newest = None;
         for (file_seq, bytes) in all.iter().rev() {
@@ -513,17 +542,10 @@ impl<S: Spool> Gate<S> {
         if head.seq == self.state.covered_through {
             return Ok(none(bad_checkpoints));
         }
-        let held = self.spool.held()?;
-        let mine = held.iter().find(|r| r.seq == head.seq);
-        if mine.is_none_or(|r| r.hash != head.hash) {
+        if self.index.get(&head.seq) != Some(&head.hash) {
             return Err(GateError::LedgerDisagrees(head.seq));
         }
-        let keep_from = held
-            .iter()
-            .filter(|r| r.open_intent)
-            .map(|r| r.seq)
-            .min()
-            .unwrap_or(u64::MAX);
+        let keep_from = self.open_intents.first().copied().unwrap_or(u64::MAX);
         let through = head
             .seq
             .min(self.state.acked_through)
@@ -535,7 +557,11 @@ impl<S: Spool> Gate<S> {
         self.spool.keep_checkpoint(bytes)?;
         self.state.covered_through = through;
         self.spool.set_state(&self.state)?;
-        self.spool.trim(through)?;
+        let gone: Vec<u64> = self.index.range(..=through).map(|(seq, _)| *seq).collect();
+        for seq in gone {
+            self.spool.remove(seq)?;
+            self.index.remove(&seq);
+        }
         Ok(Trimmed {
             receipts,
             bad_checkpoints,

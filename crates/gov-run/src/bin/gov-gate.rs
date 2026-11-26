@@ -8,6 +8,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -18,8 +19,8 @@ use gov_core::connector::ServerMap;
 use gov_core::{Id, KeySet, PublicKey, Scope};
 use gov_gate::forward::{Forwarder, ForwarderConfig};
 use gov_gate::link::HttpLedgerLink;
-use gov_gate::{DirWitnessReader, FileSpool, Gate, GateConfig, Shipped};
-use gov_run::{bind, keygen, listen_address, now, outbound_address, read_key};
+use gov_gate::{DirWitnessReader, FileSpool, Gate, GateConfig, Shipped, WitnessReader};
+use gov_run::{bind, bind_named, keygen, listen_address, now, outbound_address, read_key};
 use serde_json::json;
 
 #[derive(Parser)]
@@ -54,6 +55,10 @@ struct Serve {
     gate: String,
     #[arg(long, default_value = "127.0.0.1:8791")]
     listen: String,
+    /// Where an operator reads the gate's mode and counters. Never the address agents use:
+    /// an agent that could read them would learn when its calls go unrecorded.
+    #[arg(long, default_value = "127.0.0.1:8792")]
+    operator_listen: String,
     #[arg(long)]
     key_file: PathBuf,
     /// The spool directory: receipts wait here until a witnessed checkpoint covers them.
@@ -93,6 +98,7 @@ struct Serve {
 
 async fn serve(s: Serve) -> anyhow::Result<()> {
     let addr = listen_address(&s.listen, s.plain_http_on_network)?;
+    let operator_addr = listen_address(&s.operator_listen, s.plain_http_on_network)?;
     outbound_address("the upstream server", &s.upstream, s.plain_http_on_network)?;
     outbound_address("the Ledger", &s.ledger, s.plain_http_on_network)?;
     anyhow::ensure!(s.ship_interval > 0, "the ship interval is zero");
@@ -134,7 +140,9 @@ async fn serve(s: Serve) -> anyhow::Result<()> {
     // Ship, then trim, on a timer. What goes wrong is said on standard error, which holds
     // receipt numbers and reasons and never a request, a header or an answer.
     let shipper = forwarder.clone();
-    let witness = s.witness.map(DirWitnessReader::new);
+    let witness: Option<Arc<dyn WitnessReader>> = s
+        .witness
+        .map(|dir| Arc::new(DirWitnessReader::new(dir)) as Arc<dyn WitnessReader>);
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(s.ship_interval));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -155,7 +163,7 @@ async fn serve(s: Serve) -> anyhow::Result<()> {
                 }
             }
             if let Some(witness) = &witness {
-                match shipper.gate().await.trim_to_witness(witness) {
+                match shipper.trim(witness.clone()).await {
                     Ok(t) if t.bad_checkpoints.is_empty() => {}
                     Ok(t) => eprintln!("checkpoints that do not verify: {:?}", t.bad_checkpoints),
                     Err(e) => eprintln!("trimming: {e}"),
@@ -180,7 +188,11 @@ async fn serve(s: Serve) -> anyhow::Result<()> {
             }))
         }
     });
-    axum::serve(socket, forwarder.router().route("/healthz", health)).await?;
+    let operator = bind_named("operator", operator_addr).await?;
+    tokio::spawn(async move {
+        let _ = axum::serve(operator, axum::Router::new().route("/healthz", health)).await;
+    });
+    axum::serve(socket, forwarder.router()).await?;
     Ok(())
 }
 

@@ -33,6 +33,19 @@ fn id(s: &str) -> Id {
 struct Running {
     child: Child,
     addr: String,
+    /// Kept open: a program that prints again must still have somewhere to print.
+    out: BufReader<std::process::ChildStdout>,
+}
+impl Running {
+    /// The next line the program printed, after `prefix`.
+    fn said(&mut self, prefix: &str) -> String {
+        let mut line = String::new();
+        self.out.read_line(&mut line).unwrap();
+        line.trim()
+            .strip_prefix(prefix)
+            .unwrap_or_else(|| panic!("the program said {line:?}"))
+            .to_string()
+    }
 }
 impl Drop for Running {
     fn drop(&mut self) {
@@ -48,16 +61,14 @@ fn start(mut command: Command) -> Running {
         .stderr(Stdio::inherit())
         .spawn()
         .unwrap();
-    let mut line = String::new();
-    BufReader::new(child.stdout.take().unwrap())
-        .read_line(&mut line)
-        .unwrap();
-    let addr = line
-        .trim()
-        .strip_prefix("listening on ")
-        .unwrap_or_else(|| panic!("the program said {line:?}"))
-        .to_string();
-    Running { child, addr }
+    let out = BufReader::new(child.stdout.take().unwrap());
+    let mut running = Running {
+        child,
+        addr: String::new(),
+        out,
+    };
+    running.addr = running.said("listening on ");
+    running
 }
 
 /// A program, told that the data is fake: keys in files are allowed for nothing else.
@@ -161,6 +172,7 @@ impl Site {
             "serve", "--tenant", "acme", "--env", "prod", "--gate", "gate-1",
         ])
         .args(["--listen", "127.0.0.1:0", "--ship-interval", "1"])
+        .args(["--operator-listen", "127.0.0.1:0"])
         .arg("--key-file")
         .arg(self.path("gate.key"))
         .arg("--spool")
@@ -177,7 +189,7 @@ impl Site {
     }
     /// What an auditor does: export, then check the export against the witness.
     fn audit(&self) -> Report {
-        let (ok, _, err) = run(self
+        let (ok, said, err) = run(self
             .ledger()
             .args(["export", "--tenant", "acme", "--env", "prod", "--key-file"])
             .arg(self.path("ledger.key"))
@@ -186,6 +198,8 @@ impl Site {
             .arg("--keys-out")
             .arg(self.path("keys.json")));
         assert!(ok, "{err}");
+        // The keys file comes from the Ledger being audited, and the command says so.
+        assert!(said.contains("not evidence"), "{said}");
         let export: Export =
             serde_json::from_slice(&std::fs::read(self.path("export.json")).unwrap()).unwrap();
         let keys: TrustedKeys =
@@ -349,7 +363,8 @@ async fn a_gate_and_a_ledger_run_as_programs_leave_a_record_an_auditor_can_check
         c
     });
     let ledger_url = format!("http://{}", ledger.addr);
-    let gate = start(site.gate(&ledger_url));
+    let mut gate = start(site.gate(&ledger_url));
+    let operator = gate.said("operator on ");
 
     // An agent lists the tools and makes two calls. Nothing is blocked.
     let listing = reqwest::Client::new()
@@ -369,7 +384,13 @@ async fn a_gate_and_a_ledger_run_as_programs_leave_a_record_an_auditor_can_check
     assert_eq!(report.gates.len(), 1);
 
     // The gate says what mode it is in and what it recorded.
-    let health: Value = reqwest::get(format!("http://{}/healthz", gate.addr))
+    // On the operator's address only: an agent that could read the counters would learn
+    // when its calls go unrecorded (review finding GR-83).
+    let agents_view = reqwest::get(format!("http://{}/healthz", gate.addr))
+        .await
+        .unwrap();
+    assert_eq!(agents_view.status().as_u16(), 404);
+    let health: Value = reqwest::get(format!("http://{operator}/healthz"))
         .await
         .unwrap()
         .json()
@@ -485,6 +506,13 @@ fn a_program_does_not_start_in_a_way_that_would_expose_a_key_or_a_credential() {
             "ftp://127.0.0.1/mcp",
             local,
             "neither http nor https",
+        ),
+        // The name is whatever the resolver says it is; only a literal address is local.
+        (
+            "127.0.0.1:0",
+            "http://localhost:1/mcp",
+            local,
+            "the upstream server is plain HTTP",
         ),
         (
             "127.0.0.1:0",
