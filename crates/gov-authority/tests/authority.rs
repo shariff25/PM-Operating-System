@@ -11,7 +11,7 @@ use gov_authority::{
     Role, Status, Store, StoreError, StoredRecord, CODE_SECS, WRONG_CODES,
 };
 use gov_core::admin::{follow, AdminAction, AdminRecord, SubjectKind};
-use gov_core::enrol::{code_digest, pin, EnrolKind, EnrolRequest};
+use gov_core::enrol::{code_digest, code_names_root, EnrolKind, EnrolRequest};
 use gov_core::receipt::ChainHead;
 use gov_core::{open, seal, Envelope, Id, KeySet, PublicKey, Scope, SigningKey};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
@@ -229,7 +229,7 @@ both_stores!(only_an_admin_acts_and_every_act_is_recorded, who_may_act);
 async fn enrolment<S: Store>(store: S) {
     let a = installed(store).await;
     let ana = id("ana");
-    let agent = key("refund-bot-k1", 9);
+    let agent = key("refund-bot:k1", 9);
 
     // No code was made for this name: nothing to enrol with.
     let early = request(
@@ -272,12 +272,17 @@ async fn enrolment<S: Store>(store: S) {
         agent.public(),
         &code,
     );
-    let enrolled = a.enrol(&code, &good, NOW + 60).await.unwrap();
-    assert_eq!(enrolled.root, root());
-    assert_eq!(enrolled.pin, pin(&code, &root()).unwrap());
+    let answered = a.enrol(&code, &good, NOW + 60).await.unwrap();
+    assert_eq!(answered, root());
+    // The code, handed over by the admin, says which root key that must be (GR-115).
+    assert!(code_names_root(&code, &answered));
+    assert!(!code_names_root(
+        &code,
+        &key("an-impostor-root", 62).public()
+    ));
     let stored = a
         .store()
-        .key(&scope(), &id("refund-bot-k1"))
+        .key(&scope(), &id("refund-bot:k1"))
         .await
         .unwrap()
         .unwrap();
@@ -297,7 +302,7 @@ async fn enrolment<S: Store>(store: S) {
     assert_eq!(last.action, AdminAction::KeyEnrolled);
     assert_eq!(
         (last.subject.kind, &last.subject.id),
-        (SubjectKind::Key, &id("refund-bot-k1"))
+        (SubjectKind::Key, &id("refund-bot:k1"))
     );
     assert_eq!(last.about.as_ref().unwrap().id, id("refund-bot"));
     assert_eq!(last.actor.id, ana);
@@ -333,7 +338,7 @@ async fn nothing_enrolled<S: Store>(a: &Authority<S>) {
 async fn enrolment_attacks<S: Store>(store: S) {
     let a = installed(store).await;
     let ana = id("ana");
-    let gate = key("gate-1-k1", 20);
+    let gate = key("gate-1:k1", 20);
     let refused = |r: Result<_, AuthorityError>| assert!(matches!(r, Err(AuthorityError::Refused)));
 
     // The digest is what the Authority stores. Presenting it enrols nothing (GR-107).
@@ -343,13 +348,23 @@ async fn enrolment_attacks<S: Store>(store: S) {
     assert!(pending(&a).await, "a wrong guess does not use the code up");
 
     // Wrong guesses are counted, and the fifth cancels the code: the right one is then too
-    // late.
+    // late. The cancellation is recorded, with the Authority itself as its actor: an
+    // enrolment an admin offered was stopped, and nobody decided it (GR-117).
     for _ in 1..WRONG_CODES {
         refused(a.enrol("not-the-code", &good, NOW).await);
     }
     assert!(!pending(&a).await);
     refused(a.enrol(&code, &good, NOW).await);
     nothing_enrolled(&a).await;
+    let last = chain(&a).await.pop().unwrap();
+    assert_eq!(
+        (last.action, &last.subject.id, &last.actor.id),
+        (
+            AdminAction::EnrolmentCancelled,
+            &id("gate-1"),
+            &id("authority")
+        )
+    );
 
     // The right code with a request that does not hold: refused, and the code is spent, so
     // the honest request that follows is too late and an admin must make another.
@@ -448,13 +463,46 @@ async fn enrolment_attacks<S: Store>(store: S) {
     refused(a.enrol(&code, &late, NOW + CODE_SECS).await);
     nothing_enrolled(&a).await;
 
-    // A key id is enrolled once: a second key under the same id is refused, whoever asks.
+    // A key's id is under the name it is for, so nobody takes an id another will want
+    // (GR-116): not a bare id, not another gate's, not the name with nothing after it.
+    for kid in ["k1", "gate-2:k1", "gate-1:", "gate-1-k1"] {
+        let odd = SigningKey::from_seed(id(kid), &[23; 32]).unwrap();
+        let code = offer(&a).await;
+        let asked = request(&odd, EnrolKind::Gate, "gate-1", odd.public(), &code);
+        refused(a.enrol(&code, &asked, NOW).await);
+    }
+    nothing_enrolled(&a).await;
+
+    // A gate disabled after its code was made: the code enrols nothing (GR-118).
+    a.register_gate(&ana, &id("gate-3"), NOW).await.unwrap();
+    let g3 = key("gate-3:k1", 24);
+    let code3 = a
+        .offer_enrolment(&ana, EnrolKind::Gate, &id("gate-3"), NOW)
+        .await
+        .unwrap();
+    a.disable_gate(&ana, &id("gate-3"), NOW).await.unwrap();
+    let asked = request(&g3, EnrolKind::Gate, "gate-3", g3.public(), &code3);
+    refused(a.enrol(&code3, &asked, NOW).await);
+    nothing_enrolled(&a).await;
+
+    // A key id is enrolled once, and so is a key: a second key under the same id is
+    // refused, and so is the same key under a second id, whoever asks.
     let code = offer(&a).await;
     let first = request(&gate, EnrolKind::Gate, "gate-1", gate.public(), &code);
     a.enrol(&code, &first, NOW).await.unwrap();
-    let same_id = SigningKey::from_seed(id("gate-1-k1"), &[21; 32]).unwrap();
+    let same_id = SigningKey::from_seed(id("gate-1:k1"), &[21; 32]).unwrap();
     let code = offer(&a).await;
     let again = request(&same_id, EnrolKind::Gate, "gate-1", same_id.public(), &code);
+    refused(a.enrol(&code, &again, NOW).await);
+    let same_key = SigningKey::from_seed(id("gate-1:k2"), &[20; 32]).unwrap();
+    let code = offer(&a).await;
+    let again = request(
+        &same_key,
+        EnrolKind::Gate,
+        "gate-1",
+        same_key.public(),
+        &code,
+    );
     refused(a.enrol(&code, &again, NOW).await);
     assert_eq!(a.store().keys(&scope()).await.unwrap().len(), 1);
 
@@ -627,8 +675,14 @@ impl Store for Failing {
     ) -> StoreResult<u32> {
         self.inner.count_wrong_code(scope, kind, name).await
     }
-    async fn drop_code(&self, scope: &Scope, kind: EnrolKind, name: &Id) -> StoreResult<()> {
-        self.inner.drop_code(scope, kind, name).await
+    async fn take_code(
+        &self,
+        scope: &Scope,
+        kind: EnrolKind,
+        name: &Id,
+        digest: &gov_core::Digest,
+    ) -> StoreResult<Option<PendingCode>> {
+        self.inner.take_code(scope, kind, name, digest).await
     }
 }
 
@@ -730,3 +784,108 @@ async fn stale_head<S: Store>(store: S) {
     assert!(!a.store().any_person(&other).await.unwrap());
 }
 both_stores!(a_record_that_is_not_the_next_one_is_not_stored, stale_head);
+
+async fn used_once<S: Store>(store: S) {
+    // A code is taken by one caller, however many present it at once (GR-114); and a key,
+    // or a key id, is added once, whatever a commit asks.
+    let a = installed(store).await;
+    let code = offer(&a).await;
+    let digest = code_digest(&code);
+    let gate_name = id("gate-1");
+    let here = scope();
+    let (first, second) = tokio::join!(
+        a.store()
+            .take_code(&here, EnrolKind::Gate, &gate_name, &digest),
+        a.store()
+            .take_code(&here, EnrolKind::Gate, &gate_name, &digest),
+    );
+    let got = [first.unwrap().is_some(), second.unwrap().is_some()];
+    assert_eq!(got.iter().filter(|g| **g).count(), 1, "{got:?}");
+    assert!(!pending(&a).await);
+    // A wrong digest takes nothing and leaves the code where it is.
+    let code = offer(&a).await;
+    let wrong = code_digest("not-the-code");
+    assert!(a
+        .store()
+        .take_code(&scope(), EnrolKind::Gate, &gate_name, &wrong)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(pending(&a).await);
+    drop(code);
+
+    // Two requests with one code, at the same moment: one key is enrolled.
+    let code = offer(&a).await;
+    let (k1, k2) = (key("gate-1:k1", 20), key("gate-1:k2", 25));
+    let r1 = request(&k1, EnrolKind::Gate, "gate-1", k1.public(), &code);
+    let r2 = request(&k2, EnrolKind::Gate, "gate-1", k2.public(), &code);
+    let (e1, e2) = tokio::join!(a.enrol(&code, &r1, NOW), a.enrol(&code, &r2, NOW));
+    assert_eq!([e1.is_ok(), e2.is_ok()].iter().filter(|ok| **ok).count(), 1);
+    assert_eq!(a.store().keys(&scope()).await.unwrap().len(), 1);
+
+    // A commit that would add a key id, or a key, that is there already writes nothing.
+    let held = a.store().keys(&scope()).await.unwrap().remove(0);
+    let head = a.store().records_after(&scope(), 0, 100).await.unwrap();
+    let next = StoredRecord {
+        seq: head.last().unwrap().seq + 1,
+        ..head.last().unwrap().clone()
+    };
+    let other_key = key(held.key.kid.as_str(), 26).public();
+    let same_id = Effect::AddKey(EnrolledKey {
+        key: other_key,
+        ..held.clone()
+    });
+    let seed = if held.key.kid == id("gate-1:k1") {
+        20
+    } else {
+        25
+    };
+    let same_key = Effect::AddKey(EnrolledKey {
+        key: key("gate-1:k9", seed).public(),
+        ..held.clone()
+    });
+    for effect in [same_id, same_key] {
+        let refused = a.store().commit(&scope(), &next, &[effect]).await;
+        assert!(matches!(refused, Err(StoreError::KeyTaken)), "{refused:?}");
+    }
+    assert_eq!(
+        a.store().records_after(&scope(), 0, 100).await.unwrap(),
+        head
+    );
+    assert_eq!(a.store().keys(&scope()).await.unwrap(), vec![held]);
+}
+both_stores!(a_code_and_a_key_are_used_once, used_once);
+
+async fn first_admin_once<S: Store + 'static>(store: S) {
+    // Two installers naming a first admin at the same moment: one is named (GR-119).
+    let a = std::sync::Arc::new(authority(store));
+    let mut tasks = Vec::new();
+    for name in ["ana", "eve", "mallory", "trent"] {
+        let a = a.clone();
+        tasks.push(tokio::spawn(async move {
+            a.bootstrap(&id(name), NOW).await.is_ok()
+        }));
+    }
+    let mut named = 0;
+    for task in tasks {
+        named += usize::from(task.await.unwrap());
+    }
+    assert_eq!(named, 1);
+    assert_eq!(chain(&a).await.len(), 1);
+}
+both_stores!(the_first_admin_is_named_once, first_admin_once);
+
+async fn time_forward<S: Store>(store: S) {
+    // A record's time never goes back along the chain, whatever the clock does (GR-121).
+    let a = installed(store).await;
+    a.register_gate(&id("ana"), &id("gate-late"), NOW + 100)
+        .await
+        .unwrap();
+    a.register_gate(&id("ana"), &id("gate-early"), NOW - 500)
+        .await
+        .unwrap();
+    let times: Vec<i64> = chain(&a).await.iter().map(|r| r.at).collect();
+    assert!(times.windows(2).all(|w| w[0] <= w[1]), "{times:?}");
+    assert_eq!(*times.last().unwrap(), NOW + 100);
+}
+both_stores!(a_records_time_does_not_go_back, time_forward);

@@ -42,10 +42,20 @@ pub struct EnrolRequest {
 
 document!(EnrolRequest, "gov.enrol.v1");
 
-/// A new one-time code: 128 random bits, as text.
-pub fn new_code() -> Result<String> {
+/// A new one-time code for an agent or gate that is to pin `root` as the Authority's root
+/// key: 128 random bits, then a full stop, then the digest of that key.
+///
+/// The second half is how the enrolling party knows which root key to trust (review finding
+/// GR-115). It is handed over by the admin, out of band, with the secret; nothing that
+/// answers a request to enrol can change it, and a value sent back in the answer could have
+/// been made by whoever was sent the code.
+pub fn new_code(root: &PublicKey) -> Result<String> {
     let bytes = random_salt()?;
-    Ok(URL_SAFE_NO_PAD.encode(&bytes[..16]))
+    Ok(format!(
+        "{}.{}",
+        URL_SAFE_NO_PAD.encode(&bytes[..16]),
+        key_digest(root)?.as_str()
+    ))
 }
 
 /// What the Authority stores of a code, and what a request to enrol is signed over.
@@ -53,39 +63,17 @@ pub fn code_digest(code: &str) -> Digest {
     Digest::of(&[b"gov.enrol.code.v1\0", code.as_bytes()])
 }
 
-/// The value the Authority's answer carries beside its root key: computed from the code and
-/// that key, so only something that knew the code could have made it. The caller computes
-/// it again and pins the root key only when the two agree.
-pub fn pin(code: &str, root: &PublicKey) -> Result<Digest> {
-    let key = serde_json::to_vec(root).map_err(|_| Error::Malformed("key"))?;
-    Ok(Digest::of(&[
-        b"gov.enrol.pin.v1\0",
-        code.as_bytes(),
-        b"\0",
-        &key,
-    ]))
+/// Whether `root` is the root key the code was made for. The enrolling party pins a root
+/// key only when this holds for the key it was answered with.
+pub fn code_names_root(code: &str, root: &PublicKey) -> bool {
+    let named = code.rsplit_once('.').map(|(_, digest)| digest);
+    key_digest(root).is_ok_and(|d| named == Some(d.as_str()))
 }
 
-/// The digest of a public key, as an admin record carries it for an enrolled key. Whoever
-/// holds the key itself can check it against the record; the record alone gives no key.
+/// The digest of a public key, as an admin record carries it for an enrolled key and as a
+/// one-time code carries it for the root key. Whoever holds the key itself can check it
+/// against the digest; the digest alone gives no key.
 pub fn key_digest(key: &PublicKey) -> Result<Digest> {
     let bytes = serde_json::to_vec(key).map_err(|_| Error::Malformed("key"))?;
     Ok(Digest::of(&[b"gov.key.v1\0", &bytes]))
 }
-
-/// The Authority's word to the Ledger that a gate's key is enrolled, signed with the key
-/// its admin records are signed with. The Ledger takes the key for the gate's receipts only
-/// when its copy of the Authority's chain holds the record of that enrolment (spec §7.6,
-/// choice 3): a gate's key reaches the Ledger from the Authority, and only a witnessed one.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct KeyGrant {
-    pub v: u32,
-    pub tenant: Id,
-    pub env: Id,
-    pub authority: Id,
-    pub gate: Id,
-    pub key: PublicKey,
-}
-
-document!(KeyGrant, "gov.keygrant.v1");

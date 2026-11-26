@@ -130,6 +130,32 @@ impl Store for PgStore {
         Ok(())
     }
 
+    async fn retire_keys(&self, scope: &Scope, chain: &Id, kid: Option<&Id>) -> StoreResult<()> {
+        sqlx::query(
+            "UPDATE gate_keys SET retired = TRUE \
+             WHERE tenant = $1 AND env = $2 AND gate = $3 AND ($4::text IS NULL OR kid = $4)",
+        )
+        .bind(scope.tenant.as_str())
+        .bind(scope.env.as_str())
+        .bind(chain.as_str())
+        .bind(kid.map(|k| k.as_str()))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn key_retired(&self, scope: &Scope, kid: &Id) -> StoreResult<bool> {
+        let retired: Option<bool> = sqlx::query_scalar(
+            "SELECT retired FROM gate_keys WHERE tenant = $1 AND env = $2 AND kid = $3",
+        )
+        .bind(scope.tenant.as_str())
+        .bind(scope.env.as_str())
+        .bind(kid.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(retired.unwrap_or(false))
+    }
+
     async fn chain_kind(&self, scope: &Scope, chain: &Id) -> StoreResult<Option<ChainKind>> {
         let kind: Option<String> = sqlx::query_scalar(
             "SELECT kind FROM gate_keys WHERE tenant = $1 AND env = $2 AND gate = $3 LIMIT 1",

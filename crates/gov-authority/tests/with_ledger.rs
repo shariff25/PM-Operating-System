@@ -4,11 +4,15 @@
 
 use std::collections::BTreeSet;
 
+// The Ledger's own test helpers, for a gate's receipts.
+#[path = "../../gov-ledger/tests/common/mod.rs"]
+mod common;
+
 use gov_authority::{Authority, AuthorityError, MemoryStore, Role};
 use gov_core::admin::AdminAction;
-use gov_core::enrol::{code_digest, EnrolKind, EnrolRequest, KeyGrant};
+use gov_core::enrol::{code_digest, EnrolKind, EnrolRequest};
 use gov_core::lease::IntakeAck;
-use gov_core::{seal, Digest, Envelope, Id, KeySet, PublicKey, Scope, SigningKey};
+use gov_core::{seal, Digest, Envelope, Id, KeySet, Scope, SigningKey};
 use gov_ledger::verify::{verify, Check};
 use gov_ledger::{DirWitness, Ledger, LedgerError, Store as LedgerStore, Witness};
 
@@ -78,24 +82,9 @@ async fn ship(a: &TheAuthority, ledger: &TheLedger, acked: u64) -> u64 {
         .unwrap()
 }
 
-fn grant(signer: &SigningKey, gate: &str, key: PublicKey) -> Envelope {
-    seal(
-        &KeyGrant {
-            v: 1,
-            tenant: id("acme"),
-            env: id("prod"),
-            authority: id("authority"),
-            gate: id(gate),
-            key,
-        },
-        signer,
-    )
-    .unwrap()
-}
-
 fn refused(r: Result<(), LedgerError>) {
     assert!(
-        matches!(r, Err(LedgerError::Refused("grant_refused"))),
+        matches!(r, Err(LedgerError::Refused("key_not_enrolled"))),
         "{r:?}"
     );
 }
@@ -131,28 +120,35 @@ async fn installed() -> (TheAuthority, TheLedger) {
 #[tokio::test]
 async fn the_authoritys_chain_is_witnessed_and_a_gates_key_follows_from_it() {
     let (a, ledger) = installed().await;
-    let g1 = key("gate-1-k1", 20);
+    let g1 = key("gate-1:k1", 20);
     enrol_gate(&a, "gate-1", &g1).await;
-    let word = a.grant(&id("gate-1-k1")).await.unwrap();
+    assert_eq!(a.gate_keys().await.unwrap(), vec![g1.public()]);
 
-    // The Authority's word alone enrols nothing: the Ledger does not yet hold the record of
-    // the enrolment, so the key is not one the witness could have seen.
-    refused(ledger.grant_key(&word).await);
+    // The key alone enrols nothing: the Ledger does not yet hold the record of its
+    // enrolment, so it is not a key the witness could have seen.
+    refused(ledger.supply_key(&g1.public()).await);
     assert!(ledger
         .store()
-        .gate_key(&scope(), &id("gate-1-k1"))
+        .gate_key(&scope(), &id("gate-1:k1"))
         .await
         .unwrap()
         .is_none());
+    let receipts = common::chain("gate-1", &g1, 4, NOW, 1);
+    assert!(
+        ledger.ingest(&receipts[0], NOW).await.is_err(),
+        "no receipt before the record"
+    );
 
     // The chain is shipped, and the Ledger's signed answer agrees with the Authority's own.
     let acked = ship(&a, &ledger, 0).await;
     assert_eq!(acked, 7);
-    // Now the word is backed by a record, and the key is enrolled for the gate's receipts.
-    ledger.grant_key(&word).await.unwrap();
+    // Now the key is backed by a witnessed record: it is enrolled for the gate's receipts,
+    // for the gate the record names, whoever offers it and however often.
+    ledger.supply_key(&g1.public()).await.unwrap();
+    ledger.supply_key(&g1.public()).await.unwrap();
     let (gate, held) = ledger
         .store()
-        .gate_key(&scope(), &id("gate-1-k1"))
+        .gate_key(&scope(), &id("gate-1:k1"))
         .await
         .unwrap()
         .unwrap();
@@ -165,62 +161,82 @@ async fn the_authoritys_chain_is_witnessed_and_a_gates_key_follows_from_it() {
             .unwrap(),
         Some(gov_ledger::ChainKind::Receipt)
     );
-    // Asked twice, enrolled once.
-    ledger.grant_key(&word).await.unwrap();
+    for env in &receipts[..2] {
+        ledger.ingest(env, NOW).await.unwrap();
+    }
 
-    // What does not enrol a key at the Ledger.
-    let stranger = key("stranger-k1", 99);
-    // A grant signed by a gate's own key, or by a key the Ledger does not know.
-    refused(
-        ledger
-            .grant_key(&grant(&g1, "gate-2", stranger.public()))
-            .await,
-    );
-    refused(
-        ledger
-            .grant_key(&grant(&stranger, "gate-2", stranger.public()))
-            .await,
-    );
-    // The Authority's own signature on a key that was never enrolled, on an enrolled key for
-    // another gate, and on another key under an enrolled key's id.
-    refused(
-        ledger
-            .grant_key(&grant(&admin_key(), "gate-2", stranger.public()))
-            .await,
-    );
-    refused(
-        ledger
-            .grant_key(&grant(&admin_key(), "gate-2", g1.public()))
-            .await,
-    );
-    let same_id = SigningKey::from_seed(id("gate-1-k1"), &[21; 32]).unwrap();
-    refused(
-        ledger
-            .grant_key(&grant(&admin_key(), "gate-1", same_id.public()))
-            .await,
-    );
-    // An agent's key is not a gate's: the Authority gives no word for it, and a forged word
-    // finds no record of a gate's enrolment.
-    assert!(matches!(
-        a.grant(&id("no-such-key")).await,
-        Err(AuthorityError::Unknown(_))
-    ));
+    // What does not enrol a key at the Ledger: a key nobody enrolled; another key under an
+    // enrolled key's id; an enrolled key's bytes under another id.
+    let stranger = key("gate-2:k1", 99);
+    refused(ledger.supply_key(&stranger.public()).await);
+    let same_id = SigningKey::from_seed(id("gate-1:k1"), &[21; 32]).unwrap();
+    refused(ledger.supply_key(&same_id.public()).await);
+    let same_key = SigningKey::from_seed(id("gate-1:k7"), &[20; 32]).unwrap();
+    refused(ledger.supply_key(&same_key.public()).await);
+    // An agent's key is in the Authority's chain too, and is no gate's: agents send no
+    // receipts, and the Ledger takes none under an agent's key.
+    let bot = key("refund-bot:k1", 9);
+    let code = a
+        .offer_enrolment(&id("ana"), EnrolKind::Agent, &id("refund-bot"), NOW)
+        .await
+        .unwrap();
+    let asked = seal(
+        &EnrolRequest {
+            v: 1,
+            tenant: id("acme"),
+            env: id("prod"),
+            authority: id("authority"),
+            kind: EnrolKind::Agent,
+            name: id("refund-bot"),
+            key: bot.public(),
+            code: code_digest(&code),
+        },
+        &bot,
+    )
+    .unwrap();
+    a.enrol(&code, &asked, NOW).await.unwrap();
+    let acked = ship(&a, &ledger, acked).await;
+    refused(ledger.supply_key(&bot.public()).await);
+    assert_eq!(a.gate_keys().await.unwrap(), vec![g1.public()]);
 
-    // A gate enrolled and then disabled: once the Ledger holds both records, the key is not
-    // taken, whoever signs for it.
-    let g2 = key("gate-2-k1", 22);
+    // A gate enrolled and then disabled, before the Ledger ever saw its key: once the Ledger
+    // holds both records the key is not taken.
+    let g2 = key("gate-2:k1", 22);
     enrol_gate(&a, "gate-2", &g2).await;
-    let word2 = a.grant(&id("gate-2-k1")).await.unwrap();
     a.disable_gate(&id("ana"), &id("gate-2"), NOW)
         .await
         .unwrap();
-    assert!(a.grant(&id("gate-2-k1")).await.is_err());
     let acked = ship(&a, &ledger, acked).await;
-    assert_eq!(acked, 10);
-    refused(ledger.grant_key(&word2).await);
+    refused(ledger.supply_key(&g2.public()).await);
+
+    // A gate disabled while in use: when the Ledger takes in that record, the gate's key is
+    // retired. What it sent before stays and still verifies; nothing more is taken, and it
+    // gets no answer to a shipment (review finding GR-20).
+    a.disable_gate(&id("ana"), &id("gate-1"), NOW)
+        .await
+        .unwrap();
+    assert!(a.gate_keys().await.unwrap().is_empty());
+    let acked = ship(&a, &ledger, acked).await;
+    assert_eq!(acked, 13);
+    assert!(ledger
+        .store()
+        .key_retired(&scope(), &id("gate-1:k1"))
+        .await
+        .unwrap());
+    assert!(matches!(
+        ledger.ingest(&receipts[2], NOW).await,
+        Err(LedgerError::Refused("retired_key"))
+    ));
+    refused(ledger.supply_key(&g1.public()).await);
+    // The Authority's own key is not retired by a record about a gate of the same name.
+    assert!(!ledger
+        .store()
+        .key_retired(&scope(), &a.admin_public().kid)
+        .await
+        .unwrap());
 
     // The Authority's chain is under the same witness as the gates', and an auditor's check
-    // of the export covers it.
+    // of the export covers both, the retired gate's receipts included.
     let dir = tempfile::tempdir().unwrap();
     let witness = DirWitness::new(dir.path());
     ledger
@@ -240,23 +256,21 @@ async fn the_authoritys_chain_is_witnessed_and_a_gates_key_follows_from_it() {
         clock_skew_secs: 60,
         retention_secs: None,
     });
-    // gate-1 has a key and no receipt yet; nothing else is amiss.
-    let other: Vec<_> = report
-        .findings
-        .iter()
-        .filter(|f| f.gate.as_ref() != Some(&id("gate-1")))
-        .collect();
-    assert!(other.is_empty(), "{other:?}");
-    assert_eq!(report.receipts_verified, 10);
-    // What was witnessed says who enrolled which key for which gate.
+    assert!(report.ok(), "{:?}", report.findings);
+    assert_eq!(report.receipts_verified, 13 + 2);
+    // What was witnessed says which key was enrolled for which gate or agent, in order.
     let enrolled: Vec<Id> = a
-        .store_records()
+        .records()
         .await
+        .unwrap()
         .into_iter()
         .filter(|r| r.action == AdminAction::KeyEnrolled)
         .map(|r| r.subject.id)
         .collect();
-    assert_eq!(enrolled, vec![id("gate-1-k1"), id("gate-2-k1")]);
+    assert_eq!(
+        enrolled,
+        vec![id("gate-1:k1"), id("refund-bot:k1"), id("gate-2:k1")]
+    );
 }
 
 #[tokio::test]

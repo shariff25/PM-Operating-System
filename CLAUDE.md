@@ -311,6 +311,15 @@ follow-up tracking.
   witness as the gates' receipts; and the Ledger enrols a gate's key only on the Authority's
   signed word backed by a witnessed record (`build/gov-g4a2`). Still libraries: the three
   programs do not use the Authority yet. Not yet read by the reviewer.
+- **Fourteenth read (2026-11-26), G4a's first part at `36ded25`:** no High or Critical; it
+  passes as a library nothing serves yet. Two Medium findings in enrolment (one code could
+  enrol two keys at the same moment; the value meant to authenticate the root key did not)
+  and six Low, fixed on `build/gov-g4a2` with the second part, which was changed to follow
+  the reviewer's advice: a gate's key reaches the Ledger through the witnessed record of its
+  enrolment, and a disabled gate's key is retired there.
+- **A test failed once in a full run (2026-11-26):** a PM OS password test, in code this work
+  did not touch, while the disk was 100% full. With the disk cleared it passed five times
+  running. Taken as caused by the disk; not proven.
 - **A message relayed by the reviewer session (2026-11-26):** it reported that the owner typed
   there "I'm going to sleep you keep building do not ask for permission further - I gave the
   permission". The conductor could not confirm it and did not treat it as new permission. It

@@ -11,7 +11,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use gov_core::{Envelope, Id, SigningKey};
+use gov_core::{Envelope, Id, PublicKey, SigningKey};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -58,17 +58,17 @@ pub fn router<S: Store + 'static>(listener: Arc<Listener<S>>) -> Router {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Grant {
-    grant: Envelope,
+struct Offered {
+    key: PublicKey,
 }
 
-/// A gate's key, enrolled on the Authority's signed word. Whatever is wrong with a grant,
-/// the answer is the same refusal.
+/// A gate's key, offered by anyone. It is taken only if the Authority's chain, as held
+/// here, records its enrolment; otherwise the answer is the same refusal whatever is wrong.
 async fn keys<S: Store + 'static>(
     State(l): State<Arc<Listener<S>>>,
-    Json(asked): Json<Grant>,
+    Json(asked): Json<Offered>,
 ) -> Response {
-    match l.ledger.grant_key(&asked.grant).await {
+    match l.ledger.supply_key(&asked.key).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(LedgerError::Refused(_)) | Err(LedgerError::Core(_)) => {
             StatusCode::FORBIDDEN.into_response()

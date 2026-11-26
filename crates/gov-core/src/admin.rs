@@ -27,6 +27,9 @@ pub enum AdminAction {
     GateRegistered,
     /// A one-time code was made for an agent or a gate to enrol its key with.
     EnrolmentOffered,
+    /// A code was cancelled after too many wrong guesses. Nobody decided it: the actor is
+    /// the Authority itself.
+    EnrolmentCancelled,
     /// An agent's or gate's key was enrolled.
     KeyEnrolled,
     AgentSuspended,
@@ -120,7 +123,7 @@ impl AdminRecord {
             A::PersonAdded | A::PersonOffboarded => (&[K::Person], &[None], false),
             A::AgentRegistered => (&[K::Agent], &[Some(K::Person)], false),
             A::GateRegistered => (&[K::Gate], &[None], false),
-            A::EnrolmentOffered => (&[K::Agent, K::Gate], &[None], false),
+            A::EnrolmentOffered | A::EnrolmentCancelled => (&[K::Agent, K::Gate], &[None], false),
             A::KeyEnrolled => (&[K::Key], &[Some(K::Agent), Some(K::Gate)], true),
             A::AgentSuspended | A::AgentResumed | A::AgentDisabled => (&[K::Agent], &[None], false),
             A::GateDisabled => (&[K::Gate], &[None], false),

@@ -5,6 +5,11 @@
 //! key by a one-time code; and the signed, chained record of everything an admin did. It is
 //! a library. Nothing here is served on a listener, and there is no sign-in yet: **every
 //! record made by this step says its actor is unverified** (review finding GR-111).
+//!
+//! **A check and the write it guards are one step** (review finding GR-119). Every action
+//! reads the chain's head first, makes its checks, and commits on that head; the store
+//! refuses the commit if the head has moved, and the action starts again. Nothing changes
+//! the registry without moving the head, so no check can be overtaken.
 
 pub mod pg;
 pub mod store;
@@ -14,29 +19,24 @@ use std::collections::BTreeSet;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use gov_core::admin::{Actor, AdminAction, AdminRecord, Subject, SubjectKind};
-use gov_core::enrol::{code_digest, key_digest, new_code, pin, EnrolKind, EnrolRequest, KeyGrant};
+use gov_core::enrol::{code_digest, key_digest, new_code, EnrolKind, EnrolRequest};
 use gov_core::lease::{batch_digest, IntakeAck, ShipRequest};
-use gov_core::random_id;
-use gov_core::{open, seal, Digest, Envelope, Id, KeySet, PublicKey, Scope, SigningKey, VERSION};
+use gov_core::receipt::ChainHead;
+use gov_core::{
+    open, random_id, seal, Digest, Envelope, Id, KeySet, PublicKey, Scope, SigningKey, VERSION,
+};
 
 pub use store::{
     Agent, Effect, EnrolledKey, Gate, MemoryStore, PendingCode, Person, Role, Status, Store,
     StoreError, StoredRecord,
 };
 
-/// A batch of this Authority's records for the Ledger, under a request signed with the key
-/// the records are signed with.
-#[derive(Debug, Clone)]
-pub struct Shipment {
-    pub request: Envelope,
-    pub batch: Vec<Envelope>,
-    nonce: Id,
-}
-
 /// How long a one-time code is good for, in seconds.
 pub const CODE_SECS: i64 = 15 * 60;
 /// Wrong codes for one name before its pending code is cancelled.
 pub const WRONG_CODES: u32 = 5;
+/// How often an action starts again when another writer moved the chain's head first.
+const TRIES: u32 = 16;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthorityError {
@@ -62,12 +62,13 @@ pub enum AuthorityError {
 
 type Result<T> = std::result::Result<T, AuthorityError>;
 
-/// What a successful enrolment answers: the Authority's root key, and the value that lets
-/// the caller check it was handed the right one (see [`gov_core::enrol::pin`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Enrolled {
-    pub root: PublicKey,
-    pub pin: Digest,
+/// A batch of this Authority's records for the Ledger, under a request signed with the key
+/// the records are signed with.
+#[derive(Debug, Clone)]
+pub struct Shipment {
+    pub request: Envelope,
+    pub batch: Vec<Envelope>,
+    nonce: Id,
 }
 
 pub struct Authority<S> {
@@ -90,6 +91,17 @@ struct Did {
     value: Option<Digest>,
 }
 
+impl Did {
+    fn to(action: AdminAction, kind: SubjectKind, id: &Id) -> Self {
+        Did {
+            action,
+            on: subject(kind, id),
+            about: None,
+            value: None,
+        }
+    }
+}
+
 fn subject(kind: SubjectKind, id: &Id) -> Subject {
     Subject {
         kind,
@@ -102,6 +114,22 @@ fn of(kind: EnrolKind) -> SubjectKind {
         EnrolKind::Agent => SubjectKind::Agent,
         EnrolKind::Gate => SubjectKind::Gate,
     }
+}
+
+/// Run `$body` on the chain's head as it stands, and again from the top if the head moved
+/// before `$body`'s commit landed. `$head` is the head every check in `$body` is made on.
+macro_rules! on_head {
+    ($self:ident, $head:ident, $body:block) => {{
+        let mut tries = 0;
+        loop {
+            let $head = $self.store.head(&$self.scope).await?;
+            let out: Result<_> = async { $body }.await;
+            match out {
+                Err(AuthorityError::Store(StoreError::HeadMoved)) if tries < TRIES => tries += 1,
+                other => break other,
+            }
+        }
+    }};
 }
 
 impl<S: Store> Authority<S> {
@@ -124,52 +152,56 @@ impl<S: Store> Authority<S> {
         self.admin_key.public()
     }
 
-    /// Write one record and apply what it stands for, together. The record is built on the
-    /// chain's head as read; if another writer moved the head first, read again and retry.
-    async fn act(&self, actor: &Id, did: Did, effects: &[Effect], now: i64) -> Result<u64> {
-        let Did {
-            action,
-            on,
-            about,
-            value,
-        } = did;
+    /// Write one record on `head` and apply what it stands for, together. If the head has
+    /// moved the store writes nothing and this fails; the caller starts again.
+    async fn commit(
+        &self,
+        head: Option<ChainHead>,
+        actor: &Id,
+        did: Did,
+        effects: &[Effect],
+        now: i64,
+    ) -> Result<u64> {
+        // A record's time never goes back along the chain, whatever the clock does.
+        let at = match &head {
+            Some(h) => self
+                .store
+                .records_after(&self.scope, h.seq - 1, 1)
+                .await?
+                .first()
+                .map_or(now, |last| now.max(last.at)),
+            None => now,
+        };
+        let record = AdminRecord {
+            v: VERSION,
+            tenant: self.scope.tenant.clone(),
+            env: self.scope.env.clone(),
+            authority: self.name.clone(),
+            seq: head.as_ref().map_or(1, |h| h.seq + 1),
+            prev: head.map(|h| h.hash),
+            at,
+            actor: Actor {
+                id: actor.clone(),
+                // Nobody is signed in before G4e.
+                verified: false,
+            },
+            action: did.action,
+            subject: did.on,
+            about: did.about,
+            value: did.value,
+        };
+        record.validate()?;
+        let envelope = seal(&record, &self.admin_key)?;
         let keys = KeySet::new([self.admin_key.public()]);
-        for _ in 0..8 {
-            let head = self.store.head(&self.scope).await?;
-            let record = AdminRecord {
-                v: VERSION,
-                tenant: self.scope.tenant.clone(),
-                env: self.scope.env.clone(),
-                authority: self.name.clone(),
-                seq: head.as_ref().map_or(1, |h| h.seq + 1),
-                prev: head.map(|h| h.hash),
-                at: now,
-                actor: Actor {
-                    id: actor.clone(),
-                    // Nobody is signed in before G4e.
-                    verified: false,
-                },
-                action,
-                subject: on.clone(),
-                about: about.clone(),
-                value: value.clone(),
-            };
-            record.validate()?;
-            let envelope = seal(&record, &self.admin_key)?;
-            let hash = open::<AdminRecord>(&envelope, &keys, &self.scope)?.hash;
-            let stored = StoredRecord {
-                seq: record.seq,
-                hash,
-                at: now,
-                envelope,
-            };
-            match self.store.commit(&self.scope, &stored, effects).await {
-                Ok(()) => return Ok(record.seq),
-                Err(StoreError::HeadMoved) => continue,
-                Err(e) => return Err(e.into()),
-            }
-        }
-        Err(StoreError::HeadMoved.into())
+        let hash = open::<AdminRecord>(&envelope, &keys, &self.scope)?.hash;
+        let stored = StoredRecord {
+            seq: record.seq,
+            hash,
+            at,
+            envelope,
+        };
+        self.store.commit(&self.scope, &stored, effects).await?;
+        Ok(record.seq)
     }
 
     /// Only an active admin acts. Before sign-in exists this checks the name given, not the
@@ -183,50 +215,36 @@ impl<S: Store> Authority<S> {
 
     /// Name the installation's first admin. Possible exactly once, while nobody is known.
     pub async fn bootstrap(&self, first_admin: &Id, now: i64) -> Result<u64> {
-        if self.store.any_person(&self.scope).await? {
-            return Err(AuthorityError::Exists("an admin"));
-        }
-        let person = Person {
-            id: first_admin.clone(),
-            role: Role::Admin,
-            active: true,
-        };
-        self.act(
-            first_admin,
-            Did {
-                action: AdminAction::PersonAdded,
-                on: subject(SubjectKind::Person, first_admin),
-                about: None,
-                value: None,
-            },
-            &[Effect::PutPerson(person)],
-            now,
-        )
-        .await
+        on_head!(self, head, {
+            if head.is_some() || self.store.any_person(&self.scope).await? {
+                return Err(AuthorityError::Exists("an admin"));
+            }
+            let person = Person {
+                id: first_admin.clone(),
+                role: Role::Admin,
+                active: true,
+            };
+            let did = Did::to(AdminAction::PersonAdded, SubjectKind::Person, first_admin);
+            self.commit(head, first_admin, did, &[Effect::PutPerson(person)], now)
+                .await
+        })
     }
 
     pub async fn add_person(&self, actor: &Id, person: &Id, role: Role, now: i64) -> Result<u64> {
-        self.admin(actor).await?;
-        if self.store.person(&self.scope, person).await?.is_some() {
-            return Err(AuthorityError::Exists("person"));
-        }
-        let added = Person {
-            id: person.clone(),
-            role,
-            active: true,
-        };
-        self.act(
-            actor,
-            Did {
-                action: AdminAction::PersonAdded,
-                on: subject(SubjectKind::Person, person),
-                about: None,
-                value: None,
-            },
-            &[Effect::PutPerson(added)],
-            now,
-        )
-        .await
+        on_head!(self, head, {
+            self.admin(actor).await?;
+            if self.store.person(&self.scope, person).await?.is_some() {
+                return Err(AuthorityError::Exists("person"));
+            }
+            let added = Person {
+                id: person.clone(),
+                role,
+                active: true,
+            };
+            let did = Did::to(AdminAction::PersonAdded, SubjectKind::Person, person);
+            self.commit(head, actor, did, &[Effect::PutPerson(added)], now)
+                .await
+        })
     }
 
     /// A person leaves. Each of their agents is suspended first, with a record each, and
@@ -234,44 +252,31 @@ impl<S: Store> Authority<S> {
     /// whose agents are already stopped, never the other way round. (An agent is in any
     /// case usable only while its owner is active: see [`Authority::agent_usable`].)
     pub async fn offboard_person(&self, actor: &Id, person: &Id, now: i64) -> Result<u64> {
-        self.admin(actor).await?;
-        let Some(mut leaving) = self.store.person(&self.scope, person).await? else {
-            return Err(AuthorityError::Unknown("person"));
-        };
         if actor == person {
             // The last admin cannot remove themselves and leave nobody able to act.
             return Err(AuthorityError::NotAllowed);
         }
-        for mut agent in self.store.agents_of(&self.scope, person).await? {
-            if agent.status == Status::Active {
-                agent.status = Status::Suspended;
-                self.act(
-                    actor,
-                    Did {
-                        action: AdminAction::AgentSuspended,
-                        on: subject(SubjectKind::Agent, &agent.id),
-                        about: None,
-                        value: None,
-                    },
-                    &[Effect::PutAgent(agent.clone())],
-                    now,
-                )
-                .await?;
+        self.admin(actor).await?;
+        if self.store.person(&self.scope, person).await?.is_none() {
+            return Err(AuthorityError::Unknown("person"));
+        }
+        for agent in self.store.agents_of(&self.scope, person).await? {
+            match self.suspend_agent(actor, &agent.id, now).await {
+                // Suspended or disabled already.
+                Ok(_) | Err(AuthorityError::Unknown(_)) => {}
+                Err(e) => return Err(e),
             }
         }
-        leaving.active = false;
-        self.act(
-            actor,
-            Did {
-                action: AdminAction::PersonOffboarded,
-                on: subject(SubjectKind::Person, person),
-                about: None,
-                value: None,
-            },
-            &[Effect::PutPerson(leaving)],
-            now,
-        )
-        .await
+        on_head!(self, head, {
+            self.admin(actor).await?;
+            let Some(mut leaving) = self.store.person(&self.scope, person).await? else {
+                return Err(AuthorityError::Unknown("person"));
+            };
+            leaving.active = false;
+            let did = Did::to(AdminAction::PersonOffboarded, SubjectKind::Person, person);
+            self.commit(head, actor, did, &[Effect::PutPerson(leaving)], now)
+                .await
+        })
     }
 
     /// Name an agent and the person who answers for it. It has no key until it enrols.
@@ -283,55 +288,44 @@ impl<S: Store> Authority<S> {
         labels: BTreeSet<Id>,
         now: i64,
     ) -> Result<u64> {
-        self.admin(actor).await?;
-        if self.store.agent(&self.scope, agent).await?.is_some() {
-            return Err(AuthorityError::Exists("agent"));
-        }
-        match self.store.person(&self.scope, owner).await? {
-            Some(p) if p.active => {}
-            _ => return Err(AuthorityError::Unknown("owner")),
-        }
-        let registered = Agent {
-            id: agent.clone(),
-            owner: owner.clone(),
-            labels,
-            status: Status::Active,
-        };
-        self.act(
-            actor,
-            Did {
-                action: AdminAction::AgentRegistered,
-                on: subject(SubjectKind::Agent, agent),
+        on_head!(self, head, {
+            self.admin(actor).await?;
+            if self.store.agent(&self.scope, agent).await?.is_some() {
+                return Err(AuthorityError::Exists("agent"));
+            }
+            match self.store.person(&self.scope, owner).await? {
+                Some(p) if p.active => {}
+                _ => return Err(AuthorityError::Unknown("owner")),
+            }
+            let registered = Agent {
+                id: agent.clone(),
+                owner: owner.clone(),
+                labels: labels.clone(),
+                status: Status::Active,
+            };
+            let did = Did {
                 about: Some(subject(SubjectKind::Person, owner)),
-                value: None,
-            },
-            &[Effect::PutAgent(registered)],
-            now,
-        )
-        .await
+                ..Did::to(AdminAction::AgentRegistered, SubjectKind::Agent, agent)
+            };
+            self.commit(head, actor, did, &[Effect::PutAgent(registered)], now)
+                .await
+        })
     }
 
     pub async fn register_gate(&self, actor: &Id, gate: &Id, now: i64) -> Result<u64> {
-        self.admin(actor).await?;
-        if self.store.gate(&self.scope, gate).await?.is_some() {
-            return Err(AuthorityError::Exists("gate"));
-        }
-        let registered = Gate {
-            id: gate.clone(),
-            status: Status::Active,
-        };
-        self.act(
-            actor,
-            Did {
-                action: AdminAction::GateRegistered,
-                on: subject(SubjectKind::Gate, gate),
-                about: None,
-                value: None,
-            },
-            &[Effect::PutGate(registered)],
-            now,
-        )
-        .await
+        on_head!(self, head, {
+            self.admin(actor).await?;
+            if self.store.gate(&self.scope, gate).await?.is_some() {
+                return Err(AuthorityError::Exists("gate"));
+            }
+            let registered = Gate {
+                id: gate.clone(),
+                status: Status::Active,
+            };
+            let did = Did::to(AdminAction::GateRegistered, SubjectKind::Gate, gate);
+            self.commit(head, actor, did, &[Effect::PutGate(registered)], now)
+                .await
+        })
     }
 
     async fn set_agent(
@@ -343,26 +337,23 @@ impl<S: Store> Authority<S> {
         to: Status,
         now: i64,
     ) -> Result<u64> {
-        self.admin(actor).await?;
-        let Some(mut found) = self.store.agent(&self.scope, agent).await? else {
-            return Err(AuthorityError::Unknown("agent"));
-        };
-        if !from.contains(&found.status) {
-            return Err(AuthorityError::Unknown("agent in that state"));
-        }
-        found.status = to;
-        self.act(
-            actor,
-            Did {
-                action,
-                on: subject(SubjectKind::Agent, agent),
-                about: None,
-                value: None,
-            },
-            &[Effect::PutAgent(found)],
-            now,
-        )
-        .await
+        on_head!(self, head, {
+            self.admin(actor).await?;
+            let Some(mut found) = self.store.agent(&self.scope, agent).await? else {
+                return Err(AuthorityError::Unknown("agent"));
+            };
+            if !from.contains(&found.status) {
+                return Err(AuthorityError::Unknown("agent in that state"));
+            }
+            found.status = to;
+            // A code waiting for an agent that is stopped is of no more use (GR-118).
+            let mut effects = vec![Effect::PutAgent(found)];
+            if to != Status::Active {
+                effects.push(Effect::DropCode(EnrolKind::Agent, agent.clone()));
+            }
+            let did = Did::to(action, SubjectKind::Agent, agent);
+            self.commit(head, actor, did, &effects, now).await
+        })
     }
 
     pub async fn suspend_agent(&self, actor: &Id, agent: &Id, now: i64) -> Result<u64> {
@@ -380,39 +371,28 @@ impl<S: Store> Authority<S> {
     /// For good: a disabled agent is not resumed.
     pub async fn disable_agent(&self, actor: &Id, agent: &Id, now: i64) -> Result<u64> {
         let from = [Status::Active, Status::Suspended];
-        self.set_agent(
-            actor,
-            agent,
-            AdminAction::AgentDisabled,
-            &from,
-            Status::Disabled,
-            now,
-        )
-        .await
+        let (action, to) = (AdminAction::AgentDisabled, Status::Disabled);
+        self.set_agent(actor, agent, action, &from, to, now).await
     }
 
     pub async fn disable_gate(&self, actor: &Id, gate: &Id, now: i64) -> Result<u64> {
-        self.admin(actor).await?;
-        match self.store.gate(&self.scope, gate).await? {
-            Some(g) if g.status != Status::Disabled => {}
-            _ => return Err(AuthorityError::Unknown("gate")),
-        }
-        let disabled = Gate {
-            id: gate.clone(),
-            status: Status::Disabled,
-        };
-        self.act(
-            actor,
-            Did {
-                action: AdminAction::GateDisabled,
-                on: subject(SubjectKind::Gate, gate),
-                about: None,
-                value: None,
-            },
-            &[Effect::PutGate(disabled)],
-            now,
-        )
-        .await
+        on_head!(self, head, {
+            self.admin(actor).await?;
+            match self.store.gate(&self.scope, gate).await? {
+                Some(g) if g.status != Status::Disabled => {}
+                _ => return Err(AuthorityError::Unknown("gate")),
+            }
+            let disabled = Gate {
+                id: gate.clone(),
+                status: Status::Disabled,
+            };
+            let effects = [
+                Effect::PutGate(disabled),
+                Effect::DropCode(EnrolKind::Gate, gate.clone()),
+            ];
+            let did = Did::to(AdminAction::GateDisabled, SubjectKind::Gate, gate);
+            self.commit(head, actor, did, &effects, now).await
+        })
     }
 
     /// Whether an agent may act: it is active, and so is the person who answers for it.
@@ -424,9 +404,21 @@ impl<S: Store> Authority<S> {
         Ok(found.status == Status::Active && owner.is_some_and(|p| p.active))
     }
 
+    /// Whether a key may be enrolled for this name now: it is registered and not stopped.
+    async fn enrolable(&self, kind: EnrolKind, name: &Id) -> Result<bool> {
+        Ok(match kind {
+            EnrolKind::Agent => self.agent_usable(name).await?,
+            EnrolKind::Gate => self
+                .store
+                .gate(&self.scope, name)
+                .await?
+                .is_some_and(|g| g.status == Status::Active),
+        })
+    }
+
     /// Make a one-time code for a registered agent or gate to enrol its key with. The code
     /// is returned once and never stored: only its digest is. A code made earlier for the
-    /// same name is replaced.
+    /// same name is replaced. The code also names the root key its holder is to pin.
     pub async fn offer_enrolment(
         &self,
         actor: &Id,
@@ -434,53 +426,36 @@ impl<S: Store> Authority<S> {
         name: &Id,
         now: i64,
     ) -> Result<String> {
-        self.admin(actor).await?;
-        let registered = match kind {
-            EnrolKind::Agent => self
-                .store
-                .agent(&self.scope, name)
-                .await?
-                .is_some_and(|a| a.status == Status::Active),
-            EnrolKind::Gate => self
-                .store
-                .gate(&self.scope, name)
-                .await?
-                .is_some_and(|g| g.status == Status::Active),
-        };
-        if !registered {
-            return Err(AuthorityError::Unknown("agent or gate to enrol"));
-        }
-        let code = new_code()?;
-        let pending = PendingCode {
-            kind,
-            name: name.clone(),
-            digest: code_digest(&code),
-            expires_at: now + CODE_SECS,
-            by: actor.clone(),
-            wrong: 0,
-        };
-        self.act(
-            actor,
-            Did {
-                action: AdminAction::EnrolmentOffered,
-                on: subject(of(kind), name),
-                about: None,
-                value: None,
-            },
-            &[Effect::PutCode(pending)],
-            now,
-        )
-        .await?;
+        let code = new_code(&self.root)?;
+        on_head!(self, head, {
+            self.admin(actor).await?;
+            if !self.enrolable(kind, name).await? {
+                return Err(AuthorityError::Unknown("agent or gate to enrol"));
+            }
+            let pending = PendingCode {
+                kind,
+                name: name.clone(),
+                digest: code_digest(&code),
+                expires_at: now + CODE_SECS,
+                by: actor.clone(),
+                wrong: 0,
+            };
+            let did = Did::to(AdminAction::EnrolmentOffered, of(kind), name);
+            self.commit(head, actor, did, &[Effect::PutCode(pending)], now)
+                .await
+        })?;
         Ok(code)
     }
 
     /// Enrol a key. `code` is the code itself, as the admin gave it out; `request` is signed
-    /// by the key being enrolled and names who is enrolling (spec §7.6, choice 3).
+    /// by the key being enrolled and names who is enrolling (spec §7.6, choice 3). Returns
+    /// the Authority's root key, which the caller pins only if its code names that key
+    /// ([`gov_core::enrol::code_names_root`]).
     ///
     /// The caller may be anyone, so every refusal looks the same. A wrong code is counted,
-    /// and the fifth cancels the pending code. The right code is used up by the first
-    /// request that presents it, whether or not the rest of that request holds.
-    pub async fn enrol(&self, code: &str, request: &Envelope, now: i64) -> Result<Enrolled> {
+    /// and the fifth cancels the pending code, with a record. The right code is taken by
+    /// exactly one request, whether or not the rest of that request holds.
+    pub async fn enrol(&self, code: &str, request: &Envelope, now: i64) -> Result<PublicKey> {
         // Who the request says it is from, read before anything is believed, so that the
         // signature can be checked against the very key it asks to enrol.
         let claimed: EnrolRequest = URL_SAFE_NO_PAD
@@ -489,21 +464,16 @@ impl<S: Store> Authority<S> {
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
             .ok_or(AuthorityError::Refused)?;
         let (kind, name) = (claimed.kind, claimed.name.clone());
-        let Some(pending) = self.store.code(&self.scope, kind, &name).await? else {
+        // The code is taken, not read: of two requests with the right code, one gets it.
+        let presented = code_digest(code);
+        let Some(pending) = self
+            .store
+            .take_code(&self.scope, kind, &name, &presented)
+            .await?
+        else {
+            self.wrong_code(kind, &name, now).await?;
             return Err(AuthorityError::Refused);
         };
-        if code_digest(code) != pending.digest {
-            let wrong = self
-                .store
-                .count_wrong_code(&self.scope, kind, &name)
-                .await?;
-            if wrong >= WRONG_CODES {
-                self.store.drop_code(&self.scope, kind, &name).await?;
-            }
-            return Err(AuthorityError::Refused);
-        }
-        // The code was presented: it is spent, whatever comes next.
-        self.store.drop_code(&self.scope, kind, &name).await?;
         if now >= pending.expires_at {
             return Err(AuthorityError::Refused);
         }
@@ -514,10 +484,16 @@ impl<S: Store> Authority<S> {
         if asked.authority != self.name || asked.code != pending.digest {
             return Err(AuthorityError::Refused);
         }
-        // A key anyone could forge for, or a key id already in use, is not enrolled.
-        if asked.key.enrolable().is_err()
-            || self.store.key(&self.scope, &asked.key.kid).await?.is_some()
-        {
+        // A key anyone could forge for is not enrolled. Nor is one whose id is not under
+        // the name it is for: `<name>:<anything>`, so no gate or agent can take an id
+        // another will want (review finding GR-116).
+        let own_id = asked
+            .key
+            .kid
+            .as_str()
+            .rsplit_once(':')
+            .is_some_and(|(owner, rest)| owner == name.as_str() && !rest.is_empty());
+        if asked.key.enrolable().is_err() || !own_id {
             return Err(AuthorityError::Refused);
         }
         let enrolled = EnrolledKey {
@@ -525,39 +501,81 @@ impl<S: Store> Authority<S> {
             name: name.clone(),
             key: asked.key.clone(),
         };
-        self.act(
-            &pending.by,
-            Did {
+        let done = on_head!(self, head, {
+            // The agent or gate may have been stopped since the code was made (GR-118).
+            if !self.enrolable(kind, &name).await? {
+                return Err(AuthorityError::Refused);
+            }
+            let did = Did {
                 action: AdminAction::KeyEnrolled,
                 on: subject(SubjectKind::Key, &asked.key.kid),
                 about: Some(subject(of(kind), &name)),
                 value: Some(key_digest(&asked.key)?),
-            },
-            &[Effect::PutKey(enrolled)],
-            now,
-        )
-        .await?;
-        Ok(Enrolled {
-            root: self.root.clone(),
-            pin: pin(code, &self.root)?,
+            };
+            self.commit(
+                head,
+                &pending.by,
+                did,
+                &[Effect::AddKey(enrolled.clone())],
+                now,
+            )
+            .await
+        });
+        match done {
+            Ok(_) => Ok(self.root.clone()),
+            // The key id, or the key itself, is enrolled already.
+            Err(AuthorityError::Store(StoreError::KeyTaken)) => Err(AuthorityError::Refused),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// A wrong code was presented for a name. It is counted, and the fifth cancels the
+    /// pending code: by a record, because an enrolment an admin offered has been stopped
+    /// (review finding GR-117). The actor of that record is the Authority itself.
+    async fn wrong_code(&self, kind: EnrolKind, name: &Id, now: i64) -> Result<()> {
+        if self.store.count_wrong_code(&self.scope, kind, name).await? < WRONG_CODES {
+            return Ok(());
+        }
+        on_head!(self, head, {
+            if self.store.code(&self.scope, kind, name).await?.is_none() {
+                return Ok(());
+            }
+            let did = Did::to(AdminAction::EnrolmentCancelled, of(kind), name);
+            let effects = [Effect::DropCode(kind, name.clone())];
+            self.commit(head, &self.name, did, &effects, now).await?;
+            Ok(())
         })
     }
 
     /// Every record of this Authority's chain, opened under its own key, in order.
-    pub async fn store_records(&self) -> Vec<AdminRecord> {
+    pub async fn records(&self) -> Result<Vec<AdminRecord>> {
         let keys = KeySet::new([self.admin_key.public()]);
         let mut out = Vec::new();
         let mut after = 0;
-        while let Ok(page) = self.store.records_after(&self.scope, after, 500).await {
-            let Some(last) = page.last() else { break };
+        loop {
+            let page = self.store.records_after(&self.scope, after, 500).await?;
+            let Some(last) = page.last() else {
+                return Ok(out);
+            };
             after = last.seq;
             for stored in &page {
-                if let Ok(opened) = open::<AdminRecord>(&stored.envelope, &keys, &self.scope) {
-                    out.push(opened.doc);
-                }
+                out.push(open::<AdminRecord>(&stored.envelope, &keys, &self.scope)?.doc);
             }
         }
-        out
+    }
+
+    /// The keys enrolled for gates that are in use: what the Ledger is given beside the
+    /// Authority's chain, so it can take those gates' receipts.
+    pub async fn gate_keys(&self) -> Result<Vec<PublicKey>> {
+        let mut out = Vec::new();
+        for enrolled in self.store.keys(&self.scope).await? {
+            if enrolled.kind == EnrolKind::Gate
+                && self.enrolable(EnrolKind::Gate, &enrolled.name).await?
+            {
+                out.push(enrolled.key);
+            }
+        }
+        Ok(out)
     }
 
     /// The records after `acked`, as a shipment for the Ledger. `None` when there are none.
@@ -623,29 +641,5 @@ impl<S: Store> Authority<S> {
             return Err(AuthorityError::LedgerDisagrees(ack.seq));
         }
         Ok(ack.seq)
-    }
-
-    /// The Authority's word to the Ledger that `kid` is a gate's enrolled key. The Ledger
-    /// acts on it only once it holds the record of that enrolment.
-    pub async fn grant(&self, kid: &Id) -> Result<Envelope> {
-        let enrolled = match self.store.key(&self.scope, kid).await? {
-            Some(e) if e.kind == EnrolKind::Gate => e,
-            _ => return Err(AuthorityError::Unknown("gate key")),
-        };
-        match self.store.gate(&self.scope, &enrolled.name).await? {
-            Some(g) if g.status == Status::Active => {}
-            _ => return Err(AuthorityError::Unknown("gate")),
-        }
-        Ok(seal(
-            &KeyGrant {
-                v: VERSION,
-                tenant: self.scope.tenant.clone(),
-                env: self.scope.env.clone(),
-                authority: self.name.clone(),
-                gate: enrolled.name,
-                key: enrolled.key,
-            },
-            &self.admin_key,
-        )?)
     }
 }

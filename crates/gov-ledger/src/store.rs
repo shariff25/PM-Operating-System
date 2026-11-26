@@ -85,6 +85,10 @@ pub trait Store: Send + Sync {
     async fn add_gate_key(&self, scope: &Scope, gate: &Id, key: &PublicKey) -> StoreResult<()> {
         self.add_key(scope, gate, ChainKind::Receipt, key).await
     }
+    /// Retire a chain's keys: one of them, or all. Nothing more is taken under a retired
+    /// key; what was taken stays, and so does the key, for checking it.
+    async fn retire_keys(&self, scope: &Scope, chain: &Id, kid: Option<&Id>) -> StoreResult<()>;
+    async fn key_retired(&self, scope: &Scope, kid: &Id) -> StoreResult<bool>;
     /// What kind of document a chain holds, if it has any key.
     async fn chain_kind(&self, scope: &Scope, chain: &Id) -> StoreResult<Option<ChainKind>>;
     /// The gate a key id belongs to, and the key.
@@ -153,6 +157,7 @@ type Key = (Id, Id);
 struct Inner {
     gate_keys: BTreeMap<(Key, Id), (Id, PublicKey)>,
     kinds: BTreeMap<(Key, Id), ChainKind>,
+    retired: std::collections::BTreeSet<(Key, Id)>,
     heads: BTreeMap<(Key, Id), ChainHead>,
     receipts: BTreeMap<(Key, Id, u64), StoredReceipt>,
     refusals: Vec<(Key, Refusal)>,
@@ -202,6 +207,29 @@ impl Store for MemoryStore {
         s.gate_keys.insert(slot, (gate.clone(), key.clone()));
         s.kinds.insert((k(scope), gate.clone()), kind);
         Ok(())
+    }
+
+    async fn retire_keys(&self, scope: &Scope, chain: &Id, kid: Option<&Id>) -> StoreResult<()> {
+        let mut s = self.0.lock().unwrap();
+        let gone: Vec<(Key, Id)> = s
+            .gate_keys
+            .iter()
+            .filter(|((scope_key, held), (of, _))| {
+                *scope_key == k(scope) && of == chain && kid.is_none_or(|one| one == held)
+            })
+            .map(|(slot, _)| slot.clone())
+            .collect();
+        s.retired.extend(gone);
+        Ok(())
+    }
+
+    async fn key_retired(&self, scope: &Scope, kid: &Id) -> StoreResult<bool> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .retired
+            .contains(&(k(scope), kid.clone())))
     }
 
     async fn chain_kind(&self, scope: &Scope, chain: &Id) -> StoreResult<Option<ChainKind>> {
