@@ -485,6 +485,14 @@ Medium), which they now have, below in §5.3.1:
 | GR-95 | Arguments with no canonical form are digested over bytes, which only match on one build | Their proof is expected to fail and is recorded as `failed` with its own reason |
 | GR-96 | The shim sends the credential and proofs to whatever its gate address is | The programs' rule: HTTPS, or plain HTTP only to a literal loopback address |
 
+**Found by CI after the tenth read's fixes, 2026-11-26.** The check on `abbc640` failed, and
+the failure was a real fault in the GR-63 fix: the intent receipt was written by the request's
+own handler and only the rest of the call ran in a task of its own, so a client that left
+between the two left an intent open for ever. Moving file work to other threads (GR-82)
+made that moment long enough for CI's disk to hit it. Fixed on `build/gov-ci-open-intent`:
+the whole call, intent receipt included, runs in the task. A test with a deliberately slow
+spool fails without the fix and passes with it.
+
 ## 1. What is being built
 
 Agent Governance is a second product, separate from PM OS. It has three parts.
