@@ -78,11 +78,11 @@ impl TryFrom<RawPublicKey> for PublicKey {
     }
 }
 
-/// The encodings of the eight points of small order on the curve, and the two other spellings
-/// of a `y` of 0 or 1. For any of them a signature anyone can write verifies some messages, so
+/// The encodings of the eight points of small order on the curve, and the other spellings of
+/// the same points that some libraries read. For any of them a signature anyone can write verifies some messages, so
 /// its holder could disown everything it signed. `a_key_anyone_can_forge_for_is_refused` shows
 /// each entry really is such a key.
-const SMALL_ORDER: [&str; 12] = [
+const SMALL_ORDER: [&str; 14] = [
     "0100000000000000000000000000000000000000000000000000000000000000",
     "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
     "0000000000000000000000000000000000000000000000000000000000000000",
@@ -95,6 +95,8 @@ const SMALL_ORDER: [&str; 12] = [
     "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
     "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
     "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+    "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
 ];
 
 fn unhex(s: &str) -> Vec<u8> {

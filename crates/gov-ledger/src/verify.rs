@@ -46,8 +46,16 @@ pub enum Problem {
     /// The prune record reaches past what the witness ever covered, or its hash ties to no
     /// checkpoint and no receipt.
     PruneNotWitnessed,
-    /// Receipts were pruned sooner after a checkpoint first covered them than retention allows.
+    /// Receipts were pruned sooner after a checkpoint first covered them than retention
+    /// allows, by the verifier's own clock.
     PrunedTooSoon,
+    /// The export says receipts were pruned and the verifier was not told the retention, so
+    /// nothing shows the pruning was allowed.
+    PruneUnchecked,
+    /// A gate the verifier trusts keys for has no receipt, no prune record and no checkpoint
+    /// entry. A gate that never ran looks like this; so does one whose history was erased
+    /// before any checkpoint covered it.
+    GateNeverSeen,
     /// The export is not in a form this verifier reads, or lists a gate twice.
     BadExport(&'static str),
 }
@@ -99,8 +107,9 @@ pub struct Check<'a> {
     pub now: Option<i64>,
     /// Report a gate whose chain has not moved for this long. Needs `now`.
     pub gate_quiet_secs: Option<u32>,
-    /// The customer's retention, in seconds: report receipts pruned sooner than this after a
-    /// checkpoint first covered them.
+    /// The customer's retention, in seconds: report receipts pruned when, by `now`, less than
+    /// this has passed since a checkpoint first covered them. Without `now` nothing can be
+    /// shown old enough, and any pruning is reported.
     pub retention_secs: Option<u64>,
 }
 
@@ -209,6 +218,18 @@ pub fn verify(check: &Check<'_>) -> Report {
                         && h.seq == chain.pruned_through.saturating_add(1)
                     {
                         chain.prune_tied = true;
+                    }
+                    let went_back = chain
+                        .times
+                        .values()
+                        .next_back()
+                        .is_some_and(|last| opened.doc.at < *last);
+                    if went_back {
+                        find(
+                            Problem::BadReceipt("time_went_back"),
+                            Some(&gate.gate),
+                            Some(h.seq),
+                        );
                     }
                     chain.times.insert(h.seq, opened.doc.at);
                     chain.hashes.insert(h.seq, h.hash.clone());
@@ -373,26 +394,53 @@ pub fn verify(check: &Check<'_>) -> Report {
                     Some(chain.pruned_through),
                 );
             }
-            if let Some(retention) = check.retention_secs {
-                // The first checkpoint that covered the last pruned receipt: it arrived no
-                // earlier than the checkpoint before that one, so it was at most this old.
-                let first_cover = seen
-                    .iter()
-                    .filter(|(seq, _, _)| *seq >= chain.pruned_through)
-                    .map(|(_, _, at)| *at)
-                    .min();
-                let too_soon = first_cover.is_none_or(|covered_at| {
-                    u64::try_from(chain.pruned_at.saturating_sub(covered_at)).unwrap_or(0)
-                        < retention
-                });
-                if too_soon {
-                    find(
-                        Problem::PrunedTooSoon,
-                        Some(gate),
-                        Some(chain.pruned_through),
-                    );
+            // The record's own date is the Ledger's word. It may not be in the future, and
+            // it is not what age is measured by (review finding GR-22).
+            if check.now.is_some_and(|now| chain.pruned_at > now) {
+                find(
+                    Problem::BadPruneRecord("dated_ahead"),
+                    Some(gate),
+                    Some(chain.pruned_through),
+                );
+            }
+            match check.retention_secs {
+                None => find(
+                    Problem::PruneUnchecked,
+                    Some(gate),
+                    Some(chain.pruned_through),
+                ),
+                Some(retention) => {
+                    // The first checkpoint that covered the last pruned receipt is in the
+                    // witness, which the Ledger cannot rewrite. If less than the retention
+                    // has passed since then by the verifier's own clock, the receipt was
+                    // deleted too soon, whatever date the record carries.
+                    let first_cover = seen
+                        .iter()
+                        .filter(|(seq, _, _)| *seq >= chain.pruned_through)
+                        .map(|(_, _, at)| *at)
+                        .min();
+                    let old_enough = match (check.now, first_cover) {
+                        (Some(now), Some(covered_at)) => {
+                            u64::try_from(now.saturating_sub(covered_at)).unwrap_or(0) >= retention
+                        }
+                        _ => false,
+                    };
+                    if !old_enough {
+                        find(
+                            Problem::PrunedTooSoon,
+                            Some(gate),
+                            Some(chain.pruned_through),
+                        );
+                    }
                 }
             }
+        }
+        if covered.is_none()
+            && chain.hashes.is_empty()
+            && chain.pruned_hash.is_none()
+            && !witnessed.contains_key(gate)
+        {
+            find(Problem::GateNeverSeen, Some(gate), None);
         }
         gates.push(GateReport {
             gate: gate.clone(),

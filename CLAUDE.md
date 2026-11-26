@@ -214,6 +214,10 @@ follow-up tracking.
   Ledger's prune record, `gov verify` passing with no witness cover). Fixed on
   `build/gov-review-1`, except the signed-approval design, which is open and unbuilt; the
   reviewer's re-read is owed. Findings and what was done: the spec's "Security review" section.
+  Second read the same day, at `0175ade`: **the gate passes for the spec and for G1** (the
+  spec on the condition that the signed approval stays unbuilt until its design is reviewed)
+  and **does not pass for G2** (one High, GR-22: `gov verify` still passed a wiped chain).
+  Fixed on `build/gov-review-2`; a third read is owed.
 - **Undo, and who serves the approval page (owner, 2026-11-26):** asked to "build something
   extraordinary which will help enterprises to adopt the product", the conductor proposed
   undo: every action through the gate is either one that can be put back or one a person

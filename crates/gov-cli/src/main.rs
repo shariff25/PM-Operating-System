@@ -85,6 +85,12 @@ fn describe(problem: &Problem) -> String {
             "the prune record reaches past the witness, or ties to nothing".into()
         }
         Problem::PrunedTooSoon => "receipts were pruned sooner than the retention allows".into(),
+        Problem::PruneUnchecked => {
+            "the Ledger says it deleted receipts; pass --retention-days so that can be checked".into()
+        }
+        Problem::GateNeverSeen => {
+            "a trusted gate has no receipt and no checkpoint entry: it never ran, or its history was erased before any checkpoint (if it never ran, leave it out of --keys)".into()
+        }
         Problem::BadExport(code) => format!("the export cannot be read as one ({code})"),
     }
 }
@@ -118,7 +124,10 @@ fn print(report: &Report) {
         let seq = f.seq.map(|s| format!(" number {s}")).unwrap_or_default();
         println!("PROBLEM{gate}{seq}: {}", describe(&f.problem));
     }
-    if report.ok() {
+    let pruned = report.gates.iter().any(|g| g.pruned_through > 0);
+    if report.ok() && pruned {
+        println!("OK: nothing altered or missing was found, and what the Ledger deleted (above) is older than the retention given. This does not show that a gate recorded everything it did.");
+    } else if report.ok() {
         println!("OK: nothing altered, removed or missing was found. This does not show that a gate recorded everything it did.");
     } else {
         println!("FAILED: {} problem(s)", report.findings.len());

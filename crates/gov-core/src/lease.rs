@@ -71,8 +71,9 @@ pub struct Lease {
 
 document!(Lease, "gov.lease.v1");
 
-/// A renewal the gate has sent and not yet had answered.
-#[derive(Debug, Clone)]
+/// A renewal the gate has sent and not yet had answered. Not `Clone`: accepting a lease uses
+/// the request up, so one nonce accepts one lease (review finding GR-25).
+#[derive(Debug)]
 pub struct LeaseRequest {
     pub gate: Id,
     /// Fresh and random for each request.
@@ -99,7 +100,7 @@ impl HeldLease {
     /// must be for this gate and carry the request's nonce, so a lease recorded earlier and
     /// played back is refused; and neither its Authority time nor its revocation number may be
     /// lower than the held one's, so nothing can turn a gate's clock or its revocations back.
-    pub fn accept(held: Option<&HeldLease>, lease: Lease, request: &LeaseRequest) -> Result<Self> {
+    pub fn accept(held: Option<&HeldLease>, lease: Lease, request: LeaseRequest) -> Result<Self> {
         if lease.gate != request.gate || lease.nonce != request.nonce {
             return Err(Error::LeaseReplayed);
         }

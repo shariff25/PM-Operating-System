@@ -111,6 +111,15 @@ impl<S: Store> Ledger<S> {
                     };
                 }
             }
+            // A gate's clock does not run backwards along its own chain (finding GR-16). The
+            // receipt before may have been pruned; then there is nothing to compare with.
+            if let Some(h) = &head {
+                if let Some(before) = self.store.receipt(&self.scope, &gate, h.seq).await? {
+                    if opened.doc.at < before.at {
+                        return self.refuse(envelope, "time_went_back", true, now).await;
+                    }
+                }
+            }
             let new_head = match follow(head.as_ref(), &opened) {
                 Ok(h) => h,
                 Err(e) => return self.refuse(envelope, e.code(), true, now).await,

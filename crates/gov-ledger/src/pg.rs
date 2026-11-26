@@ -75,6 +75,8 @@ impl PgStore {
 #[async_trait]
 impl Store for PgStore {
     async fn add_gate_key(&self, scope: &Scope, gate: &Id, key: &PublicKey) -> StoreResult<()> {
+        key.enrolable()
+            .map_err(|e| StoreError::Other(e.to_string()))?;
         sqlx::query(
             "INSERT INTO gate_keys (tenant, env, kid, gate, key) VALUES ($1, $2, $3, $4, $5)",
         )

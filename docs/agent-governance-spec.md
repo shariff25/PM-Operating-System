@@ -134,6 +134,53 @@ while suspended (G6); resource identifiers are case-sensitive, so a connector fo
 that is not must fold case (G3); "the old Authority key signs the new one" has no recovery if
 the old key is stolen (open, §11).
 
+### Second read, 2026-11-26, at `0175ade`
+
+**Verdict: the gate passes for the spec and for G1; it does not pass for G2.** The spec
+passes on one condition: the signed class of approval stays unbuilt until its design is
+reviewed. The first-round findings are closed except as noted here.
+
+| Finding | Severity | What was wrong | What was done |
+|---|---|---|---|
+| GR-22 | High | The rest of GR-3. `gov verify` still passed a whole chain wiped at the witnessed head: with no retention given it said OK, and with one it measured age by the date the Ledger wrote in its own prune record | Fixed on `build/gov-review-2`. Age is measured from the first covering checkpoint in the witness to the verifier's own clock; a prune record dated after now is a finding; pruning with no retention given is a finding; with no clock nothing counts as old enough; the verdict no longer says "nothing removed" when something was pruned. What is left, and accepted by the reviewer as by design: an erasure that waits out the retention is a prune |
+| GR-23 | Medium | A trusted gate listed with no receipts, no prune record and no checkpoint entry verified OK, which is what a gate erased before any checkpoint looks like | Fixed: a finding. A gate that has never run must be left out of the trusted keys. The real control is the gate keeping its spool until a checkpoint covers it (GR-10, G3) |
+| GR-24 | Low | The store enrolled a key without the weak-key check | Fixed: both stores check |
+| GR-25 | Low | One lease request could accept two leases | Fixed: accepting a lease uses the request up |
+| GR-16 | Low | A receipt's time could go backwards along a chain | Fixed at intake and in `gov verify`. For G3: a gate never writes a time earlier than its last receipt's |
+| GR-6 | | Two more spellings of the small-order points, harmless with this library | Added to the list |
+| GR-26 | Low | "A receipt nothing covers" compares the gate's clock with the Ledger's | For G3, with the signed intake head of GR-10 |
+| GR-27 | Info | The "issuer may not approve" check is an option the caller fills | For G6: the gate builds the requirement from the rule and the chain in one place, with a test |
+
+The reviewer's conditions for the gate-served approval page (§4.4), all three adopted: the
+passkey is registered to an address the Authority does not serve; the gate builds the
+challenge itself from the bytes it will send, and its page loads no script from the
+Authority; changes to the roster stay witnessed. It also noted that this makes the gate a web
+server for people, which needs its own rows in the threat table before G6.
+
+### Third read, 2026-11-26, at `404376e` (the two designs; before the GR-22 fix)
+
+**Verdict: the gate passes for the spec and for G1** with both designs in. G2 was unchanged
+at that commit, so GR-22 still stood. The reviewer set conditions: GR-29 to GR-32 must be
+answered in §4.4 before G6 builds the signed approval, and GR-34 to GR-36 in §4.7 before G9
+builds undo. They are answered in those sections now, as requirements; none is built.
+
+| Finding | Severity | What it said | Where it is answered |
+|---|---|---|---|
+| GR-29 | Medium | Who may enrol a passkey at the gate was not said; a signed approval was only the gate's say-so afterwards | §4.4: enrolment needs an admin's approval or a delay with notice; every enrolment and removal is a receipt; the assertion, credential and challenge are kept so an approval can be re-checked |
+| GR-30 | Medium | Several gates, or anything else, under one address brings GR-2 back | §4.4: one exact address per gate, used for nothing else, never a parent domain |
+| GR-31 | Medium | The gate as a web server for people had no threat rows | §3.3, T23 to T26 |
+| GR-32 | Medium | A compromised Authority can publish a policy that asks for no signed approval, or point the gate at its own identity provider | §4.4: a local floor in the gate's own configuration; identity-provider settings and the passkey address are never taken from the bundle |
+| GR-33 | Low | The format does not tie the class to who issued it | §4.4, for G6 |
+| GR-34 | Medium | Putting back is not harmless: an undo can grant access, expose, reopen or delete | §4.7: an undo is evaluated as the concrete operation it performs; there is no general "undo" that policy allows wholesale |
+| GR-35 | Medium | "Approve only what cannot be undone" takes a person off every write the map calls reversible, though its effects may leave the system | §4.7: a second flag, `outward`; the default asks for a person when an operation cannot be undone **or** is outward; `reversible` never lowers a destructive operation |
+| GR-36 | Medium | A plain digest of a small value gives the value away to anyone who can guess | Fixed in the formats: the arguments' digest and the before-digest are salted, the salt kept by the gate with the values |
+| GR-37, GR-38 | Low | A lost update between the before-read and the write; a receipt saying `restore` when the before-read failed | §4.7 steps 1 and 1a |
+| GR-39, GR-40 | Low | Rules missing on `reverses`; an outcome did not name its intent | Fixed in the formats |
+| GR-41 | Info | The reversal class reaches `evaluate` and the receipt by two routes | For G6: one value, one place |
+
+**The reviewer has not re-read the GR-22 to GR-25 fixes or the answers above. G2's gate is
+not passed.**
+
 ## 1. What is being built
 
 Agent Governance is a second product, separate from PM OS. It has three parts.
@@ -280,6 +327,20 @@ attack; a slice is not done until that test exists and fails without the control
 | T21 | Governance on PM OS weakens PM OS | Governance can only refuse. PM OS's own grant check, approval and audit run first and unchanged; with the switch off no Governance code path runs (§8) | G7 |
 | T22 | An agent floods a system through the shared credential | Per-agent budget and a fair queue in the gate | G6 |
 
+Added on 2026-11-26 with the gate-served approval page (review finding GR-31). The gate
+becomes a web server for people; each row needs its test in G6.
+
+| # | Threat | Control | Slice |
+|---|---|---|---|
+| T23 | An argument an agent chose runs script on the approval page, and the script asks the passkey for anything | The page is built by the gate with strict encoding, a content policy with no inline and no outside script, and nothing else is served from that address | G6 |
+| T24 | Display tricks hide what is approved: a very long value, direction-override characters, look-alike letters | The approve button is offered only when every argument is shown whole in a form with those characters made visible; if the gate cannot show an argument so, there is no signed approval for that action | G6 |
+| T25 | A compromised Authority sends the approver a look-alike address | A passkey does not sign there. The sign-in could still be collected, so a sign-in alone never enrols a passkey (§4.4) and the product tells approvers the one address | G6 |
+| T26 | Cross-site request forgery on "approve"; theft of the approver's session at the gate | The approval is the passkey's signature over the challenge, not a button press under a session; sessions are short, bound to the browser, and same-site only | G6 |
+
+T12, with undo (review finding GR-35): undo does not make an injected agent's writes safe. An
+action whose effects leave the system or widen who can see something asks for a person even
+when it can be put back (§4.7).
+
 ### 3.4 Stated limits
 
 These go in the product's own documentation, not only here.
@@ -405,8 +466,31 @@ evidence           for signed: the passkey assertion and credential id
   a passkey is enrolled at the customer's gate address, not ours; the argument values never
   leave the customer, which also settles departure 2 of §2 for signed approvals and makes a
   hosted Authority possible for them; the gate needs an identity-provider client of its own.
-  To be designed in G6: enrolling passkeys across several gates under one address, and what
-  the approver is shown when the gate cannot render an argument. Proposed library:
+  The reviewer's three conditions hold in this design and are requirements on G6: the passkey
+  is registered to the gate's address, never one the Authority serves (a passkey answers any
+  challenge its registered address asks for); the gate builds the challenge from the bytes it
+  will send and its page loads nothing from the Authority; roster changes stay witnessed.
+  Requirements on G6 from the third read (GR-29 to GR-33):
+  - **Enrolling a passkey takes more than a sign-in:** an admin's approval, or a waiting time
+    with a notice to the person. Every enrolment and removal is a receipt in the gate's chain,
+    so it is witnessed. The assertion, the credential id and the challenge of each signed
+    approval are kept, so it can be checked again later against those receipts and is not
+    only the gate's say-so.
+  - **One exact address per gate, used for nothing else, never a parent domain.** A passkey
+    answers any challenge its registered address asks for, so anything else under that
+    address could collect a signature for a waiting action. If gates must share a front, that
+    front is trusted like a gate and the product says so.
+  - **A local floor.** The gate's own configuration, not the Authority's bundle, can list
+    operations that always need a signed approval; the bundle can add to it and never take
+    away. Without it a compromised Authority publishes a policy that asks for none, which is
+    detectable (T18) and not prevented.
+  - **The gate's identity-provider settings and passkey address are its own configuration,**
+    never read from the bundle.
+  - **Class is tied to issuer:** a signed countersignature is accepted only under this gate's
+    own approval key (a key apart from its receipt key), an attested one only under the
+    Authority's.
+  - If the gate cannot show an argument whole and plainly, there is no signed approval for
+    that action (T24). Proposed library:
   `webauthn-rs` (to be confirmed at G6; tests use a software authenticator).
 - **Attested.** The Authority states that a signed-in person in the right group pressed
   approve. The gate verifies the Authority's signature only.
@@ -485,8 +569,9 @@ reserved in the formats now, while no format is released, and tested:
   (the system keeps versions, and undo writes the earlier values back), `inverse` (there is an
   opposite operation: create and archive, add and remove) or `none` (a sent message, a hard
   delete, a payment). Every receipt states it (`reversal`).
-- **`before_digest` on an intent receipt:** the digest of the target's values before the
-  write. The values themselves stay in the gate's sealed store at the customer for the undo
+- **`before_digest` on an intent receipt:** the salted digest of the target's values before
+  the write (salted because a plain digest of one short field gives the field away to anyone
+  who can guess; review finding GR-36. The arguments' digest is salted the same way). The values themselves stay in the gate's sealed store at the customer for the undo
   window; the receipt and the Ledger hold only the digest.
 - **`reverses` on a receipt:** the gate, number and hash of the receipt an undo puts back.
 - **`reversible` in a policy rule's match,** so the default rule is one line: an operation
@@ -497,19 +582,41 @@ How undo will work (G9):
 1. At intent, for a `restore` or `inverse` operation, the gate reads the fields the write will
    change through the same connector it already uses to read `resource_version`, seals them,
    and writes their digest in the intent receipt. If that read fails, the action is treated as
-   having no undo, and policy decides whether it may still run.
-2. **Undo is a governed action.** A person with the right role asks for it. It has its own
-   mandate, its own intent and outcome receipts with `reverses` set, and policy may ask for a
-   countersignature on it like any other write.
+   having no undo: policy is evaluated with `none`, and the receipt's `reversal` records
+   `none`, the class actually in force, not the connector map's (GR-38). The before-read is
+   made with the gate's credential and gets a receipt of its own.
+
+   1a. An operation is `restore` only where its write is checked against the version the
+   before-values were read at. Where a system has no version to check, someone else's change
+   between the read and the write would be lost by a later undo, so the class is `none`
+   (GR-37).
+2. **Undo is a governed action, evaluated as what it does** (GR-34). Putting back is not
+   harmless: the undo of "remove a member" grants access, of "make private" exposes, of
+   "close" reopens, and the undo of "create" is a delete. So there is no general "undo"
+   operation for policy to allow wholesale. An undo is the concrete operation it performs
+   (the opposite operation, or the update, on that resource, with that operation's own kind),
+   checked against the requester's own mandate and every rule that operation would meet,
+   countersignature included. It has its own intent and outcome receipts with `reverses` set.
 3. **It refuses rather than overwrite.** If the target's version is no longer the one the
    original write left, someone has changed it since; the undo stops and says so, as a version
-   conflict does. Nothing is forced.
+   conflict does. Nothing is forced. This holds for `inverse` too: an issue others have since
+   added to is not deleted.
 4. **A task is undone as a whole:** every action under one mandate, newest first, stopping at
    the first conflict and reporting what was and was not put back.
 5. The undo window (default seven days, a figure to decide) is how long the sealed values are
    kept. After it the receipts remain and the undo is gone.
 6. Each system's page in the product shows its undo cover, as it shows custody: which
    operations restore, which invert, which cannot be put back.
+
+**The default rule, corrected (GR-35).** "Can be put back" is not "safe without a person".
+Many reversible writes have effects that are not put back: a notification or an e-mail, a
+webhook or an automation, something made visible to more people for a while. An agent turned
+by injected text would get all of those unapproved. So the connector map carries a second
+flag per operation, `outward`: its effects leave the system or widen who can see something.
+The default asks for a person when an operation cannot be undone **or** is outward, and
+`reversible: true` never lowers a destructive operation by default. The customer's rule is:
+approve what cannot be undone and what reaches outside; undo the rest. `outward` is not yet
+in the formats; it joins the connector map in G3.
 
 What undo is not, to be said in the product:
 

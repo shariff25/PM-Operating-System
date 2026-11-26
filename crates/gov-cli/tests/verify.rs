@@ -170,6 +170,59 @@ async fn an_auditor_verifies_with_files_alone() {
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stdout).contains("the witness holds no checkpoint"));
 
+    // The Ledger says it pruned: without --retention-days that is a failure, and with it the
+    // verdict no longer says "nothing removed".
+    let pruned_at = T0 + 40 * 86_400;
+    ledger
+        .prune(
+            &id("gate-1"),
+            T0 + 1,
+            &ledger_key,
+            &id("ledger"),
+            pruned_at,
+            &witness,
+        )
+        .await
+        .unwrap();
+    let after = ledger.export().await.unwrap();
+    std::fs::write(
+        dir.path().join("export.json"),
+        serde_json::to_vec(&after).unwrap(),
+    )
+    .unwrap();
+    let then = (pruned_at + 10).to_string();
+    let quiet = ["--now", then.as_str(), "--interval", "9999999"];
+    let (code, out) = gov(dir.path(), &quiet);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("pass --retention-days"), "{out}");
+    let (code, out) = gov(
+        dir.path(),
+        &[&quiet[..], &["--retention-days", "30"]].concat(),
+    );
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        out.contains("the Ledger says it deleted receipts 1 to 3"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("nothing altered, removed or missing"),
+        "{out}"
+    );
+    let (code, out) = gov(
+        dir.path(),
+        &[&quiet[..], &["--retention-days", "60"]].concat(),
+    );
+    assert_eq!(code, 1, "{out}");
+    assert!(
+        out.contains("pruned sooner than the retention allows"),
+        "{out}"
+    );
+    std::fs::write(
+        dir.path().join("export.json"),
+        serde_json::to_vec(&export).unwrap(),
+    )
+    .unwrap();
+
     // A receipt removed from the export.
     let mut cut = export.clone();
     cut.gates[0].receipts.remove(1);
