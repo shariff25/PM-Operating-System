@@ -1,7 +1,7 @@
 //! Intake, checkpoints, pruning and export (spec §6).
 
 use gov_core::lease::{Checkpoint, GateHead, IntakeAck, Pruned};
-use gov_core::receipt::{follow, Receipt};
+use gov_core::receipt::{follow, Phase, Receipt};
 use gov_core::{
     open, seal, Digest, Envelope, Error, Id, KeySet, PublicKey, Scope, SigningKey, VERSION,
 };
@@ -71,6 +71,7 @@ impl<S: Store> Ledger<S> {
                     at: now,
                     kid: envelope.kid.clone(),
                     code: code.to_string(),
+                    taken: false,
                     envelope_hash: envelope_hash(envelope),
                     envelope: keep.then(|| envelope.clone()),
                 },
@@ -87,7 +88,8 @@ impl<S: Store> Ledger<S> {
         let Some((gate, key)) = self.store.gate_key(&self.scope, &envelope.kid).await? else {
             return self.refuse(envelope, "unknown_key", false, now).await;
         };
-        let opened = match open::<Receipt>(envelope, &KeySet::new([key]), &self.scope) {
+        let keys = KeySet::new([key]);
+        let opened = match open::<Receipt>(envelope, &keys, &self.scope) {
             Ok(opened) => opened,
             Err(e) => return self.refuse(envelope, e.code(), false, now).await,
         };
@@ -109,6 +111,20 @@ impl<S: Store> Ledger<S> {
                         Some(_) => self.refuse(envelope, "fork", true, now).await,
                         None => self.refuse(envelope, "already_pruned", true, now).await,
                     };
+                }
+            }
+            // An outcome answers an intent this gate wrote, for the same action (finding
+            // GR-46). The intent may have been pruned; then there is nothing to compare with.
+            if let Some(intent_seq) = opened.doc.intent {
+                if let Some(held) = self.store.receipt(&self.scope, &gate, intent_seq).await? {
+                    let intent = open::<Receipt>(&held.envelope, &keys, &self.scope)?.doc;
+                    if intent.phase != Phase::Intent
+                        || intent.action.digest != opened.doc.action.digest
+                    {
+                        return self
+                            .refuse(envelope, "outcome_without_intent", true, now)
+                            .await;
+                    }
                 }
             }
             let new_head = match follow(head.as_ref(), &opened) {
@@ -147,7 +163,8 @@ impl<S: Store> Ledger<S> {
                                 &Refusal {
                                     at: now,
                                     kid: envelope.kid.clone(),
-                                    code: "taken_time_went_back".to_string(),
+                                    code: "time_went_back".to_string(),
+                                    taken: true,
                                     envelope_hash: envelope_hash(envelope),
                                     envelope: None,
                                 },

@@ -30,19 +30,21 @@ pub fn ledger_key() -> SigningKey {
 }
 
 /// Receipt `seq` of `gate`'s chain, after `prev`, written at `at`. Odd numbers are intents and
-/// even ones their outcomes.
+/// even ones the outcomes of the intents before them.
 pub fn receipt(gate: &str, seq: u64, prev: Option<Digest>, at: i64) -> Receipt {
+    // An outcome is for the same action as the intent before it.
+    let outcome = seq % 2 == 0;
+    let call = if outcome { seq - 1 } else { seq };
     let action = CanonicalAction::new(
         id("jira"),
         id("issue.update"),
         Kind::Write,
         ResourcePath::new("jira/project/PAY/issue/PAY-12").unwrap(),
         None,
-        &json!({"n": seq}),
+        &json!({"n": call}),
         &[9; 32],
     )
     .unwrap();
-    let outcome = seq % 2 == 0;
     Receipt {
         v: 1,
         tenant: id("acme"),

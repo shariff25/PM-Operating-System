@@ -262,7 +262,23 @@ read (GR-36, GR-39, GR-40):
 | GR-42 | Refusing a receipt dated before the one it follows ends that gate's chain, and an honest gate's clock can step back a second or two after a slow lease renewal | Intake takes the receipt and records the step back; `gov verify` reports it. For G3: a gate never writes a time earlier than its last receipt's, with a test that steps the lease clock back |
 | GR-43 | The Ledger dates its own checkpoints, so one hostile from its first day could back-date them and prune at once | `gov verify` reports a checkpoint dated earlier, by more than the interval, than a receipt it covers. The full answer is the witness store's own write times, with the object-storage witness |
 
-**The reviewer has not read `build/gov-review-3`.** It changes no finding of High severity.
+### Fifth read, 2026-11-26, at `2a5655a`
+
+**Verdict: the gate passes for the spec, G1 and G2.** The answers to the third read's
+conditions were "the ones I meant". One new Medium, to settle before the shim is built, and
+three smaller findings; all are answered on `build/gov-review-4`.
+
+| Finding | Severity | What it said | What was done |
+|---|---|---|---|
+| GR-44 | Medium | The salt of GR-36 was "drawn by the gate", but the agent's request signs the action's digest, which depends on the salt, before the gate has seen the call. Nothing said who draws it, how it travels or how long it is kept | Settled in §4.3: the shim draws it and sends it with the call; the gate refuses a salt seen before in the session and recomputes the digest; a waiting approval keeps it with the readable form; afterwards it goes with the arguments, so a receipt does not prove what the arguments were |
+| GR-45 | Low | "A checkpoint dated before a receipt it covers" compared two clocks with only the checkpoint interval as allowance | Its own setting, `--clock-skew` (default 300 seconds); the message names both clocks |
+| GR-46 | Low | Nothing checked that an outcome names an intent of its own chain for the same action, once | Intake refuses an outcome whose intent is not an intent for the same action; `gov verify` also reports a second outcome for one intent. Intake does not check "once" itself: that needs a look across the chain |
+| GR-47 | Info | A receipt taken with a stepped-back time was written among the refusals | The row is marked `taken` |
+
+Also added at the reviewer's word: the gate's approval challenge is single use and expires (T26).
+
+**The reviewer has not read `build/gov-review-4` or G3a.** Its session cannot send messages
+without a person's approval, so the conductor reads its verdicts from its transcript.
 
 ## 1. What is being built
 
@@ -418,7 +434,7 @@ becomes a web server for people; each row needs its test in G6.
 | T23 | An argument an agent chose runs script on the approval page, and the script asks the passkey for anything | The page is built by the gate with strict encoding, a content policy with no inline and no outside script, and nothing else is served from that address | G6 |
 | T24 | Display tricks hide what is approved: a very long value, direction-override characters, look-alike letters | The approve button is offered only when every argument is shown whole in a form with those characters made visible; if the gate cannot show an argument so, there is no signed approval for that action | G6 |
 | T25 | A compromised Authority sends the approver a look-alike address | A passkey does not sign there. The sign-in could still be collected, so a sign-in alone never enrols a passkey (§4.4) and the product tells approvers the one address | G6 |
-| T26 | Cross-site request forgery on "approve"; theft of the approver's session at the gate | The approval is the passkey's signature over the challenge, not a button press under a session; sessions are short, bound to the browser, and same-site only | G6 |
+| T26 | Cross-site request forgery on "approve"; theft of the approver's session at the gate | The approval is the passkey's signature over the challenge, not a button press under a session; the challenge is single use and expires, so a signature collected once cannot be presented again; sessions are short, bound to the browser, and same-site only | G6 |
 
 T12, with undo (review finding GR-35): undo does not make an injected agent's writes safe. An
 action whose effects leave the system or widen who can see something asks for a person even
@@ -507,6 +523,26 @@ args_digest       SHA-256 over the arguments in RFC 8785 canonical JSON
 The action's **digest** is SHA-256 over the canonical JSON of those six fields. Policy and
 mandates match on `system`, `operation`, `kind` and `resource`. Approvals bind the digest.
 
+- **The salt** (review findings GR-36 and GR-44). `args_digest` is over a random 32-byte salt
+  and the arguments, because a plain digest of a small value gives the value away to anyone
+  who can guess it. Rules:
+  - Whoever first forms the action draws the salt, from the system's random source. With the
+    shim that is the shim: it must sign the action's digest before the gate has seen the
+    call, so it draws the salt and sends it with the call. A salt the agent chooses cannot
+    weaken the binding: the gate recomputes the digest itself from the arguments and the salt
+    it was sent, and the request proof must match that.
+  - The gate refuses a salt it has already seen in that session. A salt is never fixed per
+    session or per agent.
+  - An action waiting for a countersignature keeps its salt with its readable form until it
+    is decided, so the page the approver reads recomputes the same digest.
+  - After the action the salt is deleted with the arguments. From then on the digest in a
+    receipt cannot be matched to any arguments, by anyone. **A receipt therefore shows that
+    an action of this shape on this resource happened, and binds an approval to it at the
+    time; it does not prove afterwards what the arguments were.** The product says so.
+    Keeping salts longer, sealed at the customer's gate for a stated time, is a setting to
+    consider with undo (G9), which keeps before-values the same way.
+  - PM OS's own `args_hash` is unsalted, so in the seam (G7) the two digests are unequal by
+    construction and both are carried.
 - The connector map is part of the signed policy bundle. It pins each upstream tool's digest
   (name, description, input schema), so a changed tool is refused until someone approves it.
 - The arguments digested are the ones the gate will send, after its last transformation. PM OS

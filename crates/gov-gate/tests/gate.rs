@@ -192,6 +192,7 @@ async fn an_observed_call_leaves_two_receipts_that_verify_end_to_end() {
         interval_secs: 60,
         now: Some(T0 + 130),
         gate_quiet_secs: None,
+        clock_skew_secs: 60,
         retention_secs: None,
     });
     assert!(report.ok(), "{:?}", report.findings);

@@ -153,6 +153,10 @@ async fn intake<S: Store>(store: S) {
         .iter()
         .map(|r| (r.code.as_str(), r.envelope.is_some()))
         .collect();
+    // Only the last is a receipt that was taken; a reader of this table can tell.
+    let taken: Vec<bool> = refusals.iter().map(|r| r.taken).collect();
+    assert_eq!(taken.iter().filter(|t| **t).count(), 1);
+    assert_eq!(taken.last(), Some(&true));
     assert_eq!(
         codes,
         vec![
@@ -163,7 +167,7 @@ async fn intake<S: Store>(store: S) {
             ("wrong_gate", true),
             ("wrong_tenant", false),
             ("malformed", true),
-            ("taken_time_went_back", false),
+            ("time_went_back", false),
         ]
     );
 }
@@ -331,6 +335,7 @@ fn check(
         interval_secs: 60,
         now,
         gate_quiet_secs: None,
+        clock_skew_secs: 60,
         retention_secs: None,
     })
 }
@@ -539,6 +544,7 @@ async fn silence<S: Store>(store: S) {
         interval_secs: 600,
         now: Some(T0 + 610),
         gate_quiet_secs: Some(300),
+        clock_skew_secs: 60,
         retention_secs: None,
     });
     assert_eq!(
@@ -629,6 +635,7 @@ async fn crash_between_store_and_witness<S: Store>(store: S) {
         interval_secs: 60,
         now: Some(T0 + 130),
         gate_quiet_secs: None,
+        clock_skew_secs: 60,
         retention_secs: Some(0),
     });
     assert!(report.ok(), "{:?}", report.findings);
@@ -658,6 +665,7 @@ fn check_days(
         interval_secs: 100 * DAY as u32,
         now,
         gate_quiet_secs: None,
+        clock_skew_secs: 60,
         retention_secs: retention_days.map(|d| d * DAY as u64),
     })
 }
@@ -1038,3 +1046,66 @@ async fn clocks<S: Store>(store: S) {
     assert!(check(&s.keys, &good, &cps, None).ok());
 }
 both_stores!(clocks_that_disagree_are_reported, clocks);
+
+/// GR-46: an outcome answers one intent of its own chain, for the same action, once.
+async fn outcomes<S: Store>(store: S) {
+    let ledger = ledger_with_gate_1(store).await;
+    let g1 = key("gate-1-key", 20);
+    // Intent 1, its outcome 2, and intent 3.
+    let c = chain("gate-1", &g1, 3, T0, 1);
+    for env in &c {
+        ledger.ingest(env, T0).await.unwrap();
+    }
+    let head = hash_of(&c[2], &g1);
+    let honest = receipt("gate-1", 4, Some(head.clone()), T0 + 3);
+    assert_eq!(honest.intent, Some(3));
+
+    // An outcome that names an outcome.
+    let mut of_outcome = honest.clone();
+    of_outcome.intent = Some(2);
+    assert_eq!(
+        refused(ledger.ingest(&seal(&of_outcome, &g1).unwrap(), T0).await),
+        "outcome_without_intent"
+    );
+    // An outcome that names the right intent, for another action.
+    let mut other_action = honest.clone();
+    other_action.action = receipt("gate-1", 9, None, T0).action;
+    assert_eq!(
+        refused(ledger.ingest(&seal(&other_action, &g1).unwrap(), T0).await),
+        "outcome_without_intent"
+    );
+    // The honest outcome of intent 3.
+    let honest_env = seal(&honest, &g1).unwrap();
+    assert_eq!(
+        ledger.ingest(&honest_env, T0).await.unwrap(),
+        Ingested::Added
+    );
+
+    // A second outcome for the same intent gets past intake's single look-up, and `verify`
+    // reports it.
+    let mut second = honest.clone();
+    second.seq = 5;
+    second.prev = Some(hash_of(&honest_env, &g1));
+    ledger
+        .ingest(&seal(&second, &g1).unwrap(), T0)
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let witness = DirWitness::new(dir.path());
+    ledger
+        .checkpoint(&ledger_key(), &id("ledger"), T0 + 10, &witness)
+        .await
+        .unwrap();
+    let export = ledger.export().await.unwrap();
+    let keys = ledger.keys(&ledger_key()).await.unwrap();
+    let report = check(&keys, &export, &witness.all().unwrap(), None);
+    assert_eq!(
+        problems(&report),
+        vec![(
+            Problem::BadReceipt("outcome_without_intent"),
+            Some("gate-1"),
+            Some(5)
+        )]
+    );
+}
+both_stores!(an_outcome_answers_one_intent_once, outcomes);

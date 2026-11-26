@@ -251,13 +251,15 @@ impl Store for PgStore {
 
     async fn record_refusal(&self, scope: &Scope, refusal: &Refusal) -> StoreResult<()> {
         sqlx::query(
-            "INSERT INTO refusals (tenant, env, at, kid, code, envelope_hash, envelope) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            "INSERT INTO refusals (tenant, env, at, kid, code, taken, envelope_hash, envelope) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(scope.tenant.as_str())
         .bind(scope.env.as_str())
         .bind(refusal.at)
         .bind(refusal.kid.as_str())
         .bind(&refusal.code)
+        .bind(refusal.taken)
         .bind(refusal.envelope_hash.as_str())
         .bind(refusal.envelope.as_ref().map(Json))
         .execute(&self.pool)
@@ -267,7 +269,8 @@ impl Store for PgStore {
 
     async fn refusals(&self, scope: &Scope) -> StoreResult<Vec<Refusal>> {
         let rows = sqlx::query(
-            "SELECT at, kid, code, envelope_hash, envelope FROM refusals WHERE tenant = $1 AND env = $2 ORDER BY id",
+            "SELECT at, kid, code, taken, envelope_hash, envelope FROM refusals \
+             WHERE tenant = $1 AND env = $2 ORDER BY id",
         )
         .bind(scope.tenant.as_str())
         .bind(scope.env.as_str())
@@ -280,6 +283,7 @@ impl Store for PgStore {
                 at: r.try_get("at")?,
                 kid: id(r.try_get("kid")?)?,
                 code: r.try_get("code")?,
+                taken: r.try_get("taken")?,
                 envelope_hash: digest(r.try_get("envelope_hash")?)?,
                 envelope: envelope.map(|e| e.0),
             });
