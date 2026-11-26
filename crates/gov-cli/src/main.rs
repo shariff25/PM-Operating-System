@@ -26,7 +26,9 @@ enum Command {
         tenant: String,
         #[arg(long)]
         env: String,
-        /// The trusted public keys: `{ "ledger": [...], "gates": { "<gate>": [...] } }`.
+        /// The trusted public keys: `{ "ledger": [...], "gates": { "<gate>": [...] },
+        /// "authorities": { "<authority>": [...] } }`. With an Authority named, each gate's
+        /// key must match a witnessed record of its enrolment in that Authority's chain.
         #[arg(long)]
         keys: PathBuf,
         /// The export, as the Ledger wrote it.
@@ -98,6 +100,12 @@ fn describe(problem: &Problem) -> String {
             "a trusted gate has no receipt and no checkpoint entry: it never ran, or its history was erased before any checkpoint (if it never ran, leave it out of --keys)".into()
         }
         Problem::BadExport(code) => format!("the export cannot be read as one ({code})"),
+        Problem::KeyNotEnrolled => {
+            "a trusted key of this gate matches no witnessed record of its enrolment".into()
+        }
+        Problem::ReceiptAfterRetirement => {
+            "a receipt is dated after its gate was disabled or its key revoked".into()
+        }
     }
 }
 

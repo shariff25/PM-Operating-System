@@ -7,7 +7,8 @@
 
 use std::collections::BTreeMap;
 
-use gov_core::admin::AdminRecord;
+use gov_core::admin::{AdminAction, AdminRecord, SubjectKind};
+use gov_core::enrol::key_digest;
 use gov_core::envelope::Opened;
 use gov_core::lease::{Checkpoint, Pruned};
 use gov_core::receipt::{follow, ChainHead, Receipt};
@@ -111,6 +112,13 @@ pub enum Problem {
     GateNeverSeen,
     /// The export is not in a form this verifier reads, or lists a gate twice.
     BadExport(&'static str),
+    /// A trusted key of this gate matches no witnessed record of its enrolment in an
+    /// Authority's chain (finding GR-84): the keys file says more than the Authority did.
+    /// Reported only when the auditor names an Authority.
+    KeyNotEnrolled,
+    /// A receipt is signed by a key and dated after the Authority's record that disabled its
+    /// gate or revoked the key, by more than the clocks may differ.
+    ReceiptAfterRetirement,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,6 +176,17 @@ pub struct Check<'a> {
     pub retention_secs: Option<u64>,
 }
 
+/// What the Authorities' verified chains say of one key id: the latest record of its
+/// enrolment for a gate, and when that gate was disabled or the key revoked, if it was.
+struct Enrolment {
+    authority: Id,
+    /// The number of the record of enrolment in that Authority's chain.
+    seq: u64,
+    gate: Id,
+    digest: Digest,
+    retired_at: Option<i64>,
+}
+
 struct Chain {
     pruned_through: u64,
     pruned_hash: Option<Digest>,
@@ -193,6 +212,10 @@ pub fn verify(check: &Check<'_>) -> Report {
     let ledger_keys = KeySet::new(check.keys.ledger.iter().cloned());
     let mut chains: BTreeMap<Id, Chain> = BTreeMap::new();
     let mut receipts_verified = 0;
+    // By key id: what the Authorities recorded, and the latest receipt each key signed
+    // (gate, time, number).
+    let mut enrolments: BTreeMap<Id, Enrolment> = BTreeMap::new();
+    let mut signed_last: BTreeMap<Id, (Id, i64, u64)> = BTreeMap::new();
 
     if check.export.v != gov_core::VERSION {
         find(Problem::BadExport("unknown_version"), None, None);
@@ -310,6 +333,54 @@ pub fn verify(check: &Check<'_>) -> Report {
                                 }
                             }
                             _ => {}
+                        }
+                    }
+                    match &link {
+                        Link::Receipt(opened) => {
+                            let last = signed_last.get(&opened.kid).map(|(_, at, _)| *at);
+                            if last.is_none_or(|at| opened.doc.at >= at) {
+                                signed_last.insert(
+                                    opened.kid.clone(),
+                                    (gate.gate.clone(), opened.doc.at, h.seq),
+                                );
+                            }
+                        }
+                        Link::Admin(opened) => {
+                            let record = &opened.doc;
+                            match (&record.action, &record.about, &record.value) {
+                                (AdminAction::KeyEnrolled, Some(about), Some(digest))
+                                    if about.kind == SubjectKind::Gate =>
+                                {
+                                    enrolments.insert(
+                                        record.subject.id.clone(),
+                                        Enrolment {
+                                            authority: gate.gate.clone(),
+                                            seq: h.seq,
+                                            gate: about.id.clone(),
+                                            digest: digest.clone(),
+                                            retired_at: None,
+                                        },
+                                    );
+                                }
+                                (AdminAction::GateDisabled, _, _) => {
+                                    for e in enrolments.values_mut().filter(|e| {
+                                        e.authority == gate.gate && e.gate == record.subject.id
+                                    }) {
+                                        e.retired_at.get_or_insert(record.at);
+                                    }
+                                }
+                                (AdminAction::Revoked, _, _)
+                                    if record.subject.kind == SubjectKind::Key =>
+                                {
+                                    if let Some(e) = enrolments
+                                        .get_mut(&record.subject.id)
+                                        .filter(|e| e.authority == gate.gate)
+                                    {
+                                        e.retired_at.get_or_insert(record.at);
+                                    }
+                                }
+                                _ => {}
+                            }
                         }
                     }
                     chain.times.insert(h.seq, link.at());
@@ -545,6 +616,29 @@ pub fn verify(check: &Check<'_>) -> Report {
             pruned_through: chain.pruned_through,
             last_moved_at: moved,
         });
+    }
+    // With an Authority named, a gate's trusted key is believed only as far as a witnessed
+    // record of its enrolment bears it out (finding GR-84): the keys file comes from the
+    // Ledger being audited, the record from the Authority, under the witness.
+    if !check.keys.authorities.is_empty() {
+        for (gate, keys) in &check.keys.gates {
+            for key in keys {
+                let borne_out = enrolments.get(&key.kid).is_some_and(|e| {
+                    &e.gate == gate
+                        && key_digest(key).is_ok_and(|d| d == e.digest)
+                        && last_heads.get(&e.authority).is_some_and(|w| e.seq <= *w)
+                });
+                if !borne_out {
+                    find(Problem::KeyNotEnrolled, Some(gate), None);
+                }
+            }
+        }
+        for (kid, (gate, at, seq)) in &signed_last {
+            let retired = enrolments.get(kid).and_then(|e| e.retired_at);
+            if retired.is_some_and(|t| at.saturating_sub(t) > i64::from(check.clock_skew_secs)) {
+                find(Problem::ReceiptAfterRetirement, Some(gate), Some(*seq));
+            }
+        }
     }
     report.receipts_verified = receipts_verified;
     report.checkpoints_verified = checkpoints_verified;

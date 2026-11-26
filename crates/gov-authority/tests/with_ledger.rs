@@ -13,8 +13,8 @@ use gov_core::admin::AdminAction;
 use gov_core::enrol::{code_digest, EnrolKind, EnrolRequest};
 use gov_core::lease::IntakeAck;
 use gov_core::{seal, Digest, Envelope, Id, KeySet, Scope, SigningKey};
-use gov_ledger::verify::{verify, Check};
-use gov_ledger::{DirWitness, Ledger, LedgerError, Store as LedgerStore, Witness};
+use gov_ledger::verify::{verify, Check, Problem};
+use gov_ledger::{DirWitness, Ledger, LedgerError, Store as LedgerStore, TrustedKeys, Witness};
 
 const NOW: i64 = 1_800_000_000;
 
@@ -281,6 +281,74 @@ async fn the_authoritys_chain_is_witnessed_and_a_gates_key_follows_from_it() {
     });
     assert!(report.ok(), "{:?}", report.findings);
     assert_eq!(report.receipts_verified, 16 + 2);
+
+    // The auditor's check believes a gate's key only as far as a witnessed record of its
+    // enrolment bears it out (GR-84). The keys file comes from the Ledger being audited.
+    let checkpoints = witness.all().unwrap();
+    let problems = |keys: &TrustedKeys, checkpoints: &[(u64, Vec<u8>)], skew: u32| {
+        verify(&Check {
+            scope: &scope(),
+            keys,
+            export: &export,
+            checkpoints,
+            interval_secs: 60,
+            now: Some(NOW + 61),
+            gate_quiet_secs: None,
+            clock_skew_secs: skew,
+            retention_secs: None,
+        })
+        .findings
+        .into_iter()
+        .map(|f| (f.problem, f.gate))
+        .collect::<Vec<_>>()
+    };
+    let not_enrolled = |gate: &str| (Problem::KeyNotEnrolled, Some(id(gate)));
+    // A key the Ledger added for a gate on its own, which no record names.
+    let mut padded = keys.clone();
+    let listed = |keys: &mut TrustedKeys, key: gov_core::PublicKey| {
+        keys.gates.get_mut(&id("gate-1")).unwrap().push(key);
+    };
+    listed(&mut padded, key("gate-1:k9", 99).public());
+    assert_eq!(
+        problems(&padded, &checkpoints, 60),
+        vec![not_enrolled("gate-1")]
+    );
+    // A key enrolled for one gate (gate-2's, by a witnessed record), listed for another.
+    let mut moved = keys.clone();
+    listed(&mut moved, g2.public());
+    assert_eq!(
+        problems(&moved, &checkpoints, 60),
+        vec![not_enrolled("gate-1")]
+    );
+    // Another key under an enrolled key's id: the record names the key by its digest.
+    let mut swapped = keys.clone();
+    swapped
+        .gates
+        .insert(id("gate-1"), vec![key("gate-1:k1", 98).public()]);
+    assert!(problems(&swapped, &checkpoints, 60).contains(&not_enrolled("gate-1")));
+    // An agent's enrolled key, listed as the key of a gate of the agent's name: an agent's
+    // enrolment makes no gate key.
+    let mut agent = keys.clone();
+    agent.gates.insert(id("refund-bot"), vec![bot.public()]);
+    assert!(problems(&agent, &checkpoints, 60).contains(&not_enrolled("refund-bot")));
+    // A record of enrolment no checkpoint covers is the Ledger's word alone.
+    assert!(problems(&keys, &[], 60).contains(&not_enrolled("gate-1")));
+    // With no Authority named there is nothing to check a key against: the gates' chains
+    // verify as before, and the only findings are that the Authority's chain is one the
+    // auditor holds no key for.
+    let mut alone = keys.clone();
+    alone.authorities.clear();
+    let found = problems(&alone, &checkpoints, 60);
+    assert!(!found.is_empty());
+    assert!(found
+        .iter()
+        .all(|(p, gate)| *p != Problem::KeyNotEnrolled && *gate == Some(id("authority"))));
+    // A receipt dated after its gate was disabled, by more than the clocks may differ:
+    // gate-1's second receipt is one second later than the record that disabled it.
+    assert_eq!(
+        problems(&keys, &checkpoints, 0),
+        vec![(Problem::ReceiptAfterRetirement, Some(id("gate-1")))]
+    );
     // What was witnessed says which key was enrolled for which gate or agent, in order.
     let enrolled: Vec<Id> = a
         .records()
