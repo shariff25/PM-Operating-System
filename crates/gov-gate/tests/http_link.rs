@@ -74,6 +74,8 @@ fn call(gate: &mut Gate<FileSpool>, n: u64) {
     let observed = Observed {
         agent: &agent,
         proof: Proof::Claimed,
+        failure: None,
+        mandates: &[],
         action: &action,
         reversal: Reversal::Restore,
         coverage: Coverage::InLine,

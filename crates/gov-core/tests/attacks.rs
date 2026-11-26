@@ -864,6 +864,7 @@ fn receipt(seq: u64, prev: Option<Digest>, phase: Phase) -> Receipt {
         agent: ReceiptAgent {
             id: id("agent-1"),
             proof: Proof::Proven,
+            failure: None,
         },
         mandate: vec![id("m-child-1"), id("m-root")],
         policy_version: Some(id("7")),

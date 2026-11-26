@@ -80,6 +80,7 @@ async fn an_auditor_verifies_with_files_alone() {
             agent: ReceiptAgent {
                 id: id("agent-1"),
                 proof: Proof::Proven,
+                failure: None,
             },
             mandate: vec![id("m-1")],
             policy_version: Some(id("7")),

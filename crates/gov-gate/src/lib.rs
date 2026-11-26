@@ -9,6 +9,7 @@
 
 pub mod forward;
 pub mod link;
+pub mod sessions;
 pub mod spool;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -18,7 +19,7 @@ use gov_core::action::{CanonicalAction, Reversal};
 use gov_core::lease::{batch_digest, Checkpoint, IntakeAck, ShipRequest};
 use gov_core::receipt::{
     ChainHead, Coverage, Decision, DecisionKind, Mode, Outcome, OutcomeStatus, Phase, Proof,
-    Reason, Receipt, ReceiptAction, ReceiptAgent,
+    ProofFailure, Reason, Receipt, ReceiptAction, ReceiptAgent,
 };
 use gov_core::{
     open, random_id, seal, Digest, Envelope, Error, Id, KeySet, Scope, SigningKey, VERSION,
@@ -121,6 +122,10 @@ pub struct Observed<'a> {
     /// In observe mode without the shim, an agent's identity is only what it says (§5.3).
     pub agent: &'a Id,
     pub proof: Proof,
+    /// Why the proof did not hold; present exactly when `proof` is `failed`.
+    pub failure: Option<ProofFailure>,
+    /// The mandate chain a session presented, its own first. Empty for a stock client.
+    pub mandates: &'a [Id],
     pub action: &'a CanonicalAction,
     pub reversal: Reversal,
     pub coverage: Coverage,
@@ -281,8 +286,9 @@ impl<S: Spool> Gate<S> {
             agent: ReceiptAgent {
                 id: call.agent.clone(),
                 proof: call.proof,
+                failure: call.failure,
             },
-            mandate: Vec::new(),
+            mandate: call.mandates.to_vec(),
             policy_version: None,
             action: ReceiptAction::from(call.action),
             reversal: call.reversal,

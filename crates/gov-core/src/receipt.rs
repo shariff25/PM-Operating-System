@@ -55,6 +55,38 @@ pub enum Proof {
     Proven,
     /// The agent only said who it was (a stock client in observe mode).
     Claimed,
+    /// Someone presented this agent's session and did not prove the key (spec §5.3.1, review
+    /// finding GR-91). The agent named is the one the session's mandate names, and nothing
+    /// may count the receipt as that agent's act. Never `claimed`: that is a client that
+    /// offered no proof at all.
+    Failed,
+}
+
+/// Why a proof did not hold. A closed list: a receipt carries no free text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProofFailure {
+    /// The gate does not know the session: it restarted, or the session ended.
+    UnknownSession,
+    /// The session's mandate has expired.
+    MandateExpired,
+    /// The proof, or the salt beside it, could not be read.
+    Unreadable,
+    /// The signature is not by the key the session belongs to.
+    BadSignature,
+    /// The proof is for another gate, session or mandate.
+    WrongSession,
+    /// The counter did not rise.
+    Replay,
+    /// The salt was used before in this session.
+    RepeatedSalt,
+    /// The proof is for another action than the one the gate computed.
+    WrongDigest,
+    /// The arguments have no canonical form, so the two sides cannot be expected to agree
+    /// on a digest. Not, by itself, a sign of an attack (review finding GR-95).
+    NoCanonicalForm,
+    /// The session has made as many calls as one session may.
+    SessionSpent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,6 +135,9 @@ pub struct Decision {
 pub struct ReceiptAgent {
     pub id: Id,
     pub proof: Proof,
+    /// Present exactly when `proof` is `failed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<ProofFailure>,
 }
 
 /// The canonical action and its digest.
@@ -264,6 +299,15 @@ impl Receipt {
             return Err(Error::Malformed(
                 "an allowed action is an intent, not a decision",
             ));
+        }
+        if (self.agent.proof == Proof::Failed) != self.agent.failure.is_some() {
+            return Err(Error::Malformed(
+                "a failed proof says why, and only a failed one",
+            ));
+        }
+        // What is proven or was attempted is about a mandate; a bare claim is about none.
+        if (self.agent.proof == Proof::Proven) && self.mandate.is_empty() {
+            return Err(Error::Malformed("a proven agent has a mandate"));
         }
         if self.mode == Mode::Enforce && self.agent.proof != Proof::Proven {
             return Err(Error::Malformed("enforce mode needs a proven agent"));

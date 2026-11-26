@@ -29,6 +29,26 @@ pub struct RequestProof {
 
 document!(RequestProof, "gov.request.v1");
 
+/// The request to open a session, signed by the agent's key (review finding GR-97): only the
+/// holder of the key a mandate names can open a session under it, so a copy of the mandate
+/// alone opens nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionOpen {
+    pub v: u32,
+    pub tenant: Id,
+    pub env: Id,
+    pub gate: Id,
+    /// The mandate the session is for.
+    pub mandate: Id,
+    /// Random, and never accepted twice by one gate.
+    pub nonce: Id,
+    /// When it was signed, in seconds. A gate takes it only near its own time.
+    pub at: i64,
+}
+
+document!(SessionOpen, "gov.session.v1");
+
 /// One agent's session on one gate.
 #[derive(Debug, Clone)]
 pub struct Session {

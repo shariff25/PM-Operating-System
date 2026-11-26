@@ -212,6 +212,7 @@ async fn stack(spool_limit: usize) -> Stack {
             upstream: format!("http://{upstream}/mcp"),
             map: jira_map(),
             call_timeout: Duration::from_secs(2),
+            sessions: None,
         },
     )
     .unwrap();
@@ -1058,6 +1059,7 @@ async fn a_client_that_leaves_while_the_intent_is_written_leaves_no_open_intent(
             upstream: format!("http://{upstream}/mcp"),
             map: jira_map(),
             call_timeout: Duration::from_secs(2),
+            sessions: None,
         },
     )
     .unwrap();
