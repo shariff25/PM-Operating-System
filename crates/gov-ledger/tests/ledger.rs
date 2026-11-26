@@ -1303,3 +1303,65 @@ async fn two_kinds<S: Store>(store: S) {
         .any(|(p, g, _)| *p == Problem::GateMissing && *g == Some("authority")));
 }
 both_stores!(a_chain_holds_one_kind_of_document, two_kinds);
+
+/// What the Ledger notes of a gate key's enrolment (review finding GR-124): written once,
+/// ended by its own Authority for a gate or for one key, and never brought back.
+async fn noted_enrolments<S: Store>(store: S) {
+    let note = |authority: &str, gate: &str, seed: u8| gov_ledger::Enrolment {
+        authority: id(authority),
+        gate: id(gate),
+        digest: gov_core::Digest::of(&[&[seed]]),
+        ended: false,
+    };
+    let s = scope();
+    assert!(store.enrolment(&s, &id("k1")).await.unwrap().is_none());
+    for (kid, gate) in [("k1", "gate-1"), ("k2", "gate-1"), ("k3", "gate-2")] {
+        store
+            .note_enrolment(&s, &id(kid), &note("authority", gate, 1))
+            .await
+            .unwrap();
+    }
+    // A second enrolment under a key id changes nothing.
+    store
+        .note_enrolment(&s, &id("k1"), &note("authority", "gate-9", 2))
+        .await
+        .unwrap();
+    let read = |kid: &'static str| {
+        let (store, s) = (&store, &s);
+        async move { store.enrolment(s, &id(kid)).await.unwrap().unwrap() }
+    };
+    assert_eq!(read("k1").await, note("authority", "gate-1", 1));
+    // Another Authority's word ends nothing of this one's.
+    store
+        .end_enrolments(&s, &id("another"), Some(&id("gate-1")), None)
+        .await
+        .unwrap();
+    assert!(!read("k1").await.ended);
+    // One key of a gate; then the gate, which leaves the other gate's key alone.
+    store
+        .end_enrolments(&s, &id("authority"), None, Some(&id("k2")))
+        .await
+        .unwrap();
+    assert!(read("k2").await.ended && !read("k1").await.ended && !read("k3").await.ended);
+    store
+        .end_enrolments(&s, &id("authority"), Some(&id("gate-1")), None)
+        .await
+        .unwrap();
+    assert!(read("k1").await.ended && !read("k3").await.ended);
+    // Ended stays ended, and another tenant's sees none of it.
+    store
+        .note_enrolment(&s, &id("k1"), &note("authority", "gate-1", 1))
+        .await
+        .unwrap();
+    assert!(read("k1").await.ended);
+    let elsewhere = Scope::new("other", "prod").unwrap();
+    assert!(store
+        .enrolment(&elsewhere, &id("k1"))
+        .await
+        .unwrap()
+        .is_none());
+}
+both_stores!(
+    what_is_noted_of_an_enrolment_is_written_once,
+    noted_enrolments
+);

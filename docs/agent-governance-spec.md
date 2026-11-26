@@ -678,6 +678,39 @@ disabling the gate retires the key; `gov verify` applies an admin record's own r
 refuses a document of the wrong kind in either chain. Still to do, with G4c: `gov verify`
 reporting a mandate id that appears in a receipt and in no record of its issue.
 
+### Fifteenth read, 2026-11-26, G4a's second part at `21645dd`
+
+**Verdict: no High or Critical. The gate passes for G4a, both parts.** GR-114 to GR-119 are
+closed; GR-120 and GR-121 are accepted as stated. The reviewer corrected one framing: G4a is
+no longer "a library nothing serves", because the Ledger's listener routes `/v1/keys` to
+anyone who can reach it. The reviewer ran the tests of four crates without Postgres; the
+Postgres stores and migrations were read, not run. It also read the CI failure on `36ded25`
+and agreed it was the test looking too early, with no way for a real open intent to result.
+The auditor's check of gate keys (GR-84) was built after this read and is unread.
+
+| Id | Severity | What | Done |
+|---|---|---|---|
+| GR-122 | Medium, before G4b | An Authority's chain could be pruned like a gate's, losing the records that say which keys are trusted | The Ledger does not prune a chain of admin records; a signed snapshot of the registry would have to be designed first |
+| GR-123 | Medium, before G4b | A record disabling a gate was kept first and acted on second: a stop between the two left the keys in use, since the record sent again was "already held" | What a record ends is done before the record is kept, and again when it comes again; what it grants is done after it is kept, and again when it comes again |
+| GR-124 | Medium, before G4b | `/v1/keys` made the Ledger read and verify every Authority chain for each request, from anyone | The Ledger notes each enrolment, and its end, as records are taken in (migration 0005); a key offered is one lookup. Limits per source wait with GR-77 |
+| GR-125 | Low | "Witnessed" overstated it: the record a key is taken on is held, and covered by the next checkpoint, not necessarily by one already | The wording below and in the code says "held"; the auditor's check asks for a checkpoint's cover |
+| GR-126 | Low | The Authority's admin key at the Ledger cannot be retired or replaced, and the Authority does not check that the witness covers its own chain | Open; with key rotation in G4d |
+| GR-127 | Low | An agent and a gate of the same name share the `<name>:` prefix of a key id | Open; to be settled with the bundle's key ids in G4b |
+
+Fixed on `build/gov-review-15`; nine controls removed one at a time, each caught by a test.
+Not yet read by the reviewer. Limit: the note of an enrolment is written when its record is
+kept or comes again; a Ledger restored from a copy older than its chain would need its
+notes rebuilt from the chain, and nothing does that yet.
+
+**To be settled in the bundle's format before G4b is built** (the reviewer's list): the root
+key signs the bundle and nothing else; the bundle names the online keys by role, each with an
+id, and a gate takes an online key only from a bundle it verified under the root; the bundle
+carries a number that only rises, and a gate refuses one older than it holds; once the gate
+and shim load the connector map and issuers' keys from the bundle, the unsigned files work
+only under an explicit test flag; `gov policy sign` is usable off the Authority's machine,
+and publishing a bundle is a `PolicyPublished` record carrying its digest. Still the
+owner's: how the root key is replaced if lost or stolen (§11, decision 9).
+
 ## 1. What is being built
 
 Agent Governance is a second product, separate from PM OS. It has three parts.
@@ -1502,6 +1535,67 @@ issuer; nothing is revoked and the gate's time is its own machine's. G4 ends eac
      is issued only inside its issuer's live signed-in session (§2) does not hold until G4e. Whether `crates/entra` can be
    depended on without PM OS's roles (§7.2) is checked first in G4e; if it cannot, the
    verifier is written again in Governance, as the tool digest was.
+
+#### 7.6.1 G4b, the policy bundle (design of 2026-11-26; not built; for the reviewer)
+
+Written to settle the reviewer's list from the fifteenth read before any code.
+
+1. **The bundle's format.** `gov.policy.v1` gains three things; a bundle without them is
+   refused.
+   - `number`: a whole number that rises by exactly one with each published bundle, from 1.
+     `version` stays as the label a person reads; order is decided by `number` alone.
+   - `keys`: the Authority's online keys by role, `mandates` and `leases` (the lease key
+     also signs the revocation feed), each a list of public keys with ids. A key appears
+     under one role only, and the root key under none: a bundle that lists its own signer,
+     or one key under two roles, is refused.
+   - `connectors`: as now, the connector map, which the gate and the shim both take from
+     the bundle.
+2. **The root key signs the bundle and nothing else** (GR-109). A gate, a shim and the
+   Authority are each configured with the root's public key, and use it only to open a
+   bundle: it is never placed in a key set that opens a mandate, a lease, a receipt or an
+   admin record, and those documents' type tags differ from the bundle's, so a signature by
+   the root over anything else opens nowhere. An online key is taken only from a bundle
+   that opened under the root.
+3. **No going back.** A gate and a shim each keep, beside their other state on disk, the
+   number and digest of the newest bundle they have accepted, written before the bundle is
+   used. A bundle with a lower number is refused. The same number with another digest is
+   refused and counted: two bundles under one number means the root key signed twice or
+   was copied. A higher number is accepted whatever the gap (a gate may have been off for
+   several releases); the Authority, which publishes, accepts only the next number.
+4. **Three commands, and where each runs.**
+   - `gov policy check <dir>`: reads the policy files, builds the bundle, and runs every
+     check a gate would (rules, key roles, each connector map), needing no key. Each
+     connector map in the directory must come with a file of sample calls and the action
+     each is to be read as; the check runs them and fails without them (the standing
+     condition of GR-65).
+   - `gov policy sign --root-key <file> --number <n>`: signs what `check` built. It opens
+     no database and no network connection, so it runs wherever the root key is kept, which
+     is meant not to be the Authority's machine.
+   - Publishing, on the Authority: a library function for now (no listener until G4e). It
+     opens the signed bundle under the root key, takes only the next number, and writes the
+     bundle and a `PolicyPublished` admin record carrying its number and digest in one
+     step. A bundle a gate holds whose digest has no such record is then something
+     `gov verify` can report, as with mandates.
+5. **The unsigned files go.** `gov-gate` and `gov-shim` take `--bundle` and `--root-key`
+   in place of `--map` and `--mandate-issuers`. The old options remain only with
+   `--unsigned-policy-for-tests`, refused unless the data class is fake, and a gate started
+   that way says so in every receipt's policy version (`unsigned`), so no record made
+   without a bundle reads as made with one. A receipt otherwise carries the bundle's number.
+6. **Policy source is JSON for now**, not the YAML §4.6 names: the strict reader the gate
+   already uses for everything it parses refuses a repeated key and an unknown field, and a
+   YAML reader would be a new dependency on the path that decides what is trusted. YAML,
+   if wanted, is converted before `check` and is not what is signed.
+7. **Delivery.** In G4b the gate and shim read the bundle from a file at start. Fetching
+   it from the Authority, and changing it without a restart, come with the lease (G4d),
+   which names the bundle a gate must hold.
+8. **An agent and a gate may not share a name** (GR-127). A key's id is under the name it
+   is for, so two things of one name could take each other's key ids. The registry refuses
+   to register an agent under a gate's name, or a gate under an agent's, and the
+   Authority's own name is refused for both.
+
+**Not built in G4b:** rules are still not evaluated against a call (G5); the lease and
+revocation (G4d); mandates from the Authority (G4c), so the `mandates` keys in a bundle are
+a test issuer's until then.
 
 **Not in G4:** countersignatures and approvals (G6), shadow decisions (G5), the console's
 screens (G8). A mandate's grants are still not checked against an action until G5, so a
