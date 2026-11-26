@@ -42,6 +42,9 @@ enum Command {
         /// that has stopped publishing is always reported.
         #[arg(long)]
         now: Option<i64>,
+        /// How far the gates' clock and the Ledger's may differ, in seconds.
+        #[arg(long, default_value_t = 300)]
+        clock_skew: u32,
         /// The retention the Ledger is meant to keep, in days: report receipts pruned sooner.
         #[arg(long)]
         retention_days: Option<u64>,
@@ -72,7 +75,7 @@ fn describe(problem: &Problem) -> String {
         Problem::LedgerSilent => "no checkpoint for more than twice the interval".into(),
         Problem::GateQuiet => "the gate's chain has not moved for longer than allowed".into(),
         Problem::CheckpointBackdated => {
-            "a checkpoint is dated earlier than a receipt it covers: the Ledger's dates cannot be relied on".into()
+            "a checkpoint (the Ledger's clock) is dated earlier than a receipt it covers (the gate's clock) by more than --clock-skew: the Ledger back-dated it, or the two clocks disagree".into()
         }
         Problem::NoCheckpoint => {
             "the witness holds no checkpoint: nothing in the export is covered".into()
@@ -147,6 +150,7 @@ fn run(cli: Cli) -> anyhow::Result<bool> {
         interval,
         now,
         retention_days,
+        clock_skew,
         gate_quiet,
     } = cli.command;
     let now = now.or_else(|| {
@@ -174,6 +178,7 @@ fn run(cli: Cli) -> anyhow::Result<bool> {
         interval_secs: interval,
         now,
         gate_quiet_secs: gate_quiet,
+        clock_skew_secs: clock_skew,
         retention_secs: retention_days.map(|d| d.saturating_mul(86_400)),
     });
     print(&report);

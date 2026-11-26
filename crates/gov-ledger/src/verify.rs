@@ -35,8 +35,10 @@ pub enum Problem {
     LedgerSilent,
     /// A gate's chain has not moved for longer than the caller allows.
     GateQuiet,
-    /// A checkpoint is dated earlier, by more than the interval, than a receipt it covers:
-    /// the Ledger's dates cannot be relied on for age (review finding GR-43).
+    /// A checkpoint is dated earlier than a receipt it covers, by more than the two clocks are
+    /// allowed to differ. The receipt's time is the gate's (the Authority's clock); the
+    /// checkpoint's is the Ledger's. Either the Ledger back-dated the checkpoint or the two
+    /// clocks disagree by more than allowed (review findings GR-43 and GR-45).
     CheckpointBackdated,
     /// The witness holds no checkpoint at all, so nothing in the export is covered.
     NoCheckpoint,
@@ -110,6 +112,8 @@ pub struct Check<'a> {
     pub now: Option<i64>,
     /// Report a gate whose chain has not moved for this long. Needs `now`.
     pub gate_quiet_secs: Option<u32>,
+    /// How far the gate's clock and the Ledger's may differ, in seconds.
+    pub clock_skew_secs: u32,
     /// The customer's retention, in seconds: report receipts pruned when, by `now`, less than
     /// this has passed since a checkpoint first covered them. Without `now` nothing can be
     /// shown old enough, and any pruning is reported.
@@ -123,6 +127,8 @@ struct Chain {
     hashes: BTreeMap<u64, Digest>,
     /// The time each receipt carries.
     times: BTreeMap<u64, i64>,
+    /// Each intent receipt's action digest, and whether an outcome has answered it.
+    intents: BTreeMap<u64, (Digest, bool)>,
     /// The first receipt links to the prune record's hash, so that hash is the gate's own.
     prune_tied: bool,
 }
@@ -172,6 +178,7 @@ pub fn verify(check: &Check<'_>) -> Report {
             pruned_at: 0,
             hashes: BTreeMap::new(),
             times: BTreeMap::new(),
+            intents: BTreeMap::new(),
             prune_tied: false,
         };
         let mut head: Option<ChainHead> = None;
@@ -233,6 +240,32 @@ pub fn verify(check: &Check<'_>) -> Report {
                             Some(&gate.gate),
                             Some(h.seq),
                         );
+                    }
+                    // An outcome answers one intent of this chain, for the same action, and an
+                    // intent has at most one outcome (finding GR-46). An intent from before
+                    // the pruned stretch cannot be checked.
+                    match (opened.doc.phase, opened.doc.intent) {
+                        (gov_core::receipt::Phase::Intent, _) => {
+                            chain
+                                .intents
+                                .insert(h.seq, (opened.doc.action.digest.clone(), false));
+                        }
+                        (_, Some(n)) if n > chain.pruned_through => {
+                            let fits =
+                                chain.intents.get_mut(&n).is_some_and(|(digest, answered)| {
+                                    let ok = !*answered && *digest == opened.doc.action.digest;
+                                    *answered = true;
+                                    ok
+                                });
+                            if !fits {
+                                find(
+                                    Problem::BadReceipt("outcome_without_intent"),
+                                    Some(&gate.gate),
+                                    Some(h.seq),
+                                );
+                            }
+                        }
+                        _ => {}
                     }
                     chain.times.insert(h.seq, opened.doc.at);
                     chain.hashes.insert(h.seq, h.hash.clone());
@@ -337,7 +370,7 @@ pub fn verify(check: &Check<'_>) -> Report {
             };
             let covered_time = chain.times.get(&h.seq).copied();
             if covered_time
-                .is_some_and(|at| at.saturating_sub(cp.at) > i64::from(check.interval_secs))
+                .is_some_and(|at| at.saturating_sub(cp.at) > i64::from(check.clock_skew_secs))
             {
                 find(Problem::CheckpointBackdated, Some(&h.gate), Some(cp.seq));
             }

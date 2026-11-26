@@ -46,6 +46,8 @@ CREATE TABLE refusals (
     at            BIGINT NOT NULL,
     kid           TEXT NOT NULL,
     code          TEXT NOT NULL,
+    -- TRUE: the receipt was taken all the same, and this row is a note, not a refusal.
+    taken         BOOLEAN NOT NULL,
     envelope_hash TEXT NOT NULL,
     envelope      JSONB,
     PRIMARY KEY (tenant, env, id)

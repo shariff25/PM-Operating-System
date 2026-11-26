@@ -223,6 +223,11 @@ follow-up tracking.
   findings are conditions on later slices: GR-10 on G3, GR-8a and GR-29 to GR-32 before G6
   builds the signed approval, GR-34 to GR-36 before G9. The reviewer session stays open and
   reads each commit the conductor sends it.
+- **Fifth read (2026-11-26), at `2a5655a`:** the gate still passes for the spec, G1 and G2;
+  one Medium on how the digest's salt travels (settled in the spec, §4.3, before the shim is
+  built) and three smaller findings, fixed on `build/gov-review-4`. The reviewer session
+  cannot send messages without a person's approval, so the conductor now reads its verdicts
+  from its transcript.
 - **G3a built (2026-11-26), after the spec passed the gate:** the gate's receipt chain, spool
   and shipping in observe mode (`crates/gov-gate`), and the Ledger's signed answer to a
   batch. It holds no credential and blocks nothing. Sent to the reviewer; not yet read. G3b

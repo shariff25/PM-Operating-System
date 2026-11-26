@@ -38,6 +38,9 @@ pub struct Refusal {
     pub at: i64,
     pub kid: Id,
     pub code: String,
+    /// The receipt was taken into the chain all the same; this row is a note about it, not a
+    /// refusal (a time that stepped back, review findings GR-42 and GR-47).
+    pub taken: bool,
     pub envelope_hash: Digest,
     /// Kept only when the envelope's signature held.
     pub envelope: Option<Envelope>,

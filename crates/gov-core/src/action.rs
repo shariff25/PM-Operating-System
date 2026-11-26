@@ -38,8 +38,11 @@ impl Reversal {
     }
 }
 
-/// A random value the gate draws for each action and keeps with the values it digests. It is
-/// never in a receipt.
+/// A random value, fresh for each action, from the system's random source. It is never in a
+/// receipt. Whoever first forms the action draws it: the shim, which must sign the action's
+/// digest before the gate has seen the call, sends it with the call, and the gate refuses a
+/// salt it has already seen in that session and computes the digest again itself (review
+/// finding GR-44; spec §4.3). For the values before a write, the gate draws it.
 pub type Salt = [u8; 32];
 
 /// The digest of an action's arguments: SHA-256 over a salt and their RFC 8785 form.
