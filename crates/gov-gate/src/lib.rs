@@ -59,6 +59,14 @@ pub struct LinkAnswer {
     pub refused: Option<String>,
 }
 
+/// A batch ready to go to the Ledger: the gate's signed request and the receipts it covers.
+#[derive(Debug, Clone)]
+pub struct Shipment {
+    pub request: Envelope,
+    pub batch: Vec<Envelope>,
+    nonce: Id,
+}
+
 /// What one round of trimming did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Trimmed {
@@ -186,6 +194,12 @@ impl<S: Spool> Gate<S> {
     /// Receipts no witnessed checkpoint covers yet.
     pub fn uncovered(&self) -> Result<usize, GateError> {
         Ok(self.spool.held()?.len())
+    }
+
+    /// A call passed through with no receipt. Counted where it outlives a restart.
+    pub fn note_not_recorded(&mut self) -> Result<(), GateError> {
+        self.state.not_recorded += 1;
+        Ok(self.spool.set_state(&self.state)?)
     }
 
     /// A time for the next receipt: never earlier than the last one's, whatever the clock
@@ -319,20 +333,37 @@ impl<S: Spool> Gate<S> {
 
     /// Send the Ledger what it has not acknowledged, in order, and check its signed answer
     /// against this gate's own chain. Nothing is removed from the spool here.
+    ///
+    /// This holds the gate for the whole exchange. A front door that must not make calls
+    /// wait on the Ledger uses [`Gate::prepare_shipment`] and [`Gate::apply_answer`] instead,
+    /// and sends in between without holding the gate (review finding GR-67).
     pub async fn ship(&mut self, link: &dyn LedgerLink) -> Result<Shipped, GateError> {
-        let held = self.spool.held()?;
-        let batch: Vec<Envelope> = held
+        let Some(shipment) = self.prepare_shipment()? else {
+            return Ok(Shipped::NothingToSend);
+        };
+        let answer = link
+            .ship(&shipment.request, &shipment.batch)
+            .await
+            .map_err(GateError::Link)?;
+        self.apply_answer(&shipment, answer)
+    }
+
+    /// The next batch for the Ledger, under a request signed with the gate's own key, so the
+    /// Ledger answers this gate and nobody else (review finding GR-55). `None` when the
+    /// Ledger has acknowledged everything held.
+    pub fn prepare_shipment(&mut self) -> Result<Option<Shipment>, GateError> {
+        let batch: Vec<Envelope> = self
+            .spool
+            .held()?
             .iter()
             .filter(|r| r.seq > self.state.acked_through)
             .take(self.config.batch)
             .map(|r| r.envelope.clone())
             .collect();
         if batch.is_empty() {
-            return Ok(Shipped::NothingToSend);
+            return Ok(None);
         }
         let nonce = random_id("ship")?;
-        // The request is signed with the gate's own key, so the Ledger answers this gate and
-        // nobody else (review finding GR-55).
         let request = seal(
             &ShipRequest {
                 v: VERSION,
@@ -345,12 +376,26 @@ impl<S: Spool> Gate<S> {
             },
             &self.key,
         )?;
-        let answer = link.ship(&request, &batch).await.map_err(GateError::Link)?;
+        Ok(Some(Shipment {
+            request,
+            batch,
+            nonce,
+        }))
+    }
+
+    /// Check the Ledger's answer to `shipment` against this gate's chain, and move on.
+    pub fn apply_answer(
+        &mut self,
+        shipment: &Shipment,
+        answer: LinkAnswer,
+    ) -> Result<Shipped, GateError> {
+        let held = self.spool.held()?;
+        let nonce = &shipment.nonce;
         let ack = open::<IntakeAck>(&answer.ack, &self.config.ledger_keys, &self.config.scope)?.doc;
         if ack.gate != self.config.gate {
             return Err(GateError::Core(Error::WrongGate));
         }
-        if ack.nonce != nonce {
+        if &ack.nonce != nonce {
             // An answer to some other batch, played back (review finding GR-55).
             return Err(GateError::Core(Error::Replay));
         }

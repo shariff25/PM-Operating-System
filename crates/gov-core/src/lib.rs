@@ -21,6 +21,7 @@ pub mod policy;
 pub mod receipt;
 pub mod request;
 pub mod revocation;
+pub mod strict;
 
 pub use envelope::{open, seal, Document, Envelope, Opened, VERSION};
 pub use error::{Error, Result};

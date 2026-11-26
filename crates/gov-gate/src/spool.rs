@@ -48,6 +48,10 @@ pub struct SpoolState {
     pub acked_through: u64,
     /// A witnessed checkpoint covers the chain this far; receipts up to here are trimmed.
     pub covered_through: u64,
+    /// Calls that passed through with no receipt, since this spool began. Kept here so the
+    /// count outlives a restart (review finding GR-73).
+    #[serde(default)]
+    pub not_recorded: u64,
 }
 
 pub trait Spool: Send {
