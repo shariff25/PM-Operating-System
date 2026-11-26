@@ -2,7 +2,9 @@
 
 use gov_core::lease::{Checkpoint, GateHead, Pruned};
 use gov_core::receipt::{follow, Receipt};
-use gov_core::{open, seal, Digest, Envelope, Error, Id, KeySet, Scope, SigningKey, VERSION};
+use gov_core::{
+    open, seal, Digest, Envelope, Error, Id, KeySet, PublicKey, Scope, SigningKey, VERSION,
+};
 
 use crate::export::{Export, GateExport, TrustedKeys};
 use crate::store::{Refusal, Store, StoreError, StoredReceipt};
@@ -45,6 +47,14 @@ impl<S: Store> Ledger<S> {
 
     pub fn store(&self) -> &S {
         &self.store
+    }
+
+    /// Enrol a gate's receipt key. A key anyone could forge for is refused, as is a key or a
+    /// key id already enrolled (review finding GR-6).
+    pub async fn enrol_gate_key(&self, gate: &Id, key: &PublicKey) -> Result<(), LedgerError> {
+        key.enrolable()?;
+        self.store.add_gate_key(&self.scope, gate, key).await?;
+        Ok(())
     }
 
     async fn refuse(
@@ -109,6 +119,7 @@ impl<S: Store> Ledger<S> {
                 seq: new_head.seq,
                 hash: new_head.hash,
                 at: opened.doc.at,
+                received_at: now,
                 envelope: envelope.clone(),
             };
             match self
@@ -174,9 +185,11 @@ impl<S: Store> Ledger<S> {
         Ok(envelope)
     }
 
-    /// Delete a gate's receipts older than `cutoff`, leaving a signed record of where the
-    /// chain was cut (spec §6.3). Only receipts the last checkpoint already covers can go:
-    /// nothing is deleted before the witness has its hash. Returns the number pruned through.
+    /// Delete a gate's receipts that arrived before `cutoff`, leaving a signed record of where
+    /// the chain was cut (spec §6.3). Age is the Ledger's own intake time, never the time the
+    /// gate wrote. Only receipts the last checkpoint already covers can go, and that
+    /// checkpoint is written to the witness first: nothing is deleted before the witness has
+    /// its hash. Returns the number pruned through.
     pub async fn prune(
         &self,
         gate: &Id,
@@ -184,10 +197,17 @@ impl<S: Store> Ledger<S> {
         key: &SigningKey,
         issuer: &Id,
         now: i64,
+        witness: &dyn Witness,
     ) -> Result<Option<u64>, LedgerError> {
-        let Some((_, envelope)) = self.store.last_checkpoint(&self.scope).await? else {
+        let Some((seq, envelope)) = self.store.last_checkpoint(&self.scope).await? else {
             return Ok(None);
         };
+        // Stored is not witnessed: after a crash the last checkpoint may be in the database
+        // only (review finding GR-14).
+        witness.put(
+            seq,
+            &serde_json::to_vec(&envelope).expect("an envelope serialises"),
+        )?;
         let keys = KeySet::new([key.public()]);
         let checkpoint = open::<Checkpoint>(&envelope, &keys, &self.scope)?.doc;
         let Some(witnessed) = checkpoint.heads.iter().find(|h| &h.gate == gate) else {

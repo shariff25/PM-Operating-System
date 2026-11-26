@@ -79,6 +79,11 @@ pub struct Requirement<'a> {
     pub action_digest: &'a Digest,
     pub class: Class,
     pub group: &'a Id,
+    /// The person who issued the root mandate, when policy does not let them approve their
+    /// own agent's action. The gate checks this itself; it is not left to the Authority.
+    pub not_approver: Option<&'a Id>,
+    /// The key that signed the countersignature, as `open` returned it.
+    pub signed_by: &'a Id,
     pub now: i64,
 }
 
@@ -89,7 +94,8 @@ impl Countersignature {
         let bound = json!({
             "tenant": self.tenant, "env": self.env, "id": self.id, "gate": self.gate,
             "mandate": self.mandate, "action_digest": self.action_digest,
-            "approver": self.approver.id, "expires_at": self.expires_at.to_string(),
+            "approver": self.approver.id, "class": self.class,
+            "issued_at": self.issued_at.to_string(), "expires_at": self.expires_at.to_string(),
         });
         let text = jcs::canonical(&bound).expect("no numbers");
         Digest::of(&[b"gov.countersign.challenge.v1\0", text.as_bytes()])
@@ -118,8 +124,13 @@ impl Countersignature {
         if want.now >= self.expires_at {
             return Err(Error::Expired);
         }
-        if revoked.is_revoked(Revocable::Countersignature, &self.id) {
+        if revoked.is_revoked(Revocable::Countersignature, &self.id)
+            || revoked.is_revoked(Revocable::Key, want.signed_by)
+        {
             return Err(Error::Revoked);
+        }
+        if want.not_approver == Some(&self.approver.id) {
+            return Err(Error::ApproverIsIssuer);
         }
         if !self.approver.groups.contains(want.group) {
             return Err(Error::WrongGroup);

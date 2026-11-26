@@ -241,6 +241,17 @@ impl Receipt {
         if self.mode == Mode::Enforce && self.agent.proof != Proof::Proven {
             return Err(Error::Malformed("enforce mode needs a proven agent"));
         }
+        if self.at < 0 {
+            return Err(Error::Malformed("a receipt's time is before the epoch"));
+        }
+        if self.mode == Mode::Enforce
+            && self.decision.kind == DecisionKind::Allow
+            && (self.mandate.is_empty() || self.policy_version.is_none())
+        {
+            return Err(Error::Malformed(
+                "an enforced allow names its mandate and policy",
+            ));
+        }
         if self.mode == Mode::Enforce && self.coverage == Coverage::Reported {
             return Err(Error::Malformed("a reported action cannot be enforced"));
         }
@@ -262,7 +273,10 @@ pub fn follow(head: Option<&ChainHead>, receipt: &Opened<Receipt>) -> Result<Cha
     receipt.doc.validate()?;
     let fits = match head {
         None => receipt.doc.seq == 1 && receipt.doc.prev.is_none(),
-        Some(h) => receipt.doc.seq == h.seq + 1 && receipt.doc.prev.as_ref() == Some(&h.hash),
+        Some(h) => {
+            h.seq.checked_add(1) == Some(receipt.doc.seq)
+                && receipt.doc.prev.as_ref() == Some(&h.hash)
+        }
     };
     if !fits {
         return Err(Error::BrokenChain);

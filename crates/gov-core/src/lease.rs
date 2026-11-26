@@ -56,6 +56,9 @@ pub struct Lease {
     pub env: Id,
     pub issuer: Id,
     pub gate: Id,
+    /// The random value the gate sent with the renewal this lease answers. A lease is good
+    /// for one request: a copy kept or replayed by someone else answers nothing.
+    pub nonce: Id,
     /// The Authority's clock when it signed, in seconds since the epoch.
     pub authority_time: i64,
     /// The policy bundle the gate must be deciding from.
@@ -68,10 +71,23 @@ pub struct Lease {
 
 document!(Lease, "gov.lease.v1");
 
-/// A lease and the gate's monotonic clock when it arrived.
+/// A renewal the gate has sent and not yet had answered.
+#[derive(Debug, Clone)]
+pub struct LeaseRequest {
+    pub gate: Id,
+    /// Fresh and random for each request.
+    pub nonce: Id,
+    /// The gate's monotonic clock when the request left, in milliseconds. It must count time
+    /// while the machine is suspended.
+    pub sent_mono_ms: u64,
+}
+
+/// A lease and the gate's monotonic clock when it was asked for.
 ///
-/// A gate's "now" is the lease's Authority time plus its own monotonic clock since. No wall
-/// clock is read, so a wrong one cannot keep an expired document alive (T20).
+/// A gate's "now" is the lease's Authority time plus its own monotonic clock since the
+/// request left. Counting from the request, not the arrival, means a lease delayed on the way
+/// is as old as it really is. No wall clock is read, so a wrong one cannot keep an expired
+/// document alive (T20).
 #[derive(Debug, Clone)]
 pub struct HeldLease {
     lease: Lease,
@@ -79,11 +95,25 @@ pub struct HeldLease {
 }
 
 impl HeldLease {
-    pub fn new(lease: Lease, received_mono_ms: u64) -> Self {
-        HeldLease {
-            lease,
-            received_mono_ms,
+    /// Take `lease` as the answer to `request`, in place of `held` (review finding GR-1). It
+    /// must be for this gate and carry the request's nonce, so a lease recorded earlier and
+    /// played back is refused; and neither its Authority time nor its revocation number may be
+    /// lower than the held one's, so nothing can turn a gate's clock or its revocations back.
+    pub fn accept(held: Option<&HeldLease>, lease: Lease, request: &LeaseRequest) -> Result<Self> {
+        if lease.gate != request.gate || lease.nonce != request.nonce {
+            return Err(Error::LeaseReplayed);
         }
+        if let Some(held) = held {
+            if lease.authority_time < held.lease.authority_time
+                || lease.revocation_seq < held.lease.revocation_seq
+            {
+                return Err(Error::LeaseReplayed);
+            }
+        }
+        Ok(HeldLease {
+            lease,
+            received_mono_ms: request.sent_mono_ms,
+        })
     }
 
     pub fn lease(&self) -> &Lease {

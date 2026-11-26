@@ -206,6 +206,14 @@ follow-up tracking.
   Later again, asked whether G2 should wait for the reviewer or go ahead: "Go". G2 (the
   Ledger and `gov verify`) is built before review on that word; it covers G2 only. Which
   session is the security reviewer is still not known to the conductor.
+  Then: "You are the conductor you decided it." The conductor starts and briefs the
+  independent reviewer session itself and decides the order of work; it still never merges a
+  pull request, and the gate is still the reviewer's to pass.
+  First review of Agent Governance, 2026-11-26, at `2d08d15`: **the gate did not pass** (four
+  High: a replayable lease, a wrong claim about signed approvals, `gov verify` trusting the
+  Ledger's prune record, `gov verify` passing with no witness cover). Fixed on
+  `build/gov-review-1`, except the signed-approval design, which is open and unbuilt; the
+  reviewer's re-read is owed. Findings and what was done: the spec's "Security review" section.
 
 ## Where the build stands (2026-11-23)
 

@@ -158,6 +158,8 @@ pub fn verify_chain(envelope: &Envelope, check: &ChainCheck<'_>) -> Result<Verif
         if check.revoked.is_revoked(Revocable::Key, &opened.kid)
             || check.revoked.is_revoked(Revocable::Mandate, &m.id)
             || check.revoked.is_revoked(Revocable::Agent, &m.agent.id)
+            // A stolen agent key, revoked and replaced, must not keep its old mandates alive.
+            || check.revoked.is_revoked(Revocable::Key, &m.agent.key.kid)
         {
             return Err(Error::Revoked);
         }

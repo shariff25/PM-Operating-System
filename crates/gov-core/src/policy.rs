@@ -37,10 +37,13 @@ pub struct Match {
 #[serde(tag = "effect", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Effect {
     Allow,
-    /// Allow once a person in `group` has countersigned, with at least this class.
+    /// Allow once a person in `group` has countersigned, with at least this class. Unless
+    /// `issuer_may_approve` is set, the person who issued the mandate may not be that person.
     Countersign {
         class: Class,
         group: Id,
+        #[serde(default)]
+        issuer_may_approve: bool,
     },
     Refuse,
 }
@@ -83,6 +86,7 @@ pub struct Subject<'a> {
 pub struct Needed {
     pub class: Class,
     pub group: Id,
+    pub issuer_may_approve: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,7 +109,8 @@ pub struct Evaluation {
 }
 
 impl Match {
-    fn applies(&self, subject: &Subject<'_>, action: &CanonicalAction) -> bool {
+    /// `refusing`: a refusal's `X/*` also covers `X` itself (review finding GR-7).
+    fn applies(&self, subject: &Subject<'_>, action: &CanonicalAction, refusing: bool) -> bool {
         self.agent.as_ref().is_none_or(|a| a == subject.agent)
             && self
                 .label
@@ -117,10 +122,15 @@ impl Match {
                 .as_ref()
                 .is_none_or(|ops| ops.contains(&action.operation))
             && self.kinds.as_ref().is_none_or(|k| k.contains(&action.kind))
-            && self
-                .resources
-                .as_ref()
-                .is_none_or(|rs| rs.iter().any(|r| r.covers(&action.resource)))
+            && self.resources.as_ref().is_none_or(|rs| {
+                rs.iter().any(|r| {
+                    if refusing {
+                        r.covers_or_is(&action.resource)
+                    } else {
+                        r.covers(&action.resource)
+                    }
+                })
+            })
     }
 }
 
@@ -151,6 +161,13 @@ impl PolicyBundle {
             if empty {
                 return Err(Error::Malformed("a rule matches an empty list"));
             }
+            // A rule about one system cannot name another system's resources.
+            if let (Some(system), Some(resources)) = (&rule.matches.system, &rule.matches.resources)
+            {
+                if resources.iter().any(|r| r.system() != system.as_str()) {
+                    return Err(Error::Malformed("a rule's resource is not in its system"));
+                }
+            }
         }
         Ok(())
     }
@@ -160,7 +177,7 @@ impl PolicyBundle {
         let matched: Vec<&Rule> = self
             .rules
             .iter()
-            .filter(|r| r.matches.applies(subject, action))
+            .filter(|r| r.matches.applies(subject, action, r.then == Effect::Refuse))
             .collect();
         // The strictest class a matching rule names; otherwise by what the action does.
         let freshness =
@@ -179,10 +196,15 @@ impl PolicyBundle {
             match &rule.then {
                 Effect::Refuse => refused = true,
                 Effect::Allow => allowed = true,
-                Effect::Countersign { class, group } => {
+                Effect::Countersign {
+                    class,
+                    group,
+                    issuer_may_approve,
+                } => {
                     needed.insert(Needed {
                         class: *class,
                         group: group.clone(),
+                        issuer_may_approve: *issuer_may_approve,
                     });
                 }
             }

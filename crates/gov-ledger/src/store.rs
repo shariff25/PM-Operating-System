@@ -24,7 +24,11 @@ pub type StoreResult<T> = Result<T, StoreError>;
 pub struct StoredReceipt {
     pub seq: u64,
     pub hash: Digest,
+    /// The time the gate wrote in the receipt.
     pub at: i64,
+    /// The Ledger's own clock when the receipt arrived. Pruning goes by this, never by the
+    /// gate's word (review finding GR-9).
+    pub received_at: i64,
     pub envelope: Envelope,
 }
 
@@ -82,7 +86,7 @@ pub trait Store: Send + Sync {
     async fn last_checkpoint(&self, scope: &Scope) -> StoreResult<Option<(u64, Envelope)>>;
 
     /// The largest number, at most `max_seq`, such that it and every stored receipt before it
-    /// is older than `cutoff`; with its hash.
+    /// arrived before `cutoff`; with its hash.
     async fn prunable_through(
         &self,
         scope: &Scope,
@@ -129,6 +133,13 @@ impl Store for MemoryStore {
         let slot = (k(scope), key.kid.clone());
         if s.gate_keys.contains_key(&slot) {
             return Err(StoreError::Other("that key id is already enrolled".into()));
+        }
+        // One key, one gate: a key under two ids could be disowned under either.
+        let same = s.gate_keys.iter().any(|((scope_key, _), (_, held))| {
+            *scope_key == k(scope) && held.bytes().ok() == key.bytes().ok()
+        });
+        if same {
+            return Err(StoreError::Other("that key is already enrolled".into()));
         }
         s.gate_keys.insert(slot, (gate.clone(), key.clone()));
         Ok(())
@@ -272,7 +283,7 @@ impl Store for MemoryStore {
     ) -> StoreResult<Option<(u64, Digest)>> {
         let mut last = None;
         for r in self.receipts(scope, gate).await? {
-            if r.seq > max_seq || r.at >= cutoff {
+            if r.seq > max_seq || r.received_at >= cutoff {
                 break;
             }
             last = Some((r.seq, r.hash));

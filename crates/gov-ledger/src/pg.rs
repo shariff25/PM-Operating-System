@@ -43,6 +43,7 @@ fn stored(r: &PgRow) -> StoreResult<StoredReceipt> {
         seq: seq_out(r.try_get("seq")?)?,
         hash: digest(r.try_get("hash")?)?,
         at: r.try_get("at")?,
+        received_at: r.try_get("received_at")?,
         envelope: envelope.0,
     })
 }
@@ -199,7 +200,8 @@ impl Store for PgStore {
             return Err(StoreError::HeadMoved);
         }
         sqlx::query(
-            "INSERT INTO receipts (tenant, env, gate, seq, hash, at, envelope) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            "INSERT INTO receipts (tenant, env, gate, seq, hash, at, received_at, envelope) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(scope.tenant.as_str())
         .bind(scope.env.as_str())
@@ -207,6 +209,7 @@ impl Store for PgStore {
         .bind(seq_in(receipt.seq)?)
         .bind(receipt.hash.as_str())
         .bind(receipt.at)
+        .bind(receipt.received_at)
         .bind(Json(&receipt.envelope))
         .execute(&mut *tx)
         .await?;
@@ -221,7 +224,7 @@ impl Store for PgStore {
         seq: u64,
     ) -> StoreResult<Option<StoredReceipt>> {
         let row = sqlx::query(
-            "SELECT seq, hash, at, envelope FROM receipts WHERE tenant = $1 AND env = $2 AND gate = $3 AND seq = $4",
+            "SELECT seq, hash, at, received_at, envelope FROM receipts WHERE tenant = $1 AND env = $2 AND gate = $3 AND seq = $4",
         )
         .bind(scope.tenant.as_str())
         .bind(scope.env.as_str())
@@ -234,7 +237,7 @@ impl Store for PgStore {
 
     async fn receipts(&self, scope: &Scope, gate: &Id) -> StoreResult<Vec<StoredReceipt>> {
         let rows = sqlx::query(
-            "SELECT seq, hash, at, envelope FROM receipts WHERE tenant = $1 AND env = $2 AND gate = $3 ORDER BY seq",
+            "SELECT seq, hash, at, received_at, envelope FROM receipts WHERE tenant = $1 AND env = $2 AND gate = $3 ORDER BY seq",
         )
         .bind(scope.tenant.as_str())
         .bind(scope.env.as_str())
@@ -328,7 +331,7 @@ impl Store for PgStore {
         let row = sqlx::query(
             "SELECT seq, hash FROM receipts r WHERE tenant = $1 AND env = $2 AND gate = $3 AND seq <= $5 \
              AND NOT EXISTS (SELECT 1 FROM receipts n WHERE n.tenant = r.tenant AND n.env = r.env \
-                             AND n.gate = r.gate AND n.seq <= r.seq AND n.at >= $4) \
+                             AND n.gate = r.gate AND n.seq <= r.seq AND n.received_at >= $4) \
              ORDER BY seq DESC LIMIT 1",
         )
         .bind(scope.tenant.as_str())

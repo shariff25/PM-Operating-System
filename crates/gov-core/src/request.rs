@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::envelope::{document, open, Envelope};
 use crate::error::{Error, Result};
 use crate::ids::{Digest, Id, Scope};
-use crate::keys::KeySet;
+use crate::keys::{KeySet, PublicKey};
 use crate::mandate::Mandate;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,15 +36,19 @@ pub struct Session {
     pub id: Id,
     /// Random, issued by the gate when the session opened.
     pub challenge: Id,
+    /// The one agent key this session belongs to. Another enrolled agent that learns the
+    /// session's id and challenge cannot sign into it and run its counter out.
+    agent_key: PublicKey,
     last_counter: u64,
 }
 
 impl Session {
-    pub fn new(gate: Id, id: Id, challenge: Id) -> Self {
+    pub fn new(gate: Id, id: Id, challenge: Id, agent_key: PublicKey) -> Self {
         Session {
             gate,
             id,
             challenge,
+            agent_key,
             last_counter: 0,
         }
     }
@@ -59,6 +63,9 @@ impl Session {
         action_digest: &Digest,
         scope: &Scope,
     ) -> Result<()> {
+        if mandate.agent.key != self.agent_key {
+            return Err(Error::WrongSession);
+        }
         let keys = KeySet::new([mandate.agent.key.clone()]);
         let p = open::<RequestProof>(proof, &keys, scope)?.doc;
         if p.gate != self.gate {

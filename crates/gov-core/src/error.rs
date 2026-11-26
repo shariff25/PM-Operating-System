@@ -55,6 +55,12 @@ pub enum Error {
     LeaseIncomplete,
     #[error("a number cannot be written in canonical form")]
     Number,
+    #[error("the lease is not the answer to this gate's request, or is older than the one held")]
+    LeaseReplayed,
+    #[error("the public key is one anyone can forge for")]
+    WeakKey,
+    #[error("the approver is the person who issued the mandate")]
+    ApproverIsIssuer,
 }
 
 impl Error {
@@ -87,6 +93,9 @@ impl Error {
             Error::LeaseStale => "lease_stale",
             Error::LeaseIncomplete => "lease_incomplete",
             Error::Number => "number",
+            Error::LeaseReplayed => "lease_replayed",
+            Error::WeakKey => "weak_key",
+            Error::ApproverIsIssuer => "approver_is_issuer",
         }
     }
 }
