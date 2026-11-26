@@ -67,6 +67,14 @@ async fn fake_jira(State(seen): State<Arc<Upstream>>, headers: HeaderMap, body: 
     *seen.last_accept_encoding.lock().unwrap() = headers
         .get("accept-encoding")
         .map(|v| v.to_str().unwrap().to_string());
+    // As a real server does, it refuses a session id it never issued.
+    let made_up = headers
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|id| id.starts_with("made-up-"));
+    if made_up {
+        return (StatusCode::NOT_FOUND, "no such session").into_response();
+    }
     if headers.get("authorization").and_then(|v| v.to_str().ok()) != Some(SECRET) {
         return (StatusCode::UNAUTHORIZED, "no token").into_response();
     }
@@ -1128,4 +1136,37 @@ async fn calls_past_the_cap_go_through_and_are_counted_as_not_recorded() {
     // The cap is on calls in flight, not on calls: once those are done, the next is recorded.
     assert_eq!(s.send(update(6, "PAY-1"), Some(SECRET), &[]).await.0, 200);
     assert_eq!(counters.recorded.load(Ordering::Relaxed), 3);
+}
+
+/// After a gate restart a session that is still running is never named by the server again:
+/// servers name a session only when it starts. The gate takes a session as the server's own
+/// when the server answers a request under it (review finding GR-113), so its listing is
+/// remembered, while an id the server refuses is still nobody's.
+#[tokio::test]
+async fn a_session_the_server_answers_under_is_one_it_issued() {
+    let s = stack(100).await;
+    let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string();
+    // This gate never saw "running" issued: it was, before the gate started.
+    s.send(list.clone(), Some(SECRET), &[("mcp-session-id", "running")])
+        .await;
+    // The server answered that listing, so the id is its own; the next listing is kept.
+    s.send(list.clone(), Some(SECRET), &[("mcp-session-id", "running")])
+        .await;
+    s.send(
+        update(2, "PAY-1"),
+        Some(SECRET),
+        &[("mcp-session-id", "running")],
+    )
+    .await;
+    assert_eq!(s.receipts()[0].action.kind, Kind::Write);
+    // An id the server refuses is not made its own by being asked about.
+    for _ in 0..2 {
+        s.send(
+            list.clone(),
+            Some(SECRET),
+            &[("mcp-session-id", "made-up-1")],
+        )
+        .await;
+    }
+    assert!(!s.forwarder.holds_listing("made-up-1"));
 }
