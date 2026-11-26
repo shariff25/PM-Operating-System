@@ -1048,6 +1048,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "gov-core",
  "gov-ledger",
  "reqwest",
@@ -1063,6 +1064,7 @@ name = "gov-ledger"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
  "gov-core",
  "serde",
  "serde_json",

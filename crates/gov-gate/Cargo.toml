@@ -19,6 +19,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+base64.workspace = true
 gov-ledger = { path = "../gov-ledger" }
 tempfile.workspace = true
 tokio.workspace = true

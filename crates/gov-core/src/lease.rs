@@ -240,3 +240,34 @@ pub struct IntakeAck {
 }
 
 document!(IntakeAck, "gov.ack.v1");
+
+/// A gate's signed request to the Ledger to take a batch of its receipts. The Ledger answers
+/// only a request signed by a key enrolled for that gate, so nobody else can ask where a
+/// gate's chain stands or fill the Ledger's refusals (review findings GR-20 and GR-55).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShipRequest {
+    pub v: u32,
+    pub tenant: Id,
+    pub env: Id,
+    pub gate: Id,
+    /// Fresh for each request; the Ledger's answer carries it back.
+    pub nonce: Id,
+    /// How many receipts the batch holds, and a digest over them in order.
+    pub count: u64,
+    pub batch: Digest,
+}
+
+document!(ShipRequest, "gov.ship.v1");
+
+/// The digest a [`ShipRequest`] carries over its batch.
+pub fn batch_digest(batch: &[crate::envelope::Envelope]) -> Digest {
+    let mut parts: Vec<&[u8]> = vec![b"gov.batch.v1\0"];
+    for e in batch {
+        parts.push(e.payload.as_bytes());
+        parts.push(b".");
+        parts.push(e.sig.as_bytes());
+        parts.push(b"\n");
+    }
+    Digest::of(&parts)
+}

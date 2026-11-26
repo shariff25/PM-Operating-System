@@ -1,6 +1,6 @@
 //! Intake, checkpoints, pruning and export (spec §6).
 
-use gov_core::lease::{Checkpoint, GateHead, IntakeAck, Pruned};
+use gov_core::lease::{batch_digest, Checkpoint, GateHead, IntakeAck, Pruned, ShipRequest};
 use gov_core::receipt::{follow, Phase, Receipt};
 use gov_core::{
     open, seal, Digest, Envelope, Error, Id, KeySet, PublicKey, Scope, SigningKey, VERSION,
@@ -178,6 +178,47 @@ impl<S: Store> Ledger<S> {
             }
         }
         Err(StoreError::HeadMoved.into())
+    }
+
+    /// Take a gate's shipment: its signed request and the batch it covers.
+    ///
+    /// The request must be signed by a key enrolled for the gate it names, and must fit the
+    /// batch: the same count, the same digest, every receipt under one of that gate's keys.
+    /// A request that does not is refused before anything is read into the chain and
+    /// **nothing is recorded**, so a stranger can neither learn where a gate's chain stands
+    /// nor fill the refusals (review findings GR-20 and GR-55). Returns the signed answer and
+    /// the reason for the first receipt refused, if any was.
+    pub async fn take_shipment(
+        &self,
+        request: &Envelope,
+        batch: &[Envelope],
+        key: &SigningKey,
+        issuer: &Id,
+        now: i64,
+    ) -> Result<(Envelope, Option<&'static str>), LedgerError> {
+        let Some((gate, gate_key)) = self.store.gate_key(&self.scope, &request.kid).await? else {
+            return Err(LedgerError::Refused("unknown_sender"));
+        };
+        let asked = open::<ShipRequest>(request, &KeySet::new([gate_key]), &self.scope)
+            .map_err(|_| LedgerError::Refused("unknown_sender"))?
+            .doc;
+        if asked.gate != gate
+            || asked.count != batch.len() as u64
+            || asked.batch != batch_digest(batch)
+            || batch.is_empty()
+        {
+            return Err(LedgerError::Refused("request_does_not_fit_batch"));
+        }
+        for envelope in batch {
+            match self.store.gate_key(&self.scope, &envelope.kid).await? {
+                Some((g, _)) if g == gate => {}
+                _ => return Err(LedgerError::Refused("request_does_not_fit_batch")),
+            }
+        }
+        let (results, ack) = self
+            .ingest_batch(batch, &asked.nonce, key, issuer, now)
+            .await?;
+        Ok((ack, results.into_iter().find_map(|r| r.err())))
     }
 
     /// Take in a batch of one gate's receipts, in order, and answer with a signed statement
