@@ -7,8 +7,8 @@ use gov_core::lease::{Checkpoint, IntakeAck};
 use gov_core::receipt::{Coverage, Mode, OutcomeStatus, Phase, Proof, Receipt};
 use gov_core::{open, seal, Envelope, Id, KeySet, ResourcePath, Scope, SigningKey};
 use gov_gate::{
-    DirWitnessReader, FileSpool, Gate, GateConfig, GateError, LedgerLink, Observed, Shipped, Spool,
-    WitnessReader,
+    DirWitnessReader, FileSpool, Gate, GateConfig, GateError, LedgerLink, LinkAnswer, Observed,
+    Shipped, Spool, WitnessReader,
 };
 use gov_ledger::verify::{verify, Check};
 use gov_ledger::{DirWitness, Ledger, MemoryStore, Witness};
@@ -90,7 +90,7 @@ struct InProcess {
 
 #[async_trait]
 impl LedgerLink for InProcess {
-    async fn ship(&self, batch: &[Envelope], nonce: &Id) -> Result<Envelope, String> {
+    async fn ship(&self, request: &Envelope, batch: &[Envelope]) -> Result<LinkAnswer, String> {
         if self.down.load(Ordering::SeqCst) {
             return Err("connection refused".into());
         }
@@ -99,12 +99,15 @@ impl LedgerLink for InProcess {
         } else {
             ledger_key()
         };
-        let (_, ack) = self
+        let (ack, refused) = self
             .ledger
-            .ingest_batch(batch, nonce, &key, &id("ledger"), T0 + 1)
+            .take_shipment(request, batch, &key, &id("ledger"), T0 + 1)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(ack)
+        Ok(LinkAnswer {
+            ack,
+            refused: refused.map(str::to_string),
+        })
     }
 }
 
@@ -121,34 +124,53 @@ async fn ledger() -> InProcess {
     }
 }
 
+/// The nonce in a gate's signed request, read without checking the signature: the fake
+/// Ledgers below answer whatever they are sent.
+fn nonce_of(request: &Envelope) -> Id {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(&request.payload)
+        .unwrap();
+    let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    id(doc["nonce"].as_str().unwrap())
+}
+
 /// A link that answers with whatever it was given, whatever was sent.
 struct Canned(Envelope);
 #[async_trait]
 impl LedgerLink for Canned {
-    async fn ship(&self, _: &[Envelope], _: &Id) -> Result<Envelope, String> {
-        Ok(self.0.clone())
+    async fn ship(&self, _: &Envelope, _: &[Envelope]) -> Result<LinkAnswer, String> {
+        Ok(LinkAnswer {
+            ack: self.0.clone(),
+            refused: None,
+        })
     }
 }
 /// A link that signs an acknowledgement of its choosing, with the right nonce.
+#[derive(Default)]
 struct Says {
     seq: u64,
     hash: Option<gov_core::Digest>,
+    refused: Option<String>,
 }
 #[async_trait]
 impl LedgerLink for Says {
-    async fn ship(&self, _: &[Envelope], nonce: &Id) -> Result<Envelope, String> {
+    async fn ship(&self, request: &Envelope, _: &[Envelope]) -> Result<LinkAnswer, String> {
         let ack = IntakeAck {
             v: 1,
             tenant: id("acme"),
             env: id("prod"),
             issuer: id("ledger"),
             gate: id("gate-1"),
-            nonce: nonce.clone(),
+            nonce: nonce_of(request),
             seq: self.seq,
             hash: self.hash.clone(),
             at: T0 + 2,
         };
-        Ok(seal(&ack, &ledger_key()).unwrap())
+        Ok(LinkAnswer {
+            ack: seal(&ack, &ledger_key()).unwrap(),
+            refused: self.refused.clone(),
+        })
     }
 }
 
@@ -212,15 +234,15 @@ async fn an_observed_call_leaves_two_receipts_that_verify_end_to_end() {
     assert_eq!(gate.ship(&link).await.unwrap(), Shipped::Advanced(6));
     assert_eq!(gate.ship(&link).await.unwrap(), Shipped::NothingToSend);
     // Acknowledged is not covered: the spool keeps everything until the witness has it.
-    assert_eq!(gate.trim_to_witness(&reader).unwrap(), 0);
+    assert_eq!(gate.trim_to_witness(&reader).unwrap().receipts, 0);
     assert_eq!(gate.uncovered().unwrap(), 6);
     link.ledger
         .checkpoint(&ledger_key(), &id("ledger"), T0 + 60, &witness)
         .await
         .unwrap();
-    assert_eq!(gate.trim_to_witness(&reader).unwrap(), 6);
+    assert_eq!(gate.trim_to_witness(&reader).unwrap().receipts, 6);
     assert_eq!(gate.uncovered().unwrap(), 0);
-    assert_eq!(gate.trim_to_witness(&reader).unwrap(), 0);
+    assert_eq!(gate.trim_to_witness(&reader).unwrap().receipts, 0);
     // The gate keeps the checkpoint it trimmed on, as it read it.
     let kept = FileSpool::open(&spool)
         .unwrap()
@@ -447,6 +469,7 @@ async fn the_gate_checks_every_answer_against_its_own_chain() {
     let wrong = Says {
         seq: 4,
         hash: Some(gov_core::Digest::of(&[b"not what the gate wrote"])),
+        ..Says::default()
     };
     assert!(matches!(
         gate.ship(&wrong).await,
@@ -456,6 +479,7 @@ async fn the_gate_checks_every_answer_against_its_own_chain() {
     let beyond = Says {
         seq: 9,
         hash: Some(gov_core::Digest::of(&[b"x"])),
+        ..Says::default()
     };
     assert!(matches!(
         gate.ship(&beyond).await,
@@ -511,18 +535,27 @@ async fn the_gate_notices_a_ledger_that_is_stuck_behind_or_ahead() {
     let stuck = Says {
         seq: 4,
         hash: Some(hashes[3].clone()),
+        ..Says::default()
     };
-    assert_eq!(gate.ship(&stuck).await.unwrap(), Shipped::NoProgress);
+    assert_eq!(
+        gate.ship(&stuck).await.unwrap(),
+        Shipped::NoProgress { refused: None }
+    );
     assert_eq!(gate.state().acked_through, 4);
 
     // Behind: the Ledger was restored from a copy that held two, then from an empty one.
     let behind = Says {
         seq: 2,
         hash: Some(hashes[1].clone()),
+        ..Says::default()
     };
     assert_eq!(gate.ship(&behind).await.unwrap(), Shipped::LedgerBehind(2));
     assert_eq!(gate.state().acked_through, 2);
-    let empty = Says { seq: 0, hash: None };
+    let empty = Says {
+        seq: 0,
+        hash: None,
+        ..Says::default()
+    };
     assert_eq!(gate.ship(&empty).await.unwrap(), Shipped::LedgerBehind(0));
     // A fresh, empty Ledger then receives the whole chain again, from receipt 1.
     let fresh = ledger().await;
@@ -564,7 +597,7 @@ async fn the_spool_is_trimmed_only_on_what_the_witness_holds() {
     // A checkpoint the Ledger signed and handed over, but never published: the gate has no
     // way to be handed one. It reads the witness, which is empty.
     let reader = DirWitnessReader::new(&witness_dir);
-    assert_eq!(gate.trim_to_witness(&reader).unwrap(), 0);
+    assert_eq!(gate.trim_to_witness(&reader).unwrap().receipts, 0);
     assert_eq!(gate.uncovered().unwrap(), 4);
 
     // The Ledger publishes a checkpoint covering receipts it was never sent (it knows the
@@ -595,13 +628,14 @@ async fn the_spool_is_trimmed_only_on_what_the_witness_holds() {
         )
     };
     let unsent = Planted(vec![covering(4, held[3].hash.clone(), 1, &ledger_key())]);
-    assert_eq!(gate.trim_to_witness(&unsent).unwrap(), 0);
+    assert_eq!(gate.trim_to_witness(&unsent).unwrap().receipts, 0);
     assert_eq!(gate.uncovered().unwrap(), 4);
 
     // After a real acknowledgement of the first two only, that same checkpoint trims two.
     let two = Says {
         seq: 2,
         hash: Some(held[1].hash.clone()),
+        ..Says::default()
     };
     assert_eq!(gate.ship(&two).await.unwrap(), Shipped::Advanced(2));
     // A checkpoint that names another hash for receipt 4: an alarm, nothing trimmed.
@@ -617,14 +651,17 @@ async fn the_spool_is_trimmed_only_on_what_the_witness_holds() {
     ));
     // One the Ledger's key did not sign, and one filed under the wrong number.
     let unsigned = Planted(vec![covering(4, held[3].hash.clone(), 1, &gate_key())]);
-    assert!(gate.trim_to_witness(&unsigned).is_err());
+    // Neither is believed; each is reported, and neither is an error that stops the gate.
+    let t = gate.trim_to_witness(&unsigned).unwrap();
+    assert_eq!((t.receipts, t.bad_checkpoints), (0, vec![1]));
     let misfiled = Planted(vec![(
         7,
         covering(4, held[3].hash.clone(), 1, &ledger_key()).1,
     )]);
-    assert!(gate.trim_to_witness(&misfiled).is_err());
+    let t = gate.trim_to_witness(&misfiled).unwrap();
+    assert_eq!((t.receipts, t.bad_checkpoints), (0, vec![7]));
     assert_eq!(gate.uncovered().unwrap(), 4);
-    assert_eq!(gate.trim_to_witness(&unsent).unwrap(), 2);
+    assert_eq!(gate.trim_to_witness(&unsent).unwrap().receipts, 2);
     assert_eq!(gate.uncovered().unwrap(), 2);
 
     // Review finding GR-52: a crash after the state moved and before the files were removed
@@ -662,7 +699,7 @@ async fn a_full_spool_says_so_and_an_open_intent_is_never_trimmed() {
         .checkpoint(&ledger_key(), &id("ledger"), T0 + 60, &witness)
         .await
         .unwrap();
-    assert_eq!(gate.trim_to_witness(&reader).unwrap(), 2);
+    assert_eq!(gate.trim_to_witness(&reader).unwrap().receipts, 2);
     assert_eq!(gate.uncovered().unwrap(), 1);
     // The outcome of the call in flight always fits.
     assert_eq!(
@@ -687,4 +724,154 @@ async fn an_observed_call_cannot_claim_custody() {
     };
     assert!(matches!(gate.begin(&claim, T0), Err(GateError::Core(_))));
     assert_eq!(gate.uncovered().unwrap(), 0);
+}
+
+/// Review finding GR-57: one unreadable checkpoint with the highest number does not stop the
+/// gate trimming on the newest one that verifies. GR-56: once covered, the gate raises the
+/// alarm itself when the witness shows its chain shorter or gone.
+#[tokio::test]
+async fn the_gate_reads_past_a_bad_checkpoint_and_notices_its_chain_going_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let spool = dir.path().join("spool");
+    let witness_dir = dir.path().join("witness");
+    let link = ledger().await;
+    let witness = DirWitness::new(&witness_dir);
+    let reader = DirWitnessReader::new(&witness_dir);
+    let mut gate = gate_at(&spool, 100, T0);
+    call(&mut gate, 1, T0);
+    gate.ship(&link).await.unwrap();
+    link.ledger
+        .checkpoint(&ledger_key(), &id("ledger"), T0 + 60, &witness)
+        .await
+        .unwrap();
+    // Someone drops a file that is not a checkpoint under the next number.
+    std::fs::write(
+        witness_dir.join(format!("checkpoint-{:020}.json", 2)),
+        b"{not a checkpoint",
+    )
+    .unwrap();
+    let t = gate.trim_to_witness(&reader).unwrap();
+    assert_eq!((t.receipts, t.bad_checkpoints.clone()), (2, vec![2]));
+
+    // A later checkpoint, rightly signed, that leaves this gate out; and one that shows its
+    // chain at receipt 1 after the witness had covered receipt 2.
+    struct Planted(Vec<(u64, Vec<u8>)>);
+    impl WitnessReader for Planted {
+        fn checkpoints(&self) -> Result<Vec<(u64, Vec<u8>)>, String> {
+            Ok(self.0.clone())
+        }
+    }
+    let signed = |heads: Vec<gov_core::lease::GateHead>| {
+        let cp = Checkpoint {
+            v: 1,
+            tenant: id("acme"),
+            env: id("prod"),
+            issuer: id("ledger"),
+            seq: 3,
+            at: T0 + 120,
+            heads,
+        };
+        Planted(vec![(
+            3,
+            serde_json::to_vec(&seal(&cp, &ledger_key()).unwrap()).unwrap(),
+        )])
+    };
+    assert!(matches!(
+        gate.trim_to_witness(&signed(vec![])),
+        Err(GateError::LedgerDisagrees(2))
+    ));
+    let shorter = signed(vec![gov_core::lease::GateHead {
+        gate: id("gate-1"),
+        seq: 1,
+        hash: gov_core::Digest::of(&[b"x"]),
+    }]);
+    assert!(matches!(
+        gate.trim_to_witness(&shorter),
+        Err(GateError::LedgerDisagrees(2))
+    ));
+}
+
+/// Review finding GR-58: an acknowledgement for a receipt already trimmed is checked against
+/// the checkpoint the spool was trimmed on, and the signed answer that raised an alarm is
+/// kept. GR-60: when the Ledger refuses a receipt, the gate passes on its reason.
+#[tokio::test]
+async fn an_alarming_answer_is_kept_and_a_refusal_is_passed_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let spool = dir.path().join("spool");
+    let link = ledger().await;
+    let witness = DirWitness::new(dir.path().join("witness"));
+    let reader = DirWitnessReader::new(dir.path().join("witness"));
+    let mut gate = gate_at(&spool, 100, T0);
+    call(&mut gate, 1, T0);
+    gate.ship(&link).await.unwrap();
+    link.ledger
+        .checkpoint(&ledger_key(), &id("ledger"), T0 + 60, &witness)
+        .await
+        .unwrap();
+    assert_eq!(gate.trim_to_witness(&reader).unwrap().receipts, 2);
+    assert!(FileSpool::open(&spool)
+        .unwrap()
+        .kept_alarm()
+        .unwrap()
+        .is_none());
+    call(&mut gate, 2, T0 + 61);
+
+    // The Ledger now says it holds the chain only through receipt 2, which is trimmed, and
+    // names a hash that is not the one in the checkpoint the gate kept.
+    let rewritten = Says {
+        seq: 2,
+        hash: Some(gov_core::Digest::of(&[b"another receipt 2"])),
+        ..Says::default()
+    };
+    assert!(matches!(
+        gate.ship(&rewritten).await,
+        Err(GateError::LedgerDisagrees(2))
+    ));
+    // The Ledger's own signed statement is kept as evidence.
+    let kept = FileSpool::open(&spool)
+        .unwrap()
+        .kept_alarm()
+        .unwrap()
+        .unwrap();
+    let env: Envelope = serde_json::from_slice(&kept).unwrap();
+    let ack = open::<IntakeAck>(&env, &KeySet::new([ledger_key().public()]), &scope())
+        .unwrap()
+        .doc;
+    assert_eq!(ack.seq, 2);
+
+    // It lost receipts this gate can no longer send.
+    let lost = Says {
+        seq: 1,
+        hash: Some(gov_core::Digest::of(&[b"x"])),
+        ..Says::default()
+    };
+    assert!(matches!(
+        gate.ship(&lost).await,
+        Err(GateError::LedgerLost(1))
+    ));
+
+    // It takes nothing and says why.
+    let cp_hash = {
+        let bytes = FileSpool::open(&spool)
+            .unwrap()
+            .kept_checkpoint()
+            .unwrap()
+            .unwrap();
+        let env: Envelope = serde_json::from_slice(&bytes).unwrap();
+        let cp = open::<Checkpoint>(&env, &KeySet::new([ledger_key().public()]), &scope())
+            .unwrap()
+            .doc;
+        cp.heads[0].hash.clone()
+    };
+    let refusing = Says {
+        seq: 2,
+        hash: Some(cp_hash),
+        refused: Some("outcome_without_intent".to_string()),
+    };
+    assert_eq!(
+        gate.ship(&refusing).await.unwrap(),
+        Shipped::NoProgress {
+            refused: Some("outcome_without_intent".to_string())
+        }
+    );
 }

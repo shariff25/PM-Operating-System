@@ -8,11 +8,12 @@
 //! are slice G3b.
 
 pub mod forward;
+pub mod link;
 pub mod spool;
 
 use async_trait::async_trait;
 use gov_core::action::{CanonicalAction, Reversal};
-use gov_core::lease::{Checkpoint, IntakeAck};
+use gov_core::lease::{batch_digest, Checkpoint, IntakeAck, ShipRequest};
 use gov_core::receipt::{
     ChainHead, Coverage, Decision, DecisionKind, Mode, Outcome, OutcomeStatus, Phase, Proof,
     Reason, Receipt, ReceiptAction, ReceiptAgent,
@@ -48,16 +49,37 @@ pub enum GateError {
     Witness(String),
 }
 
+/// What the Ledger sent back for a batch.
+#[derive(Debug, Clone)]
+pub struct LinkAnswer {
+    /// The Ledger's signed statement of the chain it holds.
+    pub ack: Envelope,
+    /// The Ledger's reason for the first receipt it refused, if it refused any. Unsigned:
+    /// it is there to be shown to an operator, not to be acted on.
+    pub refused: Option<String>,
+}
+
+/// What one round of trimming did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Trimmed {
+    /// Receipts removed from the spool.
+    pub receipts: u64,
+    /// Checkpoints in the witness, newer than the one used, that could not be read or do not
+    /// verify. They did not stop the trim; someone should look at them.
+    pub bad_checkpoints: Vec<u64>,
+}
+
 /// What one round of shipping did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Shipped {
     /// The Ledger had already acknowledged everything this gate holds.
     NothingToSend,
     /// The Ledger now holds this many more receipts.
     Advanced(u64),
-    /// Receipts were sent and the Ledger holds no more than before: it is refusing them. The
-    /// front door counts this and shows it, so a spool filling behind it is not silent.
-    NoProgress,
+    /// Receipts were sent and the Ledger holds no more than before: it is refusing them, for
+    /// the reason given if it gave one. A refused receipt ends this gate's chain at the
+    /// Ledger until someone acts, so the front door shows it; it is not silent.
+    NoProgress { refused: Option<String> },
     /// The Ledger holds less than it acknowledged before (restored from an older copy). The
     /// gate sends again from this receipt.
     LedgerBehind(u64),
@@ -66,9 +88,9 @@ pub enum Shipped {
 /// How a gate reaches the Ledger. The network one comes with the listener (G3b).
 #[async_trait]
 pub trait LedgerLink: Send + Sync {
-    /// Send receipts in order, with a nonce; get back the Ledger's signed statement of the
-    /// chain it holds, carrying that nonce.
-    async fn ship(&self, batch: &[Envelope], nonce: &Id) -> Result<Envelope, String>;
+    /// Send receipts in order, under the gate's signed request for this batch; get back the
+    /// Ledger's signed statement of the chain it holds, carrying the request's nonce.
+    async fn ship(&self, request: &Envelope, batch: &[Envelope]) -> Result<LinkAnswer, String>;
 }
 
 pub struct GateConfig {
@@ -309,8 +331,22 @@ impl<S: Spool> Gate<S> {
             return Ok(Shipped::NothingToSend);
         }
         let nonce = random_id("ship")?;
-        let answer = link.ship(&batch, &nonce).await.map_err(GateError::Link)?;
-        let ack = open::<IntakeAck>(&answer, &self.config.ledger_keys, &self.config.scope)?.doc;
+        // The request is signed with the gate's own key, so the Ledger answers this gate and
+        // nobody else (review finding GR-55).
+        let request = seal(
+            &ShipRequest {
+                v: VERSION,
+                tenant: self.config.scope.tenant.clone(),
+                env: self.config.scope.env.clone(),
+                gate: self.config.gate.clone(),
+                nonce: nonce.clone(),
+                count: batch.len() as u64,
+                batch: batch_digest(&batch),
+            },
+            &self.key,
+        )?;
+        let answer = link.ship(&request, &batch).await.map_err(GateError::Link)?;
+        let ack = open::<IntakeAck>(&answer.ack, &self.config.ledger_keys, &self.config.scope)?.doc;
         if ack.gate != self.config.gate {
             return Err(GateError::Core(Error::WrongGate));
         }
@@ -318,19 +354,37 @@ impl<S: Spool> Gate<S> {
             // An answer to some other batch, played back (review finding GR-55).
             return Err(GateError::Core(Error::Replay));
         }
-        // The Ledger says it holds the chain through `ack.seq`. Where this gate still holds
-        // that receipt, the hash must be the one it wrote. It is looked up in the whole
-        // spool, so an honest Ledger that is ahead of this batch is not taken for a liar
-        // (review finding GR-50).
-        if ack.seq > self.state.covered_through {
-            let mine = held.iter().find(|r| r.seq == ack.seq);
-            if mine.is_none_or(|r| Some(&r.hash) != ack.hash.as_ref()) {
-                return Err(GateError::LedgerDisagrees(ack.seq));
+        // The Ledger says it holds the chain through `ack.seq`. That must be a receipt this
+        // gate wrote, with the hash it has for it: looked up in the whole spool, so an honest
+        // Ledger ahead of this batch is not taken for a liar (GR-50), and, for a receipt
+        // already trimmed, in the checkpoint the spool was trimmed on (GR-58).
+        let agrees = if ack.seq == 0 {
+            ack.hash.is_none()
+        } else if let Some(mine) = held.iter().find(|r| r.seq == ack.seq) {
+            Some(&mine.hash) == ack.hash.as_ref()
+        } else if ack.seq <= self.state.covered_through {
+            match self.kept_head()? {
+                Some((seq, hash)) if seq == ack.seq => Some(&hash) == ack.hash.as_ref(),
+                // Trimmed, and not the receipt the kept checkpoint names: nothing to compare.
+                _ => true,
             }
+        } else {
+            false
+        };
+        // The signed answer that raises an alarm is kept: it is the Ledger's own signature
+        // on a statement about this gate's chain that this gate can show to be wrong.
+        let alarm = |gate: &mut Self| -> Result<(), GateError> {
+            let bytes = serde_json::to_vec(&answer.ack).map_err(|_| SpoolError::Corrupt)?;
+            Ok(gate.spool.keep_alarm(&bytes)?)
+        };
+        if !agrees {
+            alarm(self)?;
+            return Err(GateError::LedgerDisagrees(ack.seq));
         }
         if ack.seq < self.state.acked_through {
             // It holds less than it said before. Send again from there, if this gate can.
             if ack.seq < self.state.covered_through {
+                alarm(self)?;
                 return Err(GateError::LedgerLost(ack.seq));
             }
             self.state.acked_through = ack.seq;
@@ -338,7 +392,9 @@ impl<S: Spool> Gate<S> {
             return Ok(Shipped::LedgerBehind(ack.seq));
         }
         if ack.seq == self.state.acked_through {
-            return Ok(Shipped::NoProgress);
+            return Ok(Shipped::NoProgress {
+                refused: answer.refused,
+            });
         }
         let moved = ack.seq - self.state.acked_through;
         self.state.acked_through = ack.seq;
@@ -346,30 +402,71 @@ impl<S: Spool> Gate<S> {
         Ok(Shipped::Advanced(moved))
     }
 
+    /// This gate's head in the checkpoint the spool was last trimmed on.
+    fn kept_head(&self) -> Result<Option<(u64, gov_core::Digest)>, GateError> {
+        let Some(bytes) = self.spool.kept_checkpoint()? else {
+            return Ok(None);
+        };
+        let envelope: Envelope =
+            serde_json::from_slice(&bytes).map_err(|_| GateError::Spool(SpoolError::Corrupt))?;
+        let cp = open::<Checkpoint>(&envelope, &self.config.ledger_keys, &self.config.scope)?.doc;
+        Ok(cp
+            .heads
+            .into_iter()
+            .find(|h| h.gate == self.config.gate)
+            .map(|h| (h.seq, h.hash)))
+    }
+
     /// Read the witness and trim the spool to what it covers (review finding GR-49).
     ///
     /// The gate reads the witness store itself: a checkpoint is believed only if it is there,
     /// signed by the Ledger, and names the hash this gate has for the receipt it covers.
     /// Never trimmed: anything the Ledger has not acknowledged, an intent still waiting for
-    /// its outcome, or anything after one. A checkpoint that names another hash is an alarm
-    /// and nothing is trimmed. The checkpoint trimmed on is kept with the spool.
-    pub fn trim_to_witness(&mut self, witness: &dyn WitnessReader) -> Result<u64, GateError> {
+    /// its outcome, or anything after one. The checkpoint trimmed on is kept with the spool.
+    ///
+    /// The newest checkpoint that verifies is used; newer ones that do not are reported, and
+    /// do not stop the trim (GR-57). A checkpoint that names another hash for one of this
+    /// gate's receipts, or that leaves out or shortens a chain an earlier checkpoint covered,
+    /// is an alarm, and nothing is trimmed (GR-56).
+    pub fn trim_to_witness(&mut self, witness: &dyn WitnessReader) -> Result<Trimmed, GateError> {
         let all = witness.checkpoints().map_err(GateError::Witness)?;
-        let Some((file_seq, bytes)) = all.last() else {
-            return Ok(0);
-        };
-        let envelope: Envelope =
-            serde_json::from_slice(bytes).map_err(|_| GateError::Core(Error::BadEnvelope))?;
-        let cp = open::<Checkpoint>(&envelope, &self.config.ledger_keys, &self.config.scope)?.doc;
-        cp.validate()?;
-        if cp.seq != *file_seq {
-            return Err(GateError::Core(Error::Malformed("checkpoint number")));
+        let mut bad_checkpoints = Vec::new();
+        let mut newest = None;
+        for (file_seq, bytes) in all.iter().rev() {
+            let verified = serde_json::from_slice::<Envelope>(bytes)
+                .ok()
+                .and_then(|e| {
+                    open::<Checkpoint>(&e, &self.config.ledger_keys, &self.config.scope).ok()
+                })
+                .map(|o| o.doc)
+                .filter(|cp| cp.seq == *file_seq && cp.validate().is_ok());
+            match verified {
+                Some(cp) => {
+                    newest = Some((cp, bytes));
+                    break;
+                }
+                None => bad_checkpoints.push(*file_seq),
+            }
         }
-        let Some(head) = cp.heads.iter().find(|h| h.gate == self.config.gate) else {
-            return Ok(0);
+        let none = |bad_checkpoints| Trimmed {
+            receipts: 0,
+            bad_checkpoints,
         };
-        if head.seq <= self.state.covered_through {
-            return Ok(0);
+        let Some((cp, bytes)) = newest else {
+            return Ok(none(bad_checkpoints));
+        };
+        let head = cp.heads.iter().find(|h| h.gate == self.config.gate);
+        // This gate's chain was covered before. The witness now shows it shorter, or not at
+        // all: the gate is the party best placed to notice.
+        if self.state.covered_through > 0 && head.is_none_or(|h| h.seq < self.state.covered_through)
+        {
+            return Err(GateError::LedgerDisagrees(self.state.covered_through));
+        }
+        let Some(head) = head else {
+            return Ok(none(bad_checkpoints));
+        };
+        if head.seq == self.state.covered_through {
+            return Ok(none(bad_checkpoints));
         }
         let held = self.spool.held()?;
         let mine = held.iter().find(|r| r.seq == head.seq);
@@ -387,13 +484,16 @@ impl<S: Spool> Gate<S> {
             .min(self.state.acked_through)
             .min(keep_from.saturating_sub(1));
         if through <= self.state.covered_through {
-            return Ok(0);
+            return Ok(none(bad_checkpoints));
         }
-        let trimmed = through - self.state.covered_through;
+        let receipts = through - self.state.covered_through;
         self.spool.keep_checkpoint(bytes)?;
         self.state.covered_through = through;
         self.spool.set_state(&self.state)?;
         self.spool.trim(through)?;
-        Ok(trimmed)
+        Ok(Trimmed {
+            receipts,
+            bad_checkpoints,
+        })
     }
 }

@@ -16,7 +16,9 @@ use gov_core::connector::{tool_digest, ResourceTemplate, ServerMap, ToolMap};
 use gov_core::receipt::{Coverage, Mode, OutcomeStatus, Phase, Proof, Receipt};
 use gov_core::{open, Envelope, Id, KeySet, Scope, SigningKey};
 use gov_gate::forward::Forwarder;
-use gov_gate::{DirWitnessReader, FileSpool, Gate, GateConfig, LedgerLink, Shipped, Spool};
+use gov_gate::{
+    DirWitnessReader, FileSpool, Gate, GateConfig, LedgerLink, LinkAnswer, Shipped, Spool,
+};
 use gov_ledger::verify::{verify, Check};
 use gov_ledger::{DirWitness, Ledger, MemoryStore, Witness};
 use serde_json::{json, Value};
@@ -197,14 +199,17 @@ impl Stack {
 struct InProcess(Ledger<MemoryStore>);
 #[async_trait]
 impl LedgerLink for InProcess {
-    async fn ship(&self, batch: &[Envelope], nonce: &Id) -> Result<Envelope, String> {
+    async fn ship(&self, request: &Envelope, batch: &[Envelope]) -> Result<LinkAnswer, String> {
         let now = self.0.store_time();
-        let (_, ack) = self
+        let (ack, refused) = self
             .0
-            .ingest_batch(batch, nonce, &ledger_key(), &id("ledger"), now)
+            .take_shipment(request, batch, &ledger_key(), &id("ledger"), now)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(ack)
+        Ok(LinkAnswer {
+            ack,
+            refused: refused.map(str::to_string),
+        })
     }
 }
 trait Now {
@@ -366,7 +371,12 @@ async fn every_tool_call_through_the_gate_leaves_receipts_and_is_changed_by_noth
         .unwrap();
     let reader = DirWitnessReader::new(s.dir.path().join("witness"));
     assert_eq!(
-        s.forwarder.gate().await.trim_to_witness(&reader).unwrap(),
+        s.forwarder
+            .gate()
+            .await
+            .trim_to_witness(&reader)
+            .unwrap()
+            .receipts,
         8
     );
     let report = verify(&Check {

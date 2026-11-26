@@ -64,6 +64,9 @@ pub trait Spool: Send {
     /// Keep the witnessed checkpoint the spool was last trimmed on, as read from the witness.
     fn keep_checkpoint(&mut self, bytes: &[u8]) -> Result<(), SpoolError>;
     fn kept_checkpoint(&self) -> Result<Option<Vec<u8>>, SpoolError>;
+    /// Keep the Ledger's signed answer that raised an alarm, as evidence.
+    fn keep_alarm(&mut self, bytes: &[u8]) -> Result<(), SpoolError>;
+    fn kept_alarm(&self) -> Result<Option<Vec<u8>>, SpoolError>;
 }
 
 /// A spool in a directory: one file per receipt and one for the state, each written whole
@@ -82,6 +85,14 @@ impl FileSpool {
 
     fn receipt_path(&self, seq: u64) -> PathBuf {
         self.dir.join(format!("receipt-{seq:020}.json"))
+    }
+
+    fn read_optional(&self, name: &str) -> Result<Option<Vec<u8>>, SpoolError> {
+        match fs::read(self.dir.join(name)) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(io(e)),
+        }
     }
 
     fn write(&self, path: &Path, bytes: &[u8]) -> Result<(), SpoolError> {
@@ -169,11 +180,15 @@ impl Spool for FileSpool {
     }
 
     fn kept_checkpoint(&self) -> Result<Option<Vec<u8>>, SpoolError> {
-        match fs::read(self.dir.join("covered-by.json")) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(io(e)),
-        }
+        self.read_optional("covered-by.json")
+    }
+
+    fn keep_alarm(&mut self, bytes: &[u8]) -> Result<(), SpoolError> {
+        self.write(&self.dir.join("alarm.json"), bytes)
+    }
+
+    fn kept_alarm(&self) -> Result<Option<Vec<u8>>, SpoolError> {
+        self.read_optional("alarm.json")
     }
 }
 

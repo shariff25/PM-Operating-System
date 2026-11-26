@@ -212,6 +212,23 @@ Nothing of G3b is built.
   and proven identity; the Ledger's network listener; a `gov-gate` program to run. The
   forwarder is a library with a router.
 
+**G3b step 3 built (2026-11-26): the Ledger's listener and the gate's network link,** on
+`build/gov-g3b-listener`. Not yet read by the reviewer.
+
+- `gov-ledger` has a listener (`http.rs`): one route takes a shipment, and a health route.
+  A shipment is a gate's **signed request** (`gov.ship.v1`: the gate, a fresh nonce, the
+  count and a digest of the batch) and the receipts. The Ledger answers only a request
+  signed by a key enrolled for the gate it names, that fits the batch it came with. Anything
+  else gets a bare refusal and **leaves no row in the store**, so a stranger with the address
+  can neither learn where a gate's chain stands nor fill the refusals (review findings GR-20
+  and GR-55).
+- `gov-gate` has the network link (`link.rs`), and signs the request with its own key.
+- With it, the seventh read's five findings (below) are fixed.
+- 14 gate tests, one of them over real HTTP between a gate and a Ledger. Eight controls
+  broken on purpose, each caught.
+- Still not built: programs to run (`gov-ledger`, `gov-gate`) with their configuration, a
+  timer for checkpoints, TLS and timeouts on the listeners; the shim and proven identity.
+
 ## Security review of 2026-11-26 (first read; the gate did not pass)
 
 An independent reviewer session read this spec, G1 and G2 at `2d08d15`, read-only, and ran
@@ -338,9 +355,22 @@ For G3b, from the same read: "proven" on a receipt may be set only from what
 `Session::accept` returns, and a proven receipt names its mandates; a full spool in observe
 mode lets calls through unrecorded, which must be counted and shown as "not recorded".
 
-**The reviewer has not read `build/gov-review-4` or `build/gov-g3a-fixes`.** Its session
-cannot send messages without a person's approval, so the conductor reads its verdicts from
-its transcript.
+### Seventh read, 2026-11-26, at `8863183`
+
+**Verdict: the gate passes for the spec, G1, G2 and G3a.** Every Medium of the fifth and
+sixth reads is closed. Five new Low findings, fixed on `build/gov-g3b-listener`:
+
+| Finding | What it said | What was done |
+|---|---|---|
+| GR-56 | The gate stayed silent when the newest checkpoint left it out or showed its chain shorter than before | It raises the alarm itself |
+| GR-57 | One unreadable checkpoint with the highest number stopped all trimming | The newest checkpoint that verifies is used; the bad ones are reported |
+| GR-58 | An acknowledgement for a receipt already trimmed had its hash accepted unchecked, and an alarming answer was thrown away | It is checked against the checkpoint the spool was trimmed on; the Ledger's signed answer that raised an alarm is kept with the spool |
+| GR-59 | After a key rotation the gate would refuse to start on its own older receipts | Not fixed: to be decided with key rotation in G4 |
+| GR-60 | A refusal such as "outcome without intent" ends a gate's chain at the Ledger, and the gate saw only "no progress" | The Ledger's reason is passed on to the gate and shown. Stated here: an honest gate never writes such a receipt, so this bites only a gate with a fault, and then someone must act |
+
+**The reviewer has not read G3b (the connector map, the forwarder, the listener).** Its
+session cannot send messages without a person's approval, so the conductor reads its verdicts
+from its transcript.
 
 ## 1. What is being built
 

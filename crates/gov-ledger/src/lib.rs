@@ -7,6 +7,7 @@
 //! with the gate (G3).
 
 pub mod export;
+pub mod http;
 pub mod ledger;
 pub mod pg;
 pub mod store;
