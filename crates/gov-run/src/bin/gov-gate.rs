@@ -160,6 +160,7 @@ async fn serve(s: Serve) -> anyhow::Result<()> {
             map,
             call_timeout: Duration::from_secs(s.call_timeout),
             sessions,
+            max_in_flight: gov_gate::forward::MAX_IN_FLIGHT,
         },
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;

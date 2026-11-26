@@ -212,6 +212,9 @@ pub struct ForwarderConfig {
     /// Sessions with the shim. Without it the gate opens none, and every agent is recorded
     /// as claimed.
     pub sessions: Option<SessionsConfig>,
+    /// The most tool calls recorded at once ([`MAX_IN_FLIGHT`] unless a deployment says
+    /// otherwise).
+    pub max_in_flight: usize,
 }
 
 pub struct Forwarder<S> {
@@ -250,6 +253,7 @@ impl<S: Spool + 'static> Forwarder<S> {
     pub fn new(gate: Gate<S>, mut config: ForwarderConfig) -> Result<Arc<Self>, GateError> {
         config.map.validate()?;
         let sessions = config.sessions.take().map(|c| Mutex::new(Sessions::new(c)));
+        let in_flight = Arc::new(Semaphore::new(config.max_in_flight));
         Ok(Arc::new(Forwarder {
             gate: Arc::new(AsyncMutex::new(gate)),
             config,
@@ -261,7 +265,7 @@ impl<S: Spool + 'static> Forwarder<S> {
             listed: Mutex::new(Listings::default()),
             shipping: AsyncMutex::new(()),
             sessions,
-            in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            in_flight,
             clock: wall_clock,
             counters: Counters::default(),
         }))

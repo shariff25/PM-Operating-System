@@ -189,6 +189,11 @@ struct Stack {
 }
 
 async fn stack(spool_limit: usize) -> Stack {
+    stack_holding(spool_limit, gov_gate::forward::MAX_IN_FLIGHT).await
+}
+
+/// A stack whose gate records at most `max_in_flight` calls at once.
+async fn stack_holding(spool_limit: usize, max_in_flight: usize) -> Stack {
     let dir = tempfile::tempdir().unwrap();
     let seen = Arc::new(Upstream::default());
     let upstream = serve(
@@ -213,6 +218,7 @@ async fn stack(spool_limit: usize) -> Stack {
             map: jira_map(),
             call_timeout: Duration::from_secs(2),
             sessions: None,
+            max_in_flight,
         },
     )
     .unwrap();
@@ -1060,6 +1066,7 @@ async fn a_client_that_leaves_while_the_intent_is_written_leaves_no_open_intent(
             map: jira_map(),
             call_timeout: Duration::from_secs(2),
             sessions: None,
+            max_in_flight: gov_gate::forward::MAX_IN_FLIGHT,
         },
     )
     .unwrap();
@@ -1094,4 +1101,31 @@ async fn a_client_that_leaves_while_the_intent_is_written_leaves_no_open_intent(
         (receipts[0].phase, receipts[1].phase, receipts[1].intent),
         (Phase::Intent, Phase::Outcome, Some(1))
     );
+}
+
+/// No more calls are recorded at once than the gate will hold answers for (review finding
+/// GR-99). Past that, observe mode still blocks nothing: the call goes through, and is
+/// counted as not recorded.
+#[tokio::test]
+async fn calls_past_the_cap_go_through_and_are_counted_as_not_recorded() {
+    let s = stack_holding(1000, 2).await;
+    s.list().await;
+    // Four calls at once to a server that takes 400 ms: two are recorded, two are not.
+    let call = |n: u64| s.send(update(n, "PAY-SLOW"), Some(SECRET), &[]);
+    let (a, b, c, d) = tokio::join!(call(2), call(3), call(4), call(5));
+    for (status, _, _) in [a, b, c, d] {
+        assert_eq!(status, 200);
+    }
+    let counters = &s.forwarder.counters;
+    assert_eq!(
+        (
+            counters.recorded.load(Ordering::Relaxed),
+            counters.not_recorded.load(Ordering::Relaxed)
+        ),
+        (2, 2)
+    );
+    assert_eq!(s.receipts().len(), 4);
+    // The cap is on calls in flight, not on calls: once those are done, the next is recorded.
+    assert_eq!(s.send(update(6, "PAY-1"), Some(SECRET), &[]).await.0, 200);
+    assert_eq!(counters.recorded.load(Ordering::Relaxed), 3);
 }
