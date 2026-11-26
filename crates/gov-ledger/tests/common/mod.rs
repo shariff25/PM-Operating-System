@@ -64,6 +64,9 @@ pub fn receipt(gate: &str, seq: u64, prev: Option<Digest>, at: i64) -> Receipt {
         mandate: vec![id("m-1")],
         policy_version: Some(id("7")),
         action: ReceiptAction::from(&action),
+        reversal: gov_core::action::Reversal::Restore,
+        before_digest: None,
+        reverses: None,
         decision: Decision {
             kind: DecisionKind::Allow,
             reason: Reason::Ok,

@@ -19,6 +19,25 @@ pub enum Kind {
     Destructive,
 }
 
+/// Whether, and how, an operation can be put back (spec §4.7). From the signed connector map,
+/// like [`Kind`]. Reserved in slice G1's formats; undo itself is slice G9.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Reversal {
+    /// The system keeps versions: undo writes the earlier values back.
+    Restore,
+    /// There is an opposite operation: create and archive, add and remove.
+    Inverse,
+    /// It cannot be put back: a sent message, a hard delete, a payment.
+    None,
+}
+
+impl Reversal {
+    pub fn reversible(self) -> bool {
+        !matches!(self, Reversal::None)
+    }
+}
+
 /// The digest of an action's arguments: SHA-256 over their RFC 8785 form.
 pub fn args_digest(args: &Value) -> Result<Digest> {
     Ok(Digest::of(&[

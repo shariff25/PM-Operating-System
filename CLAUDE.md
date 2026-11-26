@@ -214,6 +214,14 @@ follow-up tracking.
   Ledger's prune record, `gov verify` passing with no witness cover). Fixed on
   `build/gov-review-1`, except the signed-approval design, which is open and unbuilt; the
   reviewer's re-read is owed. Findings and what was done: the spec's "Security review" section.
+- **Undo, and who serves the approval page (owner, 2026-11-26):** asked to "build something
+  extraordinary which will help enterprises to adopt the product", the conductor proposed
+  undo: every action through the gate is either one that can be put back or one a person
+  approved. The owner's "Go" covered two things: write undo into the spec as slice G9 and
+  reserve its fields in the formats now (done; undo itself is not built and follows G6); and,
+  for review finding GR-2, the gate serves the approval page for a signed approval, not the
+  Authority (spec §4.4; not built, slice G6). Whether another product already offers undo has
+  not been checked.
 
 ## Where the build stands (2026-11-23)
 

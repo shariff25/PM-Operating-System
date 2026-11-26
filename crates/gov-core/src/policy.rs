@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::action::{CanonicalAction, Kind};
+use crate::action::{CanonicalAction, Kind, Reversal};
 use crate::countersign::Class;
 use crate::envelope::document;
 use crate::error::{Error, Result};
@@ -31,6 +31,10 @@ pub struct Match {
     pub kinds: Option<BTreeSet<Kind>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<Vec<ResourcePattern>>,
+    /// `false` matches only operations that cannot be put back; `true` only those that can
+    /// (spec §4.7). The rule "what cannot be undone needs a person" is one line with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reversible: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,8 +114,15 @@ pub struct Evaluation {
 
 impl Match {
     /// `refusing`: a refusal's `X/*` also covers `X` itself (review finding GR-7).
-    fn applies(&self, subject: &Subject<'_>, action: &CanonicalAction, refusing: bool) -> bool {
+    fn applies(
+        &self,
+        subject: &Subject<'_>,
+        action: &CanonicalAction,
+        reversal: Reversal,
+        refusing: bool,
+    ) -> bool {
         self.agent.as_ref().is_none_or(|a| a == subject.agent)
+            && self.reversible.is_none_or(|r| r == reversal.reversible())
             && self
                 .label
                 .as_ref()
@@ -172,12 +183,21 @@ impl PolicyBundle {
         Ok(())
     }
 
-    /// Decide `action` for `subject`.
-    pub fn evaluate(&self, subject: &Subject<'_>, action: &CanonicalAction) -> Evaluation {
+    /// Decide `action` for `subject`. `reversal` is the connector map's word on whether the
+    /// operation can be put back.
+    pub fn evaluate(
+        &self,
+        subject: &Subject<'_>,
+        action: &CanonicalAction,
+        reversal: Reversal,
+    ) -> Evaluation {
         let matched: Vec<&Rule> = self
             .rules
             .iter()
-            .filter(|r| r.matches.applies(subject, action, r.then == Effect::Refuse))
+            .filter(|r| {
+                r.matches
+                    .applies(subject, action, reversal, r.then == Effect::Refuse)
+            })
             .collect();
         // The strictest class a matching rule names; otherwise by what the action does.
         let freshness =
