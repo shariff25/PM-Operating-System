@@ -71,6 +71,9 @@ fn describe(problem: &Problem) -> String {
         }
         Problem::LedgerSilent => "no checkpoint for more than twice the interval".into(),
         Problem::GateQuiet => "the gate's chain has not moved for longer than allowed".into(),
+        Problem::CheckpointBackdated => {
+            "a checkpoint is dated earlier than a receipt it covers: the Ledger's dates cannot be relied on".into()
+        }
         Problem::NoCheckpoint => {
             "the witness holds no checkpoint: nothing in the export is covered".into()
         }

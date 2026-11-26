@@ -39,6 +39,7 @@ pub fn receipt(gate: &str, seq: u64, prev: Option<Digest>, at: i64) -> Receipt {
         ResourcePath::new("jira/project/PAY/issue/PAY-12").unwrap(),
         None,
         &json!({"n": seq}),
+        &[9; 32],
     )
     .unwrap();
     let outcome = seq % 2 == 0;
@@ -78,6 +79,7 @@ pub fn receipt(gate: &str, seq: u64, prev: Option<Digest>, at: i64) -> Receipt {
             upstream_ref: Some(id("PAY-12")),
             response_digest: None,
         }),
+        intent: outcome.then(|| seq - 1),
     }
 }
 

@@ -111,15 +111,6 @@ impl<S: Store> Ledger<S> {
                     };
                 }
             }
-            // A gate's clock does not run backwards along its own chain (finding GR-16). The
-            // receipt before may have been pruned; then there is nothing to compare with.
-            if let Some(h) = &head {
-                if let Some(before) = self.store.receipt(&self.scope, &gate, h.seq).await? {
-                    if opened.doc.at < before.at {
-                        return self.refuse(envelope, "time_went_back", true, now).await;
-                    }
-                }
-            }
             let new_head = match follow(head.as_ref(), &opened) {
                 Ok(h) => h,
                 Err(e) => return self.refuse(envelope, e.code(), true, now).await,
@@ -131,12 +122,40 @@ impl<S: Store> Ledger<S> {
                 received_at: now,
                 envelope: envelope.clone(),
             };
+            // A gate's clock should not run backwards along its own chain (finding GR-16),
+            // but refusing the receipt would end the chain: every later one links to it. A
+            // slow lease renewal can step an honest gate's clock back a second or two (finding
+            // GR-42). So the receipt is taken, the step back is recorded, and `verify`
+            // reports it. The receipt before may have been pruned; then there is nothing to
+            // compare with.
+            let mut stepped_back = false;
+            if let Some(h) = &head {
+                if let Some(before) = self.store.receipt(&self.scope, &gate, h.seq).await? {
+                    stepped_back = opened.doc.at < before.at;
+                }
+            }
             match self
                 .store
                 .append(&self.scope, &gate, head.map_or(0, |h| h.seq), &stored)
                 .await
             {
-                Ok(()) => return Ok(Ingested::Added),
+                Ok(()) => {
+                    if stepped_back {
+                        self.store
+                            .record_refusal(
+                                &self.scope,
+                                &Refusal {
+                                    at: now,
+                                    kid: envelope.kid.clone(),
+                                    code: "taken_time_went_back".to_string(),
+                                    envelope_hash: envelope_hash(envelope),
+                                    envelope: None,
+                                },
+                            )
+                            .await?;
+                    }
+                    return Ok(Ingested::Added);
+                }
                 Err(StoreError::HeadMoved) => continue,
                 Err(e) => return Err(e.into()),
             }

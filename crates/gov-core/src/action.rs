@@ -38,11 +38,30 @@ impl Reversal {
     }
 }
 
-/// The digest of an action's arguments: SHA-256 over their RFC 8785 form.
-pub fn args_digest(args: &Value) -> Result<Digest> {
+/// A random value the gate draws for each action and keeps with the values it digests. It is
+/// never in a receipt.
+pub type Salt = [u8; 32];
+
+/// The digest of an action's arguments: SHA-256 over a salt and their RFC 8785 form.
+///
+/// Salted because a plain digest of a small value (a status, a yes or no, an amount) gives the
+/// value to anyone who can guess it, and receipts outlive the values (review finding GR-36).
+/// Whoever must recompute the digest, such as the page an approver reads, is given the salt
+/// with the readable arguments.
+pub fn args_digest(args: &Value, salt: &Salt) -> Result<Digest> {
     Ok(Digest::of(&[
         b"gov.args.v1\0",
+        salt,
         jcs::canonical(args)?.as_bytes(),
+    ]))
+}
+
+/// The digest of a target's values before a write, salted for the same reason (spec §4.7).
+pub fn before_digest(values: &Value, salt: &Salt) -> Result<Digest> {
+    Ok(Digest::of(&[
+        b"gov.before.v1\0",
+        salt,
+        jcs::canonical(values)?.as_bytes(),
     ]))
 }
 
@@ -101,6 +120,7 @@ impl CanonicalAction {
         resource: ResourcePath,
         resource_version: Option<Id>,
         args: &Value,
+        salt: &Salt,
     ) -> Result<Self> {
         if resource.system() != system.as_str() {
             return Err(Error::Malformed("resource is not in its system"));
@@ -111,7 +131,7 @@ impl CanonicalAction {
             kind,
             resource,
             resource_version,
-            args_digest: args_digest(args)?,
+            args_digest: args_digest(args, salt)?,
         })
     }
 
@@ -191,6 +211,7 @@ mod tests {
             ResourcePath::new("jira/project/PAY/issue/PAY-12").unwrap(),
             version.map(|v| Id::new(v).unwrap()),
             &args,
+            &[9; 32],
         )
         .unwrap()
     }
@@ -220,6 +241,20 @@ mod tests {
         assert_ne!(a.digest(), kind.digest());
     }
 
+    /// Review finding GR-36: the same small value under two salts gives unrelated digests, so
+    /// a digest cannot be matched against a list of guesses.
+    #[test]
+    fn a_digest_of_a_small_value_does_not_give_it_away() {
+        let yes = json!({"approved": true});
+        let a = args_digest(&yes, &[1; 32]).unwrap();
+        assert_eq!(a, args_digest(&yes, &[1; 32]).unwrap());
+        assert_ne!(a, args_digest(&yes, &[2; 32]).unwrap());
+        assert_ne!(
+            before_digest(&yes, &[1; 32]).unwrap(),
+            args_digest(&yes, &[1; 32]).unwrap()
+        );
+    }
+
     #[test]
     fn a_resource_must_be_in_its_system() {
         assert!(CanonicalAction::new(
@@ -229,6 +264,7 @@ mod tests {
             ResourcePath::new("github/repo/x").unwrap(),
             None,
             &json!({}),
+            &[9; 32],
         )
         .is_err());
     }

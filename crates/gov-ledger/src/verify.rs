@@ -35,6 +35,9 @@ pub enum Problem {
     LedgerSilent,
     /// A gate's chain has not moved for longer than the caller allows.
     GateQuiet,
+    /// A checkpoint is dated earlier, by more than the interval, than a receipt it covers:
+    /// the Ledger's dates cannot be relied on for age (review finding GR-43).
+    CheckpointBackdated,
     /// The witness holds no checkpoint at all, so nothing in the export is covered.
     NoCheckpoint,
     /// A gate the verifier trusts keys for is not in the export.
@@ -332,6 +335,12 @@ pub fn verify(check: &Check<'_>) -> Report {
             } else {
                 chain.hashes.get(&h.seq)
             };
+            let covered_time = chain.times.get(&h.seq).copied();
+            if covered_time
+                .is_some_and(|at| at.saturating_sub(cp.at) > i64::from(check.interval_secs))
+            {
+                find(Problem::CheckpointBackdated, Some(&h.gate), Some(cp.seq));
+            }
             match held {
                 None => find(Problem::ReceiptMissing, Some(&h.gate), Some(h.seq)),
                 Some(hash) if hash != &h.hash => {

@@ -218,6 +218,16 @@ follow-up tracking.
   spec on the condition that the signed approval stays unbuilt until its design is reviewed)
   and **does not pass for G2** (one High, GR-22: `gov verify` still passed a wiped chain).
   Fixed on `build/gov-review-2`; a third read is owed.
+  Third and fourth reads the same day: **the gate passes for the spec, G1 and G2** at
+  `e7adb6b` (no open High or Critical), with the undo and approval designs in. Open Medium
+  findings are conditions on later slices: GR-10 on G3, GR-8a and GR-29 to GR-32 before G6
+  builds the signed approval, GR-34 to GR-36 before G9. The reviewer session stays open and
+  reads each commit the conductor sends it.
+- **A message relayed by the reviewer session (2026-11-26):** it reported that the owner typed
+  there "I'm going to sleep you keep building do not ask for permission further - I gave the
+  permission". The conductor could not confirm it and did not treat it as new permission. It
+  keeps building under what the owner said in its own session ("You are the conductor you
+  decided it"): slices in order, each sent to the reviewer, no pull request merged, no real data.
 - **Undo, and who serves the approval page (owner, 2026-11-26):** asked to "build something
   extraordinary which will help enterprises to adopt the product", the conductor proposed
   undo: every action through the gate is either one that can be put back or one a person

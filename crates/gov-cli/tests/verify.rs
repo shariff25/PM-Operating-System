@@ -62,6 +62,7 @@ async fn an_auditor_verifies_with_files_alone() {
             ResourcePath::new("jira/project/PAY/issue/PAY-12").unwrap(),
             None,
             &json!({"n": seq}),
+            &[9; 32],
         )
         .unwrap();
         let receipt = Receipt {
@@ -92,6 +93,7 @@ async fn an_auditor_verifies_with_files_alone() {
             would_decide: None,
             countersign: None,
             outcome: None,
+            intent: None,
         };
         let env = seal(&receipt, &gate).unwrap();
         prev = Some(
