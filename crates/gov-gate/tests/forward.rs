@@ -278,6 +278,35 @@ impl Stack {
     }
 }
 
+/// A file's text, and with it the text of everything in it that is base64: a receipt's body
+/// is carried encoded, so a search of the raw file alone would miss what is inside it.
+fn laid_bare(bytes: &[u8]) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    fn strings(value: &Value, out: &mut Vec<String>) {
+        match value {
+            Value::String(s) => out.push(s.clone()),
+            Value::Array(items) => items.iter().for_each(|v| strings(v, out)),
+            Value::Object(map) => map.values().for_each(|v| strings(v, out)),
+            _ => {}
+        }
+    }
+    let mut text = String::from_utf8_lossy(bytes).into_owned();
+    if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
+        let mut found = Vec::new();
+        strings(&value, &mut found);
+        for s in found {
+            if let Ok(decoded) = URL_SAFE_NO_PAD.decode(&s) {
+                if std::str::from_utf8(&decoded).is_ok() {
+                    text.push('\n');
+                    text.push_str(&laid_bare(&decoded));
+                }
+            }
+        }
+    }
+    text
+}
+
 struct InProcess(Ledger<MemoryStore>);
 #[async_trait]
 impl LedgerLink for InProcess {
@@ -428,11 +457,19 @@ async fn every_tool_call_through_the_gate_leaves_receipts_and_is_changed_by_noth
 
     // Nothing the agent sent or the server answered is on the gate's disk: not the
     // credential, not an argument value, not the reply.
+    let mut spooled = String::new();
     for entry in std::fs::read_dir(s.dir.path().join("spool")).unwrap() {
-        let text = std::fs::read_to_string(entry.unwrap().path()).unwrap();
-        for secret in ["agent-jira-token", "Refund flow", "4411", "no such issue"] {
-            assert!(!text.contains(secret), "{secret} is in the spool");
-        }
+        spooled.push_str(&laid_bare(&std::fs::read(entry.unwrap().path()).unwrap()));
+    }
+    // The search reaches inside the receipts: what a receipt does hold is found.
+    assert!(spooled.contains("triage-bot") && spooled.contains("issue.update"));
+    for secret in [
+        "agent-jira-token",
+        "Refund flow",
+        "customer 4411",
+        "no such issue",
+    ] {
+        assert!(!spooled.contains(secret), "{secret} is in the spool");
     }
 
     // And the chain it wrote is one an auditor can check from files alone.
