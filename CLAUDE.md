@@ -243,6 +243,18 @@ follow-up tracking.
   Fixed on `build/gov-review-8` with GR-68 to GR-73 (GR-72, the gate's clock, waits for G4);
   19 controls broken on purpose, each caught. The re-read, and the first read of the listener
   step, are owed.
+- **Ninth read (2026-11-26), at `5c6c4e6`:** the gate passes for the spec, G1, G2, G3a and
+  G3b steps 1 to 3 **in observe mode**; the four findings that barred shadow and enforce mode
+  are closed, with a standing condition that each connector map has its own test and is read
+  by the reviewer. Two new Medium (GR-74, refusals stored without limit; GR-75, nothing
+  required an encrypted connection) and six Low; GR-77 and GR-81 stay open as conditions on
+  the listener's hardening and on G4.
+- **G3b step 4 built (2026-11-26):** the two programs, `gov-ledger` and `gov-gate`, in a new
+  crate `gov-run` (`build/gov-g3b-programs`). Run as an operator would against a fake MCP
+  server and Postgres, the auditor's check of the export passes, also across a gate restart.
+  Keys are files, refused unless `GOV_DATA_CLASS=fake`; neither program speaks TLS, so both
+  keep to their own machine unless told otherwise; the gate's connector map is an unsigned
+  file until G4. Not yet read by the reviewer. Still to build in G3b: the shim.
 - **A message relayed by the reviewer session (2026-11-26):** it reported that the owner typed
   there "I'm going to sleep you keep building do not ask for permission further - I gave the
   permission". The conductor could not confirm it and did not treat it as new permission. It

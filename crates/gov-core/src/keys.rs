@@ -46,6 +46,21 @@ impl SigningKey {
         Ok(SigningKey { kid, pair })
     }
 
+    /// The key kept in a key file's text (see [`new_key_file`]). This crate reads no file:
+    /// the program that does checks who else can read it.
+    pub fn from_file_text(text: &str) -> Result<Self> {
+        let file: KeyFile = serde_json::from_str(text).map_err(|_| Error::Malformed("key file"))?;
+        let mut seed = [0u8; 32];
+        let decoded = URL_SAFE_NO_PAD
+            .decode(&file.seed)
+            .map_err(|_| Error::Malformed("key file"))?;
+        if decoded.len() != seed.len() {
+            return Err(Error::Malformed("key file"));
+        }
+        seed.copy_from_slice(&decoded);
+        SigningKey::from_seed(file.kid, &seed)
+    }
+
     pub fn kid(&self) -> &Id {
         &self.kid
     }
@@ -60,6 +75,27 @@ impl SigningKey {
     pub(crate) fn sign(&self, message: &[u8]) -> Vec<u8> {
         self.pair.sign(message).as_ref().to_vec()
     }
+}
+
+/// A private key as a file holds it. It has no `Debug`, so it cannot be printed by accident.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeyFile {
+    kid: Id,
+    seed: String,
+}
+
+/// A new random key: the text of its key file, to be written where only the program that
+/// signs with it can read, and the public key to enrol.
+pub fn new_key_file(kid: Id) -> Result<(String, PublicKey)> {
+    let seed = random_salt()?;
+    let public = SigningKey::from_seed(kid.clone(), &seed)?.public();
+    let text = serde_json::to_string(&KeyFile {
+        kid,
+        seed: URL_SAFE_NO_PAD.encode(seed),
+    })
+    .map_err(|_| Error::Malformed("key file"))?;
+    Ok((text, public))
 }
 
 /// A public key and its id, as it appears inside a document (a mandate names its agent's).

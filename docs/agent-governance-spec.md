@@ -232,8 +232,36 @@ Nothing of G3b is built.
   session; the map cannot fail and derives a Jira project from the issue key; shipping no
   longer holds the gate. `gov-core` has 45 attack tests and the forwarder 7; 19 controls
   broken on purpose, each caught. Not yet re-read by the reviewer.
-- Still not built: programs to run (`gov-ledger`, `gov-gate`) with their configuration, a
-  timer for checkpoints, TLS and timeouts on the listeners; the shim and proven identity.
+- Still not built after this step: the shim and proven identity; TLS.
+
+**G3b step 4 built (2026-11-26): the two programs,** on `build/gov-g3b-programs`, in a new
+crate `gov-run`. Built after the eighth read's fixes; not yet read by the reviewer.
+
+- `gov-ledger` has `keygen`, `enrol` (a gate's public key, once; this stands in for the
+  Authority until G4), `serve` (the listener, and a checkpoint to the witness on a timer) and
+  `export` (the export and the public keys, for `gov verify`). Its database address comes
+  from `GOV_LEDGER_DATABASE_URL`, never from the command line, and a failure to connect is
+  reported without the address.
+- `gov-gate` has `keygen` and `serve`: the forwarder in observe mode in front of one MCP
+  server, shipping on a timer and trimming its spool to the witness. `/healthz` says the mode,
+  that nothing is enforced, and the counts of recorded, not recorded and unmapped calls.
+- **Keys are files for now** (§9: the file driver). A key file is created new, never over
+  another, readable by its owner alone; a program refuses a key file anyone else can read or
+  that is a link, prints nothing from it, and refuses to start at all unless
+  `GOV_DATA_CLASS=fake`.
+- **Neither program speaks TLS.** So by default each listens only on its own machine and
+  sends plain HTTP only to its own machine; HTTPS to anywhere is allowed. An operator with a
+  TLS terminator in front passes `--plain-http-on-network`. An address that carries a user
+  name or password is refused.
+- **Stated limits of this step:** the connector map and the Ledger's public keys are files
+  the operator supplies to the gate, unsigned, until the Authority signs the bundle (G4):
+  whoever can change those files can change what the gate records a call as. No pruning job
+  is run. Nothing stops a program cleanly: it is killed, and the spool and the Ledger's
+  intake are built to be safe against that.
+- One test runs both programs as an operator would, against a fake MCP server and Postgres:
+  keys, enrolment, calls through the gate, a restart of the gate, and the auditor's check of
+  the export against the witness passing each time. A second test covers what each program
+  refuses to start with.
 
 ## Security review of 2026-11-26 (first read; the gate did not pass)
 
@@ -401,6 +429,27 @@ enforce mode until they are closed. All but one line of this table is fixed on
 | GR-71 | An unmapped tool's name went into the receipt, text the server or caller chose | The receipt carries `unmapped-` and 16 hex digits of a digest of the name |
 | GR-72 | Receipts are stamped from the gate machine's clock | Not changed: stated in the code; the lease's time is used once there is an Authority (G4) |
 | GR-73 | The count of unrecorded calls was lost at a restart | Kept in the spool's state as well |
+
+### Ninth read, 2026-11-26, at `5c6c4e6`
+
+**Verdict: the gate passes for the spec, G1, G2, G3a and G3b steps 1 to 3, in observe mode.**
+No High or Critical. GR-61, 62 and 64 are closed; GR-65 is closed in the code with a standing
+condition: **each connector map needs its own test that two arguments cannot name different
+targets, and the reviewer reads each map.** GR-63 and GR-66 to GR-73 are closed (GR-72
+accepted as stated, until G4). New findings:
+
+| Finding | Severity | What it said | What was done |
+|---|---|---|---|
+| GR-74 | Medium | A refused receipt whose signature held is stored whole every time it arrives; a stuck gate resends its batch every round, so the refusals table grows without limit | See the status note for the fixes of the ninth read |
+| GR-75 | Medium | Nothing requires an encrypted connection: receipts, and through the forwarder an agent's credential, could cross a network in the clear | The programs refuse plain HTTP beyond their own machine unless the operator passes `--plain-http-on-network` (G3b step 4) |
+| GR-76 | Low | At 4,096 remembered sessions the whole table is emptied, so one agent can make every session's tools `unknown` | See the status note |
+| GR-77 | Low | An anonymous request to the Ledger costs a database lookup, with no rate limit | Open: with the listener's hardening |
+| GR-78 | Low | The Ledger's answer to the gate is read whole with no cap | See the status note |
+| GR-79 | Low | Two rounds of shipping at once prepare the same batch | See the status note |
+| GR-80 | Low | Only the last alarming answer is kept | See the status note |
+| GR-81 | Low | A mandate's grants for a folded system are not linted | Open: a condition on G4 (the Authority lints at issue; the chain check refuses an upper-case grant for a folded system) |
+
+The reviewer said GR-74 and GR-75 should be fixed before G3b is called done.
 
 ## 1. What is being built
 
@@ -1061,8 +1110,8 @@ is later work.
 ## 9. Code layout and rules
 
 - Crates, all new: `gov-core` (documents, canonical action, scope and policy evaluation,
-  verification; no I/O, no clock, no network), `gov-ledger`, `gov-gate` (library and binary),
-  `gov-authority`, `gov-cli` (the `gov` command: `verify`, `enrol`, `policy check|sign`,
+  verification; no I/O, no clock, no network), `gov-ledger`, `gov-gate` (libraries), `gov-run`
+  (the programs `gov-ledger` and `gov-gate`), `gov-authority`, `gov-cli` (the `gov` command: `verify`, `enrol`, `policy check|sign`,
   `mandate`).
 - **Dependency rule,** checked by a test over `cargo metadata`: no `gov-*` crate depends on a
   `pmos-*` crate, except the extracted MCP client crate and, if confirmed (§7.2), the Entra

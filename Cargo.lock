@@ -1076,6 +1076,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "gov-run"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "gov-core",
+ "gov-gate",
+ "gov-ledger",
+ "reqwest",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "h2"
 version = "0.4.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
