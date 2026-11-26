@@ -531,9 +531,56 @@ async fn a_record_sent_again_is_acted_on_and_the_authoritys_chain_is_kept() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        (noted.gate, noted.ended, noted.authority),
-        (id("gate-1"), true, id("authority"))
+        (&noted.gate, noted.ended, &noted.authority),
+        (&id("gate-1"), true, &id("authority"))
     );
+
+    // A Ledger restored from another copy can hold notes that say more, or less, than its
+    // chain (GR-131). At start the notes are written again from the chain: a note with no
+    // record behind it goes, a missing one comes back, and an ended one is ended again.
+    let stray = gov_ledger::Enrolment {
+        authority: id("authority"),
+        gate: id("gate-7"),
+        digest: gov_core::enrol::key_digest(&key("gate-7:k1", 77).public()).unwrap(),
+        ended: false,
+    };
+    ledger.store().clear_enrolments(&scope()).await.unwrap();
+    ledger
+        .store()
+        .note_enrolment(&scope(), &id("gate-7:k1"), &stray)
+        .await
+        .unwrap();
+    // A live note for a gate the chain says is disabled.
+    let revived = gov_ledger::Enrolment {
+        ended: false,
+        ..noted.clone()
+    };
+    ledger
+        .store()
+        .note_enrolment(
+            &scope(),
+            &id("gate-2:k1"),
+            &gov_ledger::Enrolment {
+                gate: id("gate-2"),
+                digest: gov_core::enrol::key_digest(&g2.public()).unwrap(),
+                ..revived
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(ledger.rebuild_notes().await.unwrap(), acked);
+    let note = |kid: &'static str| {
+        let ledger = &ledger;
+        async move { ledger.store().enrolment(&scope(), &id(kid)).await.unwrap() }
+    };
+    assert!(note("gate-7:k1").await.is_none());
+    assert!(note("gate-1:k1").await.unwrap().ended);
+    assert!(note("gate-2:k1").await.unwrap().ended);
+    refused(ledger.supply_key(&g2.public()).await);
+    refused(ledger.supply_key(&key("gate-7:k1", 77).public()).await);
+    // Done twice it says the same.
+    ledger.rebuild_notes().await.unwrap();
+    assert!(note("gate-1:k1").await.unwrap().ended);
 
     // The Authority's chain is not pruned, however old: it is what says which keys are
     // trusted. A gate's chain of the same age is.

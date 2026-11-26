@@ -369,6 +369,16 @@ follow-up tracking.
   the application calls, identity and mandate as text fields, and enforcement before shadow
   mode. The scene cannot be shown as working enforcement until G6; nothing is blocked today.
   "The rest you keep building": slices in order, as before.
+- **Seventeenth and eighteenth reads (2026-11-26), G4b at `04e5117` and spec text at
+  `1600134`:** no High or Critical; G4b is sound as built. The design of G4c (mandates from
+  the Authority, spec §7.6.2) may be built once one Medium point was in the text (GR-138:
+  the gate holds every mandate to the template in the root-signed bundle it holds, so a
+  taken mandates key yields only what the templates allow), which it is. Two Medium points
+  on the spec text written from the owner's feedback, both reworded: an outsider verifies
+  that the gate recorded a refusal, not that nothing reached the system; and with the gate
+  as a library inside PM OS, PM OS's operator can go round it, so the scene is run with a
+  separate gate holding the credential. The reviewer agreed with the three items not taken
+  up. Its session reported a usage limit once during this read and then answered.
 - **A message relayed by the reviewer session (2026-11-26):** it reported that the owner typed
   there "I'm going to sleep you keep building do not ask for permission further - I gave the
   permission". The conductor could not confirm it and did not treat it as new permission. It

@@ -241,6 +241,30 @@ impl<S: Store> Ledger<S> {
         self.enrol_gate_key(&gate, key).await
     }
 
+    /// Write the notes of enrolments again from the Authorities' chains as this Ledger holds
+    /// them, and retire the keys those chains say are ended. For when the Ledger starts: on
+    /// a Ledger restored from an older copy the notes could say more, or less, than the
+    /// chain (review finding GR-131), and a key is taken on the notes. Every record is
+    /// opened under its chain's own keys; one that does not open stops the rebuild, and
+    /// with it the start. Returns how many records were read.
+    pub async fn rebuild_notes(&self) -> Result<u64, LedgerError> {
+        self.store.clear_enrolments(&self.scope).await?;
+        let mut read = 0;
+        for (authority, held) in self.store.gate_keys(&self.scope).await? {
+            if self.store.chain_kind(&self.scope, &authority).await? != Some(ChainKind::Admin) {
+                continue;
+            }
+            let keys = KeySet::new(held.iter().cloned());
+            for stored in self.store.receipts(&self.scope, &authority).await? {
+                let record = open::<AdminRecord>(&stored.envelope, &keys, &self.scope)?.doc;
+                self.grant_trust(&authority, &record).await?;
+                self.end_trust(&authority, &record).await?;
+                read += 1;
+            }
+        }
+        Ok(read)
+    }
+
     /// What one of an Authority's records grants at the Ledger: an enrolment is noted, so
     /// that the key it names can be supplied. Done only for a record the chain holds, and
     /// again when the record comes again, in case the Ledger stopped between keeping it and
