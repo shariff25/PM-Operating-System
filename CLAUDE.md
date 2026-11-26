@@ -268,6 +268,13 @@ follow-up tracking.
   reach, a failed proof with no mark of its own); they are, in §5.3.1. Standing condition
   from GR-75: any other embedder of the gate's libraries (G7) must make the programs' check
   on plain HTTP itself.
+- **Eleventh read (2026-11-26), at `b97d8b3`:** the gate passes for the spec, G1, G2, G3a and
+  G3b steps 1 to 4 in observe mode; G3b is done but for the shim, and **the shim may be built
+  from §5.3.1 as written**. Four Low findings (GR-97 to GR-100). Before it, CI had found a
+  real fault in an earlier fix (an agent leaving at the wrong instant left a receipt without
+  its outcome); fixed at `e76ab0f` and read by the reviewer.
+- **Owner, 2026-11-26: "Build the shim".** Given as the reviewer's verdict clearing it came
+  in. The shim is built from §5.3.1, on `build/gov-shim`.
 - **A message relayed by the reviewer session (2026-11-26):** it reported that the owner typed
   there "I'm going to sleep you keep building do not ask for permission further - I gave the
   permission". The conductor could not confirm it and did not treat it as new permission. It

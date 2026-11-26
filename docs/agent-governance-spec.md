@@ -493,6 +493,25 @@ made that moment long enough for CI's disk to hit it. Fixed on `build/gov-ci-ope
 the whole call, intent receipt included, runs in the task. A test with a deliberately slow
 spool fails without the fix and passes with it.
 
+### Eleventh read, 2026-11-26, at `b97d8b3`
+
+**Verdict: the gate passes for the spec, G1, G2, G3a and G3b steps 1 to 4, in observe mode;
+G3b is done but for the shim, and the shim may be built from §5.3.1 as written.** No High or
+Critical. GR-82, GR-76, GR-84, GR-86 and GR-87 are closed; GR-88 to GR-96 are answered in the
+design; the fix for the fault CI found (the open intent) was read and found right, and
+nothing else in the forwarder can be left half-done by a client that leaves.
+
+| Finding | Severity | What it said | What is done |
+|---|---|---|---|
+| GR-97 | Low | Someone holding a copy of the chain can keep the unproven sessions full, and so stop the real shim opening one after a restart | Built into the shim's first version: the request to open a session is signed by the agent's key over the gate's name and a fresh value |
+| GR-98 | Low | Any local process, an agent on the gate's own machine included, can read the operator address | With the shim's step: a secret on the operator address |
+| GR-99 | Low | No cap on calls in flight: each holds up to 4 MB for up to the call's time limit | With the shim's step: a cap; past it, in observe mode, the call is forwarded and counted as not recorded |
+| GR-100 | Low | If the witness's newest 16 checkpoints all fail to verify, nothing is trimmed until someone removes them | Stated here. A Ledger that can write to the witness can also stop publishing, so this adds little; the gate reports the bad checkpoints each round |
+
+Open conditions on later slices, by the reviewer's list: GR-77 (listener hardening), GR-81
+(G4), GR-85 (G8), a test for each connector map (GR-65), GR-8a and GR-29 to GR-32 (G6),
+GR-34 to GR-36 (G9).
+
 ## 1. What is being built
 
 Agent Governance is a second product, separate from PM OS. It has three parts.
