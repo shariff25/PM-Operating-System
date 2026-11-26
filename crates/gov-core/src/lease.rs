@@ -217,9 +217,10 @@ pub struct Pruned {
 
 document!(Pruned, "gov.pruned.v1");
 
-/// The Ledger's signed statement, in answer to a batch of receipts, of where it now holds a
+/// The Ledger's signed statement, in answer to one batch of receipts, of where it now holds a
 /// gate's chain. A gate keeps what it shipped until it has this, and keeps its spool until a
-/// witnessed checkpoint covers it (review finding GR-10).
+/// witnessed checkpoint covers it (review finding GR-10). It carries the nonce the gate sent
+/// with the batch, so an old answer cannot be played back (GR-55).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IntakeAck {
@@ -228,8 +229,12 @@ pub struct IntakeAck {
     pub env: Id,
     pub issuer: Id,
     pub gate: Id,
+    pub nonce: Id,
+    /// The number of the last receipt the Ledger holds for this gate; 0 if it holds none.
     pub seq: u64,
-    pub hash: Digest,
+    /// That receipt's hash. Absent only when `seq` is 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<Digest>,
     /// The Ledger's clock when it signed.
     pub at: i64,
 }

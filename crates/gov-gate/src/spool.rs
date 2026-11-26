@@ -61,6 +61,9 @@ pub trait Spool: Send {
     fn held(&self) -> Result<Vec<Spooled>, SpoolError>;
     /// Drop receipts up to and including `seq`.
     fn trim(&mut self, seq: u64) -> Result<(), SpoolError>;
+    /// Keep the witnessed checkpoint the spool was last trimmed on, as read from the witness.
+    fn keep_checkpoint(&mut self, bytes: &[u8]) -> Result<(), SpoolError>;
+    fn kept_checkpoint(&self) -> Result<Option<Vec<u8>>, SpoolError>;
 }
 
 /// A spool in a directory: one file per receipt and one for the state, each written whole
@@ -159,5 +162,63 @@ impl Spool for FileSpool {
             }
         }
         Ok(())
+    }
+
+    fn keep_checkpoint(&mut self, bytes: &[u8]) -> Result<(), SpoolError> {
+        self.write(&self.dir.join("covered-by.json"), bytes)
+    }
+
+    fn kept_checkpoint(&self) -> Result<Option<Vec<u8>>, SpoolError> {
+        match fs::read(self.dir.join("covered-by.json")) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(io(e)),
+        }
+    }
+}
+
+/// Reads checkpoints from the witness store itself. A gate trims its spool only on what it
+/// reads here, never on a checkpoint someone hands it (review finding GR-49).
+pub trait WitnessReader: Send + Sync {
+    /// Every checkpoint in the witness: its number and its bytes.
+    fn checkpoints(&self) -> Result<Vec<(u64, Vec<u8>)>, String>;
+}
+
+/// The directory witness, read directly: `checkpoint-<twenty digits>.json`.
+pub struct DirWitnessReader {
+    dir: PathBuf,
+}
+
+impl DirWitnessReader {
+    pub fn new(dir: impl AsRef<Path>) -> Self {
+        DirWitnessReader {
+            dir: dir.as_ref().to_path_buf(),
+        }
+    }
+}
+
+impl WitnessReader for DirWitnessReader {
+    fn checkpoints(&self) -> Result<Vec<(u64, Vec<u8>)>, String> {
+        let mut out = Vec::new();
+        let entries = match fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(e.to_string()),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Some(seq) = name
+                .strip_prefix("checkpoint-")
+                .and_then(|s| s.strip_suffix(".json"))
+                .filter(|s| s.len() == 20 && s.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|s| s.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            out.push((seq, fs::read(entry.path()).map_err(|e| e.to_string())?));
+        }
+        out.sort_by_key(|(seq, _)| *seq);
+        Ok(out)
     }
 }

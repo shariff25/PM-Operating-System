@@ -134,8 +134,8 @@ Where G3a differs from the text below:
   call in flight, so an outcome is never the receipt that does not fit. When the spool is
   full the gate says so; what the front door does then in observe mode (let the call through
   unrecorded, and count it where an operator sees it) is G3b's, and must be stated on screen.
-- The checkpoint a gate trims on is one handed to it. Reading it from the witness store
-  itself, not from the Ledger, is G3b's.
+- (Changed after the sixth read.) The gate reads checkpoints from the witness store itself
+  and cannot be handed one.
 - Not in G3a: the MCP front door, the shim, the move of PM OS's MCP client layer into a
   shared crate, the connector map (with `kind`, the reversal class and `outward`), the
   Ledger's network listener and the bound on recorded refusals (GR-20), case folding for
@@ -277,8 +277,29 @@ three smaller findings; all are answered on `build/gov-review-4`.
 
 Also added at the reviewer's word: the gate's approval challenge is single use and expires (T26).
 
-**The reviewer has not read `build/gov-review-4` or G3a.** Its session cannot send messages
-without a person's approval, so the conductor reads its verdicts from its transcript.
+### Sixth read, 2026-11-26, G3a at `5250505`
+
+**Verdict: the gate passes for G3a.** No High or Critical. Three Medium findings were
+conditions on G3b; all eight findings are fixed on `build/gov-g3a-fixes`, before G3b starts.
+
+| Finding | Severity | What it said | What was done |
+|---|---|---|---|
+| GR-48 | Medium | A crash after an outcome was written, and before its intent was marked answered, made the gate write a second outcome of `unknown` on restart | On opening, an open intent that a held outcome already names is marked answered and nothing is written |
+| GR-49 | Medium | The gate trimmed its spool on any checkpoint the Ledger signed and handed to it, so a Ledger could have it drop receipts that were never witnessed | The gate reads the witness store itself (`trim_to_witness`); it cannot be handed a checkpoint. It never trims past what the Ledger acknowledged, and keeps the checkpoint it trimmed on |
+| GR-50 | Medium | The gate could not tell a Ledger that takes nothing from one with nothing to take; never sent again to a Ledger restored from an older copy; and took an honest Ledger that was ahead for a liar | `ship` answers one of four things: nothing to send, advanced, no progress, or the Ledger is behind (and the gate sends again from there). The acknowledged receipt is looked up in the whole spool. The Ledger answers even when it holds nothing |
+| GR-51 | Low | The gate adopted spool files without checking them | Each is opened under the gate's own key and its number and hash compared |
+| GR-52 | Low | A crash between moving the state and trimming left covered receipts behind | Opening the gate removes them |
+| GR-53 | Low | One far-future clock reading pins every later receipt to that time | A receipt whose time was raised to the last one's says so (`at_clamped`) |
+| GR-54 | Low | A receipt could say observe mode with custody coverage | Refused: custody belongs to enforce mode |
+| GR-55 | Low | The Ledger's answer was not tied to one request, and intake does not know who is sending | The answer carries the batch's nonce and the gate refuses another. Authenticating the gate to the listener is G3b's |
+
+For G3b, from the same read: "proven" on a receipt may be set only from what
+`Session::accept` returns, and a proven receipt names its mandates; a full spool in observe
+mode lets calls through unrecorded, which must be counted and shown as "not recorded".
+
+**The reviewer has not read `build/gov-review-4` or `build/gov-g3a-fixes`.** Its session
+cannot send messages without a person's approval, so the conductor reads its verdicts from
+its transcript.
 
 ## 1. What is being built
 

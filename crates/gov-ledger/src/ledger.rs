@@ -187,6 +187,7 @@ impl<S: Store> Ledger<S> {
     pub async fn ingest_batch(
         &self,
         batch: &[Envelope],
+        nonce: &Id,
         key: &SigningKey,
         issuer: &Id,
         now: i64,
@@ -205,17 +206,18 @@ impl<S: Store> Ledger<S> {
                 Err(other) => return Err(other),
             });
         }
-        let Some(head) = self.store.head(&self.scope, &gate).await? else {
-            return Err(LedgerError::Refused("nothing_held"));
-        };
+        // The answer says what is held even when that is nothing: a gate whose Ledger was
+        // restored from an older copy has to learn it, to send again (review finding GR-50).
+        let head = self.store.head(&self.scope, &gate).await?;
         let ack = IntakeAck {
             v: VERSION,
             tenant: self.scope.tenant.clone(),
             env: self.scope.env.clone(),
             issuer: issuer.clone(),
             gate,
-            seq: head.seq,
-            hash: head.hash,
+            nonce: nonce.clone(),
+            seq: head.as_ref().map_or(0, |h| h.seq),
+            hash: head.map(|h| h.hash),
             at: now,
         };
         Ok((results, seal(&ack, key)?))
