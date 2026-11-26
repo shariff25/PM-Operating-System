@@ -309,6 +309,9 @@ async fn enrolment<S: Store>(store: S) {
 }
 both_stores!(a_key_is_enrolled_with_a_one_time_code, enrolment);
 
+/// A request to enrol, made for a given code.
+type MakeRequest<'a> = Box<dyn Fn(&str) -> Envelope + 'a>;
+
 /// A fresh code for the gate.
 async fn offer<S: Store>(a: &Authority<S>) -> String {
     a.offer_enrolment(&id("ana"), EnrolKind::Gate, &id("gate-1"), NOW)
@@ -351,7 +354,7 @@ async fn enrolment_attacks<S: Store>(store: S) {
     // The right code with a request that does not hold: refused, and the code is spent, so
     // the honest request that follows is too late and an admin must make another.
     let stranger = key("stranger-k1", 99);
-    let cases: Vec<(&str, Box<dyn Fn(&str) -> Envelope>)> = vec![
+    let cases: Vec<(&str, MakeRequest)> = vec![
         // Signed by another key than the one it asks to enrol.
         (
             "another signer",
