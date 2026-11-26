@@ -18,8 +18,8 @@ use crate::store::ChainKind;
 
 /// One document of a chain, of whichever kind the chain holds.
 enum Link {
-    Receipt(Opened<Receipt>),
-    Admin(Opened<AdminRecord>),
+    Receipt(Box<Opened<Receipt>>),
+    Admin(Box<Opened<AdminRecord>>),
 }
 
 impl Link {
@@ -34,12 +34,12 @@ impl Link {
     ) -> Result<Self, &'static str> {
         match kind {
             ChainKind::Receipt => match open::<Receipt>(envelope, keys, scope) {
-                Ok(o) if &o.doc.gate == chain => Ok(Link::Receipt(o)),
+                Ok(o) if &o.doc.gate == chain => Ok(Link::Receipt(Box::new(o))),
                 Ok(_) => Err("wrong_gate"),
                 Err(e) => Err(e.code()),
             },
             ChainKind::Admin => match open::<AdminRecord>(envelope, keys, scope) {
-                Ok(o) if &o.doc.authority == chain => Ok(Link::Admin(o)),
+                Ok(o) if &o.doc.authority == chain => Ok(Link::Admin(Box::new(o))),
                 Ok(_) => Err("wrong_gate"),
                 Err(e) => Err(e.code()),
             },
