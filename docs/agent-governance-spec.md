@@ -134,6 +134,32 @@ while suspended (G6); resource identifiers are case-sensitive, so a connector fo
 that is not must fold case (G3); "the old Authority key signs the new one" has no recovery if
 the old key is stolen (open, §11).
 
+### Second read, 2026-11-26, at `0175ade`
+
+**Verdict: the gate passes for the spec and for G1; it does not pass for G2.** The spec
+passes on one condition: the signed class of approval stays unbuilt until its design is
+reviewed. The first-round findings are closed except as noted here.
+
+| Finding | Severity | What was wrong | What was done |
+|---|---|---|---|
+| GR-22 | High | The rest of GR-3. `gov verify` still passed a whole chain wiped at the witnessed head: with no retention given it said OK, and with one it measured age by the date the Ledger wrote in its own prune record | Fixed on `build/gov-review-2`. Age is measured from the first covering checkpoint in the witness to the verifier's own clock; a prune record dated after now is a finding; pruning with no retention given is a finding; with no clock nothing counts as old enough; the verdict no longer says "nothing removed" when something was pruned. What is left, and accepted by the reviewer as by design: an erasure that waits out the retention is a prune |
+| GR-23 | Medium | A trusted gate listed with no receipts, no prune record and no checkpoint entry verified OK, which is what a gate erased before any checkpoint looks like | Fixed: a finding. A gate that has never run must be left out of the trusted keys. The real control is the gate keeping its spool until a checkpoint covers it (GR-10, G3) |
+| GR-24 | Low | The store enrolled a key without the weak-key check | Fixed: both stores check |
+| GR-25 | Low | One lease request could accept two leases | Fixed: accepting a lease uses the request up |
+| GR-16 | Low | A receipt's time could go backwards along a chain | Fixed at intake and in `gov verify`. For G3: a gate never writes a time earlier than its last receipt's |
+| GR-6 | | Two more spellings of the small-order points, harmless with this library | Added to the list |
+| GR-26 | Low | "A receipt nothing covers" compares the gate's clock with the Ledger's | For G3, with the signed intake head of GR-10 |
+| GR-27 | Info | The "issuer may not approve" check is an option the caller fills | For G6: the gate builds the requirement from the rule and the chain in one place, with a test |
+
+The reviewer's conditions for the gate-served approval page (§4.4), all three adopted: the
+passkey is registered to an address the Authority does not serve; the gate builds the
+challenge itself from the bytes it will send, and its page loads no script from the
+Authority; changes to the roster stay witnessed. It also noted that this makes the gate a web
+server for people, which needs its own rows in the threat table before G6.
+
+**The reviewer has not re-read the GR-22 to GR-25 fixes, the undo design (§4.7) or the
+approval design. G2's gate is not passed.**
+
 ## 1. What is being built
 
 Agent Governance is a second product, separate from PM OS. It has three parts.
@@ -405,8 +431,14 @@ evidence           for signed: the passkey assertion and credential id
   a passkey is enrolled at the customer's gate address, not ours; the argument values never
   leave the customer, which also settles departure 2 of §2 for signed approvals and makes a
   hosted Authority possible for them; the gate needs an identity-provider client of its own.
-  To be designed in G6: enrolling passkeys across several gates under one address, and what
-  the approver is shown when the gate cannot render an argument. Proposed library:
+  The reviewer's three conditions hold in this design and are requirements on G6: the passkey
+  is registered to the gate's address, never one the Authority serves (a passkey answers any
+  challenge its registered address asks for); the gate builds the challenge from the bytes it
+  will send and its page loads nothing from the Authority; roster changes stay witnessed.
+  To be designed in G6: enrolling passkeys across several gates under one address, what
+  the approver is shown when the gate cannot render an argument, and the threat rows for the
+  gate as a web server for people (phishing of its address, session theft, the identity-
+  provider client it now holds). Proposed library:
   `webauthn-rs` (to be confirmed at G6; tests use a software authenticator).
 - **Attested.** The Authority states that a signed-in person in the right group pressed
   approve. The gate verifies the Authority's signature only.

@@ -1047,7 +1047,7 @@ fn asked(mono_ms: u64) -> LeaseRequest {
 }
 /// A first lease, asked for at `mono_ms`.
 fn held_at(lease: Lease, mono_ms: u64) -> HeldLease {
-    HeldLease::accept(None, lease, &asked(mono_ms)).unwrap()
+    HeldLease::accept(None, lease, asked(mono_ms)).unwrap()
 }
 
 /// Review finding GR-1: a lease is the answer to one request, and never moves a gate back.
@@ -1064,17 +1064,17 @@ fn a_replayed_or_older_lease_is_refused() {
         nonce: id("n-2"),
         sent_mono_ms: 10_005_000,
     };
-    let held = HeldLease::accept(Some(&first), newer.clone(), &next).unwrap();
+    let held = HeldLease::accept(Some(&first), newer.clone(), next).unwrap();
     assert_eq!(held.now(10_005_000).unwrap(), NOW + 10_000);
 
     // The old lease, kept by someone and played back: it answers no request the gate made.
-    let third = LeaseRequest {
+    let third = || LeaseRequest {
         gate: id("gate-1"),
         nonce: id("n-3"),
         sent_mono_ms: 10_006_000,
     };
     assert_eq!(
-        HeldLease::accept(Some(&held), lease(), &third).unwrap_err(),
+        HeldLease::accept(Some(&held), lease(), third()).unwrap_err(),
         Error::LeaseReplayed
     );
     // Even with the right nonce (a hostile network replaying into a guessed request), a lease
@@ -1082,7 +1082,7 @@ fn a_replayed_or_older_lease_is_refused() {
     let mut back_in_time = lease();
     back_in_time.nonce = id("n-3");
     assert_eq!(
-        HeldLease::accept(Some(&held), back_in_time, &third).unwrap_err(),
+        HeldLease::accept(Some(&held), back_in_time, third()).unwrap_err(),
         Error::LeaseReplayed
     );
     let mut fewer_revocations = newer.clone();
@@ -1090,7 +1090,7 @@ fn a_replayed_or_older_lease_is_refused() {
     fewer_revocations.authority_time = NOW + 10_001;
     fewer_revocations.revocation_seq = 41;
     assert_eq!(
-        HeldLease::accept(Some(&held), fewer_revocations, &third).unwrap_err(),
+        HeldLease::accept(Some(&held), fewer_revocations, third()).unwrap_err(),
         Error::LeaseReplayed
     );
     // Each check alone: a lease that is newer in every way but answers another request...
@@ -1099,7 +1099,7 @@ fn a_replayed_or_older_lease_is_refused() {
     wrong_nonce.authority_time = NOW + 20_000;
     wrong_nonce.revocation_seq = 60;
     assert_eq!(
-        HeldLease::accept(Some(&held), wrong_nonce, &third).unwrap_err(),
+        HeldLease::accept(Some(&held), wrong_nonce, third()).unwrap_err(),
         Error::LeaseReplayed
     );
     // ...and one that answers this request, with every revocation, but an older clock.
@@ -1108,7 +1108,7 @@ fn a_replayed_or_older_lease_is_refused() {
     older_clock.authority_time = NOW + 9_999;
     older_clock.revocation_seq = 60;
     assert_eq!(
-        HeldLease::accept(Some(&held), older_clock, &third).unwrap_err(),
+        HeldLease::accept(Some(&held), older_clock, third()).unwrap_err(),
         Error::LeaseReplayed
     );
     // Another gate's lease.
@@ -1116,14 +1116,14 @@ fn a_replayed_or_older_lease_is_refused() {
     other_gate.nonce = id("n-3");
     other_gate.gate = id("gate-2");
     assert_eq!(
-        HeldLease::accept(Some(&held), other_gate, &third).unwrap_err(),
+        HeldLease::accept(Some(&held), other_gate, third()).unwrap_err(),
         Error::LeaseReplayed
     );
     // A lease held up on the way is as old as its request, not as young as its arrival: asked
     // for at 10_006_000, it is already past the strict class by 10_016_001 however late it came.
     let mut delayed = newer;
     delayed.nonce = id("n-3");
-    let held = HeldLease::accept(Some(&held), delayed, &third).unwrap();
+    let held = HeldLease::accept(Some(&held), delayed, third()).unwrap();
     let limits = FreshnessLimits::default();
     assert_eq!(
         held.permits(10_016_001, Freshness::Strict, &limits, &id("7"), 57)

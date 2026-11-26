@@ -38,6 +38,15 @@ async fn ledger_with_gates<S: Store>(store: S) -> Ledger<S> {
     ledger
 }
 
+async fn ledger_with_gate_1<S: Store>(store: S) -> Ledger<S> {
+    let ledger = Ledger::new(store, scope());
+    ledger
+        .enrol_gate_key(&id("gate-1"), &key("gate-1-key", 20).public())
+        .await
+        .unwrap();
+    ledger
+}
+
 fn refused(r: Result<Ingested, LedgerError>) -> &'static str {
     match r {
         Err(LedgerError::Refused(code)) => code,
@@ -105,11 +114,18 @@ async fn intake<S: Store>(store: S) {
         "wrong_tenant"
     );
     // A receipt that breaks its own rules.
-    let mut broken = receipt("gate-1", 3, Some(hash_of(&c1[1], &g1)), T0);
+    let mut broken = receipt("gate-1", 3, Some(hash_of(&c1[1], &g1)), T0 + 1);
     broken.outcome = c_outcome();
     assert_eq!(
         refused(ledger.ingest(&seal(&broken, &g1).unwrap(), T0).await),
         "malformed"
+    );
+
+    // A receipt dated before the one it follows.
+    let earlier = receipt("gate-1", 3, Some(hash_of(&c1[1], &g1)), T0 - 5);
+    assert_eq!(
+        refused(ledger.ingest(&seal(&earlier, &g1).unwrap(), T0).await),
+        "time_went_back"
     );
 
     // The chain itself is untouched by all of that, and goes on.
@@ -142,6 +158,7 @@ async fn intake<S: Store>(store: S) {
             ("wrong_gate", true),
             ("wrong_tenant", false),
             ("malformed", true),
+            ("time_went_back", true),
         ]
     );
 }
@@ -551,7 +568,7 @@ fn the_witness_never_rewrites_a_checkpoint() {
 }
 
 async fn crash_between_store_and_witness<S: Store>(store: S) {
-    let ledger = ledger_with_gates(store).await;
+    let ledger = ledger_with_gate_1(store).await;
     let g1 = key("gate-1-key", 20);
     ledger
         .ingest(&chain("gate-1", &g1, 1, T0, 1)[0], T0)
@@ -599,7 +616,17 @@ async fn crash_between_store_and_witness<S: Store>(store: S) {
     assert_eq!(cps.iter().map(|(n, _)| *n).collect::<Vec<_>>(), vec![1, 2]);
     let export = ledger.export().await.unwrap();
     let keys = ledger.keys(&ledger_key()).await.unwrap();
-    assert!(check(&keys, &export, &cps, None).ok());
+    let report = verify(&Check {
+        scope: &scope(),
+        keys: &keys,
+        export: &export,
+        checkpoints: &cps,
+        interval_secs: 60,
+        now: Some(T0 + 130),
+        gate_quiet_secs: None,
+        retention_secs: Some(0),
+    });
+    assert!(report.ok(), "{:?}", report.findings);
 }
 both_stores!(
     a_checkpoint_stored_but_not_witnessed_goes_out_next,
@@ -615,6 +642,7 @@ fn check_days(
     export: &Export,
     cps: &[(u64, Vec<u8>)],
     retention_days: Option<u64>,
+    now: Option<i64>,
 ) -> Report {
     verify(&Check {
         scope: &scope(),
@@ -622,15 +650,15 @@ fn check_days(
         export,
         checkpoints: cps,
         // Checkpoints in this test are days apart.
-        interval_secs: 10 * DAY as u32,
-        now: None,
+        interval_secs: 100 * DAY as u32,
+        now,
         gate_quiet_secs: None,
         retention_secs: retention_days.map(|d| d * DAY as u64),
     })
 }
 
 async fn pruning<S: Store>(store: S) {
-    let ledger = ledger_with_gates(store).await;
+    let ledger = ledger_with_gate_1(store).await;
     let dir = tempfile::tempdir().unwrap();
     let witness = DirWitness::new(dir.path());
     let lk = ledger_key();
@@ -646,32 +674,28 @@ async fn pruning<S: Store>(store: S) {
         ledger.ingest(env, T0 + i as i64 * DAY).await.unwrap();
     }
     let far = T0 + 100 * DAY;
+    let day_6 = T0 + 6 * DAY;
     assert_eq!(
         ledger
-            .prune(&gate, far, &lk, &li, T0 + 6 * DAY, &witness)
+            .prune(&gate, far, &lk, &li, day_6, &witness)
             .await
             .unwrap(),
         None
     );
-    ledger
-        .checkpoint(&lk, &li, T0 + 6 * DAY, &witness)
-        .await
-        .unwrap();
+    ledger.checkpoint(&lk, &li, day_6, &witness).await.unwrap();
     for (i, env) in c[6..].iter().enumerate() {
         ledger.ingest(env, T0 + (6 + i as i64) * DAY).await.unwrap();
     }
     // Everything is older than the cutoff, but only six receipts are witnessed.
+    let day_10 = T0 + 10 * DAY;
     assert_eq!(
         ledger
-            .prune(&gate, far, &lk, &li, T0 + 10 * DAY, &witness)
+            .prune(&gate, far, &lk, &li, day_10, &witness)
             .await
             .unwrap(),
         Some(6)
     );
-    ledger
-        .checkpoint(&lk, &li, T0 + 10 * DAY, &witness)
-        .await
-        .unwrap();
+    ledger.checkpoint(&lk, &li, day_10, &witness).await.unwrap();
     // A cutoff inside the chain: receipts 7 and 8 arrived before day 8, receipt 9 did not.
     let cutoff = T0 + 8 * DAY;
     let pruned_at = T0 + 40 * DAY;
@@ -689,19 +713,14 @@ async fn pruning<S: Store>(store: S) {
             .unwrap(),
         None
     );
-    assert_eq!(
-        ledger
-            .prune(&id("gate-2"), far, &lk, &li, pruned_at, &witness)
-            .await
-            .unwrap(),
-        None
-    );
 
     let export = ledger.export().await.unwrap();
     assert_eq!(export.gates[0].receipts.len(), 2);
     let keys = ledger.keys(&lk).await.unwrap();
     let cps = witness.all().unwrap();
-    let report = check_days(&keys, &export, &cps, Some(30));
+    // Verified an hour after the prune, on day 40: receipt 8 was first covered on day 10.
+    let later = Some(pruned_at + 3_600);
+    let report = check_days(&keys, &export, &cps, Some(30), later);
     assert!(report.ok(), "{:?}", report.findings);
     assert_eq!(report.gates[0].verified, Some((9, 10)));
     assert_eq!(report.gates[0].pruned_through, 8);
@@ -740,8 +759,8 @@ async fn pruning<S: Store>(store: S) {
         };
         seal(&doc, &lk).unwrap()
     };
-    let found = |export: &Export, retention: Option<u64>| {
-        let report = check_days(&keys, export, &cps, retention);
+    let found = |export: &Export, retention: Option<u64>, now: Option<i64>| {
+        let report = check_days(&keys, export, &cps, retention, now);
         report
             .findings
             .iter()
@@ -752,11 +771,11 @@ async fn pruning<S: Store>(store: S) {
     // A prune record that lies about where the chain was cut does not fit the next receipt.
     let mut lying = export.clone();
     lying.gates[0].pruned = Some(record(8, &hash_of(&c[0], &g1), pruned_at));
-    assert!(found(&lying, None).contains(&(Problem::BrokenChain, Some(9))));
+    assert!(found(&lying, Some(30), later).contains(&(Problem::BrokenChain, Some(9))));
     // Nor does an export that hides that anything was pruned.
     let mut hiding = export.clone();
     hiding.gates[0].pruned = None;
-    assert!(found(&hiding, None).contains(&(Problem::BrokenChain, Some(1))));
+    assert!(found(&hiding, Some(30), later).contains(&(Problem::BrokenChain, Some(1))));
     // Nor a record the Ledger's key did not sign.
     let mut forged = export.clone();
     let doc = gov_core::open::<Pruned>(
@@ -767,38 +786,64 @@ async fn pruning<S: Store>(store: S) {
     .unwrap()
     .doc;
     forged.gates[0].pruned = Some(seal(&doc, &g1).unwrap());
-    assert!(found(&forged, None)
-        .iter()
-        .any(|(p, _)| matches!(p, Problem::BadPruneRecord(_))));
+    let f = found(&forged, Some(30), later);
+    assert!(
+        f.iter()
+            .any(|(p, _)| matches!(p, Problem::BadPruneRecord(_))),
+        "{f:?}"
+    );
 
     // Review finding GR-3. Whoever runs the Ledger deletes every receipt and signs a record
     // for it. Past what the witness ever covered: refused outright.
     let mut erased = export.clone();
     erased.gates[0].receipts.clear();
     erased.gates[0].pruned = Some(record(9999, &hash_of(&c[9], &g1), pruned_at));
-    assert!(found(&erased, None).contains(&(Problem::PruneNotWitnessed, Some(9999))));
+    assert!(found(&erased, Some(30), later).contains(&(Problem::PruneNotWitnessed, Some(9999))));
     // At the witnessed head with a hash the witness does not have: refused.
     erased.gates[0].pruned = Some(record(10, &hash_of(&c[0], &g1), pruned_at));
-    let f = found(&erased, None);
+    let f = found(&erased, Some(30), later);
     assert!(f.contains(&(Problem::PruneNotWitnessed, Some(10))), "{f:?}");
-    // At the witnessed head with the right hash, which the operator knows: the witness cannot
-    // tell this from an honest prune, so the customer's retention has to. Receipt 10 was
-    // first covered on day 10; "pruned" on day 12 against 30 days' retention is too soon.
-    erased.gates[0].pruned = Some(record(10, &hash_of(&c[9], &g1), T0 + 12 * DAY));
+
+    // Review finding GR-22. At the witnessed head with the right hash, which the operator
+    // knows: the witness cannot tell this from an honest prune, so the customer's retention
+    // has to. Receipt 10 was first covered on day 10; the wipe is checked on day 12.
+    let day_12 = Some(T0 + 12 * DAY);
+    erased.gates[0].pruned = Some(record(10, &hash_of(&c[9], &g1), T0 + 12 * DAY - 60));
     assert_eq!(
-        found(&erased, Some(30)),
+        found(&erased, Some(30), day_12),
         vec![(Problem::PrunedTooSoon, Some(10))]
     );
-    // The honest record above was written on day 40: 30 days after the cover on day 10.
-    assert!(found(&export, Some(30)).is_empty());
+    // Without the retention the pruning cannot be checked, and that is a finding, not "OK".
     assert_eq!(
-        found(&export, Some(31)),
+        found(&erased, None, day_12),
+        vec![(Problem::PruneUnchecked, Some(10))]
+    );
+    // The Ledger dates its record 91 days ahead: age is measured by the verifier's clock and
+    // the witness, never by the record, and a record dated after now is itself reported.
+    erased.gates[0].pruned = Some(record(10, &hash_of(&c[9], &g1), T0 + 103 * DAY));
+    assert_eq!(
+        found(&erased, Some(30), day_12),
+        vec![
+            (Problem::BadPruneRecord("dated_ahead"), Some(10)),
+            (Problem::PrunedTooSoon, Some(10)),
+        ]
+    );
+    // With no clock given, nothing can be shown old enough.
+    assert_eq!(
+        found(&export, Some(30), None),
         vec![(Problem::PrunedTooSoon, Some(8))]
     );
+    // The honest prune, checked 30 days and an hour after the cover on day 10.
+    assert!(found(&export, Some(30), later).is_empty());
+    assert_eq!(
+        found(&export, Some(31), later),
+        vec![(Problem::PrunedTooSoon, Some(8))]
+    );
+
     // A prune record numbered past the largest number does not crash the check (GR-11).
     erased.gates[0].pruned = Some(record(u64::MAX, &hash_of(&c[9], &g1), pruned_at));
     erased.gates[0].receipts = vec![c[0].clone()];
-    assert!(found(&erased, None).contains(&(Problem::PruneNotWitnessed, Some(u64::MAX))));
+    assert!(found(&erased, Some(30), later).contains(&(Problem::PruneNotWitnessed, Some(u64::MAX))));
 }
 both_stores!(pruning_keeps_the_chain_verifiable, pruning);
 
@@ -843,6 +888,15 @@ async fn no_cover<S: Store>(store: S) {
     dropped.gates.retain(|g| g.gate.as_str() != "gate-2");
     let report = check(&s.keys, &dropped, &only_gate_1, None);
     assert!(problems(&report).contains(&(Problem::GateMissing, Some("gate-2"), None)));
+
+    // (c2) Or kept in the export as an empty entry, with no prune record (finding GR-23).
+    let mut emptied = good.clone();
+    emptied.gates[1].receipts.clear();
+    let report = check(&s.keys, &emptied, &only_gate_1, None);
+    assert_eq!(
+        problems(&report),
+        vec![(Problem::GateNeverSeen, Some("gate-2"), None)]
+    );
 
     // (d) A receipt older than the latest checkpoint that no checkpoint covers.
     let g1 = key("gate-1-key", 20);
@@ -928,6 +982,12 @@ async fn enrolment<S: Store>(store: S) {
     // And a key id that is taken.
     assert!(ledger
         .enrol_gate_key(&id("gate-3"), &key("gate-1-key", 77).public())
+        .await
+        .is_err());
+    // The store itself refuses, whoever calls it (finding GR-24).
+    assert!(ledger
+        .store()
+        .add_gate_key(&scope(), &id("gate-3"), &weak)
         .await
         .is_err());
     assert_eq!(ledger.store().gate_keys(&scope()).await.unwrap().len(), 2);

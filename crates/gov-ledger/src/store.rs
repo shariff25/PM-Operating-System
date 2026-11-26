@@ -45,6 +45,8 @@ pub struct Refusal {
 
 #[async_trait]
 pub trait Store: Send + Sync {
+    /// Enrol a gate's key. Every store refuses a key anyone could forge for, a key id that is
+    /// taken, and a key already enrolled under another id.
     async fn add_gate_key(&self, scope: &Scope, gate: &Id, key: &PublicKey) -> StoreResult<()>;
     /// The gate a key id belongs to, and the key.
     async fn gate_key(&self, scope: &Scope, kid: &Id) -> StoreResult<Option<(Id, PublicKey)>>;
@@ -129,6 +131,8 @@ fn k(scope: &Scope) -> Key {
 #[async_trait]
 impl Store for MemoryStore {
     async fn add_gate_key(&self, scope: &Scope, gate: &Id, key: &PublicKey) -> StoreResult<()> {
+        key.enrolable()
+            .map_err(|e| StoreError::Other(e.to_string()))?;
         let mut s = self.0.lock().unwrap();
         let slot = (k(scope), key.kid.clone());
         if s.gate_keys.contains_key(&slot) {
