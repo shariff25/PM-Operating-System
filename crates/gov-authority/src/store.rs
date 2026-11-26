@@ -95,6 +95,16 @@ pub struct EnrolledKey {
     pub key: PublicKey,
 }
 
+/// A policy bundle as published: signed by the root key, kept whole for the gates to fetch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Published {
+    pub number: u64,
+    /// The hash of the signed bundle, as the record of publishing carries it.
+    pub digest: Digest,
+    pub envelope: Envelope,
+}
+
 /// One change to the registry, applied with the record that stands for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
@@ -107,6 +117,8 @@ pub enum Effect {
     /// under any id, is enrolled already, the whole commit fails with
     /// [`StoreError::KeyTaken`] and nothing is written (review findings GR-114, GR-116).
     AddKey(EnrolledKey),
+    /// Keep a published bundle under its number.
+    PutBundle(Published),
 }
 
 /// One admin record as stored.
@@ -144,6 +156,9 @@ pub trait Store: Send + Sync {
     async fn agents_of(&self, scope: &Scope, owner: &Id) -> StoreResult<Vec<Agent>>;
     async fn gate(&self, scope: &Scope, id: &Id) -> StoreResult<Option<Gate>>;
     async fn key(&self, scope: &Scope, kid: &Id) -> StoreResult<Option<EnrolledKey>>;
+    /// The published bundle with the highest number.
+    async fn latest_bundle(&self, scope: &Scope) -> StoreResult<Option<Published>>;
+    async fn bundle(&self, scope: &Scope, number: u64) -> StoreResult<Option<Published>>;
     /// Every enrolled key, in order of key id.
     async fn keys(&self, scope: &Scope) -> StoreResult<Vec<EnrolledKey>>;
 
@@ -183,6 +198,7 @@ struct State {
     gates: BTreeMap<(Key, Id), Gate>,
     keys: BTreeMap<(Key, Id), EnrolledKey>,
     codes: BTreeMap<(Key, EnrolKind, Id), PendingCode>,
+    bundles: BTreeMap<(Key, u64), Published>,
 }
 
 /// A store in memory, for tests and for the library's own use where nothing must outlive
@@ -254,6 +270,9 @@ impl Store for MemoryStore {
                 }
                 Effect::AddKey(e) => {
                     s.keys.insert((key.clone(), e.key.kid.clone()), e);
+                }
+                Effect::PutBundle(b) => {
+                    s.bundles.insert((key.clone(), b.number), b);
                 }
             }
         }
@@ -334,6 +353,26 @@ impl Store for MemoryStore {
             .unwrap()
             .keys
             .get(&(k(scope), kid.clone()))
+            .cloned())
+    }
+
+    async fn latest_bundle(&self, scope: &Scope) -> StoreResult<Option<Published>> {
+        let s = self.0.lock().unwrap();
+        Ok(s.bundles
+            .iter()
+            .filter(|((scope_key, _), _)| *scope_key == k(scope))
+            .map(|(_, b)| b)
+            .next_back()
+            .cloned())
+    }
+
+    async fn bundle(&self, scope: &Scope, number: u64) -> StoreResult<Option<Published>> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .bundles
+            .get(&(k(scope), number))
             .cloned())
     }
 

@@ -13,8 +13,8 @@ use sqlx::types::Json;
 use sqlx::Row;
 
 use crate::store::{
-    Agent, Effect, EnrolledKey, Gate, PendingCode, Person, Store, StoreError, StoreResult,
-    StoredRecord,
+    Agent, Effect, EnrolledKey, Gate, PendingCode, Person, Published, Store, StoreError,
+    StoreResult, StoredRecord,
 };
 
 impl From<sqlx::Error> for StoreError {
@@ -107,6 +107,7 @@ fn row(effect: &Effect) -> (String, String, Option<String>, Option<serde_json::V
         ),
         Effect::PutGate(g) => ("gate".into(), g.id.to_string(), None, Some(json(g))),
         Effect::AddKey(e) => ("key".into(), e.key.kid.to_string(), None, Some(json(e))),
+        Effect::PutBundle(b) => ("bundle".into(), b.number.to_string(), None, Some(json(b))),
         Effect::PutCode(c) => (
             format!("code-{}", kind_text(c.kind)),
             c.name.to_string(),
@@ -310,6 +311,24 @@ impl Store for PgStore {
 
     async fn key(&self, scope: &Scope, kid: &Id) -> StoreResult<Option<EnrolledKey>> {
         self.entry(scope, "key", kid.as_str()).await
+    }
+
+    async fn latest_bundle(&self, scope: &Scope) -> StoreResult<Option<Published>> {
+        let row = sqlx::query(
+            "SELECT doc FROM authority_registry \
+             WHERE tenant = $1 AND env = $2 AND kind = 'bundle' \
+             ORDER BY (doc ->> 'number')::bigint DESC LIMIT 1",
+        )
+        .bind(scope.tenant.as_str())
+        .bind(scope.env.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| Ok(r.try_get::<Json<Published>, _>("doc")?.0))
+            .transpose()
+    }
+
+    async fn bundle(&self, scope: &Scope, number: u64) -> StoreResult<Option<Published>> {
+        self.entry(scope, "bundle", &number.to_string()).await
     }
 
     async fn keys(&self, scope: &Scope) -> StoreResult<Vec<EnrolledKey>> {
