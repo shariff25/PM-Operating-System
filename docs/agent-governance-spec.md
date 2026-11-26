@@ -354,10 +354,17 @@ reviewer.
   name a first admin.
 - **Still not built in G4a:** nothing is served by the Authority on a listener and there is
   no `gov-authority` program, so none of this is yet reachable from the three programs,
-  which still use the stand-ins of G3b; `gov verify`, the command, does not yet take an
-  Authority's keys; the auditor's check that each gate key matches a witnessed enrolment
-  (GR-84) is not yet written. The Ledger finds an enrolment by reading the Authority's
+  which still use the stand-ins of G3b. The Ledger finds an enrolment by reading the Authority's
   whole chain, which is fine at this size and is to be indexed before it is not.
+- **The auditor's check of gate keys (GR-84), built 2026-11-26, not yet read by the
+  reviewer.** When the keys file given to `gov verify` names an Authority, a gate's key is
+  believed only if that Authority's verified chain holds a record of that key id's enrolment
+  for that gate, with that key's digest, at a number a checkpoint covers; otherwise the
+  check reports it. A receipt dated after the record that disabled its gate (or revoked its
+  key), by more than the clocks may differ, is reported too. Limits: with no Authority named
+  the check is not made, as before; if the Authority's chain were pruned past an enrolment,
+  the key would be reported, so that chain is not to be pruned; the comparison of dates is
+  between two clocks and is only as fine as `--clock-skew`.
 - One more test on both of the Ledger's stores (a chain holds one kind of document), and
   two with an Authority and a Ledger together.
 

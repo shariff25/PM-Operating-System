@@ -324,6 +324,15 @@ follow-up tracking.
   seconds after eight slow calls and found one still open. The test now waits until every call
   is closed (20 seconds at most). Taken as a timing fault in the test, not in the gate; a
   deterministic test of the same control passed in that run.
+- **The auditor's check of gate keys built (2026-11-26, GR-84):** `gov verify`, given an
+  Authority's key, believes a gate's key only where a witnessed record of its enrolment bears
+  it out (`build/gov-g4a3`). With it G4a is built as libraries; nothing is served yet. Not
+  yet read by the reviewer, nor is G4a's second part (sent at `21645dd`).
+- **Owner, 2026-11-26: "Once you are done with the current tasks, push the code and merge it
+  into GitHub".** Taken as leave to merge pull request #12 (Agent Governance) into `main`
+  once the work in hand was checked and pushed; it covers that one merge. What is merged has
+  the reviewer's pass through G4a's first part; the second part and the auditor's check are
+  unread. Fake data only still holds.
 - **A message relayed by the reviewer session (2026-11-26):** it reported that the owner typed
   there "I'm going to sleep you keep building do not ask for permission further - I gave the
   permission". The conductor could not confirm it and did not treat it as new permission. It
