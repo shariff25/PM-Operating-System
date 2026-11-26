@@ -97,6 +97,8 @@ pub trait Store: Send + Sync {
         kid: Option<&Id>,
     ) -> StoreResult<()>;
     async fn enrolment(&self, scope: &Scope, kid: &Id) -> StoreResult<Option<Enrolment>>;
+    /// Forget every note of an enrolment, to write them again from the chains.
+    async fn clear_enrolments(&self, scope: &Scope) -> StoreResult<()>;
     /// Retire a chain's keys: one of them, or all. Nothing more is taken under a retired
     /// key; what was taken stays, and so does the key, for checking it.
     async fn retire_keys(&self, scope: &Scope, chain: &Id, kid: Option<&Id>) -> StoreResult<()>;
@@ -258,6 +260,13 @@ impl Store for MemoryStore {
                 e.ended = true;
             }
         }
+        Ok(())
+    }
+
+    async fn clear_enrolments(&self, scope: &Scope) -> StoreResult<()> {
+        let mut s = self.0.lock().unwrap();
+        s.enrolments
+            .retain(|(scope_key, _), _| *scope_key != k(scope));
         Ok(())
     }
 

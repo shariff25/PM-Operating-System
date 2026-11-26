@@ -142,9 +142,16 @@ async fn main() -> anyhow::Result<()> {
             anyhow::ensure!(checkpoint_interval > 0, "the checkpoint interval is zero");
             std::fs::create_dir_all(&witness)?;
             let witness = DirWitness::new(&witness);
+            // Before anything is served: what this Ledger notes of each gate key is written
+            // again from the Authorities' chains it holds (review finding GR-131).
+            let ledger = ledger(&which).await?;
+            ledger
+                .rebuild_notes()
+                .await
+                .map_err(|e| anyhow::anyhow!("the Authorities' chains cannot be read: {e}"))?;
             let listener = Arc::new(Listener {
                 health: Default::default(),
-                ledger: ledger(&which).await?,
+                ledger,
                 key,
                 issuer,
                 clock: now,

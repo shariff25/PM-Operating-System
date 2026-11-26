@@ -169,6 +169,15 @@ impl Store for PgStore {
         Ok(())
     }
 
+    async fn clear_enrolments(&self, scope: &Scope) -> StoreResult<()> {
+        sqlx::query("DELETE FROM key_enrolments WHERE tenant = $1 AND env = $2")
+            .bind(scope.tenant.as_str())
+            .bind(scope.env.as_str())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     async fn enrolment(&self, scope: &Scope, kid: &Id) -> StoreResult<Option<Enrolment>> {
         let row = sqlx::query(
             "SELECT authority, gate, digest, ended FROM key_enrolments \
