@@ -35,6 +35,7 @@ async fn listener() -> (String, Arc<Listener<MemoryStore>>) {
         .await
         .unwrap();
     let state = Arc::new(Listener {
+        health: Default::default(),
         ledger,
         key: ledger_key(),
         issuer: id("ledger"),
@@ -212,4 +213,30 @@ async fn an_answer_too_large_to_be_an_answer_is_not_read() {
         Err(GateError::Link(why)) => assert!(why.contains("larger than an answer"), "{why}"),
         other => panic!("{other:?}"),
     }
+}
+
+/// A Ledger whose checkpoints keep failing says so on its health route (review finding
+/// GR-87): receipts are arriving and nothing is witnessing them.
+#[tokio::test]
+async fn the_ledgers_health_shows_checkpoints_that_keep_failing() {
+    use std::sync::atomic::Ordering;
+    let state = Arc::new(Listener {
+        health: Default::default(),
+        ledger: Ledger::new(MemoryStore::default(), scope()),
+        key: ledger_key(),
+        issuer: id("ledger"),
+        clock: || T0,
+    });
+    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/healthz", tcp.local_addr().unwrap());
+    let served = state.clone();
+    tokio::spawn(async move { axum::serve(tcp, router(served)).await.unwrap() });
+
+    let ok = reqwest::get(&url).await.unwrap();
+    assert_eq!(ok.status().as_u16(), 200);
+    state.health.checkpoint_failures.store(2, Ordering::Relaxed);
+    let failing = reqwest::get(&url).await.unwrap();
+    assert_eq!(failing.status().as_u16(), 503);
+    let body: serde_json::Value = failing.json().await.unwrap();
+    assert_eq!(body["checkpoint_failures"], 2);
 }

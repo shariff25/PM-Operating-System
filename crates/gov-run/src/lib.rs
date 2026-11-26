@@ -104,21 +104,33 @@ pub fn outbound_address(what: &str, url: &str, plain_http_on_network: bool) -> a
     if !parsed.username().is_empty() || parsed.password().is_some() {
         bail!("{what} carries a user name or password; a URL here holds no secret");
     }
-    let host = parsed.host_str().unwrap_or_default();
-    let local = host == "localhost"
-        || host
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .parse::<IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback());
+    // A literal loopback address only. The name `localhost` is whatever the machine's
+    // resolver says it is (review finding GR-86).
+    let local = parsed
+        .host_str()
+        .unwrap_or_default()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback());
     match parsed.scheme() {
         "https" => Ok(()),
         "http" if local || plain_http_on_network => Ok(()),
         "http" => bail!(
-            "{what} is plain HTTP to another machine; use https, or pass --plain-http-on-network"
+            "{what} is plain HTTP to another machine; use https or a loopback address such as 127.0.0.1, or pass --plain-http-on-network"
         ),
         _ => bail!("{what} is neither http nor https"),
     }
+}
+
+/// Bind a second listener, and say where on its own line: `<name> on <address>`.
+pub async fn bind_named(name: &str, addr: SocketAddr) -> anyhow::Result<tokio::net::TcpListener> {
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("cannot listen on {addr}"))?;
+    println!("{name} on {}", listener.local_addr()?);
+    std::io::stdout().flush()?;
+    Ok(listener)
 }
 
 /// Bind, and say where on standard output, so whoever started the program knows the port.

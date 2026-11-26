@@ -904,3 +904,126 @@ fn alarms_are_kept_up_to_a_limit() {
     spool.keep_alarm(1, b"{\"again\":true}").unwrap();
     assert_eq!(spool.kept_alarms().unwrap()[0].1, b"{\"again\":true}");
 }
+
+/// A spool that counts how often it is read whole.
+struct Counting {
+    inner: FileSpool,
+    scans: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+impl Spool for Counting {
+    fn state(&self) -> Result<gov_gate::SpoolState, gov_gate::SpoolError> {
+        self.inner.state()
+    }
+    fn append(
+        &mut self,
+        receipt: &gov_gate::Spooled,
+        state: &gov_gate::SpoolState,
+    ) -> Result<(), gov_gate::SpoolError> {
+        self.inner.append(receipt, state)
+    }
+    fn close_intent(&mut self, seq: u64) -> Result<(), gov_gate::SpoolError> {
+        self.inner.close_intent(seq)
+    }
+    fn set_state(&mut self, state: &gov_gate::SpoolState) -> Result<(), gov_gate::SpoolError> {
+        self.inner.set_state(state)
+    }
+    fn held(&self) -> Result<Vec<gov_gate::Spooled>, gov_gate::SpoolError> {
+        self.scans.fetch_add(1, Ordering::SeqCst);
+        self.inner.held()
+    }
+    fn get(&self, seq: u64) -> Result<Option<gov_gate::Spooled>, gov_gate::SpoolError> {
+        self.inner.get(seq)
+    }
+    fn remove(&mut self, seq: u64) -> Result<(), gov_gate::SpoolError> {
+        self.inner.remove(seq)
+    }
+    fn trim(&mut self, seq: u64) -> Result<(), gov_gate::SpoolError> {
+        self.inner.trim(seq)
+    }
+    fn keep_checkpoint(&mut self, bytes: &[u8]) -> Result<(), gov_gate::SpoolError> {
+        self.inner.keep_checkpoint(bytes)
+    }
+    fn kept_checkpoint(&self) -> Result<Option<Vec<u8>>, gov_gate::SpoolError> {
+        self.inner.kept_checkpoint()
+    }
+    fn keep_alarm(&mut self, seq: u64, bytes: &[u8]) -> Result<(), gov_gate::SpoolError> {
+        self.inner.keep_alarm(seq, bytes)
+    }
+    fn kept_alarms(&self) -> Result<Vec<(u64, Vec<u8>)>, gov_gate::SpoolError> {
+        self.inner.kept_alarms()
+    }
+}
+
+/// A witness reader that counts how often the whole witness is read.
+struct NewestOnly {
+    inner: DirWitnessReader,
+    whole: std::sync::atomic::AtomicU64,
+}
+impl gov_gate::WitnessReader for NewestOnly {
+    fn checkpoints(&self) -> Result<Vec<(u64, Vec<u8>)>, String> {
+        self.whole.fetch_add(1, Ordering::SeqCst);
+        self.inner.checkpoints()
+    }
+    fn newest(&self, limit: usize) -> Result<Vec<(u64, Vec<u8>)>, String> {
+        self.inner.newest(limit)
+    }
+}
+
+/// The spool is read whole once, when the gate opens, and never again for a call, a
+/// shipment or a trim; and a trim reads the newest end of the witness, not all of it (review
+/// finding GR-82). A mode that blocks nothing must not slow to a stop as the spool fills.
+#[tokio::test]
+async fn a_call_never_reads_the_whole_spool_and_a_trim_never_the_whole_witness() {
+    let dir = tempfile::tempdir().unwrap();
+    let scans = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let spool = Counting {
+        inner: FileSpool::open(dir.path().join("spool")).unwrap(),
+        scans: scans.clone(),
+    };
+    let mut gate = Gate::open(config(1000), gate_key(), spool, T0).unwrap();
+    assert_eq!(scans.load(Ordering::SeqCst), 1);
+
+    let link = ledger().await;
+    let witness = DirWitness::new(dir.path().join("witness"));
+    let reader = NewestOnly {
+        inner: DirWitnessReader::new(dir.path().join("witness")),
+        whole: Default::default(),
+    };
+    let agent = id("triage-bot");
+    let mut trimmed = 0;
+    for round in 0..3u64 {
+        for n in 0..4u64 {
+            let a = action(round * 10 + n);
+            let now = T0 + (round * 10 + n) as i64;
+            let seq = gate.begin(&observed(&agent, &a), now).unwrap();
+            gate.finish(seq, OutcomeStatus::Ok, None, now).unwrap();
+        }
+        assert_eq!(gate.ship(&link).await.unwrap(), Shipped::Advanced(8));
+        link.ledger
+            .checkpoint(
+                &ledger_key(),
+                &id("ledger"),
+                T0 + 100 + round as i64 * 60,
+                &witness,
+            )
+            .await
+            .unwrap();
+        trimmed += gate.trim_to_witness(&reader).unwrap().receipts;
+    }
+    assert_eq!((trimmed, gate.uncovered().unwrap()), (24, 0));
+    assert_eq!(
+        scans.load(Ordering::SeqCst),
+        1,
+        "the spool was read whole again"
+    );
+    assert_eq!(reader.whole.load(Ordering::SeqCst), 0);
+
+    // The newest end of a long witness is what is read: the last three of these, in order.
+    let numbers: Vec<u64> = DirWitnessReader::new(dir.path().join("witness"))
+        .newest(2)
+        .unwrap()
+        .iter()
+        .map(|(seq, _)| *seq)
+        .collect();
+    assert_eq!(numbers, vec![2, 3]);
+}

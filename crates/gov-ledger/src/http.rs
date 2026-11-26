@@ -3,6 +3,7 @@
 //! One route takes a shipment. It answers only a request signed by an enrolled gate key; a
 //! request from anyone else gets a bare 401 and leaves no trace in the store.
 
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use axum::extract::{DefaultBodyLimit, State};
@@ -21,7 +22,17 @@ use crate::store::Store;
 pub const MAX_BATCH: usize = 1000;
 const MAX_BODY: usize = 8 * 1024 * 1024;
 
+/// What the health route reports besides being up (review finding GR-87).
+#[derive(Debug, Default)]
+pub struct Health {
+    /// Checkpoints that failed in a row. Zero once one is published.
+    pub checkpoint_failures: AtomicU64,
+    /// When the last checkpoint was published, in seconds since the epoch; zero for never.
+    pub last_checkpoint_at: AtomicI64,
+}
+
 pub struct Listener<S> {
+    pub health: Health,
     pub ledger: Ledger<S>,
     /// The Ledger's signing key, for its answers.
     pub key: SigningKey,
@@ -39,9 +50,24 @@ struct Shipment {
 pub fn router<S: Store + 'static>(listener: Arc<Listener<S>>) -> Router {
     Router::new()
         .route("/v1/receipts", post(receipts::<S>))
-        .route("/healthz", get(|| async { "ok" }))
+        .route("/healthz", get(health::<S>))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(listener)
+}
+
+/// Up, and publishing checkpoints. A Ledger whose checkpoints keep failing answers 503: its
+/// receipts are arriving and nothing is witnessing them.
+async fn health<S: Store + 'static>(State(l): State<Arc<Listener<S>>>) -> Response {
+    let failures = l.health.checkpoint_failures.load(Ordering::Relaxed);
+    let body = Json(json!({
+        "checkpoint_failures": failures,
+        "last_checkpoint_at": l.health.last_checkpoint_at.load(Ordering::Relaxed),
+    }));
+    if failures > 0 {
+        (StatusCode::SERVICE_UNAVAILABLE, body).into_response()
+    } else {
+        body.into_response()
+    }
 }
 
 async fn receipts<S: Store + 'static>(

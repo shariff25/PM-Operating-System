@@ -65,7 +65,12 @@ pub trait Spool: Send {
     fn close_intent(&mut self, seq: u64) -> Result<(), SpoolError>;
     fn set_state(&mut self, state: &SpoolState) -> Result<(), SpoolError>;
     /// Every receipt still held, in order.
+    /// Every receipt held. Reads the whole spool: for opening a gate, not for each call.
     fn held(&self) -> Result<Vec<Spooled>, SpoolError>;
+    /// One receipt, by number.
+    fn get(&self, seq: u64) -> Result<Option<Spooled>, SpoolError>;
+    /// Drop one receipt. Dropping one that is not there is no error.
+    fn remove(&mut self, seq: u64) -> Result<(), SpoolError>;
     /// Drop receipts up to and including `seq`.
     fn trim(&mut self, seq: u64) -> Result<(), SpoolError>;
     /// Keep the witnessed checkpoint the spool was last trimmed on, as read from the witness.
@@ -176,10 +181,36 @@ impl Spool for FileSpool {
         Ok(out)
     }
 
+    fn get(&self, seq: u64) -> Result<Option<Spooled>, SpoolError> {
+        match fs::read(self.receipt_path(seq)) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(|_| SpoolError::Corrupt),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(io(e)),
+        }
+    }
+
+    fn remove(&mut self, seq: u64) -> Result<(), SpoolError> {
+        match fs::remove_file(self.receipt_path(seq)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(io(e)),
+        }
+    }
+
     fn trim(&mut self, seq: u64) -> Result<(), SpoolError> {
-        for held in self.held()? {
-            if held.seq <= seq {
-                fs::remove_file(self.receipt_path(held.seq)).map_err(io)?;
+        // By name alone: no receipt is read to decide whether it goes.
+        for entry in fs::read_dir(&self.dir).map_err(io)? {
+            let name = entry.map_err(io)?.file_name();
+            let number = name
+                .to_str()
+                .and_then(|n| n.strip_prefix("receipt-"))
+                .and_then(|n| n.strip_suffix(".json"))
+                .filter(|n| n.len() == 20 && n.bytes().all(|b| b.is_ascii_digit()))
+                .and_then(|n| n.parse::<u64>().ok());
+            if number.is_some_and(|n| n <= seq) {
+                fs::remove_file(self.dir.join(&name)).map_err(io)?;
             }
         }
         Ok(())
@@ -225,6 +256,26 @@ impl Spool for FileSpool {
 pub trait WitnessReader: Send + Sync {
     /// Every checkpoint in the witness: its number and its bytes.
     fn checkpoints(&self) -> Result<Vec<(u64, Vec<u8>)>, String>;
+    /// The newest `limit` checkpoints, oldest of them first. The witness only grows, and a
+    /// gate needs its newest end alone (review finding GR-82).
+    fn newest(&self, limit: usize) -> Result<Vec<(u64, Vec<u8>)>, String> {
+        let mut all = self.checkpoints()?;
+        Ok(all.split_off(all.len().saturating_sub(limit)))
+    }
+}
+
+/// How many of the witness's newest checkpoints a gate reads. If none of them verifies,
+/// nothing is trimmed and they are reported.
+pub const WITNESS_WINDOW: usize = 16;
+
+/// What was read from the witness. Only [`WitnessRead::from`] makes one, so a gate cannot be
+/// handed checkpoints that did not come from a witness store (review finding GR-49).
+pub struct WitnessRead(pub(crate) Vec<(u64, Vec<u8>)>);
+
+impl WitnessRead {
+    pub fn from(witness: &dyn WitnessReader) -> Result<Self, String> {
+        witness.newest(WITNESS_WINDOW).map(WitnessRead)
+    }
 }
 
 /// The directory witness, read directly: `checkpoint-<twenty digits>.json`.
@@ -240,8 +291,9 @@ impl DirWitnessReader {
     }
 }
 
-impl WitnessReader for DirWitnessReader {
-    fn checkpoints(&self) -> Result<Vec<(u64, Vec<u8>)>, String> {
+impl DirWitnessReader {
+    /// The numbers of the checkpoints in the directory, in order. No file is opened.
+    fn numbers(&self) -> Result<Vec<u64>, String> {
         let mut out = Vec::new();
         let entries = match fs::read_dir(&self.dir) {
             Ok(entries) => entries,
@@ -249,19 +301,40 @@ impl WitnessReader for DirWitnessReader {
             Err(e) => return Err(e.to_string()),
         };
         for entry in entries {
-            let entry = entry.map_err(|e| e.to_string())?;
-            let name = entry.file_name().to_string_lossy().to_string();
-            let Some(seq) = name
-                .strip_prefix("checkpoint-")
+            let name = entry.map_err(|e| e.to_string())?.file_name();
+            let seq = name
+                .to_str()
+                .and_then(|s| s.strip_prefix("checkpoint-"))
                 .and_then(|s| s.strip_suffix(".json"))
                 .filter(|s| s.len() == 20 && s.bytes().all(|b| b.is_ascii_digit()))
-                .and_then(|s| s.parse::<u64>().ok())
-            else {
-                continue;
-            };
-            out.push((seq, fs::read(entry.path()).map_err(|e| e.to_string())?));
+                .and_then(|s| s.parse::<u64>().ok());
+            if let Some(seq) = seq {
+                out.push(seq);
+            }
         }
-        out.sort_by_key(|(seq, _)| *seq);
+        out.sort_unstable();
         Ok(out)
+    }
+
+    fn read(&self, numbers: &[u64]) -> Result<Vec<(u64, Vec<u8>)>, String> {
+        numbers
+            .iter()
+            .map(|seq| {
+                fs::read(self.dir.join(format!("checkpoint-{seq:020}.json")))
+                    .map(|bytes| (*seq, bytes))
+                    .map_err(|e| e.to_string())
+            })
+            .collect()
+    }
+}
+
+impl WitnessReader for DirWitnessReader {
+    fn checkpoints(&self) -> Result<Vec<(u64, Vec<u8>)>, String> {
+        self.read(&self.numbers()?)
+    }
+
+    fn newest(&self, limit: usize) -> Result<Vec<(u64, Vec<u8>)>, String> {
+        let numbers = self.numbers()?;
+        self.read(&numbers[numbers.len().saturating_sub(limit)..])
     }
 }
