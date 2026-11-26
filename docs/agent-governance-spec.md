@@ -1,9 +1,9 @@
 # Agent Governance: mandates, a gate and a ledger
 
-Status: **slice G1 built before review** (see "Status of the build" below); nothing else is
-built. Revision r1, 2026-11-26, written from `claude/web-app` at `c125014`. The independent
+Status: **slices G1 and G2 built before review** (see "Status of the build" below); nothing
+else is built. Revision r1, 2026-11-26, written from `claude/web-app` at `c125014`. The independent
 security reviewer has not read this spec or G1. The owner, 2026-11-26, after the spec was
-pushed: "lets start building G1". The gate (no open High or Critical) still applies before
+pushed: "lets start building G1", and then "Go" for G2. The gate (no open High or Critical) still applies before
 anything here touches real data.
 
 Source of the requirement: the owner's architecture proposal of 2026-11-26, the published page
@@ -60,6 +60,46 @@ Where the build differs from the text below, or chose the more refusing reading:
 - A checkpoint carries its own rising number, so a missing checkpoint shows.
 - Not in G1: the connector map, templates and the approver roster in the bundle (G3, G4, G6);
   the revocation feed's document (G4).
+
+**G2 built before review (owner's "Go" of 2026-11-26)**, on branch `build/gov-g2`: the crates
+`crates/gov-ledger` (a library) and `crates/gov-cli` (the `gov` command). 10 tests, each of
+the Ledger's run against a store in memory and against Postgres. Thirteen controls were broken
+on purpose, one at a time, and every one is caught.
+
+- Built: intake (a receipt must be signed by an enrolled gate key, name that key's gate, keep
+  its own rules and follow the chain head exactly; a resent receipt is accepted as already
+  held; everything else is refused and the refusal recorded); a chain head per gate; signed
+  checkpoints over every head, numbered, written to the witness on each call; the directory
+  witness, which never rewrites a file; pruning with a signed record; the export; and
+  verification, as a pure function and as `gov verify`, which needs only files.
+- What `gov verify` reports: a receipt that does not verify; a chain broken by a removed,
+  reordered, repeated or replaced receipt; a checkpoint that does not verify or is missing; a
+  checkpoint that covers a receipt the export lacks, or names another hash for it; a later
+  checkpoint with a shorter chain; a Ledger that stopped publishing; a gate whose chain has
+  not moved for longer than the caller allows. Its verdict says, in words, that it does not
+  show a gate recorded everything it did (T9).
+- Threats with a test in G2: T10 (all of it), T19 (no row is read or written without the
+  tenant and environment, on both stores), and the detection half of T9 that needs no
+  reconciliation (heartbeats, numbered chains).
+- Agent Governance's own database: tests use `GOV_TEST_DATABASE_URL`, a database and role
+  separate from PM OS's; CI creates them.
+
+Where G2 differs from the text below, or chose the more refusing reading:
+- **No network listener yet.** G2 is the library and the command. The endpoint gates ship
+  receipts to is built with the gate (G3), when there is something to call it.
+- **Nothing is pruned before a checkpoint covers it,** so the witness always has the hash of
+  the last receipt deleted. §6.3 did not say this.
+- A fork or a gap signed by a real gate is kept whole in the refusals, as evidence; a receipt
+  whose signature did not hold is kept only as a hash.
+- A checkpoint stored but not written to the witness (a crash in between) is written before
+  the next one is made.
+- The witness is strict: its checkpoints must start at 1 with no gap. Retiring old
+  checkpoints from a witness is not designed.
+- The trusted keys given to `gov verify` are a file the customer keeps. Until the Authority
+  exists (G4) nothing issues that file; the Ledger can print the gate keys it holds.
+- An "inclusion proof" (§7.3, Evidence) is not built; `gov verify` checks whole chains.
+- The directory witness sets each file read-only. That is a guard against accident, not
+  against whoever controls the directory; object storage with a lock is later work.
 
 ## 1. What is being built
 

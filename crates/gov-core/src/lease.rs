@@ -168,3 +168,20 @@ impl Checkpoint {
         Ok(())
     }
 }
+
+/// The Ledger's signed statement that it has deleted a gate's receipts up to a number, and
+/// the hash of the last one deleted, so what remains still links to something (spec §6.3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Pruned {
+    pub v: u32,
+    pub tenant: Id,
+    pub env: Id,
+    pub issuer: Id,
+    pub gate: Id,
+    pub through_seq: u64,
+    pub hash: Digest,
+    pub at: i64,
+}
+
+document!(Pruned, "gov.pruned.v1");

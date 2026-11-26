@@ -1,0 +1,23 @@
+[package]
+name = "gov-cli"
+description = "Agent Governance: the `gov` command. Verifies a Ledger export against the witness with public keys alone."
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "gov"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+gov-core = { path = "../gov-core" }
+gov-ledger = { path = "../gov-ledger" }
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
