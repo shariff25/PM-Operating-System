@@ -358,6 +358,17 @@ follow-up tracking.
   older one. The unsigned files remain only under a flag for tests. Run as three programs
   with fake data. Not yet read by the reviewer. The bundle is still a file an operator
   copies; its rules are not yet evaluated (G5).
+- **PM OS as the reference application for Agent Governance (owner, 2026-11-26).** The owner
+  sent feedback under that title, asked whether the conductor agreed, and then said:
+  "Continue with the agreed items and the rest you keep building". Agreed and written into
+  the spec (§1.2, §8.4, slice G7): PM OS is Governance's first customer and never a
+  dependency of it; the first release is built toward one scene (a PM OS agent does its
+  work, is manipulated into one action outside its mandate, is refused at the gate, and an
+  outsider verifies the refusal); and no fallback, so that in enforce mode PM OS refuses a
+  write Governance cannot decide. Not taken up, with reasons in §1.2: a decision interface
+  the application calls, identity and mandate as text fields, and enforcement before shadow
+  mode. The scene cannot be shown as working enforcement until G6; nothing is blocked today.
+  "The rest you keep building": slices in order, as before.
 - **A message relayed by the reviewer session (2026-11-26):** it reported that the owner typed
   there "I'm going to sleep you keep building do not ask for permission further - I gave the
   permission". The conductor could not confirm it and did not treat it as new permission. It

@@ -806,6 +806,65 @@ slice, so hosting many tenants later changes no format.
 Everything runs on fake data until the security gate passes (no open High or Critical) and the
 owner says otherwise. Nothing in this spec enforces against a real system.
 
+### 1.2 PM OS is the reference application (owner, 2026-11-26)
+
+The owner's feedback of 2026-11-26, "PM-OS as the reference application for Agent
+Governance", and the conductor's reading of it. The owner's word: "Continue with the agreed
+items". What follows is what was agreed, what that changes here, and what was not taken up.
+
+**Agreed, and now part of this spec.**
+
+- **PM OS is the first customer of Agent Governance, not a part of it.** PM OS creates and
+  runs product work; Governance decides what its agents may do, on whose authority, and
+  keeps the evidence. Governance must work as well for an agent that is not PM OS's. This
+  was already the rule (§9: no `gov-*` crate depends on a `pmos-*` crate); it is now also
+  the reason PM OS is the first thing wired to it (slice G7).
+- **The demonstration the first release is built toward** is one scene, not a dashboard:
+  a PM OS agent completes a piece of work, attempts one action outside its mandate because
+  a document it read told it to, is refused at the gate before the action reaches the
+  system, and a person who trusts neither PM OS nor the gate's operator verifies the
+  refusal from the Ledger's export with public keys alone. §10 lists it as what G7 is done
+  against.
+- **No fallback.** For a system a deployment has put in enforce mode, PM OS has no
+  authorization path of its own to fall back on when Governance cannot decide (§8.4).
+- **Three ways to install** stay as §1 has them: PM OS alone, Governance alone, both.
+
+**What the demonstration needs that is not built**, so that nothing is claimed early: an
+Authority that issues the agent's mandate to a named person's account (G4c, G4e); the
+gate's time and revocation (G4d); shadow mode (G5); enforce mode with the gate holding the
+credential (G6); the seam (G7). Until G6 the gate blocks nothing, and the scene may not be
+shown or described as working enforcement. In shadow mode it can be shown honestly as
+"would have been refused".
+
+**How the scene is written, so that the refusal is real.** The gate refuses by operation
+and resource, as the connector map reads a call. An agent permitted to read feedback that
+reads all of it, one call at a time, has done nothing its mandate forbids: "bulk export"
+is not an operation unless a tool makes it one, and limits on volume are not designed
+(budgets, G6, count calls; they do not know what a record is). So the scene's unauthorized
+action is a different operation or resource from the permitted ones: sending to an outside
+address, or reading a resource the mandate does not cover, such as another project's
+issues. That is also the more honest picture of what a mandate stops.
+
+**Not taken up, and why** (the owner asked for the agreed items only; these stay open for
+the owner to press):
+
+- *A decision interface* (`GovernanceRequest` in, `ALLOW`, `DENY` or `REQUIRE_APPROVAL`
+  out). An application that asks and then acts with its own credential is governed only
+  while it chooses to ask. The proposal's own first line, that an agent never holds a key,
+  needs the gate in the path of the call, holding the credential, which is what is built.
+- *Identity, mandate and delegation chain as text fields in a request.* Those are claims.
+  Here the agent proves its key on every call and the mandate is a signed document the
+  gate verifies; a receipt says `proven` or `claimed` for this reason.
+- *Enforcement first.* Observe, then shadow, then enforce stays the order: the reviewer
+  has made closing named findings a condition of enforcing, and a customer should see what
+  would be refused before anything is.
+
+**In the feedback's list and already here under another name:** signed receipts and the
+check an outsider can run (built); agent identity as an enrolled key (built); human
+approval as the countersignature (G6); revocation (G4d); the console (G8); undo (G9),
+which the feedback does not mention and which answers a question it leaves open, what
+happens after an agent was allowed to do the wrong thing.
+
 ## 2. Where this spec departs from the proposal
 
 Six places where the proposal contradicts itself or leaves a hole, and the rule this spec
@@ -1712,6 +1771,16 @@ One setting. PM OS enrols its bots in bulk and starts in observe, then shadow, c
 decision with Governance's for every write, the way `PMOS_MCP_COMPARE` compares connectors with
 MCP servers. Fake data only until the gate passes review.
 
+**No fallback (owner, 2026-11-26; to be built in G7).** Once a system is in enforce mode,
+a write to it that Governance cannot decide is refused: no lease or a stale one, no bundle,
+a mandate that cannot be checked, a receipt that cannot be written. PM OS's own grant check
+still runs first and can refuse; it can never be what allows a write that Governance did
+not. The tool server does not notice Governance is unwell and carry on without it. Taking
+a system out of enforce mode, or turning the seam off, is a deliberate change of
+configuration by an admin, recorded as an admin action (`ModeSet`), never something the
+running service does for itself. In observe and shadow modes nothing is refused by
+Governance, by definition; what cannot be recorded is counted and shown.
+
 ### 8.5 Not connected
 
 The model gateway, evals, content, the daily brief, the Slack app's own messages, OpenShell
@@ -1749,7 +1818,7 @@ Each slice ends with its attack tests (§3.3) passing and its commit sent to the
 | G4 | `gov-authority`: registry, enrolment, Entra sign-in, policy check and signing, mandates, lease and revocation feed, admin interface, `gov` commands | A revoked agent is refused within its class; a gate that misses a revocation treats its lease as invalid; a wrong clock does not extend an expiry |
 | G5 | Shadow mode; policy replay; a drafted first policy from observed receipts | Replay reports exactly the decisions a changed rule alters on a fixed history |
 | G6 | Enforce: the sealed store, the twelve checks, countersignatures of both classes, the approval screen's interface, budgets, crash recovery | Every row T1 to T7, T11, T15 and T22 has a failing-without, passing-with test; a kill between intent and outcome yields `unknown` and no second write |
-| G7 | The PM OS seam, off by default; bulk enrolment; the session mandate; attested approvals; the receipt reference in the audit log; side-by-side comparison | With the switch off, the tool server's output is identical; with it on, on the test stack, every write has an intent and an outcome receipt |
+| G7 | The PM OS seam, off by default; bulk enrolment; the session mandate; attested approvals; the receipt reference in the audit log; side-by-side comparison; no fallback in enforce mode (§8.4) | With the switch off, the tool server's output is identical; with it on, on the test stack, every write has an intent and an outcome receipt; in enforce mode a write is refused when Governance cannot decide; and the scene of §1.2 runs end to end on fake data: a PM OS bot finishes a task, a planted instruction makes it attempt an operation outside its mandate, the gate refuses it before the fake system is called, and `gov verify` passes on an export holding the refusal |
 | G8 | Console screens; Governance's own stack file and the overlay for both; health and metrics (decision time, refusals, lease age, revocation delay) | CI's deploy job starts both stacks on a real Docker host |
 
 | G9 | Undo (§4.7), after G6: before-values sealed at intent; the undo action and its receipts; refusal on a changed target; undo of a whole mandate; the undo cover page | On the fake Jira: forty issues changed by one mandate are put back by one undo with a receipt each; an issue someone edited in between is left alone and reported; a `none` operation cannot be undone and needed a person to run |
