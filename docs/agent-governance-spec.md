@@ -1729,6 +1729,80 @@ Written to settle the reviewer's list from the fifteenth read before any code.
 revocation (G4d); mandates from the Authority (G4c), so the `mandates` keys in a bundle are
 a test issuer's until then.
 
+#### 7.6.2 G4c, mandates from the Authority (design of 2026-11-26; not built; for the reviewer)
+
+Ends the test issuer. Written before any code; nothing here is served until G4e, so every
+function below is a library call, usable only by someone on the Authority's machine.
+
+1. **Templates are policy.** The bundle gains `templates`, a list. A template has an id,
+   the grants a mandate from it may carry at most, the longest life (never more than the
+   bundle's own cap, default 8 hours), limits, whether a mandate from it may be delegated,
+   and who may ask for it: the agent's owner always, and beyond that only the people or
+   roles the template names. A mandate says `template: "<id>@<bundle number>"`, and the
+   signer is shown templates added, removed and changed like rules (§7.6.1, point 4).
+2. **Issuing to a person's request.** The Authority issues a mandate when all of these hold,
+   checked on the chain's head it then commits on:
+   - the person is active, and is the agent's owner or one the template names. Being an
+     admin is not enough: an admin manages the registry, and does not thereby hold every
+     agent's authority;
+   - the agent is usable (§7.1) and the mandate is bound to one of its enrolled keys, named
+     in the request;
+   - the template is in the **latest published bundle**; the grants asked for are inside
+     the template's, by the same containment check a gate applies to a chain; the life
+     asked for is within the template's;
+   - the key the Authority signs with is listed under `mandates` in that same bundle. An
+     Authority whose mandates key the root has not named issues nothing.
+   The mandate's id is 128 random bits from the Authority and is never reused. The mandate
+   and a `MandateIssued` record (the mandate's id, the agent, the digest of the signed
+   mandate) are written in one step.
+3. **Nobody is signed in until G4e**, and the mandate says so. `issued_by.session` is
+   absent on every mandate issued before then, as the admin record's actor is unverified.
+   A condition on G6, stated now: a gate in enforce mode refuses a mandate whose root has
+   no session. So no mandate issued by whoever could run a command can ever back an
+   enforced action.
+4. **Delegation.** A parent agent asks, in a document of its own (`gov.delegate.v1`: the
+   parent mandate's id, the child agent and its key id, the narrowed grants, the life, a
+   nonce, the time), signed with the key the parent mandate is bound to. The Authority
+   issues the child only if: the parent mandate verifies now and is not revoked; its
+   template allows delegating; the child is another enrolled, usable agent; the child's
+   grants and life are inside the parent's; the chain would be no deeper than 3; the nonce
+   has not been seen and the time is within the clock allowance. The child embeds the
+   parent's signed mandate, so a gate checks the chain without asking the Authority. A
+   delegated mandate's `issued_by` is the parent agent; the person at the root is found by
+   walking the chain, and the record names both.
+5. **Listing.** A person sees the mandates of agents they own; an admin and an auditor see
+   every mandate's id, agent, template, issuer, times and state, and never its grants'
+   resources beyond what the template already says. (Listing is what the admin interface
+   serves in G4e; here it is a library call with the same rule.)
+6. **Revoking.** The person who issued a mandate, the agent's owner, or an admin may revoke
+   it. One entry is enough for its descendants: a gate checks every link of a chain against
+   the revocations it holds. Offboarding a person, or suspending or disabling an agent,
+   revokes that agent's live mandates, each with its own `Revoked` record, in the same step
+   as the change that caused it (§7.6, choice 4).
+7. **The revocation feed.** Every revocation takes the next number, from 1, with no gaps,
+   and carries the kind, the id and the time after which the thing would have expired
+   anyway. The feed a gate fetches is "everything after number N": a signed document
+   (`gov.revocations.v1`: from, through, the entries, and the newest number there is),
+   signed with the **leases key**, which the bundle names, and never the admin-record key.
+   An entry is left out of the feed only once its expiry has passed by more than the clock
+   allowance, and the numbers of dropped entries are never reused, so a gate that asks from
+   an old number is told the range it missed was dropped rather than shown a shorter feed.
+   The gate's use of the feed, and the lease that says how far a gate must have read, are
+   G4d.
+8. **`gov verify` reports a mandate nobody issued.** A receipt marked `proven` names its
+   mandate ids. With an Authority named, an id with no witnessed `MandateIssued` record is
+   reported, as a gate key with no enrolment record is (GR-84). This makes a forged or
+   test-issued mandate visible to an auditor even in observe mode.
+9. **Three keys at the Authority, three uses.** The admin-record key signs admin records;
+   the mandates key signs mandates; the leases key signs the revocation feed (and leases,
+   G4d). Each is refused for the others' documents by type tag and by key set, as the root
+   is for anything but a bundle. All are files, for fake data only, until a key service
+   exists.
+
+**Not built in G4c:** anything served over HTTP (G4e); the gate reading the feed, closing
+sessions, and its clock (G4d); grants checked against a call (G5); limits charged (G6); a
+limit on how many mandates may be issued in a time, which belongs with the listener.
+
 **Not in G4:** countersignatures and approvals (G6), shadow decisions (G5), the console's
 screens (G8). A mandate's grants are still not checked against an action until G5, so a
 proven receipt is still not an authorised one.
