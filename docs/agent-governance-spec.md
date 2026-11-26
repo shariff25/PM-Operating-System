@@ -321,13 +321,45 @@ reviewer.
   key and a value that pins it.
 - Every record says its actor is **unverified**: there is no sign-in before G4e. "Only an
   admin acts" is checked against the name given, not against a person.
-- **Not in this part:** the Authority's chain is not yet shipped to the Ledger, the Ledger
-  does not yet take chains of two kinds, and `gov verify` does not yet read admin records;
-  a gate's key does not yet reach the Ledger from the Authority; nothing is served on a
-  listener and there is no `gov-authority` program. Those are the second part of G4a.
-- Six tests on both stores, and two in `gov-core`: who may act; enrolment; what does not
+- **Not in this part:** shipping the Authority's chain to the Ledger and the rest of what
+  follows from it, which is the second part, below.
+- Ten tests on both stores (after the fourteenth read), and two in `gov-core`: who may act; enrolment; what does not
   enrol a key; an offboarded owner's agents stopping; two admins at once keeping one chain;
   and an action whose record cannot be kept changing nothing.
+
+**G4a, second part, built (2026-11-26): the Authority's chain at the Ledger,** on
+`build/gov-g4a2`. Built while the reviewer read the first part; not yet read.
+
+- **A chain holds one kind of document** (GR-108). At the Ledger a key is enrolled for a
+  gate's receipts or for an Authority's admin records, and every key of a chain is of that
+  chain's kind. At intake a key is read as its own kind only, so the Authority's key on a
+  receipt, or a gate's key on an admin record, is refused. `gov verify`'s trusted keys are
+  kept per kind in the same way, and it follows either kind of chain.
+- **The Authority ships its chain** to the Ledger as a gate does, under a request signed
+  with its admin-record key, and checks the Ledger's signed answer against its own chain.
+  The chain is then in the same checkpoints as the gates', and under the same witness.
+- **A gate's key reaches the Ledger through the Authority's chain** (GR-107, and as the
+  reviewer's fourteenth read advised). A key offered to the Ledger, by anyone, is enrolled
+  only when the Ledger's own copy of the Authority's chain holds the record of its
+  enrolment for a gate, with a key of that digest, and no later record disabling the gate or
+  revoking the key. So the keys a Ledger takes receipts under are the ones the witness has
+  seen enrolled. **A record that disables a gate retires its key at the Ledger:** what the
+  gate sent stays and still verifies, and nothing more is taken (the open half of GR-20).
+  The Ledger is given one key at installation: the Authority's admin-record key.
+- **After the fourteenth read** (below): a one-time code is taken by exactly one request,
+  and a key or key id is enrolled once; the code names the root key to pin and no value
+  comes back; a key's id is under its name; cancelling a code after wrong guesses is
+  recorded; a code enrols nothing for an agent or gate stopped since it was made; every
+  check an action makes is on the chain's head it commits on, so two installers cannot both
+  name a first admin.
+- **Still not built in G4a:** nothing is served by the Authority on a listener and there is
+  no `gov-authority` program, so none of this is yet reachable from the three programs,
+  which still use the stand-ins of G3b; `gov verify`, the command, does not yet take an
+  Authority's keys; the auditor's check that each gate key matches a witnessed enrolment
+  (GR-84) is not yet written. The Ledger finds an enrolment by reading the Authority's
+  whole chain, which is fine at this size and is to be indexed before it is not.
+- One more test on both of the Ledger's stores (a chain holds one kind of document), and
+  two with an Authority and a Ledger together.
 
 ## Security review of 2026-11-26 (first read; the gate did not pass)
 
@@ -613,6 +645,31 @@ opened a new fault, GR-112.
 | GR-111 | Low, G4a to G4d | Before sign-in exists, an admin record must not read as a person's proven act | §7.6, choice 8 |
 | GR-112 | Medium | The shim forgot its listings on every `x-gov-reopen`, but only a restarted gate has lost its own; an idle session then broke every later call | Fixed on `build/gov-review-13`: the gate says whether it still holds a listing for that MCP session, and the shim forgets only when it does not |
 | GR-113 | Low | After a gate restart a running MCP session's id is never issued again, so its listings are never remembered | Fixed: an id is taken as issued when the server answers a request under it successfully |
+
+### Fourteenth read, 2026-11-26, G4a's first part at `36ded25`
+
+**Verdict: no High or Critical. G4a's first part passes as a library that nothing serves
+yet;** GR-107 and GR-108 are answered in the text and, but for two points, kept in the code.
+GR-112 and GR-113 are closed. The reviewer read the first part only; the second part was
+built while it read, and then changed to follow this verdict's advice.
+
+| Finding | Severity | What it said | What was done (`build/gov-g4a2`) |
+|---|---|---|---|
+| GR-114 | Medium | Two requests with the right code at the same moment both enrolled; and a second key under an enrolled id silently replaced the first | The code is taken, not read: one statement removes and returns it, to one caller. Adding a key never replaces: a taken id or key fails the whole commit |
+| GR-115 | Medium | The "pin" did not authenticate the root key: whoever answers has been sent the code | The code carries the digest of the root key; the enrolling party checks the key it is answered with against the code it was given out of band; nothing comes back |
+| GR-116 | Low | A public key could be enrolled under two ids, and the enrolling party chose its own id | A key is enrolled once; its id is `<name>:<anything>` |
+| GR-117 | Low | Five wrong guesses cancelled a code with no record | The cancellation is an admin record, with the Authority as its actor. Not done: a limit per source, which needs a listener (G4e) |
+| GR-118 | Low | A code made before an agent or gate was disabled still enrolled a key | Checked again when enrolling; and stopping an agent or gate drops its code |
+| GR-119 | Low | Checks were made before the commit, not in it: two bootstraps could both name a first admin | Every action reads the chain's head first, checks, and commits on that head; if the head moved, it starts again |
+| GR-120 | Low | Taking a session id as issued when the server answers under it reopens GR-76 for a server that checks no ids | Stated here: such a server vouches for any id, and is one to fix |
+| GR-121 | Low | The text promised less than the code does; an admin record's time could go back | The text is changed (§7.6, choice 1); a record's time is never earlier than the one before |
+
+The reviewer's advice for the second part, all followed: a gate's key is enrolled at the
+Ledger from the record of its enrolment, with the key beside it, and no separate signed
+request; the Ledger takes a gate's receipts only after it holds that record, and a record
+disabling the gate retires the key; `gov verify` applies an admin record's own rules and
+refuses a document of the wrong kind in either chain. Still to do, with G4c: `gov verify`
+reporting a mandate id that appears in a receipt and in no record of its issue.
 
 ## 1. What is being built
 
@@ -1367,10 +1424,10 @@ issuer; nothing is revoked and the gate's time is its own machine's. G4 ends eac
    - **Chains have a kind.** A chain at the Ledger takes one kind of document. A key is
      enrolled for receipts or for admin records, never both: a key enrolled for admin
      records is refused on a receipt, and a gate's key on an admin record.
-   - **Record before effect.** An admin action takes effect only after its record is
-     durably written, as an intent receipt precedes a call. A crash leaves a record with no
-     effect, which the Authority completes or marks as not done when it starts; never an
-     effect with no record.
+   - **Record and effect together.** An admin action's record and what it changes are
+     written in one step, so there is never one without the other (as built, and stronger
+     than the "record first, completed at start" this text first said: GR-121). A record's
+     time never goes back along the chain.
    - **Issuing a mandate is an admin action** and is recorded, with the mandate's id. A
      mandate id that appears in a gate's receipt and in no admin record is then something
      `gov verify` can report: a mandate the witness never saw issued.
@@ -1397,13 +1454,22 @@ issuer; nothing is revoked and the gate's time is its own machine's. G4 ends eac
      could forge for is refused (GR-6), as is a key or key id already enrolled.
    - Wrong codes for one name are counted; after five the name's pending code is cancelled
      and an admin must make another.
-   - The answer carries the Authority's root public key and a value computed from the code
-     over that key, so the gate or agent pins the key it enrolled with and cannot be handed
-     another by something in between.
-   - **A gate's key reaches the Ledger from the Authority,** in a request signed with the
-     Authority's admin-record key, which the Ledger is configured with at installation. The
-     Ledger enrols a receipt key on that request alone; the `gov-ledger enrol` command stays
-     for an installation with no Authority.
+   - **The code names the root key to pin** (GR-115, which replaced what this text first
+     said). The code the admin hands over is `<secret>.<digest of the Authority's root
+     key>`. The answer to a request to enrol carries the root key, and the gate or agent
+     pins it only if its digest is the one in the code it was given out of band. No value
+     computed from the code comes back: anything answering in the Authority's place has
+     been sent the code and could compute it.
+   - A key's id is `<name>:<anything>`, under the name it is for, and a public key is
+     enrolled once, under one id (GR-116).
+   - **A gate's key reaches the Ledger through the Authority's chain.** The Ledger is given
+     the Authority's admin-record key at installation. A gate's key, offered to the Ledger
+     by anyone, is taken only if the Ledger's own copy of the Authority's chain holds the
+     record of that key's enrolment for a gate, with a key of exactly that digest, and no
+     later record disabling the gate or revoking the key. No signature on the offer is
+     asked for or needed: the record is signed, numbered and witnessed. A record that
+     disables a gate, or revokes a key, retires that key at the Ledger when it arrives. The
+     `gov-ledger enrol` command stays for an installation with no Authority.
 4. **An agent has one owner, a person.** Offboarding the person suspends their agents and
    revokes those agents' mandates in one admin action with one record each.
 5. **Revocation in observe mode** (with GR-110, to be built in G4d). The gate still blocks

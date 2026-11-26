@@ -306,6 +306,24 @@ follow-up tracking.
   code and its signed admin records (`crates/gov-authority`, on `build/gov-g4a`), on memory
   and Postgres stores. A library only: nothing is served, nobody is signed in, and its chain
   is not yet shipped to the Ledger. Not yet read by the reviewer.
+- **G4a, second part, built (2026-11-26):** the Ledger holds chains of two kinds and reads
+  each key as its own kind only; the Authority ships its admin records there, under the same
+  witness as the gates' receipts; and the Ledger enrols a gate's key only on the Authority's
+  signed word backed by a witnessed record (`build/gov-g4a2`). Still libraries: the three
+  programs do not use the Authority yet. Not yet read by the reviewer.
+- **Fourteenth read (2026-11-26), G4a's first part at `36ded25`:** no High or Critical; it
+  passes as a library nothing serves yet. Two Medium findings in enrolment (one code could
+  enrol two keys at the same moment; the value meant to authenticate the root key did not)
+  and six Low, fixed on `build/gov-g4a2` with the second part, which was changed to follow
+  the reviewer's advice: a gate's key reaches the Ledger through the witnessed record of its
+  enrolment, and a disabled gate's key is retired there.
+- **A test failed once in a full run (2026-11-26):** a PM OS password test, in code this work
+  did not touch, while the disk was 100% full. With the disk cleared it passed five times
+  running. Taken as caused by the disk; not proven.
+- **CI failed once on `36ded25` (2026-11-26):** a gate test looked at the record a fixed 1.2
+  seconds after eight slow calls and found one still open. The test now waits until every call
+  is closed (20 seconds at most). Taken as a timing fault in the test, not in the gate; a
+  deterministic test of the same control passed in that run.
 - **A message relayed by the reviewer session (2026-11-26):** it reported that the owner typed
   there "I'm going to sleep you keep building do not ask for permission further - I gave the
   permission". The conductor could not confirm it and did not treat it as new permission. It

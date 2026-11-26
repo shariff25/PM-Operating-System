@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use gov_core::receipt::ChainHead;
 use gov_core::{Digest, Envelope, Id, PublicKey, Scope};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -51,11 +52,45 @@ pub struct Refusal {
     pub envelope: Option<Envelope>,
 }
 
+/// What a chain holds. A chain is of one kind, fixed by the first key enrolled for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChainKind {
+    /// A gate's receipts.
+    #[default]
+    Receipt,
+    /// An Authority's admin records.
+    Admin,
+}
+
+impl ChainKind {
+    pub fn is_receipt(&self) -> bool {
+        *self == ChainKind::Receipt
+    }
+}
+
 #[async_trait]
 pub trait Store: Send + Sync {
-    /// Enrol a gate's key. Every store refuses a key anyone could forge for, a key id that is
-    /// taken, and a key already enrolled under another id.
-    async fn add_gate_key(&self, scope: &Scope, gate: &Id, key: &PublicKey) -> StoreResult<()>;
+    /// Enrol a key for a chain of `kind`. Every store refuses a key anyone could forge for,
+    /// a key id that is taken, a key already enrolled under another id, and a key of one
+    /// kind for a chain that holds the other.
+    async fn add_key(
+        &self,
+        scope: &Scope,
+        chain: &Id,
+        kind: ChainKind,
+        key: &PublicKey,
+    ) -> StoreResult<()>;
+    /// Enrol a gate's receipt key.
+    async fn add_gate_key(&self, scope: &Scope, gate: &Id, key: &PublicKey) -> StoreResult<()> {
+        self.add_key(scope, gate, ChainKind::Receipt, key).await
+    }
+    /// Retire a chain's keys: one of them, or all. Nothing more is taken under a retired
+    /// key; what was taken stays, and so does the key, for checking it.
+    async fn retire_keys(&self, scope: &Scope, chain: &Id, kid: Option<&Id>) -> StoreResult<()>;
+    async fn key_retired(&self, scope: &Scope, kid: &Id) -> StoreResult<bool>;
+    /// What kind of document a chain holds, if it has any key.
+    async fn chain_kind(&self, scope: &Scope, chain: &Id) -> StoreResult<Option<ChainKind>>;
     /// The gate a key id belongs to, and the key.
     async fn gate_key(&self, scope: &Scope, kid: &Id) -> StoreResult<Option<(Id, PublicKey)>>;
     /// Every gate key, by gate.
@@ -121,6 +156,8 @@ type Key = (Id, Id);
 #[derive(Default)]
 struct Inner {
     gate_keys: BTreeMap<(Key, Id), (Id, PublicKey)>,
+    kinds: BTreeMap<(Key, Id), ChainKind>,
+    retired: std::collections::BTreeSet<(Key, Id)>,
     heads: BTreeMap<(Key, Id), ChainHead>,
     receipts: BTreeMap<(Key, Id, u64), StoredReceipt>,
     refusals: Vec<(Key, Refusal)>,
@@ -138,10 +175,24 @@ fn k(scope: &Scope) -> Key {
 
 #[async_trait]
 impl Store for MemoryStore {
-    async fn add_gate_key(&self, scope: &Scope, gate: &Id, key: &PublicKey) -> StoreResult<()> {
+    async fn add_key(
+        &self,
+        scope: &Scope,
+        gate: &Id,
+        kind: ChainKind,
+        key: &PublicKey,
+    ) -> StoreResult<()> {
         key.enrolable()
             .map_err(|e| StoreError::Other(e.to_string()))?;
         let mut s = self.0.lock().unwrap();
+        if s.kinds
+            .get(&(k(scope), gate.clone()))
+            .is_some_and(|held| *held != kind)
+        {
+            return Err(StoreError::Other(
+                "that chain holds the other kind of document".into(),
+            ));
+        }
         let slot = (k(scope), key.kid.clone());
         if s.gate_keys.contains_key(&slot) {
             return Err(StoreError::Other("that key id is already enrolled".into()));
@@ -154,7 +205,41 @@ impl Store for MemoryStore {
             return Err(StoreError::Other("that key is already enrolled".into()));
         }
         s.gate_keys.insert(slot, (gate.clone(), key.clone()));
+        s.kinds.insert((k(scope), gate.clone()), kind);
         Ok(())
+    }
+
+    async fn retire_keys(&self, scope: &Scope, chain: &Id, kid: Option<&Id>) -> StoreResult<()> {
+        let mut s = self.0.lock().unwrap();
+        let gone: Vec<(Key, Id)> = s
+            .gate_keys
+            .iter()
+            .filter(|((scope_key, held), (of, _))| {
+                *scope_key == k(scope) && of == chain && kid.is_none_or(|one| one == held)
+            })
+            .map(|(slot, _)| slot.clone())
+            .collect();
+        s.retired.extend(gone);
+        Ok(())
+    }
+
+    async fn key_retired(&self, scope: &Scope, kid: &Id) -> StoreResult<bool> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .retired
+            .contains(&(k(scope), kid.clone())))
+    }
+
+    async fn chain_kind(&self, scope: &Scope, chain: &Id) -> StoreResult<Option<ChainKind>> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .kinds
+            .get(&(k(scope), chain.clone()))
+            .copied())
     }
 
     async fn gate_key(&self, scope: &Scope, kid: &Id) -> StoreResult<Option<(Id, PublicKey)>> {

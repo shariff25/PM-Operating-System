@@ -19,6 +19,9 @@ pub enum StoreError {
     /// The chain's head moved between the read and the write. The caller reads again.
     #[error("the chain's head moved")]
     HeadMoved,
+    /// A key id, or a public key, that is enrolled already.
+    #[error("that key is enrolled already")]
+    KeyTaken,
     #[error("storage: {0}")]
     Other(String),
 }
@@ -100,7 +103,10 @@ pub enum Effect {
     PutGate(Gate),
     PutCode(PendingCode),
     DropCode(EnrolKind, Id),
-    PutKey(EnrolledKey),
+    /// Enrol a key. Unlike the others this never replaces: if the key id, or the public key
+    /// under any id, is enrolled already, the whole commit fails with
+    /// [`StoreError::KeyTaken`] and nothing is written (review findings GR-114, GR-116).
+    AddKey(EnrolledKey),
 }
 
 /// One admin record as stored.
@@ -147,12 +153,20 @@ pub trait Store: Send + Sync {
         kind: EnrolKind,
         name: &Id,
     ) -> StoreResult<Option<PendingCode>>;
-    /// A wrong code was presented for this name. Counts it and returns the count. This and
-    /// [`Store::drop_code`] are not admin actions and have no record: nobody decided them.
+    /// A wrong code was presented for this name. Counts it and returns the count. Not an
+    /// admin action and not recorded: nobody decided it.
     async fn count_wrong_code(&self, scope: &Scope, kind: EnrolKind, name: &Id)
         -> StoreResult<u32>;
-    /// Remove a pending code: it was presented, or guessed at too often.
-    async fn drop_code(&self, scope: &Scope, kind: EnrolKind, name: &Id) -> StoreResult<()>;
+    /// Take the pending code whose digest is `digest`: remove it and return it, in one step.
+    /// Of two callers presenting the same code at once, one gets it and the other gets
+    /// nothing, so a code is used once (review finding GR-114).
+    async fn take_code(
+        &self,
+        scope: &Scope,
+        kind: EnrolKind,
+        name: &Id,
+        digest: &Digest,
+    ) -> StoreResult<Option<PendingCode>>;
 }
 
 type Key = (Id, Id);
@@ -197,11 +211,30 @@ impl Store for MemoryStore {
     ) -> StoreResult<()> {
         let mut s = self.0.lock().unwrap();
         let key = k(scope);
-        let chain = s.records.entry(key.clone()).or_default();
-        if chain.last().map_or(0, |r| r.seq) + 1 != record.seq {
+        let head = s
+            .records
+            .get(&key)
+            .and_then(|c| c.last())
+            .map_or(0, |r| r.seq);
+        if head + 1 != record.seq {
             return Err(StoreError::HeadMoved);
         }
-        chain.push(record.clone());
+        // A key is enrolled once: checked before anything is written.
+        for effect in effects {
+            if let Effect::AddKey(e) = effect {
+                let taken = s.keys.iter().any(|((scope_key, kid), held)| {
+                    *scope_key == key
+                        && (kid == &e.key.kid || held.key.bytes().ok() == e.key.bytes().ok())
+                });
+                if taken {
+                    return Err(StoreError::KeyTaken);
+                }
+            }
+        }
+        s.records
+            .entry(key.clone())
+            .or_default()
+            .push(record.clone());
         for effect in effects {
             match effect.clone() {
                 Effect::PutPerson(p) => {
@@ -219,7 +252,7 @@ impl Store for MemoryStore {
                 Effect::DropCode(kind, name) => {
                     s.codes.remove(&(key.clone(), kind, name));
                 }
-                Effect::PutKey(e) => {
+                Effect::AddKey(e) => {
                     s.keys.insert((key.clone(), e.key.kid.clone()), e);
                 }
             }
@@ -347,12 +380,18 @@ impl Store for MemoryStore {
             }))
     }
 
-    async fn drop_code(&self, scope: &Scope, kind: EnrolKind, name: &Id) -> StoreResult<()> {
-        self.0
-            .lock()
-            .unwrap()
-            .codes
-            .remove(&(k(scope), kind, name.clone()));
-        Ok(())
+    async fn take_code(
+        &self,
+        scope: &Scope,
+        kind: EnrolKind,
+        name: &Id,
+        digest: &Digest,
+    ) -> StoreResult<Option<PendingCode>> {
+        let mut s = self.0.lock().unwrap();
+        let slot = (k(scope), kind, name.clone());
+        if s.codes.get(&slot).is_some_and(|c| &c.digest == digest) {
+            return Ok(s.codes.remove(&slot));
+        }
+        Ok(None)
     }
 }

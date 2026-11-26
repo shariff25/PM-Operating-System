@@ -11,7 +11,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use gov_core::{Envelope, Id, SigningKey};
+use gov_core::{Envelope, Id, PublicKey, SigningKey};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -50,9 +50,31 @@ struct Shipment {
 pub fn router<S: Store + 'static>(listener: Arc<Listener<S>>) -> Router {
     Router::new()
         .route("/v1/receipts", post(receipts::<S>))
+        .route("/v1/keys", post(keys::<S>))
         .route("/healthz", get(health::<S>))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(listener)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Offered {
+    key: PublicKey,
+}
+
+/// A gate's key, offered by anyone. It is taken only if the Authority's chain, as held
+/// here, records its enrolment; otherwise the answer is the same refusal whatever is wrong.
+async fn keys<S: Store + 'static>(
+    State(l): State<Arc<Listener<S>>>,
+    Json(asked): Json<Offered>,
+) -> Response {
+    match l.ledger.supply_key(&asked.key).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(LedgerError::Refused(_)) | Err(LedgerError::Core(_)) => {
+            StatusCode::FORBIDDEN.into_response()
+        }
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 
 /// Up, and publishing checkpoints. A Ledger whose checkpoints keep failing answers 503: its

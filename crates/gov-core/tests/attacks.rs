@@ -2292,24 +2292,38 @@ fn an_admin_record_keeps_its_rules_and_is_never_a_receipt() {
     assert!(open::<Receipt>(&first, &keys, &scope()).is_err());
 }
 
-/// The code enrols, never its digest; and the answer's pin holds only for the root key the
-/// code's holder was meant to get (review finding GR-107).
+/// The code enrols, never its digest; and it names the root key its holder is to pin, so
+/// that whatever answers a request to enrol cannot hand over another (review findings
+/// GR-107 and GR-115).
 #[test]
-fn an_enrolment_code_and_its_pin() {
-    use gov_core::enrol::{code_digest, new_code, pin, EnrolKind, EnrolRequest};
-    let (a, b) = (new_code().unwrap(), new_code().unwrap());
+fn an_enrolment_code_names_the_root_key_to_pin() {
+    use gov_core::enrol::{code_digest, code_names_root, new_code, EnrolKind, EnrolRequest};
+    let root = authority().public();
+    let other_root = key("another-root", 77).public();
+    let (a, b) = (new_code(&root).unwrap(), new_code(&root).unwrap());
     assert_ne!(a, b);
-    assert!(a.len() >= 22, "128 bits as text");
+    assert!(a.split('.').next().unwrap().len() >= 22, "128 bits as text");
     assert_ne!(code_digest(&a), code_digest(&b));
     // The digest is not the code: what the Authority stores does not hash to itself.
     assert_ne!(code_digest(code_digest(&a).as_str()), code_digest(&a));
 
-    let root = authority().public();
-    let other_root = key("another-root", 77).public();
-    let tag = pin(&a, &root).unwrap();
-    assert_eq!(tag, pin(&a, &root).unwrap());
-    assert_ne!(tag, pin(&a, &other_root).unwrap(), "another root key");
-    assert_ne!(tag, pin(&b, &root).unwrap(), "another code");
+    // The code says which root key to trust, and no other key passes for it.
+    assert!(code_names_root(&a, &root));
+    assert!(!code_names_root(&a, &other_root));
+    let same_id_other_key = SigningKey::from_seed(id("authority-1"), &[78; 32])
+        .unwrap()
+        .public();
+    assert!(!code_names_root(&a, &same_id_other_key));
+    // A code with its second half cut off, or swapped for another key's, names nothing the
+    // real root matches.
+    let secret = a.split('.').next().unwrap();
+    assert!(!code_names_root(secret, &root));
+    let swapped = new_code(&other_root).unwrap();
+    assert!(!code_names_root(&swapped, &root));
+    // The whole code is what is digested: changing which root it names changes the digest,
+    // so a code cannot be re-pointed at another root and still enrol.
+    let repointed = format!("{secret}.{}", swapped.rsplit_once('.').unwrap().1);
+    assert_ne!(code_digest(&repointed), code_digest(&a));
 
     // The request is signed by the key it enrols, and names who is enrolling.
     let agent = key("refund-bot-k1", 9);

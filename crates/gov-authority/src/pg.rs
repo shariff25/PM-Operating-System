@@ -106,7 +106,7 @@ fn row(effect: &Effect) -> (String, String, Option<String>, Option<serde_json::V
             Some(json(a)),
         ),
         Effect::PutGate(g) => ("gate".into(), g.id.to_string(), None, Some(json(g))),
-        Effect::PutKey(e) => ("key".into(), e.key.kid.to_string(), None, Some(json(e))),
+        Effect::AddKey(e) => ("key".into(), e.key.kid.to_string(), None, Some(json(e))),
         Effect::PutCode(c) => (
             format!("code-{}", kind_text(c.kind)),
             c.name.to_string(),
@@ -194,6 +194,27 @@ impl Store for PgStore {
         }
         for effect in effects {
             let (kind, name, owner, doc) = row(effect);
+            // A key is enrolled once: no replacing. The key id is the row's name and the
+            // public key has a unique index of its own, so either being taken fails the
+            // insert, and with it the whole transaction.
+            if let (Effect::AddKey(_), Some(doc)) = (effect, &doc) {
+                let added = sqlx::query(
+                    "INSERT INTO authority_registry (tenant, env, kind, name, owner, doc) \
+                     VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
+                )
+                .bind(scope.tenant.as_str())
+                .bind(scope.env.as_str())
+                .bind(&kind)
+                .bind(&name)
+                .bind(&owner)
+                .bind(Json(doc))
+                .execute(&mut *tx)
+                .await?;
+                if added.rows_affected() != 1 {
+                    return Err(StoreError::KeyTaken);
+                }
+                continue;
+            }
             match doc {
                 Some(doc) => {
                     sqlx::query(
@@ -336,17 +357,30 @@ impl Store for PgStore {
         Ok(u32::try_from(wrong.unwrap_or(0)).unwrap_or(u32::MAX))
     }
 
-    async fn drop_code(&self, scope: &Scope, kind: EnrolKind, name: &Id) -> StoreResult<()> {
-        sqlx::query(
+    async fn take_code(
+        &self,
+        scope: &Scope,
+        kind: EnrolKind,
+        name: &Id,
+        digest: &Digest,
+    ) -> StoreResult<Option<PendingCode>> {
+        // One statement: the row is deleted and returned to exactly one caller.
+        let row = sqlx::query(
             "DELETE FROM authority_registry \
-             WHERE tenant = $1 AND env = $2 AND kind = $3 AND name = $4",
+             WHERE tenant = $1 AND env = $2 AND kind = $3 AND name = $4 \
+               AND doc ->> 'digest' = $5 \
+             RETURNING doc",
         )
         .bind(scope.tenant.as_str())
         .bind(scope.env.as_str())
         .bind(format!("code-{}", kind_text(kind)))
         .bind(name.as_str())
-        .execute(&self.pool)
+        .bind(digest.as_str())
+        .fetch_optional(&self.pool)
         .await?;
-        Ok(())
+        match row {
+            Some(r) => Ok(Some(r.try_get::<Json<PendingCode>, _>("doc")?.0)),
+            None => Ok(None),
+        }
     }
 }

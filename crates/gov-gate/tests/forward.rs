@@ -770,21 +770,34 @@ async fn a_call_is_closed_whatever_becomes_of_the_client_or_the_server() {
             .send()
             .await;
     }
-    tokio::time::sleep(Duration::from_millis(1200)).await;
-    let r2 = s2.receipts();
-    assert!(!r2.is_empty() && r2.len() % 2 == 0, "{} receipts", r2.len());
-    let intents: Vec<u64> = r2
-        .iter()
-        .filter(|x| x.phase == Phase::Intent)
-        .map(|x| x.seq)
-        .collect();
-    for intent in &intents {
-        assert!(
-            r2.iter()
-                .any(|x| x.phase == Phase::Outcome && x.intent == Some(*intent)),
-            "intent {intent} was left open"
-        );
+    // Every call the gate took runs to its end, however slow the machine: wait for the
+    // record to stop growing rather than for a fixed time (a fixed 1.2 s was too short on a
+    // loaded CI runner), then every intent must have its outcome.
+    let open = |r: &[Receipt]| -> Vec<u64> {
+        r.iter()
+            .filter(|x| x.phase == Phase::Intent)
+            .map(|x| x.seq)
+            .filter(|seq| {
+                !r.iter()
+                    .any(|x| x.phase == Phase::Outcome && x.intent == Some(*seq))
+            })
+            .collect()
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut r2 = s2.receipts();
+    while (r2.is_empty() || !open(&r2).is_empty()) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        r2 = s2.receipts();
     }
+    // And once closed it stays so: nothing more is written.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let settled = s2.receipts();
+    assert!(
+        !settled.is_empty() && settled.len() % 2 == 0,
+        "{} receipts",
+        settled.len()
+    );
+    assert_eq!(open(&settled), Vec::<u64>::new(), "intents left open");
 
     // The server never answers: the gate gives up, tells the agent so, and records that it
     // does not know what the server did.
