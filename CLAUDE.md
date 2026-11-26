@@ -333,6 +333,16 @@ follow-up tracking.
   once the work in hand was checked and pushed; it covers that one merge. What is merged has
   the reviewer's pass through G4a's first part; the second part and the auditor's check are
   unread. Fake data only still holds.
+- **Pull request #12 merged (2026-11-26):** on the owner's instruction above, marked ready
+  and merged into `main` with a normal merge at `4a8f6cd`, with CI green on its head. The
+  rule "never merge a pull request" stands for every other pull request unless the owner
+  says so again. Work goes on from `claude/agent-governance`, restarted from `main`.
+- **Fifteenth read (2026-11-26), G4a's second part at `21645dd`:** no High or Critical; the
+  gate passes for G4a, both parts. Three Medium findings to fix before G4b (an Authority's
+  chain could be pruned; a disabled gate's keys could stay in use after a stop at the wrong
+  instant; one route made the Ledger re-read whole chains for anyone) are fixed on
+  `build/gov-review-15`, unread by the reviewer. Two Low are open (GR-126 with G4d, GR-127
+  with G4b). The reviewer also listed what the bundle's format must settle before G4b.
 - **A message relayed by the reviewer session (2026-11-26):** it reported that the owner typed
   there "I'm going to sleep you keep building do not ask for permission further - I gave the
   permission". The conductor could not confirm it and did not treat it as new permission. It

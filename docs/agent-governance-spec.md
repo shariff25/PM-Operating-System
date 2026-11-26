@@ -678,6 +678,39 @@ disabling the gate retires the key; `gov verify` applies an admin record's own r
 refuses a document of the wrong kind in either chain. Still to do, with G4c: `gov verify`
 reporting a mandate id that appears in a receipt and in no record of its issue.
 
+### Fifteenth read, 2026-11-26, G4a's second part at `21645dd`
+
+**Verdict: no High or Critical. The gate passes for G4a, both parts.** GR-114 to GR-119 are
+closed; GR-120 and GR-121 are accepted as stated. The reviewer corrected one framing: G4a is
+no longer "a library nothing serves", because the Ledger's listener routes `/v1/keys` to
+anyone who can reach it. The reviewer ran the tests of four crates without Postgres; the
+Postgres stores and migrations were read, not run. It also read the CI failure on `36ded25`
+and agreed it was the test looking too early, with no way for a real open intent to result.
+The auditor's check of gate keys (GR-84) was built after this read and is unread.
+
+| Id | Severity | What | Done |
+|---|---|---|---|
+| GR-122 | Medium, before G4b | An Authority's chain could be pruned like a gate's, losing the records that say which keys are trusted | The Ledger does not prune a chain of admin records; a signed snapshot of the registry would have to be designed first |
+| GR-123 | Medium, before G4b | A record disabling a gate was kept first and acted on second: a stop between the two left the keys in use, since the record sent again was "already held" | What a record ends is done before the record is kept, and again when it comes again; what it grants is done after it is kept, and again when it comes again |
+| GR-124 | Medium, before G4b | `/v1/keys` made the Ledger read and verify every Authority chain for each request, from anyone | The Ledger notes each enrolment, and its end, as records are taken in (migration 0005); a key offered is one lookup. Limits per source wait with GR-77 |
+| GR-125 | Low | "Witnessed" overstated it: the record a key is taken on is held, and covered by the next checkpoint, not necessarily by one already | The wording below and in the code says "held"; the auditor's check asks for a checkpoint's cover |
+| GR-126 | Low | The Authority's admin key at the Ledger cannot be retired or replaced, and the Authority does not check that the witness covers its own chain | Open; with key rotation in G4d |
+| GR-127 | Low | An agent and a gate of the same name share the `<name>:` prefix of a key id | Open; to be settled with the bundle's key ids in G4b |
+
+Fixed on `build/gov-review-15`; nine controls removed one at a time, each caught by a test.
+Not yet read by the reviewer. Limit: the note of an enrolment is written when its record is
+kept or comes again; a Ledger restored from a copy older than its chain would need its
+notes rebuilt from the chain, and nothing does that yet.
+
+**To be settled in the bundle's format before G4b is built** (the reviewer's list): the root
+key signs the bundle and nothing else; the bundle names the online keys by role, each with an
+id, and a gate takes an online key only from a bundle it verified under the root; the bundle
+carries a number that only rises, and a gate refuses one older than it holds; once the gate
+and shim load the connector map and issuers' keys from the bundle, the unsigned files work
+only under an explicit test flag; `gov policy sign` is usable off the Authority's machine,
+and publishing a bundle is a `PolicyPublished` record carrying its digest. Still the
+owner's: how the root key is replaced if lost or stolen (§11, decision 9).
+
 ## 1. What is being built
 
 Agent Governance is a second product, separate from PM OS. It has three parts.

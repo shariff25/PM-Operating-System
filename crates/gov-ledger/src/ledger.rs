@@ -9,7 +9,7 @@ use gov_core::{
 };
 
 use crate::export::{Export, GateExport, TrustedKeys};
-use crate::store::{ChainKind, Refusal, Store, StoreError, StoredReceipt};
+use crate::store::{ChainKind, Enrolment, Refusal, Store, StoreError, StoredReceipt};
 use crate::witness::{Witness, WitnessError};
 
 #[derive(Debug, thiserror::Error)]
@@ -219,39 +219,14 @@ impl<S: Store> Ledger<S> {
     pub async fn supply_key(&self, key: &PublicKey) -> Result<(), LedgerError> {
         let refused = || LedgerError::Refused("key_not_enrolled");
         let digest = key_digest(key)?;
-        let mut gate: Option<Id> = None;
-        let chains = self.store.gate_keys(&self.scope).await?;
-        for (authority, held) in &chains {
-            if self.store.chain_kind(&self.scope, authority).await? != Some(ChainKind::Admin) {
-                continue;
-            }
-            let chain_keys = KeySet::new(held.iter().cloned());
-            for stored in self.store.receipts(&self.scope, authority).await? {
-                let record = open::<AdminRecord>(&stored.envelope, &chain_keys, &self.scope)?.doc;
-                match record.action {
-                    AdminAction::KeyEnrolled
-                        if record.subject.id == key.kid
-                            && record.value.as_ref() == Some(&digest) =>
-                    {
-                        // A gate's key, not an agent's: agents send no receipts.
-                        gate = record
-                            .about
-                            .filter(|s| s.kind == SubjectKind::Gate)
-                            .map(|s| s.id);
-                    }
-                    AdminAction::GateDisabled if Some(&record.subject.id) == gate.as_ref() => {
-                        gate = None;
-                    }
-                    AdminAction::Revoked
-                        if record.subject.kind == SubjectKind::Key
-                            && record.subject.id == key.kid =>
-                    {
-                        gate = None;
-                    }
-                    _ => {}
-                }
-            }
-        }
+        // One lookup in what the Authorities' records said as they were taken in, not a
+        // reading of their chains (review finding GR-124).
+        let gate = self
+            .store
+            .enrolment(&self.scope, &key.kid)
+            .await?
+            .filter(|e| !e.ended && e.digest == digest)
+            .map(|e| e.gate);
         let Some(gate) = gate else {
             return Err(refused());
         };
@@ -264,6 +239,58 @@ impl<S: Store> Ledger<S> {
             };
         }
         self.enrol_gate_key(&gate, key).await
+    }
+
+    /// What one of an Authority's records grants at the Ledger: an enrolment is noted, so
+    /// that the key it names can be supplied. Done only for a record the chain holds, and
+    /// again when the record comes again, in case the Ledger stopped between keeping it and
+    /// noting it. Safe to do twice.
+    async fn grant_trust(&self, authority: &Id, record: &AdminRecord) -> Result<(), LedgerError> {
+        if let (AdminAction::KeyEnrolled, Some(about), Some(digest)) =
+            (&record.action, &record.about, &record.value)
+        {
+            if about.kind == SubjectKind::Gate {
+                let enrolment = Enrolment {
+                    authority: authority.clone(),
+                    gate: about.id.clone(),
+                    digest: digest.clone(),
+                    ended: false,
+                };
+                self.store
+                    .note_enrolment(&self.scope, &record.subject.id, &enrolment)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// What one of an Authority's records ends at the Ledger: a gate disabled or a key
+    /// revoked ends enrolments and retires keys. Done **before** the record is kept, so that
+    /// the Ledger stopping between the two steps leaves a key retired and a record to come
+    /// again, never a record kept and a disabled gate's key in use (review finding GR-123);
+    /// and done again when the record comes again. Safe to do twice.
+    async fn end_trust(&self, authority: &Id, record: &AdminRecord) -> Result<(), LedgerError> {
+        match record.action {
+            AdminAction::GateDisabled => {
+                self.store
+                    .end_enrolments(&self.scope, authority, Some(&record.subject.id), None)
+                    .await?;
+                self.retire_gate_keys(&record.subject.id, None).await?;
+            }
+            AdminAction::Revoked if record.subject.kind == SubjectKind::Key => {
+                self.store
+                    .end_enrolments(&self.scope, authority, None, Some(&record.subject.id))
+                    .await?;
+                if let Some((gate, _)) =
+                    self.store.gate_key(&self.scope, &record.subject.id).await?
+                {
+                    self.retire_gate_keys(&gate, Some(&record.subject.id))
+                        .await?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// Retire a gate's keys. Only a gate's: an Authority's word does not retire the keys of
@@ -301,7 +328,13 @@ impl<S: Store> Ledger<S> {
                         .receipt(&self.scope, authority, opened.doc.seq)
                         .await?;
                     return match held {
-                        Some(r) if r.hash == opened.hash => Ok(Ingested::AlreadyHeld),
+                        Some(r) if r.hash == opened.hash => {
+                            // Sent again, perhaps because the Ledger stopped before it
+                            // had acted on it: act on it again (GR-123).
+                            self.end_trust(authority, &opened.doc).await?;
+                            self.grant_trust(authority, &opened.doc).await?;
+                            Ok(Ingested::AlreadyHeld)
+                        }
                         Some(_) => self.refuse(envelope, "fork", true, now).await,
                         None => self.refuse(envelope, "already_pruned", true, now).await,
                     };
@@ -311,6 +344,7 @@ impl<S: Store> Ledger<S> {
                 Ok(h) => h,
                 Err(e) => return self.refuse(envelope, e.code(), true, now).await,
             };
+            self.end_trust(authority, &opened.doc).await?;
             let stored = StoredReceipt {
                 seq: new_head.seq,
                 hash: new_head.hash,
@@ -324,23 +358,7 @@ impl<S: Store> Ledger<S> {
                 .await
             {
                 Ok(()) => {
-                    // The Authority's chain says a gate is disabled or a key revoked:
-                    // nothing more is taken under those keys (review finding GR-20).
-                    let record = &opened.doc;
-                    match record.action {
-                        AdminAction::GateDisabled => {
-                            self.retire_gate_keys(&record.subject.id, None).await?;
-                        }
-                        AdminAction::Revoked if record.subject.kind == SubjectKind::Key => {
-                            if let Some((gate, _)) =
-                                self.store.gate_key(&self.scope, &record.subject.id).await?
-                            {
-                                self.retire_gate_keys(&gate, Some(&record.subject.id))
-                                    .await?;
-                            }
-                        }
-                        _ => {}
-                    }
+                    self.grant_trust(authority, &opened.doc).await?;
                     return Ok(Ingested::Added);
                 }
                 Err(StoreError::HeadMoved) => continue,
@@ -502,6 +520,12 @@ impl<S: Store> Ledger<S> {
         now: i64,
         witness: &dyn Witness,
     ) -> Result<Option<u64>, LedgerError> {
+        // An Authority's chain is not pruned (review finding GR-122): it is what says which
+        // gate keys are trusted and what an auditor derives them from. Until a signed
+        // snapshot of the registry exists, its records are kept.
+        if self.store.chain_kind(&self.scope, gate).await? == Some(ChainKind::Admin) {
+            return Ok(None);
+        }
         let Some((seq, envelope)) = self.store.last_checkpoint(&self.scope).await? else {
             return Ok(None);
         };

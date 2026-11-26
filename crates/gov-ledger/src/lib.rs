@@ -16,5 +16,5 @@ pub mod witness;
 
 pub use export::{Export, GateExport, TrustedKeys};
 pub use ledger::{Ingested, Ledger, LedgerError};
-pub use store::{ChainKind, MemoryStore, Store};
+pub use store::{ChainKind, Enrolment, MemoryStore, Store};
 pub use witness::{DirWitness, Witness};

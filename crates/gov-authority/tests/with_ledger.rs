@@ -459,3 +459,122 @@ async fn the_authority_checks_the_ledgers_answer_against_its_own_chain() {
     let acked = a.check_answer(&second, &ack, &ledger_keys()).await.unwrap();
     assert!(a.shipment(acked, 100).await.unwrap().is_none());
 }
+
+/// Put a record of the Authority's straight into the Ledger's store, as the Ledger would
+/// have left it had it stopped after keeping the record and before acting on it.
+async fn kept_but_not_acted_on(ledger: &TheLedger, envelope: &Envelope, admin_keys: &KeySet) {
+    let opened =
+        gov_core::open::<gov_core::admin::AdminRecord>(envelope, admin_keys, &scope()).unwrap();
+    let stored = gov_ledger::store::StoredReceipt {
+        seq: opened.doc.seq,
+        hash: opened.hash,
+        at: opened.doc.at,
+        received_at: NOW,
+        envelope: envelope.clone(),
+    };
+    ledger
+        .store()
+        .append(&scope(), &id("authority"), opened.doc.seq - 1, &stored)
+        .await
+        .unwrap();
+}
+
+/// A Ledger that stopped between keeping a record and acting on it acts on it when the
+/// Authority sends it again (review finding GR-123), an Authority's chain is not pruned
+/// (GR-122), and a key offered to the Ledger is looked up, not searched for (GR-124).
+#[tokio::test]
+async fn a_record_sent_again_is_acted_on_and_the_authoritys_chain_is_kept() {
+    let (a, ledger) = installed().await;
+    let admin_keys = KeySet::new([a.admin_public()]);
+    let g1 = key("gate-1:k1", 20);
+    let acked = ship(&a, &ledger, 0).await;
+
+    // The record of an enrolment, kept and not acted on: the key is not yet one the Ledger
+    // will take. Sent again, it is noted, and the key is taken.
+    enrol_gate(&a, "gate-1", &g1).await;
+    let batch = a.shipment(acked, 100).await.unwrap().unwrap().batch;
+    for envelope in &batch {
+        kept_but_not_acted_on(&ledger, envelope, &admin_keys).await;
+    }
+    refused(ledger.supply_key(&g1.public()).await);
+    let acked = ship(&a, &ledger, acked).await;
+    ledger.supply_key(&g1.public()).await.unwrap();
+    let receipts = common::chain("gate-1", &g1, 2, NOW, 1);
+    ledger.ingest(&receipts[0], NOW).await.unwrap();
+
+    // The record that disables the gate, kept and not acted on: the key is still in use.
+    // Sent again, the key is retired and can no longer be supplied.
+    a.disable_gate(&id("ana"), &id("gate-1"), NOW)
+        .await
+        .unwrap();
+    let batch = a.shipment(acked, 100).await.unwrap().unwrap().batch;
+    for envelope in &batch {
+        kept_but_not_acted_on(&ledger, envelope, &admin_keys).await;
+    }
+    let retired = || async {
+        ledger
+            .store()
+            .key_retired(&scope(), &id("gate-1:k1"))
+            .await
+            .unwrap()
+    };
+    assert!(!retired().await);
+    let acked = ship(&a, &ledger, acked).await;
+    assert!(retired().await);
+    assert!(matches!(
+        ledger.ingest(&receipts[1], NOW).await,
+        Err(LedgerError::Refused("retired_key"))
+    ));
+    refused(ledger.supply_key(&g1.public()).await);
+
+    // A gate disabled before its key was ever supplied: the enrolment is ended in what
+    // the Ledger noted, so the key is not taken afterwards.
+    let g2 = key("gate-2:k1", 22);
+    enrol_gate(&a, "gate-2", &g2).await;
+    let acked = ship(&a, &ledger, acked).await;
+    a.disable_gate(&id("ana"), &id("gate-2"), NOW)
+        .await
+        .unwrap();
+    let acked = ship(&a, &ledger, acked).await;
+    refused(ledger.supply_key(&g2.public()).await);
+
+    // What the Ledger noted is what the records said, by key id.
+    let noted = ledger
+        .store()
+        .enrolment(&scope(), &id("gate-1:k1"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (noted.gate, noted.ended, noted.authority),
+        (id("gate-1"), true, id("authority"))
+    );
+
+    // The Authority's chain is not pruned, however old: it is what says which keys are
+    // trusted. A gate's chain of the same age is.
+    let dir = tempfile::tempdir().unwrap();
+    let witness = DirWitness::new(dir.path());
+    ledger
+        .checkpoint(&ledger_key(), &id("ledger"), NOW + 60, &witness)
+        .await
+        .unwrap();
+    let far = NOW + 1_000_000;
+    let prune = |chain: &'static str| {
+        let (ledger, witness) = (&ledger, &witness);
+        async move {
+            ledger
+                .prune(&id(chain), far, &ledger_key(), &id("ledger"), far, witness)
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(prune("authority").await, None);
+    assert_eq!(prune("gate-1").await, Some(1));
+    let held = ledger
+        .store()
+        .receipts(&scope(), &id("authority"))
+        .await
+        .unwrap();
+    assert_eq!(held.len() as u64, acked);
+    assert_eq!(held[0].seq, 1);
+}
