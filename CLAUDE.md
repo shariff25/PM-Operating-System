@@ -198,6 +198,11 @@ follow-up tracking.
   (`docs/agent-governance-spec.md`); the reviewer reads it before any code, as the proposal
   itself requires. The build-before-review instruction of 2026-11-24 does not cover it. Fake
   data only until the gate passes.
+  Later the same day, with the spec pushed and unread by the reviewer: "PM-OS 11 keep it aside
+  and lets start building G1". Taken as: leave pull request #11 as it is, and build slice G1
+  before the reviewer's read. G1 is marked "built before review" in the spec; it goes to the
+  reviewer with the spec, and this go-ahead covers G1 only. The work is on
+  `claude/agent-governance`, with its own draft pull request.
 
 ## Where the build stands (2026-11-23)
 

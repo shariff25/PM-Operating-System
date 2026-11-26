@@ -1,0 +1,19 @@
+[package]
+name = "gov-core"
+description = "Agent Governance: the signed documents, the canonical action, scope and policy evaluation. No I/O, no clock, no network."
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Ed25519. Already in Cargo.lock through jsonwebtoken and rustls; no second crypto library.
+aws-lc-rs = "1"
+base64.workspace = true
+serde.workspace = true
+# float_roundtrip: without it serde_json reads some decimals one unit off (RFC 8785's own
+# example, 333333333.33333329, is one), and a digest must be over the number that was sent.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+sha2.workspace = true
+thiserror.workspace = true
