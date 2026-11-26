@@ -228,10 +228,8 @@ impl<S: Spool> Gate<S> {
     fn append(&mut self, mut receipt: Receipt, open_intent: bool) -> Result<u64, GateError> {
         // The limit is checked when a call begins, with room kept for the outcome of every
         // call in flight: an outcome is never the receipt that does not fit.
-        if open_intent {
-            if self.index.len() + self.open_intents.len() + 2 > self.config.spool_limit {
-                return Err(GateError::SpoolFull);
-            }
+        if open_intent && self.index.len() + self.open_intents.len() + 2 > self.config.spool_limit {
+            return Err(GateError::SpoolFull);
         }
         let seq = self.state.head.as_ref().map_or(1, |h| h.seq + 1);
         receipt.seq = seq;
