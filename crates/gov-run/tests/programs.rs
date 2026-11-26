@@ -103,8 +103,14 @@ fn update_tool() -> Value {
     })
 }
 
-async fn fake_jira(body: Bytes) -> Json<Value> {
+/// Set if the fake server is ever sent a header of the gate's or the shim's own.
+static GOV_HEADER_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+async fn fake_jira(headers: axum::http::HeaderMap, body: Bytes) -> Json<Value> {
     UPSTREAM_HITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if headers.keys().any(|k| k.as_str().starts_with("x-gov-")) {
+        GOV_HEADER_SEEN.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
     let msg: Value = serde_json::from_slice(&body).unwrap();
     let result = match msg["method"].as_str().unwrap_or_default() {
         "tools/list" => json!({"tools": [update_tool()]}),
@@ -520,8 +526,12 @@ async fn a_gate_and_a_ledger_run_as_programs_leave_a_record_an_auditor_can_check
     let before = hits();
     let no_secret = through_shim(tool_call(20, "PAY-20"), None);
     assert_eq!(no_secret.send().await.unwrap().status().as_u16(), 401);
-    let wrong = through_shim(tool_call(20, "PAY-20"), Some("key-0000"));
-    assert_eq!(wrong.send().await.unwrap().status().as_u16(), 401);
+    // A wrong secret, the start of the right one, and the right one with more after it.
+    let longer = format!("{secret}0");
+    for wrong in ["key-0000", &secret[..secret.len() - 1], &longer] {
+        let request = through_shim(tool_call(20, "PAY-20"), Some(wrong));
+        assert_eq!(request.send().await.unwrap().status().as_u16(), 401);
+    }
     let from_a_page = through_shim(tool_call(20, "PAY-20"), Some(&secret))
         .header("origin", "https://evil.example");
     assert_eq!(from_a_page.send().await.unwrap().status().as_u16(), 403);
@@ -620,6 +630,10 @@ async fn a_gate_and_a_ledger_run_as_programs_leave_a_record_an_auditor_can_check
             "{secret} is in a file the programs wrote"
         );
     }
+
+    // The session, the proof, the salt, the agent's name for the gate and the shim's secret
+    // stop at the gate: the server was never sent one of them.
+    assert!(!GOV_HEADER_SEEN.load(std::sync::atomic::Ordering::SeqCst));
 
     drop(shim);
     drop(gate);
