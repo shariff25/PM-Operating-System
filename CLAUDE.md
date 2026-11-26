@@ -185,6 +185,20 @@ follow-up tracking.
   the gate passed on 2026-11-22; that review, and the gate, are still owed before real data or
   a pilot.
 
+## Owner's decisions of 2026-11-26
+
+- **Agent Governance, a second product (owner, 2026-11-26):** the owner's proposal "Mandate
+  Architecture" ("An agent never holds a key. It holds a mandate."): an Authority issues signed
+  mandates, a Gate holds the system credentials and decides, a Ledger keeps signed receipts.
+  PM OS stays a separate product and meets it at one seam, the tool server's write point.
+  "lets start building", after the conductor's plan: a thin first release (self-hosted, one
+  tenant, the MCP gate, Jira on the fake first, Entra sign-in, separate `gov-*` crates in this
+  repository with their own database), built in slices G1 to G8. The owner named no other cut,
+  so these are the conductor's recommended defaults. Spec and threat model first
+  (`docs/agent-governance-spec.md`); the reviewer reads it before any code, as the proposal
+  itself requires. The build-before-review instruction of 2026-11-24 does not cover it. Fake
+  data only until the gate passes.
+
 ## Where the build stands (2026-11-23)
 
 - Pushed and checked: `claude/web-app` (draft pull request #10).
