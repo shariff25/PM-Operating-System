@@ -420,7 +420,7 @@ impl<S: Spool> Gate<S> {
         // on a statement about this gate's chain that this gate can show to be wrong.
         let alarm = |gate: &mut Self| -> Result<(), GateError> {
             let bytes = serde_json::to_vec(&answer.ack).map_err(|_| SpoolError::Corrupt)?;
-            Ok(gate.spool.keep_alarm(&bytes)?)
+            Ok(gate.spool.keep_alarm(ack.seq, &bytes)?)
         };
         if !agrees {
             alarm(self)?;

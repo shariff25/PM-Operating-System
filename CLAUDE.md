@@ -248,7 +248,8 @@ follow-up tracking.
   are closed, with a standing condition that each connector map has its own test and is read
   by the reviewer. Two new Medium (GR-74, refusals stored without limit; GR-75, nothing
   required an encrypted connection) and six Low; GR-77 and GR-81 stay open as conditions on
-  the listener's hardening and on G4.
+  the listener's hardening and on G4. The rest are fixed on `build/gov-review-9`; the
+  reviewer's read of those fixes and of the programs is owed.
 - **G3b step 4 built (2026-11-26):** the two programs, `gov-ledger` and `gov-gate`, in a new
   crate `gov-run` (`build/gov-g3b-programs`). Run as an operator would against a fake MCP
   server and Postgres, the auditor's check of the export passes, also across a gate restart.

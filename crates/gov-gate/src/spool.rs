@@ -20,6 +20,9 @@ pub enum SpoolError {
     Corrupt,
 }
 
+/// The most alarming answers kept. A Ledger gone wrong cannot fill the gate's disk with them.
+pub const MAX_ALARMS: usize = 64;
+
 fn io(e: std::io::Error) -> SpoolError {
     SpoolError::Io(e.to_string())
 }
@@ -68,9 +71,12 @@ pub trait Spool: Send {
     /// Keep the witnessed checkpoint the spool was last trimmed on, as read from the witness.
     fn keep_checkpoint(&mut self, bytes: &[u8]) -> Result<(), SpoolError>;
     fn kept_checkpoint(&self) -> Result<Option<Vec<u8>>, SpoolError>;
-    /// Keep the Ledger's signed answer that raised an alarm, as evidence.
-    fn keep_alarm(&mut self, bytes: &[u8]) -> Result<(), SpoolError>;
-    fn kept_alarm(&self) -> Result<Option<Vec<u8>>, SpoolError>;
+    /// Keep the Ledger's signed answer that raised an alarm, as evidence, under the receipt
+    /// number it speaks of. Each is kept, not only the last (review finding GR-80), up to
+    /// [`MAX_ALARMS`]: past that the earliest ones are the ones that stay.
+    fn keep_alarm(&mut self, seq: u64, bytes: &[u8]) -> Result<(), SpoolError>;
+    /// The kept alarms, by receipt number.
+    fn kept_alarms(&self) -> Result<Vec<(u64, Vec<u8>)>, SpoolError>;
 }
 
 /// A spool in a directory: one file per receipt and one for the state, each written whole
@@ -187,12 +193,30 @@ impl Spool for FileSpool {
         self.read_optional("covered-by.json")
     }
 
-    fn keep_alarm(&mut self, bytes: &[u8]) -> Result<(), SpoolError> {
-        self.write(&self.dir.join("alarm.json"), bytes)
+    fn keep_alarm(&mut self, seq: u64, bytes: &[u8]) -> Result<(), SpoolError> {
+        let path = self.dir.join(format!("alarm-{seq:020}.json"));
+        if !path.exists() && self.kept_alarms()?.len() >= MAX_ALARMS {
+            return Ok(());
+        }
+        self.write(&path, bytes)
     }
 
-    fn kept_alarm(&self) -> Result<Option<Vec<u8>>, SpoolError> {
-        self.read_optional("alarm.json")
+    fn kept_alarms(&self) -> Result<Vec<(u64, Vec<u8>)>, SpoolError> {
+        let mut out = Vec::new();
+        for entry in fs::read_dir(&self.dir).map_err(io)? {
+            let name = entry.map_err(io)?.file_name();
+            let seq = name
+                .to_str()
+                .and_then(|n| n.strip_prefix("alarm-"))
+                .and_then(|n| n.strip_suffix(".json"))
+                .filter(|n| n.len() == 20)
+                .and_then(|n| n.parse::<u64>().ok());
+            if let Some(seq) = seq {
+                out.push((seq, fs::read(self.dir.join(&name)).map_err(io)?));
+            }
+        }
+        out.sort_by_key(|(seq, _)| *seq);
+        Ok(out)
     }
 }
 

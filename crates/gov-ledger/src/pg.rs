@@ -251,8 +251,11 @@ impl Store for PgStore {
 
     async fn record_refusal(&self, scope: &Scope, refusal: &Refusal) -> StoreResult<()> {
         sqlx::query(
-            "INSERT INTO refusals (tenant, env, at, kid, code, taken, envelope_hash, envelope) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            "INSERT INTO refusals \
+             (tenant, env, at, last_at, kid, code, taken, envelope_hash, envelope) \
+             VALUES ($1, $2, $3, $3, $4, $5, $6, $7, $8) \
+             ON CONFLICT (tenant, env, envelope_hash, code) \
+             DO UPDATE SET seen = refusals.seen + 1, last_at = EXCLUDED.at",
         )
         .bind(scope.tenant.as_str())
         .bind(scope.env.as_str())
@@ -269,7 +272,7 @@ impl Store for PgStore {
 
     async fn refusals(&self, scope: &Scope) -> StoreResult<Vec<Refusal>> {
         let rows = sqlx::query(
-            "SELECT at, kid, code, taken, envelope_hash, envelope FROM refusals \
+            "SELECT at, seen, last_at, kid, code, taken, envelope_hash, envelope FROM refusals \
              WHERE tenant = $1 AND env = $2 ORDER BY id",
         )
         .bind(scope.tenant.as_str())
@@ -281,6 +284,9 @@ impl Store for PgStore {
             let envelope: Option<Json<Envelope>> = r.try_get("envelope")?;
             out.push(Refusal {
                 at: r.try_get("at")?,
+                seen: u64::try_from(r.try_get::<i64, _>("seen")?)
+                    .map_err(|_| StoreError::Other("a count below zero".into()))?,
+                last_at: r.try_get("last_at")?,
                 kid: id(r.try_get("kid")?)?,
                 code: r.try_get("code")?,
                 taken: r.try_get("taken")?,

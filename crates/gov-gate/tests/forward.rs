@@ -812,3 +812,75 @@ async fn a_slow_ledger_holds_up_no_call() {
         Shipped::Advanced(2)
     );
 }
+
+/// A link that takes its time.
+struct Slow(InProcess);
+#[async_trait]
+impl LedgerLink for Slow {
+    async fn ship(&self, request: &Envelope, batch: &[Envelope]) -> Result<LinkAnswer, String> {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        self.0.ship(request, batch).await
+    }
+}
+
+/// One round of shipping at a time (review finding GR-79): two rounds started together do
+/// not send the same batch twice.
+#[tokio::test]
+async fn two_rounds_of_shipping_do_not_send_the_same_batch() {
+    let s = stack(100).await;
+    s.list().await;
+    s.send(update(2, "PAY-1"), Some(SECRET), &[]).await;
+    let ledger = Ledger::new(MemoryStore::default(), scope());
+    ledger
+        .enrol_gate_key(&id("gate-1"), &gate_key().public())
+        .await
+        .unwrap();
+    let link = Slow(InProcess(ledger));
+    let (a, b) = tokio::join!(s.forwarder.ship(&link), s.forwarder.ship(&link));
+    let mut both = vec![a.unwrap(), b.unwrap()];
+    both.sort_by_key(|x| matches!(x, Shipped::NothingToSend));
+    assert_eq!(both, vec![Shipped::Advanced(2), Shipped::NothingToSend]);
+    assert_eq!(
+        s.forwarder
+            .counters
+            .ship_no_progress
+            .load(Ordering::Relaxed),
+        0
+    );
+}
+
+/// When the table of sessions is full, the one seen longest ago is forgotten and no other
+/// (review finding GR-76): a client making up session ids cannot wipe every session's
+/// listing at a stroke.
+#[tokio::test]
+async fn a_flood_of_sessions_forgets_only_the_oldest() {
+    let s = stack(100_000).await;
+    let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string();
+    s.send(list.clone(), Some(SECRET), &[("mcp-session-id", "first")])
+        .await;
+    s.send(list.clone(), Some(SECRET), &[("mcp-session-id", "second")])
+        .await;
+    for n in 0..gov_gate::forward::MAX_SESSIONS - 1 {
+        let session = format!("flood-{n}");
+        s.send(list.clone(), Some(SECRET), &[("mcp-session-id", &session)])
+            .await;
+    }
+    // "first" was pushed out; "second", listed just after it, was not.
+    s.send(
+        update(2, "PAY-1"),
+        Some(SECRET),
+        &[("mcp-session-id", "first")],
+    )
+    .await;
+    s.send(
+        update(3, "PAY-1"),
+        Some(SECRET),
+        &[("mcp-session-id", "second")],
+    )
+    .await;
+    let r = s.receipts();
+    assert_eq!(
+        (r[0].action.kind, r[2].action.kind),
+        (Kind::Unknown, Kind::Write)
+    );
+}

@@ -440,16 +440,16 @@ accepted as stated, until G4). New findings:
 
 | Finding | Severity | What it said | What was done |
 |---|---|---|---|
-| GR-74 | Medium | A refused receipt whose signature held is stored whole every time it arrives; a stuck gate resends its batch every round, so the refusals table grows without limit | See the status note for the fixes of the ninth read |
+| GR-74 | Medium | A refused receipt whose signature held is stored whole every time it arrives; a stuck gate resends its batch every round, so the refusals table grows without limit | A refusal is stored once per envelope and reason, with a count and the time it was last seen (`build/gov-review-9`) |
 | GR-75 | Medium | Nothing requires an encrypted connection: receipts, and through the forwarder an agent's credential, could cross a network in the clear | The programs refuse plain HTTP beyond their own machine unless the operator passes `--plain-http-on-network` (G3b step 4) |
-| GR-76 | Low | At 4,096 remembered sessions the whole table is emptied, so one agent can make every session's tools `unknown` | See the status note |
+| GR-76 | Low | At 4,096 remembered sessions the whole table is emptied, so one agent can make every session's tools `unknown` | Only the session seen longest ago is forgotten. Not done: a cap per agent, because without the shim an agent's name is only what it says |
 | GR-77 | Low | An anonymous request to the Ledger costs a database lookup, with no rate limit | Open: with the listener's hardening |
-| GR-78 | Low | The Ledger's answer to the gate is read whole with no cap | See the status note |
-| GR-79 | Low | Two rounds of shipping at once prepare the same batch | See the status note |
-| GR-80 | Low | Only the last alarming answer is kept | See the status note |
+| GR-78 | Low | The Ledger's answer to the gate is read whole with no cap | Read with a cap of 64 KB |
+| GR-79 | Low | Two rounds of shipping at once prepare the same batch | One round at a time in the forwarder; calls do not wait for it |
+| GR-80 | Low | Only the last alarming answer is kept | Each is kept under the receipt number it speaks of, up to 64 |
 | GR-81 | Low | A mandate's grants for a folded system are not linted | Open: a condition on G4 (the Authority lints at issue; the chain check refuses an upper-case grant for a folded system) |
 
-The reviewer said GR-74 and GR-75 should be fixed before G3b is called done.
+The reviewer said GR-74 and GR-75 should be fixed before G3b is called done. Both are; the reviewer's read of the fixes, and of the programs (step 4), is owed.
 
 ## 1. What is being built
 

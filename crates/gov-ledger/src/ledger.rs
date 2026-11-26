@@ -69,6 +69,8 @@ impl<S: Store> Ledger<S> {
                 &self.scope,
                 &Refusal {
                     at: now,
+                    seen: 1,
+                    last_at: now,
                     kid: envelope.kid.clone(),
                     code: code.to_string(),
                     taken: false,
@@ -162,6 +164,8 @@ impl<S: Store> Ledger<S> {
                                 &self.scope,
                                 &Refusal {
                                     at: now,
+                                    seen: 1,
+                                    last_at: now,
                                     kid: envelope.kid.clone(),
                                     code: "time_went_back".to_string(),
                                     taken: true,

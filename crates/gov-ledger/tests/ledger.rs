@@ -1109,3 +1109,31 @@ async fn outcomes<S: Store>(store: S) {
     );
 }
 both_stores!(an_outcome_answers_one_intent_once, outcomes);
+
+/// A refusal is stored once however often it arrives (review finding GR-74): a gate whose
+/// chain is stuck resends its batch every round, and a recorded shipment can be replayed.
+async fn refusals_once<S: Store>(store: S) {
+    let ledger = ledger_with_gate_1(store).await;
+    let g1 = key("gate-1-key", 20);
+    // Receipt 3 of a chain that has no receipt 1: signed by the gate, and refused.
+    let gap = seal(&receipt("gate-1", 3, None, T0), &g1).unwrap();
+    for at in [T0, T0 + 5, T0 + 9] {
+        assert!(ledger.ingest(&gap, at).await.is_err());
+    }
+    let refusals = ledger.store().refusals(&scope()).await.unwrap();
+    assert_eq!(refusals.len(), 1);
+    let r = &refusals[0];
+    assert_eq!((r.at, r.seen, r.last_at), (T0, 3, T0 + 9));
+    assert!(r.envelope.is_some(), "the evidence is kept, once");
+    // Another envelope is another row.
+    let other = seal(&receipt("gate-1", 5, None, T0), &g1).unwrap();
+    assert!(ledger.ingest(&other, T0 + 10).await.is_err());
+    assert!(ledger.ingest(&gap, T0 + 11).await.is_err());
+    let refusals = ledger.store().refusals(&scope()).await.unwrap();
+    let seen: Vec<u64> = refusals.iter().map(|r| r.seen).collect();
+    assert_eq!(seen, vec![4, 1]);
+}
+both_stores!(
+    a_refusal_is_stored_once_however_often_it_arrives,
+    refusals_once
+);

@@ -811,9 +811,9 @@ async fn an_alarming_answer_is_kept_and_a_refusal_is_passed_on() {
     assert_eq!(gate.trim_to_witness(&reader).unwrap().receipts, 2);
     assert!(FileSpool::open(&spool)
         .unwrap()
-        .kept_alarm()
+        .kept_alarms()
         .unwrap()
-        .is_none());
+        .is_empty());
     call(&mut gate, 2, T0 + 61);
 
     // The Ledger now says it holds the chain only through receipt 2, which is trimmed, and
@@ -828,12 +828,10 @@ async fn an_alarming_answer_is_kept_and_a_refusal_is_passed_on() {
         Err(GateError::LedgerDisagrees(2))
     ));
     // The Ledger's own signed statement is kept as evidence.
-    let kept = FileSpool::open(&spool)
-        .unwrap()
-        .kept_alarm()
-        .unwrap()
-        .unwrap();
-    let env: Envelope = serde_json::from_slice(&kept).unwrap();
+    let kept = FileSpool::open(&spool).unwrap().kept_alarms().unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].0, 2);
+    let env: Envelope = serde_json::from_slice(&kept[0].1).unwrap();
     let ack = open::<IntakeAck>(&env, &KeySet::new([ledger_key().public()]), &scope())
         .unwrap()
         .doc;
@@ -845,6 +843,20 @@ async fn an_alarming_answer_is_kept_and_a_refusal_is_passed_on() {
         hash: Some(gov_core::Digest::of(&[b"x"])),
         ..Says::default()
     };
+    assert!(matches!(
+        gate.ship(&lost).await,
+        Err(GateError::LedgerLost(1))
+    ));
+    // Each alarming answer is kept, under the receipt it speaks of (review finding GR-80):
+    // the second did not replace the first.
+    let seqs: Vec<u64> = FileSpool::open(&spool)
+        .unwrap()
+        .kept_alarms()
+        .unwrap()
+        .iter()
+        .map(|(seq, _)| *seq)
+        .collect();
+    assert_eq!(seqs, vec![1, 2]);
     assert!(matches!(
         gate.ship(&lost).await,
         Err(GateError::LedgerLost(1))
@@ -874,4 +886,21 @@ async fn an_alarming_answer_is_kept_and_a_refusal_is_passed_on() {
             refused: Some("outcome_without_intent".to_string())
         }
     );
+}
+
+/// A Ledger gone wrong cannot fill the gate's disk with alarms: the earliest are the ones
+/// that stay.
+#[test]
+fn alarms_are_kept_up_to_a_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut spool = FileSpool::open(dir.path()).unwrap();
+    for seq in 1..=(gov_gate::spool::MAX_ALARMS as u64 + 10) {
+        spool.keep_alarm(seq, b"{}").unwrap();
+    }
+    let kept = spool.kept_alarms().unwrap();
+    assert_eq!(kept.len(), gov_gate::spool::MAX_ALARMS);
+    assert_eq!(kept.first().unwrap().0, 1);
+    // One already kept can still be written again.
+    spool.keep_alarm(1, b"{\"again\":true}").unwrap();
+    assert_eq!(spool.kept_alarms().unwrap()[0].1, b"{\"again\":true}");
 }
