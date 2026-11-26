@@ -760,6 +760,27 @@ Postgres was again read, not run, by the reviewer.
 | GR-133 | Low | A gate and its shim started on different bundles fail proofs for every tool whose map differs | Stated in §7.6.1, point 7 |
 | GR-134 | Low | The Ledger's public keys stay an unsigned file the gate trusts | §7.6.1, point 9: they stay local configuration, and why |
 
+### Seventeenth and eighteenth reads, 2026-11-26: G4b at `04e5117`, the G4c design and §1.2, §8.4 at `1600134`
+
+**Verdict: no High or Critical; the gate still passes. G4b is sound as built**, GR-128 is
+closed in the text and the code, and GR-129 to GR-134 are answered. **G4c may be built from
+§7.6.2 once GR-138 is in the text**, which it is. §1.2 and §8.4 weaken no control; each
+claimed more than the design gives in one place, now reworded. The three items of the
+owner's feedback that were not taken up are, in the reviewer's words, rightly refused.
+Postgres was read, not run, by the reviewer.
+
+| Id | Severity | What | Done |
+|---|---|---|---|
+| GR-135 | Low | The signer's list of changes is written field by field, so a field added later would show nothing | Fixed on `build/gov-review-16`: anything that differs and is not named is shown as "other changes" |
+| GR-136 | Low | The bundle's time was the signer's clock, so nobody else could rebuild the same digest from the repository | Fixed: `sign` takes the time from `--issued-at`, which a second person repeats |
+| GR-137 | Low | `--yes` skips the question | Kept; it still prints the changes, and its help says they must have been shown to a person elsewhere |
+| GR-138 | Medium, before G4c | The template was checked only by the Authority at issue, so whoever takes the online mandates key could sign any grants | §7.6.2, point 10: the gate holds every chain's root mandate to the template in the bundle it holds |
+| GR-139 | Low | A parent agent could hand authority to any enrolled agent, whose owner never asked | §7.6.2, point 4: the child has the root person as owner, or the template names who may receive; the request names the Authority |
+| GR-140 | Low | A feed that only adds cannot undo a suspension | §7.6.2, point 6: suspending revokes mandates and never adds the agent's id; only disabling does |
+| GR-141 | Medium, before the scene is shown | "Verifies the refusal" claimed more than an export shows, and with the library seam PM OS is the gate's operator | §1.2 reworded; the scene runs with a separate gate holding the credential, or says whose word the refusal is |
+| GR-142 | Medium, before the scene is shown | Turning the seam off is PM OS's own setting, so it is not always a recorded act | §8.4 reworded: with the library seam the cover is in line, not custody, and PM OS's operator can go round it |
+| GR-143 | Low | "Names both" does not fit a record with one `about` field | §7.6.2, point 4: the record is about the child agent; the parent is in the mandate, which the record's digest covers |
+
 ## 1. What is being built
 
 Agent Governance is a second product, separate from PM OS. It has three parts.
@@ -822,9 +843,17 @@ items". What follows is what was agreed, what that changes here, and what was no
 - **The demonstration the first release is built toward** is one scene, not a dashboard:
   a PM OS agent completes a piece of work, attempts one action outside its mandate because
   a document it read told it to, is refused at the gate before the action reaches the
-  system, and a person who trusts neither PM OS nor the gate's operator verifies the
-  refusal from the Ledger's export with public keys alone. §10 lists it as what G7 is done
-  against.
+  system, and a person outside verifies, from the Ledger's export with public keys alone,
+  **that the gate recorded a refusal and that the record has not been altered or removed**,
+  trusting neither PM OS's database nor the Ledger's operator. §10 lists it as what G7 is
+  done against.
+- **What that person cannot verify, said in the scene itself** (review finding GR-141). A
+  receipt proves what the gate said, not what reached the system (T9). And where the gate
+  is a library inside PM OS's tool server (§8.1), PM OS holds the credential and is the
+  gate's operator: the refusal is then PM OS's own word, signed. So the scene is run with
+  a **separate gate process holding the only credential**, where the party believed is the
+  gate and not the application; run with the library seam, it is described as "in line",
+  and the words "PM OS could not have done it" are not used.
 - **No fallback.** For a system a deployment has put in enforce mode, PM OS has no
   authorization path of its own to fall back on when Governance cannot decide (§8.4).
 - **Three ways to install** stay as §1 has them: PM OS alone, Governance alone, both.
@@ -1766,10 +1795,14 @@ function below is a library call, usable only by someone on the Authority's mach
    issues the child only if: the parent mandate verifies now and is not revoked; its
    template allows delegating; the child is another enrolled, usable agent; the child's
    grants and life are inside the parent's; the chain would be no deeper than 3; the nonce
-   has not been seen and the time is within the clock allowance. The child embeds the
+   has not been seen and the time is within the clock allowance; and the request names
+   this Authority, so it cannot be used at another. **The receiving side agrees** (review
+   finding GR-139): the child agent's owner is the person at the root of the chain, unless
+   the template names other owners or agents who may receive from it. The child embeds the
    parent's signed mandate, so a gate checks the chain without asking the Authority. A
    delegated mandate's `issued_by` is the parent agent; the person at the root is found by
-   walking the chain, and the record names both.
+   walking the chain. The `MandateIssued` record is about the child agent, as for any
+   mandate; the parent is inside the mandate whose digest the record carries (GR-143).
 5. **Listing.** A person sees the mandates of agents they own; an admin and an auditor see
    every mandate's id, agent, template, issuer, times and state, and never its grants'
    resources beyond what the template already says. (Listing is what the admin interface
@@ -1778,7 +1811,10 @@ function below is a library call, usable only by someone on the Authority's mach
    it. One entry is enough for its descendants: a gate checks every link of a chain against
    the revocations it holds. Offboarding a person, or suspending or disabling an agent,
    revokes that agent's live mandates, each with its own `Revoked` record, in the same step
-   as the change that caused it (§7.6, choice 4).
+   as the change that caused it (§7.6, choice 4). The feed only ever adds, so it carries
+   nothing that must later be undone (review finding GR-140): suspending an agent revokes
+   its mandates and never puts the agent's id in the feed, and an agent resumed is issued
+   new mandates; only disabling an agent puts its id there, for good.
 7. **The revocation feed.** Every revocation takes the next number, from 1, with no gaps,
    and carries the kind, the id and the time after which the thing would have expired
    anyway. The feed a gate fetches is "everything after number N": a signed document
@@ -1798,6 +1834,20 @@ function below is a library call, usable only by someone on the Authority's mach
    G4d). Each is refused for the others' documents by type tag and by key set, as the root
    is for anything but a bundle. All are files, for fake data only, until a key service
    exists.
+
+10. **The gate holds a mandate to its template** (review finding GR-138). The mandates
+    key is online, so a mandate's signature alone must not be worth more than the root
+    allowed. When a gate verifies a chain it also checks the chain's root mandate against
+    the template of that id **in the bundle the gate holds**: the grants inside the
+    template's, the life within the template's, the limits no looser, and, if the chain
+    has a child, that the template allows delegating. Taking the Authority's machine then
+    yields only what the reviewed, root-signed templates already allow. The number in
+    `template: "<id>@<number>"` records which bundle the Authority issued from; it does not
+    choose which template governs. **The template in the held bundle governs**: narrowing a
+    template tightens every live mandate from it at once, and removing a template ends
+    them. In G4c this check is built into the chain check in `gov-core` and used by the
+    gate's sessions; with no grants yet checked against a call (G5), what it changes today
+    is which mandates a session is opened for.
 
 **Not built in G4c:** anything served over HTTP (G4e); the gate reading the feed, closing
 sessions, and its clock (G4d); grants checked against a call (G5); limits charged (G6); a
@@ -1850,9 +1900,19 @@ a write to it that Governance cannot decide is refused: no lease or a stale one,
 a mandate that cannot be checked, a receipt that cannot be written. PM OS's own grant check
 still runs first and can refuse; it can never be what allows a write that Governance did
 not. The tool server does not notice Governance is unwell and carry on without it. Taking
-a system out of enforce mode, or turning the seam off, is a deliberate change of
-configuration by an admin, recorded as an admin action (`ModeSet`), never something the
-running service does for itself. In observe and shadow modes nothing is refused by
+a system out of enforce mode is an admin action at the Authority, recorded (`ModeSet`), and
+never something the running service does for itself.
+
+**What this does not cover** (review finding GR-142). The seam's own switch is PM OS's
+setting. With the library seam PM OS still holds the system's credential, so whoever
+operates PM OS can unset the switch and write directly, with no record at the Authority:
+the cover is **in line, not custody** (§5.2), and receipts say so. "No fallback" is a rule
+about what the running service does, not a control on its operator. The stronger claim
+holds only where a separate gate holds the only credential. What the Ledger can show
+afterwards is the trace of going round: a gate in enforce mode that goes quiet while the
+system's own log shows writes, which is reconciliation (§7.5), not built.
+
+ In observe and shadow modes nothing is refused by
 Governance, by definition; what cannot be recorded is counted and shown.
 
 ### 8.5 Not connected
