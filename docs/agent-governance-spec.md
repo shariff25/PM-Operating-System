@@ -365,6 +365,36 @@ reviewer.
   the check is not made, as before; if the Authority's chain were pruned past an enrolment,
   the key would be reported, so that chain is not to be pruned; the comparison of dates is
   between two clocks and is only as fine as `--clock-skew`.
+- **G4b built (2026-11-26), from §7.6.1 after the sixteenth read; not yet read by the
+  reviewer.** The signed policy bundle, in four steps on `build/gov-g4b`:
+  - *the format* (`gov-core`): a number that rises, the online keys by role, a bundle that
+    opens under the root key alone and may not list its own signer, the rule that a gate
+    does not go back, and the list of what changed between two bundles;
+  - *the release step* (`gov policy check`, `gov policy sign`; `gov-run`'s `policy_dir`): a
+    policy directory of JSON files with sample calls for every connector map; the signer
+    runs the check itself, is shown what changed since the bundle before, and the digest
+    signed is printed;
+  - *publishing* (`gov-authority`): only the next number, only under the root key, kept
+    with a `PolicyPublished` record of its digest; and an agent and a gate may not share a
+    name (GR-127);
+  - *the programs*: `gov-gate` and `gov-shim` take `--bundle`, `--root-key`,
+    `--bundle-state` and `--server`; the unsigned files work only with
+    `--unsigned-policy-for-tests` and fake data; every receipt carries the bundle's number
+    and the start of its digest, or `unsigned`.
+  Run as three programs on a signed bundle with fake data, an agent's call through the shim
+  is recorded as proven and the auditor's check passes; a gate started on an older bundle,
+  or on another under the same number, does not start. Sixty controls removed one at a
+  time; each removal fails a test, but one of two overlapping guards against writing over
+  a signed bundle.
+  **Limits, and what is not built:** the bundle reaches a gate as a file an operator
+  copies, read at start (fetching it, and changing it without a restart, come with the
+  lease in G4d); two bundles under one number stops a program from starting and is not yet
+  counted anywhere an operator's dashboard reads; with no state file any validly signed
+  bundle is taken (GR-132); the bundle's rules are still not evaluated against a call
+  (G5); the `mandates` keys are a test issuer's until G4c; nothing checks that a bundle a
+  gate ran on was published by the Authority (`gov verify` reporting a policy version with
+  no `PolicyPublished` record is not written); the `gov` command now links the programs'
+  library to read a key file, though no command of it opens a network connection.
 - One more test on both of the Ledger's stores (a chain holds one kind of document), and
   two with an Authority and a Ledger together.
 
