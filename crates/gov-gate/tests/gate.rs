@@ -8,7 +8,7 @@ use gov_core::receipt::{Coverage, Mode, OutcomeStatus, Phase, Proof, Receipt};
 use gov_core::{open, seal, Envelope, Id, KeySet, ResourcePath, Scope, SigningKey};
 use gov_gate::{
     DirWitnessReader, FileSpool, Gate, GateConfig, GateError, LedgerLink, LinkAnswer, Observed,
-    Shipped, Spool, WitnessReader,
+    Shipped, Spool, Who, WitnessReader,
 };
 use gov_ledger::verify::{verify, Check};
 use gov_ledger::{DirWitness, Ledger, MemoryStore, Witness};
@@ -62,10 +62,7 @@ fn action(n: u64) -> CanonicalAction {
 }
 fn observed<'a>(agent: &'a Id, action: &'a CanonicalAction) -> Observed<'a> {
     Observed {
-        agent,
-        proof: Proof::Claimed,
-        failure: None,
-        mandates: &[],
+        who: Who::claimed(agent.clone()),
         action,
         reversal: Reversal::Restore,
         coverage: Coverage::InLine,

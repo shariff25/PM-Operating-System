@@ -253,10 +253,16 @@ the shim". Not yet read by the reviewer. With it G3b is built.
   (GR-99).
 - **Stated limits.** There is no Authority, so the mandate in every test is issued by a test
   issuer whose public key the gate is given in a file: "proven" means "holds the key a
-  mandate from that issuer names". Revocation is not checked. After a gate restart a shim's
-  first call is a failed proof (`unknown_session`), and its calls stay failed
-  (`wrong_digest`) until the client lists the tools again, because the gate has forgotten
-  the listing the shim still remembers. The shim's secret and the operator's secret are
+  mandate from that issuer names". **A proven receipt says who made the call. It does not
+  say the mandate's grants cover the action: nothing checks that until shadow mode (G5), so
+  a proven receipt is not an authorised one** (GR-106). Revocation is not checked. After a
+  gate restart a shim's first call is a failed proof (`unknown_session`); the shim then
+  forgets its tool listing, as the gate has, so the next call is proven again, with the tool
+  recorded as `unknown` until the client lists the tools (GR-103, fixed after the twelfth
+  read). One slow tool call holds an agent's other calls behind it, because the shim sends
+  one at a time (GR-104); and the cap on calls in flight is shared by all agents, so one
+  agent's slow calls can leave others' unrecorded for that time (GR-105): a share for each
+  agent belongs with budgets in G6. The shim's secret and the operator's secret are
   files. The shim speaks HTTP to the agent, not stdio.
 - Tests: four on sessions (who opens one; each way a proof fails; a session ending with its
   mandate and its calls; unproven sessions never pushing out a proven one), one on the
@@ -537,6 +543,27 @@ nothing else in the forwarder can be left half-done by a client that leaves.
 | GR-98 | Low | Any local process, an agent on the gate's own machine included, can read the operator address | With the shim's step: a secret on the operator address |
 | GR-99 | Low | No cap on calls in flight: each holds up to 4 MB for up to the call's time limit | With the shim's step: a cap; past it, in observe mode, the call is forwarded and counted as not recorded |
 | GR-100 | Low | If the witness's newest 16 checkpoints all fail to verify, nothing is trimmed until someone removes them | Stated here. A Ledger that can write to the witness can also stop publishing, so this adds little; the gate reports the bad checkpoints each round |
+
+Open conditions on later slices, by the reviewer's list: GR-77 (listener hardening), GR-81
+(G4), GR-85 (G8), a test for each connector map (GR-65), GR-8a and GR-29 to GR-32 (G6),
+GR-34 to GR-36 (G9).
+
+### Twelfth read, 2026-11-26, the shim at `543407a`
+
+**Verdict: the gate passes for G3b as a whole, all five steps, in observe mode**, with the
+spec, G1, G2 and G3a. No High or Critical. The reviewer's answers to the two questions put
+to it: "proven" cannot be written for anything but a success of `Session::accept` on the
+action the gate computed; and nothing that reaches the shim's port without its secret can
+get a call signed. GR-97, GR-98 and GR-99 are closed.
+
+| Finding | Severity | What it said | What is done |
+|---|---|---|---|
+| GR-101 | Low | `proof` was a field any caller of `Gate::begin` could set, so a later front door could write "proven" by mistake | Who made a call is a value with private fields, built only from a claim or from what `Sessions::prove` returned; a proven call has a private field of its own (`build/gov-review-12`) |
+| GR-102 | Low | The time check on a request to open a session could overflow: a panic that poisoned the sessions' lock in a debug build, a wrapped value in a release build | Compared without arithmetic that can overflow; and a panic no longer leaves the sessions unusable |
+| GR-103 | Low, before G6 | After a gate restart every honest call failed its proof until the client listed the tools again | The shim forgets its listing when the gate says the session is gone |
+| GR-104 | Low | One slow call holds an agent's other calls, the cost of sending one at a time | Stated in the status note; a window of accepted counters would remove it |
+| GR-105 | Low | The cap on calls in flight is shared by all agents | Stated; a share per agent belongs with budgets (G6) |
+| GR-106 | Info | A proven receipt is not an authorised one | Stated in the status note; reports must say so |
 
 Open conditions on later slices, by the reviewer's list: GR-77 (listener hardening), GR-81
 (G4), GR-85 (G8), a test for each connector map (GR-65), GR-8a and GR-29 to GR-32 (G6),

@@ -584,10 +584,9 @@ async fn a_gate_and_a_ledger_run_as_programs_leave_a_record_an_auditor_can_check
     let lost = through_shim(tool_call(23, "PAY-23"), Some(&secret));
     assert_eq!(lost.send().await.unwrap().status().as_u16(), 200);
     assert_eq!(hits(), before + 1, "the call went to the server once");
-    // The tools are listed again, as a client does after it reconnects, and the next call
-    // is proven under a new session.
-    let listed = through_shim(list.clone(), Some(&secret));
-    assert_eq!(listed.send().await.unwrap().status().as_u16(), 200);
+    // The next call is proven under a new session, without the client doing anything: the
+    // shim forgot its listing when the gate said the session was gone, so both sides take
+    // the tool for one they have not seen listed, and agree (review finding GR-103).
     let again = through_shim(tool_call(24, "PAY-24"), Some(&secret));
     assert_eq!(again.send().await.unwrap().status().as_u16(), 200);
     let health = site.health(&operator).await;

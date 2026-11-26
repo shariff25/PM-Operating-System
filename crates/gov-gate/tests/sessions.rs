@@ -178,6 +178,13 @@ fn only_the_keys_holder_opens_a_session() {
     s.open(&m, &request, NOW).unwrap();
     assert_eq!(s.open(&m, &request, NOW + 1), Err(OpenRefused::Invalid));
     assert_eq!(s.len(), 1);
+
+    // A time at either end of the range is refused like any other; it does not stop the
+    // gate (review finding GR-102).
+    for (n, at) in [i64::MIN, i64::MAX, i64::MIN + 1].into_iter().enumerate() {
+        let extreme = ask(&agent(), "gate-1", &format!("x-{n}"), at);
+        assert_eq!(s.open(&m, &extreme, NOW), Err(OpenRefused::Invalid));
+    }
 }
 
 /// Proven is said only for a proof that holds for the action the gate computed, and each
@@ -200,9 +207,9 @@ fn a_call_is_proven_only_by_a_proof_that_holds() {
         true,
         NOW,
     ) {
-        Proved::Proven(who) => {
-            assert_eq!(who.agent, id("triage-bot"));
-            assert_eq!(who.mandates, vec![id("m-1")]);
+        Proved::Proven(call) => {
+            assert_eq!(call.who().agent, id("triage-bot"));
+            assert_eq!(call.who().mandates, vec![id("m-1")]);
         }
         other => panic!("{other:?}"),
     }

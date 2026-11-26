@@ -27,16 +27,16 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use gov_core::action::Salt;
 use gov_core::connector::{tool_digest, ServerMap};
-use gov_core::receipt::{Coverage, OutcomeStatus, Proof, ProofFailure};
+use gov_core::receipt::{Coverage, OutcomeStatus, ProofFailure};
 use gov_core::{Digest, Envelope, Id};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::Semaphore;
 
-use crate::sessions::{OpenRefused, Presented, Proved, Sessions, SessionsConfig};
+use crate::sessions::{OpenRefused, Proved, Sessions, SessionsConfig};
 use crate::{
-    Gate, GateError, LedgerLink, Observed, Shipped, Spool, Trimmed, WitnessRead, WitnessReader,
+    Gate, GateError, LedgerLink, Observed, Shipped, Spool, Trimmed, Who, WitnessRead, WitnessReader,
 };
 
 /// The largest request, or answer the gate must read, that it will hold.
@@ -437,11 +437,10 @@ async fn open_session<S: Spool + 'static>(
     }) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    let opened = sessions.lock().expect("the sessions' lock").open(
-        &asked.mandate,
-        &asked.request,
-        (f.clock)(),
-    );
+    let opened = sessions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .open(&asked.mandate, &asked.request, (f.clock)());
     match opened {
         Ok((session, challenge)) => {
             axum::Json(json!({"session": session, "challenge": challenge})).into_response()
@@ -668,23 +667,25 @@ async fn call<S: Spool + 'static>(
                 let now = (f.clock)();
                 // Who made the call. Proven is said by `Sessions::prove` alone, for the
                 // action computed just above from this gate's own map and listing.
-                let (agent, proof, failure, mandates) = match (&shim, &f.sessions) {
+                let who = match (&shim, &f.sessions) {
                     (Some(shim), Some(sessions)) => {
                         let canonical = gov_core::action::args_digest(&args, &salt).is_ok();
-                        let proved = sessions.lock().expect("the sessions' lock").prove(
-                            &shim.session,
-                            shim.proof.as_ref(),
-                            shim.salt.as_ref(),
-                            &mapped.action.digest(),
-                            canonical,
-                            now,
-                        );
-                        match proved {
-                            Proved::Proven(who) => {
+                        let proved = sessions
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .prove(
+                                &shim.session,
+                                shim.proof.as_ref(),
+                                shim.salt.as_ref(),
+                                &mapped.action.digest(),
+                                canonical,
+                                now,
+                            );
+                        match &proved {
+                            Proved::Proven(_) => {
                                 f.counters.proven.fetch_add(1, Ordering::Relaxed);
-                                (who.agent, Proof::Proven, None, who.mandates)
                             }
-                            Proved::Failed { who, why } => {
+                            Proved::Failed { why, .. } => {
                                 f.counters.proof_failed.fetch_add(1, Ordering::Relaxed);
                                 // The shim opens another session before its next call.
                                 reopen = matches!(
@@ -693,23 +694,16 @@ async fn call<S: Spool + 'static>(
                                         | ProofFailure::MandateExpired
                                         | ProofFailure::SessionSpent
                                 );
-                                let who = who.unwrap_or(Presented {
-                                    agent: Id::new("unknown-session").expect("an identifier"),
-                                    mandates: Vec::new(),
-                                });
-                                (who.agent, Proof::Failed, Some(why), who.mandates)
                             }
                         }
+                        Who::from_session(&proved)
                     }
                     // A stock client only says who it is.
-                    _ => (agent, Proof::Claimed, None, Vec::new()),
+                    _ => Who::claimed(agent),
                 };
                 f.with_gate(move |gate| {
                     let observed = Observed {
-                        agent: &agent,
-                        proof,
-                        failure,
-                        mandates: &mandates,
+                        who,
                         action: &mapped.action,
                         reversal: mapped.reversal,
                         // The agent holds its own credential; the gate is only in the path.
