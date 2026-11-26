@@ -1018,6 +1018,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "gov-authority"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "gov-core",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "gov-cli"
 version = "0.1.0"
 dependencies = [

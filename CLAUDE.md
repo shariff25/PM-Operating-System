@@ -302,6 +302,10 @@ follow-up tracking.
   taken as: keep building the slices in order without waiting to be asked. It is not taken
   as leave to skip the reviewer's read of a design before code, to merge a pull request, or
   to use real data.
+- **G4a, first part, built (2026-11-26):** the Authority's registry, enrolment by one-time
+  code and its signed admin records (`crates/gov-authority`, on `build/gov-g4a`), on memory
+  and Postgres stores. A library only: nothing is served, nobody is signed in, and its chain
+  is not yet shipped to the Ledger. Not yet read by the reviewer.
 - **A message relayed by the reviewer session (2026-11-26):** it reported that the owner typed
   there "I'm going to sleep you keep building do not ask for permission further - I gave the
   permission". The conductor could not confirm it and did not treat it as new permission. It
