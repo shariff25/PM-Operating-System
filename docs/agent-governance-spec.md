@@ -711,6 +711,25 @@ only under an explicit test flag; `gov policy sign` is usable off the Authority'
 and publishing a bundle is a `PolicyPublished` record carrying its digest. Still the
 owner's: how the root key is replaced if lost or stolen (§11, decision 9).
 
+### Sixteenth read, 2026-11-26, at `3ccfb5a`
+
+**Verdict: no High or Critical; the gate still passes.** GR-122 to GR-124 are closed (the
+reviewer walked the stops on each side of keeping a record and found none that leaves a
+disabled gate's key in use). The auditor's check of gate keys is sound for what it checks.
+The G4b design stands in all eight points; JSON for now, and the bundle read from a file at
+start, are confirmed. **G4b may be built once GR-128 is answered in the text**, which it is.
+Postgres was again read, not run, by the reviewer.
+
+| Id | Severity | What | Done |
+|---|---|---|---|
+| GR-128 | Medium, before G4b | Keeping the root key off the Authority's machine only helps if what it signs does not come from that machine, and the text did not say where the signer's input comes from or what the signer sees | §7.6.1, point 4: the input is the reviewed repository; `sign` runs the check itself, shows what changed since the previous signed bundle, and prints the digest it signed |
+| GR-129 | Low | A receipt carried the bundle's number only, so two bundles under one number could not be told apart | §7.6.1, point 5: the policy version is the number and the digest |
+| GR-130 | Low | "A receipt after its gate was disabled" compares the gate's own date with the Authority's, so it catches only a gate that dates honestly | Open; to use the witness's order (the first checkpoint that covered each), with G4d |
+| GR-131 | Low | On a Ledger restored from an older copy, the notes of enrolments can disagree with the chain | Open; rebuild the notes from the chain at start, with the `gov-ledger` program's next change |
+| GR-132 | Low | A gate or shim with no saved state accepts any validly signed bundle, an old one included | Stated in §7.6.1, point 3, as a limit until the lease names the bundle (G4d) |
+| GR-133 | Low | A gate and its shim started on different bundles fail proofs for every tool whose map differs | Stated in §7.6.1, point 7 |
+| GR-134 | Low | The Ledger's public keys stay an unsigned file the gate trusts | §7.6.1, point 9: they stay local configuration, and why |
+
 ## 1. What is being built
 
 Agent Governance is a second product, separate from PM OS. It has three parts.
@@ -1560,7 +1579,10 @@ Written to settle the reviewer's list from the fifteenth read before any code.
    number and digest of the newest bundle they have accepted, written before the bundle is
    used. A bundle with a lower number is refused. The same number with another digest is
    refused and counted: two bundles under one number means the root key signed twice or
-   was copied. A higher number is accepted whatever the gap (a gate may have been off for
+   was copied. A gate or shim with no saved state accepts any validly signed bundle, an old
+   one included, so wiping that state undoes the removal of an online key until the lease
+   names the bundle a gate must hold (G4d): a stated limit of G4b (GR-132). A higher number
+   is accepted whatever the gap (a gate may have been off for
    several releases); the Authority, which publishes, accepts only the next number.
 4. **Three commands, and where each runs.**
    - `gov policy check <dir>`: reads the policy files, builds the bundle, and runs every
@@ -1568,9 +1590,18 @@ Written to settle the reviewer's list from the fifteenth read before any code.
      connector map in the directory must come with a file of sample calls and the action
      each is to be read as; the check runs them and fails without them (the standing
      condition of GR-65).
-   - `gov policy sign --root-key <file> --number <n>`: signs what `check` built. It opens
-     no database and no network connection, so it runs wherever the root key is kept, which
-     is meant not to be the Authority's machine.
+   - `gov policy sign --root-key <file> --number <n> --previous <signed bundle>` (GR-128).
+     Its input is the policy directory **as checked out from the reviewed repository**
+     (threat T18), never a directory or a built file carried from the Authority's machine:
+     were it otherwise, whoever took that machine would add a key of their own under
+     `mandates` and the root would sign it. So `sign` takes the directory, not a built
+     bundle, and runs `check` itself. It reads the previous signed bundle (required for
+     every number but 1), verifies it under the same root, requires the next number, and
+     prints what changed before it signs: online keys added and removed, by role; rules
+     added, removed and changed; connector maps added, removed and changed. It asks for a
+     typed yes unless told `--yes`, and prints the digest it signed, which the person
+     publishing compares with the digest the Authority reports. It opens no database and
+     no network connection.
    - Publishing, on the Authority: a library function for now (no listener until G4e). It
      opens the signed bundle under the root key, takes only the next number, and writes the
      bundle and a `PolicyPublished` admin record carrying its number and digest in one
@@ -1580,18 +1611,30 @@ Written to settle the reviewer's list from the fifteenth read before any code.
    in place of `--map` and `--mandate-issuers`. The old options remain only with
    `--unsigned-policy-for-tests`, refused unless the data class is fake, and a gate started
    that way says so in every receipt's policy version (`unsigned`), so no record made
-   without a bundle reads as made with one. A receipt otherwise carries the bundle's number.
+   without a bundle reads as made with one. A receipt otherwise carries the bundle's number
+   and the start of its digest (`<number>-<16 hex digits>`), so that two bundles under one
+   number, the case point 3 counts as an alarm, can be told apart in the record (GR-129).
 6. **Policy source is JSON for now**, not the YAML §4.6 names: the strict reader the gate
    already uses for everything it parses refuses a repeated key and an unknown field, and a
    YAML reader would be a new dependency on the path that decides what is trusted. YAML,
    if wanted, is converted before `check` and is not what is signed.
 7. **Delivery.** In G4b the gate and shim read the bundle from a file at start. Fetching
    it from the Authority, and changing it without a restart, come with the lease (G4d),
-   which names the bundle a gate must hold.
+   which names the bundle a gate must hold. Until then a gate and its shim can be started
+   on different bundles; every tool whose map differs then fails its proof, with a reason
+   that says so, until both run the same one (GR-133).
 8. **An agent and a gate may not share a name** (GR-127). A key's id is under the name it
    is for, so two things of one name could take each other's key ids. The registry refuses
    to register an agent under a gate's name, or a gate under an agent's, and the
    Authority's own name is refused for both.
+
+9. **The Ledger's keys stay local configuration** (GR-134). The gate checks the Ledger's
+   acknowledgements and checkpoints against public keys from a file. They are not put in
+   the bundle: the Ledger is the party that checks on the Authority's records, and an
+   auditor is meant to hold the Ledger's key from outside the installation (§7.6, choice
+   7); a bundle naming the Ledger's key would let whoever signs policy choose who witnesses
+   it. A wrong file there cannot make a receipt: it can only make a gate believe, or
+   refuse to believe, that its receipts were taken.
 
 **Not built in G4b:** rules are still not evaluated against a call (G5); the lease and
 revocation (G4d); mandates from the Authority (G4c), so the `mandates` keys in a bundle are
