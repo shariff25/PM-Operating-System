@@ -290,6 +290,18 @@ follow-up tracking.
   are written in the spec (§7.6) and sent to the reviewer before any code. Five steps, G4a to
   G4e. One departure from the spec's wording: admin actions are recorded in a signed document
   of their own, chained and witnessed like receipts, not as receipts.
+- **Thirteenth read (2026-11-26), the G4 design at `b2a0c74`:** no High or Critical; G4a
+  may be built once two Medium points were answered in §7.6 (how enrolment works; three
+  conditions on admin records), which they are. A third (key roles: a root key that signs
+  only the policy bundle) is settled in the text before G4b. One of the twelfth-read fixes
+  opened a new Medium in the shim (GR-112), fixed on `build/gov-review-13`.
+- **Owner, 2026-11-26: "Build don't stop and push the code as shariff25@gmail.com in
+  github".** From this point commits are authored with that address instead of the account's
+  noreply address (the instruction of 2026-11-24 is changed by this one); earlier commits are
+  not rewritten. The address is then public in the repository's history. "Don't stop" is
+  taken as: keep building the slices in order without waiting to be asked. It is not taken
+  as leave to skip the reviewer's read of a design before code, to merge a pull request, or
+  to use real data.
 - **A message relayed by the reviewer session (2026-11-26):** it reported that the owner typed
   there "I'm going to sleep you keep building do not ask for permission further - I gave the
   permission". The conductor could not confirm it and did not treat it as new permission. It

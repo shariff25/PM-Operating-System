@@ -569,6 +569,22 @@ Open conditions on later slices, by the reviewer's list: GR-77 (listener hardeni
 (G4), GR-85 (G8), a test for each connector map (GR-65), GR-8a and GR-29 to GR-32 (G6),
 GR-34 to GR-36 (G9).
 
+### Thirteenth read, 2026-11-26, the G4 build design at `b2a0c74`
+
+**Verdict: no High or Critical; G4a may be built from §7.6 once GR-107 and GR-108 are
+answered in the text**, which they now are. GR-101 and GR-102 are closed. The fix for GR-103
+opened a new fault, GR-112.
+
+| Finding | Severity | What it said | What is done |
+|---|---|---|---|
+| GR-107 | Medium, before G4a | Enrolment "signed over the code's digest": if only the digest travels, the stored digest is the secret; if the code travels, the signature does not stop a race | §7.6, choice 3, rewritten: the code itself is presented, under the connection rule, used up by the first request; the signature covers the name and the key; wrong codes are counted; the answer pins the root key; how a gate's key reaches the Ledger is said |
+| GR-108 | Medium, before G4a | Admin records needed typed chains, record before effect, and mandate issue recorded; no free text | §7.6, choice 1 |
+| GR-109 | Medium, before G4b | One key for bundles and for leases puts the trust root on the busiest signer | §7.6, choice 2: a root key signs the bundle, which names the online keys by role |
+| GR-110 | Low, before G4d | A revoked agent has proven its key, so one "failed proof" reason is untrue; and after its session closes its calls lose its name | §7.6, choice 5 |
+| GR-111 | Low, G4a to G4d | Before sign-in exists, an admin record must not read as a person's proven act | §7.6, choice 8 |
+| GR-112 | Medium | The shim forgot its listings on every `x-gov-reopen`, but only a restarted gate has lost its own; an idle session then broke every later call | Fixed on `build/gov-review-13`: the gate says whether it still holds a listing for that MCP session, and the shim forgets only when it does not |
+| GR-113 | Low | After a gate restart a running MCP session's id is never issued again, so its listings are never remembered | Fixed: an id is taken as issued when the server answers a request under it successfully |
+
 ## 1. What is being built
 
 Agent Governance is a second product, separate from PM OS. It has three parts.
@@ -1286,9 +1302,11 @@ log, GitHub's audit log) and reports any write with no matching outcome receipt,
 `outcome: unknown` it can now resolve. Until it exists the product states that an unrecorded
 write by a compromised gate would be found only by hand.
 
-### 7.6 How G4 is built (design of 2026-11-26; not built, not yet read by the reviewer)
+### 7.6 How G4 is built (design of 2026-11-26; not built)
 
-Written before code, for the reviewer, as §5.3.1 was for the shim. §7.1 to §7.5 say what the
+Written before code, as §5.3.1 was for the shim. The reviewer read it on 2026-11-26
+(thirteenth read) and said G4a may be built once GR-107 and GR-108 were answered in this
+text; they are, with GR-109 to GR-111, each marked where it lands. §7.1 to §7.5 say what the
 Authority is; this says how the slice is cut, what each step replaces, and the choices that
 were open.
 
@@ -1308,37 +1326,78 @@ issuer; nothing is revoked and the gate's time is its own machine's. G4 ends eac
 
 **Choices made here, for the reviewer to confirm or refuse.**
 
-1. **Admin records are their own document, not receipts** (a departure from §7.4's wording).
-   A receipt is about an agent's action on a system: its rules (an action's digest, a
-   reversal class, a mode, a proof) do not fit "Ana enrolled the agent `refund-bot`". Bending
-   them would weaken the receipt's own rules. So: a signed document `gov.admin.v1` (who, what,
-   on what, when, the policy version, and for a change the digest of the new value), numbered
-   and chained like receipts, signed by the Authority's own enrolled key, shipped to the
-   Ledger into the Authority's chain, listed in the same checkpoints and checked by the same
-   `gov verify`. §7.4's point stands: every admin action is covered by the witness.
-2. **The Authority's keys.** One key signs mandates, bundles, leases and the revocation feed
-   (the trust root a gate is configured with, as a public key); a second, enrolled at the
-   Ledger like a gate's, signs its admin records. Both are files under the rule of §9 until a
-   key service exists. Losing the first is losing the installation; the spec says so, and
-   rotation of it is designed in G4d with GR-59, not assumed.
-3. **Enrolment code.** 128 random bits, shown once, stored only as a digest, bound to one
-   named agent or gate and to the admin who made it, good for 15 minutes and for one use. The
-   agent's or gate's request to enrol is signed with the key being enrolled, over the code's
-   digest and the Authority's name, so the code cannot be used for another key by someone
-   who sees the request. A key anyone could forge for is refused (GR-6), as is a key or key
-   id already enrolled.
+1. **Admin records are their own document, not receipts** (a departure from §7.4's wording;
+   the reviewer agreed, on the conditions of GR-108, which follow). A receipt is about an
+   agent's action on a system: its rules (an action's digest, a reversal class, a mode, a
+   proof) do not fit "Ana enrolled the agent `refund-bot`". Bending them would weaken the
+   receipt's own rules. So: a signed document `gov.admin.v1` (who, what, on what, when, the
+   policy version, and for a change the digest of the new value), numbered and chained like
+   receipts, signed by the Authority's admin-record key, shipped to the Ledger into the
+   Authority's chain, listed in the same checkpoints and checked by the same `gov verify`.
+   §7.4's point stands: every admin action is covered by the witness. And (GR-108):
+   - **Chains have a kind.** A chain at the Ledger takes one kind of document. A key is
+     enrolled for receipts or for admin records, never both: a key enrolled for admin
+     records is refused on a receipt, and a gate's key on an admin record.
+   - **Record before effect.** An admin action takes effect only after its record is
+     durably written, as an intent receipt precedes a call. A crash leaves a record with no
+     effect, which the Authority completes or marks as not done when it starts; never an
+     effect with no record.
+   - **Issuing a mandate is an admin action** and is recorded, with the mandate's id. A
+     mandate id that appears in a gate's receipt and in no admin record is then something
+     `gov verify` can report: a mandate the witness never saw issued.
+   - **No free text.** "What" is one of a closed list of actions; "on what" and "who" are
+     identifiers; anything longer is carried as a digest.
+2. **The Authority's keys, by role** (GR-109, to be built in G4b). A **root key** signs the
+   policy bundle and nothing else; it is used on release, not while serving, and can be kept
+   off the Authority's machine. The bundle names the **online keys** by role: one for
+   mandates, one for leases and the revocation feed. A gate is configured with the root's
+   public key and takes the others from a bundle it has verified. Taking the Authority's
+   machine then means forging leases and mandates until the bundle is reissued, not forging
+   policy. A further key, enrolled at the Ledger for admin records only, signs those. All
+   are files under the rule of §9 until a key service exists. Losing the root is losing the
+   installation; the spec says so, and its rotation is designed in G4d with GR-59.
+3. **Enrolment** (GR-107). An admin makes a code: 128 random bits, shown once, bound to one
+   named agent or gate and to the admin who made it, good for 15 minutes and for one use.
+   The Authority stores only its digest.
+   - The request to enrol **presents the code itself**, never only its digest: the digest is
+     what the Authority stores, so it must not be enough to enrol. The code therefore
+     travels only under the programs' connection rule (HTTPS, or a literal loopback
+     address), and is used up by the first request that presents it, right or wrong.
+   - The request is signed with the key being enrolled, over the code's digest, the
+     Authority's name, the agent's or gate's own name, and the public key. A key anyone
+     could forge for is refused (GR-6), as is a key or key id already enrolled.
+   - Wrong codes for one name are counted; after five the name's pending code is cancelled
+     and an admin must make another.
+   - The answer carries the Authority's root public key and a value computed from the code
+     over that key, so the gate or agent pins the key it enrolled with and cannot be handed
+     another by something in between.
+   - **A gate's key reaches the Ledger from the Authority,** in a request signed with the
+     Authority's admin-record key, which the Ledger is configured with at installation. The
+     Ledger enrols a receipt key on that request alone; the `gov-ledger enrol` command stays
+     for an installation with no Authority.
 4. **An agent has one owner, a person.** Offboarding the person suspends their agents and
    revokes those agents' mandates in one admin action with one record each.
-5. **Revocation in observe mode.** The gate still blocks nothing. A call under a session
-   whose agent, mandate or key is revoked is forwarded and recorded as a failed proof with a
-   reason of its own (`revoked`), and the session is closed. Enforce mode (G6) refuses it.
+5. **Revocation in observe mode** (with GR-110, to be built in G4d). The gate still blocks
+   nothing. A call under a session whose agent, mandate or key is revoked is forwarded and
+   recorded as a failed proof, with one reason for a revoked key and another for a revoked
+   agent or mandate: the caller did hold the key, and the receipt must not say otherwise.
+   The session is closed, and the gate keeps a marker for that agent key, so that the calls
+   the shim goes on to make with no session are still recorded as that agent's, revoked,
+   and not as an unnamed client's claim. Enforce mode (G6) refuses them.
 6. **GR-81.** The Authority lints a mandate's grants for a folded system at issue, and the
    chain check refuses an upper-case grant for one.
 7. **GR-84.** The trusted-keys record an auditor gives `gov verify` is written by the
    Authority from its registry at enrolment time, as admin records the witness covers, not by
-   the Ledger being audited.
-8. **Sign-in comes last (G4e).** Until then the admin interface is a library and the `gov`
-   command, usable only by someone on the Authority's machine. Whether `crates/entra` can be
+   the Ledger being audited. The anchor: an auditor holds two public keys from outside the
+   installation, the Authority's admin-record key and the Ledger's key; every other key
+   follows from the verified admin chain.
+8. **Sign-in comes last (G4e)** (with GR-111). Until then the admin interface is a library
+   and the `gov` command, usable only by someone on the Authority's machine, and:
+   - every admin record made before G4e marks its actor as **unverified**, as `claimed` does
+     for an agent, so that none reads as a person's proven act;
+   - no admin function is served on any listener until G4e;
+   - a mandate issued in G4c names a person nobody signed in, so the rule that a mandate
+     is issued only inside its issuer's live signed-in session (§2) does not hold until G4e. Whether `crates/entra` can be
    depended on without PM OS's roles (§7.2) is checked first in G4e; if it cannot, the
    verifier is written again in Governance, as the tool digest was.
 
