@@ -224,6 +224,10 @@ pub struct Receipt {
     pub countersign: Option<CountersignRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<Outcome>,
+    /// On an outcome: the number of the intent receipt it answers, in this gate's chain. Two
+    /// identical actions in flight are told apart by it (review finding GR-40).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<u64>,
 }
 
 document!(Receipt, "gov.receipt.v1");
@@ -270,6 +274,23 @@ impl Receipt {
         }
         if self.reverses.is_some() && self.action.kind == Kind::Read {
             return Err(Error::Malformed("a read undoes nothing"));
+        }
+        // An undo points at a receipt that exists already: never number 0, and in this gate's
+        // own chain never itself or a later one (review finding GR-39).
+        if let Some(r) = &self.reverses {
+            if r.seq == 0 || (r.gate == self.gate && r.seq >= self.seq) {
+                return Err(Error::Malformed("an undo points at an earlier receipt"));
+            }
+        }
+        match (self.phase, self.intent) {
+            (Phase::Outcome, Some(n)) if n >= 1 && n < self.seq => {}
+            (Phase::Outcome, _) => {
+                return Err(Error::Malformed("an outcome names its earlier intent"));
+            }
+            (_, Some(_)) => {
+                return Err(Error::Malformed("only an outcome names an intent"));
+            }
+            (_, None) => {}
         }
         if self.at < 0 {
             return Err(Error::Malformed("a receipt's time is before the epoch"));

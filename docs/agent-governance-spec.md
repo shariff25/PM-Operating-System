@@ -178,8 +178,23 @@ builds undo. They are answered in those sections now, as requirements; none is b
 | GR-39, GR-40 | Low | Rules missing on `reverses`; an outcome did not name its intent | Fixed in the formats |
 | GR-41 | Info | The reversal class reaches `evaluate` and the receipt by two routes | For G6: one value, one place |
 
-**The reviewer has not re-read the GR-22 to GR-25 fixes or the answers above. G2's gate is
-not passed.**
+### Fourth read, 2026-11-26, at `e7adb6b`
+
+**Verdict: the gate passes for the spec, for G1 and for G2. No High or Critical is open.**
+The reviewer re-ran its attacks on `gov verify` and each is now reported; GR-22 to GR-25 and
+GR-16 are closed. It is a pass on code that touches no real system. Before real data the open
+Medium findings still need their answers built: GR-10 (G3), GR-8a and GR-29 to GR-32 (before
+G6 builds the signed approval), GR-34 to GR-36 (before G9).
+
+Two new Low findings, both fixed on `build/gov-review-3`, with the format fixes of the third
+read (GR-36, GR-39, GR-40):
+
+| Finding | What it said | What was done |
+|---|---|---|
+| GR-42 | Refusing a receipt dated before the one it follows ends that gate's chain, and an honest gate's clock can step back a second or two after a slow lease renewal | Intake takes the receipt and records the step back; `gov verify` reports it. For G3: a gate never writes a time earlier than its last receipt's, with a test that steps the lease clock back |
+| GR-43 | The Ledger dates its own checkpoints, so one hostile from its first day could back-date them and prune at once | `gov verify` reports a checkpoint dated earlier, by more than the interval, than a receipt it covers. The full answer is the witness store's own write times, with the object-storage witness |
+
+**The reviewer has not read `build/gov-review-3`.** It changes no finding of High severity.
 
 ## 1. What is being built
 

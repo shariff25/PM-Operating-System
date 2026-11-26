@@ -121,13 +121,6 @@ async fn intake<S: Store>(store: S) {
         "malformed"
     );
 
-    // A receipt dated before the one it follows.
-    let earlier = receipt("gate-1", 3, Some(hash_of(&c1[1], &g1)), T0 - 5);
-    assert_eq!(
-        refused(ledger.ingest(&seal(&earlier, &g1).unwrap(), T0).await),
-        "time_went_back"
-    );
-
     // The chain itself is untouched by all of that, and goes on.
     assert_eq!(ledger.ingest(&c1[2], T0).await.unwrap(), Ingested::Added);
     assert_eq!(ledger.ingest(&c1[3], T0).await.unwrap(), Ingested::Added);
@@ -140,6 +133,18 @@ async fn intake<S: Store>(store: S) {
             .unwrap()
             .seq,
         4
+    );
+
+    // A receipt dated before the one it follows: an honest gate's clock can step back a
+    // second after a slow lease renewal, and refusing would end its chain (finding GR-42). It
+    // is taken, and the step back is recorded.
+    let earlier = receipt("gate-1", 5, Some(hash_of(&c1[3], &g1)), T0 - 5);
+    assert_eq!(
+        ledger
+            .ingest(&seal(&earlier, &g1).unwrap(), T0)
+            .await
+            .unwrap(),
+        Ingested::Added
     );
 
     // Every refusal is recorded; the envelope is kept only where its signature held.
@@ -158,7 +163,7 @@ async fn intake<S: Store>(store: S) {
             ("wrong_gate", true),
             ("wrong_tenant", false),
             ("malformed", true),
-            ("time_went_back", true),
+            ("taken_time_went_back", false),
         ]
     );
 }
@@ -993,3 +998,43 @@ async fn enrolment<S: Store>(store: S) {
     assert_eq!(ledger.store().gate_keys(&scope()).await.unwrap().len(), 2);
 }
 both_stores!(a_weak_or_repeated_gate_key_is_not_enrolled, enrolment);
+
+/// GR-16 and GR-42: a receipt dated before the one it follows is reported by `verify`. GR-43:
+/// so is a checkpoint dated before a receipt it covers.
+async fn clocks<S: Store>(store: S) {
+    let s = stack(store).await;
+    let good = s.ledger.export().await.unwrap();
+    let cps = DirWitness::new(s.witness_dir.path()).all().unwrap();
+    let g1 = key("gate-1-key", 20);
+
+    let mut back = good.clone();
+    let stepped = receipt(
+        "gate-1",
+        7,
+        Some(hash_of(&back.gates[0].receipts[5], &g1)),
+        T0 + 30,
+    );
+    back.gates[0].receipts[6] = seal(&stepped, &g1).unwrap();
+    assert!(problems(&check(&s.keys, &back, &cps, None)).contains(&(
+        Problem::BadReceipt("time_went_back"),
+        Some("gate-1"),
+        Some(7)
+    )));
+
+    // The Ledger re-dates its first checkpoint a day early. The receipts it covers say otherwise.
+    let env: Envelope = serde_json::from_slice(&cps[0].1).unwrap();
+    let mut doc = gov_core::open::<Checkpoint>(
+        &env,
+        &gov_core::KeySet::new([ledger_key().public()]),
+        &scope(),
+    )
+    .unwrap()
+    .doc;
+    doc.at = T0 - 86_400;
+    let mut redated = cps.clone();
+    redated[0].1 = serde_json::to_vec(&seal(&doc, &ledger_key()).unwrap()).unwrap();
+    let report = check(&s.keys, &good, &redated, None);
+    assert!(problems(&report).contains(&(Problem::CheckpointBackdated, Some("gate-1"), Some(1))));
+    assert!(check(&s.keys, &good, &cps, None).ok());
+}
+both_stores!(clocks_that_disagree_are_reported, clocks);

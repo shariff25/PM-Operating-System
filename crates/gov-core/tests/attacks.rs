@@ -63,6 +63,7 @@ fn action_on(resource: &str, op: &str, kind: Kind, args: Value) -> CanonicalActi
         ResourcePath::new(resource).unwrap(),
         Some(id("7")),
         &args,
+        &[9; 32],
     )
     .unwrap()
 }
@@ -880,6 +881,7 @@ fn receipt(seq: u64, prev: Option<Digest>, phase: Phase) -> Receipt {
             upstream_ref: Some(id("PAY-12")),
             response_digest: None,
         }),
+        intent: (phase == Phase::Outcome).then(|| seq - 1),
     }
 }
 
@@ -1764,7 +1766,7 @@ fn a_before_digest_belongs_to_the_intent_of_a_write_that_can_be_put_back() {
     r.before_digest = Some(Digest::of(&[b"before"]));
     assert!(r.validate().is_err());
     // An undo names the receipt it puts back, and is a write.
-    let mut undo = receipt(1, None, Phase::Intent);
+    let mut undo = receipt(50, Some(Digest::of(&[b"r49"])), Phase::Intent);
     undo.reverses = Some(gov_core::receipt::ReceiptRef {
         gate: id("gate-1"),
         seq: 41,
@@ -1777,4 +1779,40 @@ fn a_before_digest_belongs_to_the_intent_of_a_write_that_can_be_put_back() {
     let mut v = serde_json::to_value(receipt(1, None, Phase::Intent)).unwrap();
     v.as_object_mut().unwrap().remove("reversal");
     assert!(serde_json::from_value::<Receipt>(v).is_err());
+}
+
+/// GR-39 and GR-40: an undo points at an earlier receipt; an outcome names its intent.
+#[test]
+fn an_undo_and_an_outcome_point_backwards() {
+    let earlier = |gate: &str, seq: u64| gov_core::receipt::ReceiptRef {
+        gate: id(gate),
+        seq,
+        hash: Digest::of(&[b"r"]),
+    };
+    let mut undo = receipt(5, Some(Digest::of(&[b"x"])), Phase::Intent);
+    undo.reverses = Some(earlier("gate-1", 4));
+    undo.validate().unwrap();
+    for bad in [
+        earlier("gate-1", 5),
+        earlier("gate-1", 6),
+        earlier("gate-1", 0),
+        earlier("gate-2", 0),
+    ] {
+        undo.reverses = Some(bad);
+        assert!(undo.validate().is_err());
+    }
+    // Another gate's chain has its own numbers.
+    undo.reverses = Some(earlier("gate-2", 900));
+    undo.validate().unwrap();
+
+    let mut outcome = receipt(6, Some(Digest::of(&[b"x"])), Phase::Outcome);
+    assert_eq!(outcome.intent, Some(5));
+    outcome.validate().unwrap();
+    for bad in [None, Some(0), Some(6), Some(7)] {
+        outcome.intent = bad;
+        assert!(outcome.validate().is_err(), "{bad:?}");
+    }
+    let mut intent = receipt(5, Some(Digest::of(&[b"x"])), Phase::Intent);
+    intent.intent = Some(4);
+    assert!(intent.validate().is_err());
 }
