@@ -259,6 +259,15 @@ follow-up tracking.
 - **The shim (2026-11-26):** its protocol is written in the spec (§5.3.1) and sent to the
   reviewer before any code; the conductor's choice, since the build-before-review go-aheads
   covered G1 and G2 only. The shim is the last part of G3b.
+- **Tenth read (2026-11-26), at `09dea18`, and the shim's design at `4fba4cf`:** the gate
+  passes for the spec, G1, G2, G3a and G3b steps 1 to 4 **in observe mode**. One new Medium to
+  fix before G3b is called done (GR-82: the gate slows to a stop when the Ledger is down,
+  because every receipt reads the whole spool under one lock) and five Low. The shim may be
+  built once four Medium points in its design were answered in the text (GR-88 to GR-91: a
+  copied mandate evicting the real session, a call run twice, a signing port a web page can
+  reach, a failed proof with no mark of its own); they are, in §5.3.1. Standing condition
+  from GR-75: any other embedder of the gate's libraries (G7) must make the programs' check
+  on plain HTTP itself.
 - **A message relayed by the reviewer session (2026-11-26):** it reported that the owner typed
   there "I'm going to sleep you keep building do not ask for permission further - I gave the
   permission". The conductor could not confirm it and did not treat it as new permission. It

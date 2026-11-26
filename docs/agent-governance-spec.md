@@ -452,6 +452,39 @@ accepted as stated, until G4). New findings:
 
 The reviewer said GR-74 and GR-75 should be fixed before G3b is called done. Both are; the reviewer's read of the fixes, and of the programs (step 4), is owed.
 
+### Tenth read, 2026-11-26, at `09dea18`, and the shim's design at `4fba4cf`
+
+**Verdict: the gate passes for the spec, G1, G2, G3a and G3b steps 1 to 4, in observe mode.**
+No High or Critical. GR-74 is closed; GR-75 is closed for the two programs, with a standing
+condition: **the libraries still take any address, so any other embedder (PM OS's tool
+server, G7) must make the same check.** GR-78 to GR-80 are closed. The reworked secrecy
+checks in the tests were read and found sound.
+
+| Finding | Severity | What it said | What is done |
+|---|---|---|---|
+| GR-76 | Low, partly closed | Evicting the oldest session one at a time still lets 4,096 made-up ids push every real session out | To fix on `build/gov-review-10`: remember only session ids the upstream itself issued |
+| GR-82 | Medium | Every receipt written reads every file in the spool under the gate's one lock, and the trim reads the whole, ever-growing witness under it; a mode that must block nothing slows to a stop when the Ledger is down | To fix on `build/gov-review-10`, before G3b is called done |
+| GR-83 | Low | The gate's counters are served where agents can read them, so an agent learns when it is unrecorded | To fix: a separate operator address |
+| GR-84 | Low | The keys file `gov-ledger export` writes comes from the Ledger being audited | To fix: the command says so in words; a condition on G4 |
+| GR-85 | Low | The serving database role also runs migrations | Open: a separate role when the stack file is written (G8) |
+| GR-86 | Low | The name `localhost` is trusted without being resolved | To fix: a literal loopback address only |
+| GR-87 | Low | A checkpoint or shipment that keeps failing shows only on standard error | To fix: the Ledger's health route shows it; the rest with G8 |
+
+**The shim's design (§5.3.1): may be built once four things in the text change** (all
+Medium), which they now have, below in §5.3.1:
+
+| Finding | What it said | What the design now says |
+|---|---|---|
+| GR-88 | A copied mandate chain could keep evicting the real shim's session | A session counts against an agent's cap only after its first valid proof; unproven sessions expire in seconds under their own small cap; a proven session is never closed to make room for an unproven one |
+| GR-89 | "Opens another and sends the call again" could run a call twice | In observe mode an unknown session is a failed proof: the call is forwarded once and a response header tells the shim to reopen for the next call. The shim resends only when the gate says, distinctly, that the call was not forwarded |
+| GR-90 | A loopback port that signs anything can be reached from a web page on that machine | A secret made at each start and required on every request; a request with an `Origin` header or a foreign `Host` is refused; only `application/json` is taken |
+| GR-91 | A failed proof had no mark of its own: `claimed` is also what a stock client gets | A third proof value, `failed`, with a reason from a closed list; counted and reported apart; never counted as the agent's act |
+| GR-92 | A counter that must rise fails honest calls made in parallel | The shim sends tool calls to the gate one at a time |
+| GR-93 | A session can outlive its mandate | The gate checks the mandate's expiry on every call |
+| GR-94 | The shim could sign one reading of a request and send another | The shim reads with the same strict reader and forwards its own writing-out |
+| GR-95 | Arguments with no canonical form are digested over bytes, which only match on one build | Their proof is expected to fail and is recorded as `failed` with its own reason |
+| GR-96 | The shim sends the credential and proofs to whatever its gate address is | The programs' rule: HTTPS, or plain HTTP only to a literal loopback address |
+
 ## 1. What is being built
 
 Agent Governance is a second product, separate from PM OS. It has three parts.
@@ -980,29 +1013,58 @@ Every interface that reports a system's state says "not enforced" for the first 
 - **The library.** The same decision code as a Rust crate with no network listener, for PM OS's
   tool server (§8).
 
-#### 5.3.1 The shim's protocol (design of 2026-11-26; not built, not yet read by the reviewer)
+#### 5.3.1 The shim's protocol (design of 2026-11-26; not built)
 
-Written before code, for the reviewer. It covers observe mode; what enforce mode adds is
-marked.
+Written before code. The reviewer read it on 2026-11-26 and said it may be built once
+findings GR-88 to GR-91 were answered in this text; they are, with GR-92 to GR-96, and each
+is marked where it lands. It covers observe mode; what enforce mode adds is marked.
 
 **What the shim is.** A program the agent's runtime starts beside the agent. To the agent it
 is the MCP server (HTTP on this machine only, on a port of its own). It holds two files: the
 agent's private key, and the agent's mandate chain. It forwards every message to the gate
 and adds a proof to each tool call. The agent's own code and credential do not change.
 
+**Who may use the shim** (GR-90). A port on this machine can be reached by more than the
+agent: by any local process, and by a web page open in a browser here. So, in the first
+build: the shim makes a random secret at each start and hands it only to the runtime that
+started it, and every request must carry it; a request with an `Origin` header, or a `Host`
+that is not the shim's own address, is refused; only `application/json` is taken. A socket
+only the runtime's user can open follows later.
+
+**Where the shim sends** (GR-96). To its configured gate only, under the programs' rule:
+HTTPS, or plain HTTP only to a literal loopback address.
+
 **Opening a session.** The shim posts its mandate chain to the gate (`POST /v1/sessions`).
 The gate verifies the chain (signatures, tenant and environment, expiry, each link inside
 its parent) against the issuer keys it trusts, makes a session id and a random challenge,
 binds the session to the one agent key the leaf mandate names, and answers with both. One
 session carries one mandate. Sessions live in the gate's memory: after a restart the gate
-answers "no such session" and the shim opens another and sends the call again. A session
-ends after an idle time and after a fixed number of calls; the number of open sessions per
-agent key is capped, and when it is reached the oldest is closed.
+does not know the session (see "An unknown session" below). A session ends after an idle
+time and after a fixed number of calls, and the gate checks the mandate's expiry on every
+call, not only at opening (GR-93).
 
 Opening a session proves nothing about who opened it: a mandate chain is not a secret.
-Possession of the key is proven on every call, never before.
+Possession of the key is proven on every call, never before. So an opened session is
+**unproven** until its first valid proof (GR-88):
+- an unproven session expires in seconds, and unproven sessions have a small cap of their
+  own per agent key;
+- only a proven session counts against the agent's cap of sessions;
+- a proven session is never closed to make room for an unproven one. Someone holding a copy
+  of the chain can therefore fill the unproven sessions for a few seconds at a time, and
+  cannot close the real shim's session.
 
-**A tool call.** The shim:
+**An unknown session** (GR-89). The shim never sends a call twice unless the gate has said,
+in a way the shim can tell apart, that the call was not forwarded.
+- In observe mode a call under a session the gate does not know is a failed proof: the call
+  is forwarded once, the server's answer is returned, and a response header tells the shim
+  to open a new session before its next call.
+- In enforce mode (G6) the refusal comes before anything is forwarded and says so, and the
+  shim opens a session and sends the call again.
+
+**A tool call.** The shim reads the agent's request with the same strict reader the gate
+uses and forwards its own writing-out of it, so that what it signs is what it sends
+(GR-94). It sends tool calls to the gate one at a time, so the counter rises in the order
+the gate sees (GR-92). Then it:
 
 1. draws a fresh 32-byte salt (§4.3);
 2. maps the call to a canonical action with **the same connector map the gate uses** and the
@@ -1023,8 +1085,16 @@ None of the `x-gov-*` headers is sent upstream.
 **When the proof does not hold** (a bad signature, a counter that did not rise, a repeated
 salt, a digest that differs because the shim's map or listing is not the gate's):
 - in observe mode the call still goes through, because observe mode blocks nothing. Its
-  receipt says `claimed`, carries the reason code, and names the agent the session's mandate
-  names, marked as not proven. A counter of failed proofs is shown with the others.
+  receipt says **`failed`**, a third value beside `proven` and `claimed`, with a reason from
+  a closed list (GR-91). A receipt's own rules require the reason exactly when the value is
+  `failed`. `claimed` stays what a stock client with no shim gets; a failed proof is a
+  different fact: someone presented this agent's session and could not prove the key. The
+  receipt may name the mandate's agent, and nothing counts it as that agent's act. Failed
+  proofs are counted and reported apart from claimed ones.
+- arguments with no canonical form are digested over their bytes, which the shim and the
+  gate only agree on when both are one build. Such a call is `unknown` in any case; its
+  proof is expected to fail and is recorded as `failed` with a reason of its own, so that
+  it is not read as an attack (GR-95).
 - in enforce mode (G6) the call is refused at step 1 of §5.1.
 
 **Where the map comes from.** Until the Authority exists (G4) the shim reads the connector
@@ -1037,10 +1107,10 @@ it); and a proof over the tool's name and arguments instead of the canonical act
 would change the request proof reviewed in G1, and an approval binds the action's digest).
 
 **Stated limits.**
-- The shim signs whatever is sent to its port. Anything on the machine that can reach that
-  port acts as the agent. Keeping the port to the agent's runtime alone is the integration's
-  job (a socket only the runtime's user can open, in a later step), and each integration's
-  spec says how (T13).
+- The shim signs whatever reaches it with its secret. Whatever holds that secret acts as the
+  agent: the runtime, and anything that can read the runtime's memory or environment. A
+  socket only the runtime's user can open comes in a later step, and each integration's spec
+  says where the secret lives (T13).
 - The key and the mandate are files, under the rule of §9: fake data only.
 - Until G4 the mandate is issued by a test issuer whose public key the gate is given in a
   file. "Proven" then means "holds the key a mandate from that test issuer names", no more.
