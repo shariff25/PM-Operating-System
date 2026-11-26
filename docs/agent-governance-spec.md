@@ -1536,6 +1536,67 @@ issuer; nothing is revoked and the gate's time is its own machine's. G4 ends eac
    depended on without PM OS's roles (§7.2) is checked first in G4e; if it cannot, the
    verifier is written again in Governance, as the tool digest was.
 
+#### 7.6.1 G4b, the policy bundle (design of 2026-11-26; not built; for the reviewer)
+
+Written to settle the reviewer's list from the fifteenth read before any code.
+
+1. **The bundle's format.** `gov.policy.v1` gains three things; a bundle without them is
+   refused.
+   - `number`: a whole number that rises by exactly one with each published bundle, from 1.
+     `version` stays as the label a person reads; order is decided by `number` alone.
+   - `keys`: the Authority's online keys by role, `mandates` and `leases` (the lease key
+     also signs the revocation feed), each a list of public keys with ids. A key appears
+     under one role only, and the root key under none: a bundle that lists its own signer,
+     or one key under two roles, is refused.
+   - `connectors`: as now, the connector map, which the gate and the shim both take from
+     the bundle.
+2. **The root key signs the bundle and nothing else** (GR-109). A gate, a shim and the
+   Authority are each configured with the root's public key, and use it only to open a
+   bundle: it is never placed in a key set that opens a mandate, a lease, a receipt or an
+   admin record, and those documents' type tags differ from the bundle's, so a signature by
+   the root over anything else opens nowhere. An online key is taken only from a bundle
+   that opened under the root.
+3. **No going back.** A gate and a shim each keep, beside their other state on disk, the
+   number and digest of the newest bundle they have accepted, written before the bundle is
+   used. A bundle with a lower number is refused. The same number with another digest is
+   refused and counted: two bundles under one number means the root key signed twice or
+   was copied. A higher number is accepted whatever the gap (a gate may have been off for
+   several releases); the Authority, which publishes, accepts only the next number.
+4. **Three commands, and where each runs.**
+   - `gov policy check <dir>`: reads the policy files, builds the bundle, and runs every
+     check a gate would (rules, key roles, each connector map), needing no key. Each
+     connector map in the directory must come with a file of sample calls and the action
+     each is to be read as; the check runs them and fails without them (the standing
+     condition of GR-65).
+   - `gov policy sign --root-key <file> --number <n>`: signs what `check` built. It opens
+     no database and no network connection, so it runs wherever the root key is kept, which
+     is meant not to be the Authority's machine.
+   - Publishing, on the Authority: a library function for now (no listener until G4e). It
+     opens the signed bundle under the root key, takes only the next number, and writes the
+     bundle and a `PolicyPublished` admin record carrying its number and digest in one
+     step. A bundle a gate holds whose digest has no such record is then something
+     `gov verify` can report, as with mandates.
+5. **The unsigned files go.** `gov-gate` and `gov-shim` take `--bundle` and `--root-key`
+   in place of `--map` and `--mandate-issuers`. The old options remain only with
+   `--unsigned-policy-for-tests`, refused unless the data class is fake, and a gate started
+   that way says so in every receipt's policy version (`unsigned`), so no record made
+   without a bundle reads as made with one. A receipt otherwise carries the bundle's number.
+6. **Policy source is JSON for now**, not the YAML §4.6 names: the strict reader the gate
+   already uses for everything it parses refuses a repeated key and an unknown field, and a
+   YAML reader would be a new dependency on the path that decides what is trusted. YAML,
+   if wanted, is converted before `check` and is not what is signed.
+7. **Delivery.** In G4b the gate and shim read the bundle from a file at start. Fetching
+   it from the Authority, and changing it without a restart, come with the lease (G4d),
+   which names the bundle a gate must hold.
+8. **An agent and a gate may not share a name** (GR-127). A key's id is under the name it
+   is for, so two things of one name could take each other's key ids. The registry refuses
+   to register an agent under a gate's name, or a gate under an agent's, and the
+   Authority's own name is refused for both.
+
+**Not built in G4b:** rules are still not evaluated against a call (G5); the lease and
+revocation (G4d); mandates from the Authority (G4c), so the `mandates` keys in a bundle are
+a test issuer's until then.
+
 **Not in G4:** countersignatures and approvals (G6), shadow decisions (G5), the console's
 screens (G8). A mandate's grants are still not checked against an action until G5, so a
 proven receipt is still not an authorised one.
