@@ -1,0 +1,489 @@
+//! Slice G3b: the MCP forwarder in observe mode, between a real HTTP client and a small fake
+//! Jira MCP server, with a real spool, Ledger and witness behind it.
+
+use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use axum::body::Bytes;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
+use axum::Router;
+use gov_core::action::{Kind, Reversal};
+use gov_core::connector::{tool_digest, ResourceTemplate, ServerMap, ToolMap};
+use gov_core::receipt::{Coverage, Mode, OutcomeStatus, Phase, Proof, Receipt};
+use gov_core::{open, Envelope, Id, KeySet, Scope, SigningKey};
+use gov_gate::forward::Forwarder;
+use gov_gate::{DirWitnessReader, FileSpool, Gate, GateConfig, LedgerLink, Shipped, Spool};
+use gov_ledger::verify::{verify, Check};
+use gov_ledger::{DirWitness, Ledger, MemoryStore, Witness};
+use serde_json::{json, Value};
+
+const SECRET: &str = "Bearer agent-jira-token-do-not-record";
+
+fn id(s: &str) -> Id {
+    Id::new(s).unwrap()
+}
+fn scope() -> Scope {
+    Scope::new("acme", "prod").unwrap()
+}
+fn gate_key() -> SigningKey {
+    SigningKey::from_seed(id("gate-1-key"), &[20; 32]).unwrap()
+}
+fn ledger_key() -> SigningKey {
+    SigningKey::from_seed(id("ledger-1"), &[50; 32]).unwrap()
+}
+
+// ----- a fake Jira MCP server: enough of the protocol to list and call tools --------------
+
+fn update_tool() -> Value {
+    json!({
+        "name": "jira_update_issue",
+        "description": "Update an issue",
+        "inputSchema": {"type": "object", "properties": {"project": {"type": "string"}, "key": {"type": "string"}}},
+    })
+}
+fn delete_tool() -> Value {
+    json!({"name": "jira_delete_project", "description": "Delete a project", "inputSchema": {"type": "object"}})
+}
+
+async fn fake_jira(headers: HeaderMap, body: Bytes) -> Response {
+    if headers.get("authorization").and_then(|v| v.to_str().ok()) != Some(SECRET) {
+        return (StatusCode::UNAUTHORIZED, "no token").into_response();
+    }
+    // The gate's own header must not reach the server.
+    assert!(headers.get("x-gov-agent").is_none());
+    let msg: Value = serde_json::from_slice(&body).unwrap();
+    let rpc_id = msg["id"].clone();
+    let result = match msg["method"].as_str().unwrap_or_default() {
+        "initialize" => {
+            json!({"protocolVersion": "2025-06-18", "serverInfo": {"name": "fake-jira"}, "capabilities": {"tools": {}}})
+        }
+        "tools/list" => json!({"tools": [update_tool(), delete_tool()]}),
+        "tools/call" => {
+            let args = &msg["params"]["arguments"];
+            if args["key"] == "PAY-404" {
+                json!({"isError": true, "content": [{"type": "text", "text": "no such issue"}]})
+            } else {
+                json!({"content": [{"type": "text", "text": "done: customer 4411 refunded"}]})
+            }
+        }
+        _ => json!({}),
+    };
+    let reply = json!({"jsonrpc": "2.0", "id": rpc_id, "result": result});
+    // A server error that still carries a well-formed answer.
+    if msg["params"]["arguments"]["key"] == "PAY-500" {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [("content-type", "application/json")],
+            reply.to_string(),
+        )
+            .into_response();
+    }
+    // A server may answer a call with an event stream; this one does when asked to.
+    if msg["params"]["arguments"]["stream"] == true {
+        let sse = format!("event: message\ndata: {reply}\n\n");
+        return (
+            [
+                ("content-type", "text/event-stream"),
+                ("mcp-session-id", "s-77"),
+            ],
+            sse,
+        )
+            .into_response();
+    }
+    (
+        [
+            ("content-type", "application/json"),
+            ("mcp-session-id", "s-77"),
+        ],
+        reply.to_string(),
+    )
+        .into_response()
+}
+
+async fn serve(router: Router) -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    addr
+}
+
+fn jira_map() -> ServerMap {
+    ServerMap {
+        server: id("jira-mcp"),
+        system: id("jira"),
+        fold_case: true,
+        tools: vec![ToolMap {
+            tool: id("jira_update_issue"),
+            digest: tool_digest(&update_tool()).unwrap(),
+            operation: id("issue.update"),
+            kind: Kind::Write,
+            reversal: Reversal::Restore,
+            outward: false,
+            resource: ResourceTemplate::new("jira/project/{project}/issue/{key}").unwrap(),
+        }],
+    }
+}
+
+struct Stack {
+    forwarder: Arc<Forwarder<FileSpool>>,
+    gate_url: String,
+    dir: tempfile::TempDir,
+    client: reqwest::Client,
+}
+
+async fn stack(spool_limit: usize) -> Stack {
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = serve(Router::new().route("/mcp", post(fake_jira))).await;
+    let config = GateConfig {
+        scope: scope(),
+        gate: id("gate-1"),
+        ledger_keys: KeySet::new([ledger_key().public()]),
+        spool_limit,
+        batch: 100,
+    };
+    let spool = FileSpool::open(dir.path().join("spool")).unwrap();
+    let gate = Gate::open(config, gate_key(), spool, 0).unwrap();
+    let forwarder = Forwarder::new(gate, &format!("http://{upstream}/mcp"), jira_map()).unwrap();
+    let addr = serve(forwarder.clone().router()).await;
+    Stack {
+        forwarder,
+        gate_url: format!("http://{addr}/mcp"),
+        dir,
+        client: reqwest::Client::new(),
+    }
+}
+
+impl Stack {
+    async fn post(&self, body: Value, token: Option<&str>) -> (u16, String, String) {
+        let mut req = self
+            .client
+            .post(&self.gate_url)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("x-gov-agent", "triage-bot");
+        if let Some(t) = token {
+            req = req.header("authorization", t);
+        }
+        let res = req.body(body.to_string()).send().await.unwrap();
+        let status = res.status().as_u16();
+        let session = res
+            .headers()
+            .get("mcp-session-id")
+            .map(|v| v.to_str().unwrap().to_string())
+            .unwrap_or_default();
+        (status, session, res.text().await.unwrap())
+    }
+    async fn call(&self, n: u64, tool: &str, args: Value) -> (u16, String) {
+        let body = json!({"jsonrpc": "2.0", "id": n, "method": "tools/call", "params": {"name": tool, "arguments": args}});
+        let (status, _, text) = self.post(body, Some(SECRET)).await;
+        (status, text)
+    }
+    fn receipts(&self) -> Vec<Receipt> {
+        let keys = KeySet::new([gate_key().public()]);
+        FileSpool::open(self.dir.path().join("spool"))
+            .unwrap()
+            .held()
+            .unwrap()
+            .iter()
+            .map(|r| open::<Receipt>(&r.envelope, &keys, &scope()).unwrap().doc)
+            .collect()
+    }
+}
+
+struct InProcess(Ledger<MemoryStore>);
+#[async_trait]
+impl LedgerLink for InProcess {
+    async fn ship(&self, batch: &[Envelope], nonce: &Id) -> Result<Envelope, String> {
+        let now = self.0.store_time();
+        let (_, ack) = self
+            .0
+            .ingest_batch(batch, nonce, &ledger_key(), &id("ledger"), now)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(ack)
+    }
+}
+trait Now {
+    fn store_time(&self) -> i64;
+}
+impl Now for Ledger<MemoryStore> {
+    fn store_time(&self) -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+}
+
+#[tokio::test]
+async fn every_tool_call_through_the_gate_leaves_receipts_and_is_changed_by_nothing() {
+    let s = stack(100).await;
+
+    // The handshake and the listing pass through untouched, session header and all.
+    let (status, session, text) = s
+        .post(
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+            Some(SECRET),
+        )
+        .await;
+    assert_eq!((status, session.as_str()), (200, "s-77"));
+    assert!(text.contains("fake-jira"));
+    let (_, _, text) = s
+        .post(
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+            Some(SECRET),
+        )
+        .await;
+    assert!(text.contains("jira_update_issue") && text.contains("jira_delete_project"));
+    assert!(s.receipts().is_empty(), "only tool calls leave receipts");
+
+    // A mapped write.
+    let (status, text) = s
+        .call(
+            3,
+            "jira_update_issue",
+            json!({"project": "PAY", "key": "PAY-12", "summary": "Refund flow"}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    let reply: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(reply["id"], 3);
+    assert_eq!(
+        reply["result"]["content"][0]["text"],
+        "done: customer 4411 refunded"
+    );
+    // One the server answers with an error, one answered as an event stream, and one for a
+    // tool the map does not know.
+    let (_, text) = s
+        .call(
+            4,
+            "jira_update_issue",
+            json!({"project": "PAY", "key": "PAY-404"}),
+        )
+        .await;
+    assert!(text.contains("no such issue"));
+    let (_, text) = s
+        .call(
+            5,
+            "jira_update_issue",
+            json!({"project": "PAY", "key": "PAY-13", "stream": true}),
+        )
+        .await;
+    assert!(text.starts_with("event: message\ndata: "), "{text}");
+    let (_, text) = s
+        .call(6, "jira_delete_project", json!({"project": "PAY"}))
+        .await;
+    assert!(text.contains("done"));
+
+    let r = s.receipts();
+    assert_eq!(r.len(), 8);
+    for (i, receipt) in r.iter().enumerate() {
+        // Observe mode, in the path only, by an agent that only said who it was.
+        assert_eq!(receipt.mode, Mode::Observe);
+        assert_eq!(receipt.coverage, Coverage::InLine);
+        assert_eq!(
+            (receipt.agent.id.as_str(), receipt.agent.proof),
+            ("triage-bot", Proof::Claimed)
+        );
+        assert_eq!(
+            receipt.phase,
+            if i % 2 == 0 {
+                Phase::Intent
+            } else {
+                Phase::Outcome
+            }
+        );
+    }
+    // What each call was comes from the signed map.
+    assert_eq!(r[0].action.operation.as_str(), "issue.update");
+    assert_eq!(r[0].action.kind, Kind::Write);
+    assert_eq!(
+        r[0].action.resource.as_str(),
+        "jira/project/pay/issue/pay-12"
+    );
+    assert_eq!(r[0].reversal, Reversal::Restore);
+    let outcomes: Vec<OutcomeStatus> = r
+        .iter()
+        .filter_map(|x| x.outcome.as_ref().map(|o| o.status))
+        .collect();
+    assert_eq!(
+        outcomes,
+        vec![
+            OutcomeStatus::Ok,
+            OutcomeStatus::Failed,
+            OutcomeStatus::Ok,
+            OutcomeStatus::Ok
+        ]
+    );
+    // The unmapped tool is recorded as unknown, with the worst assumed of it.
+    assert_eq!(
+        (r[6].action.kind, r[6].action.resource.as_str()),
+        (Kind::Unknown, "jira/unmapped")
+    );
+    assert_eq!(r[6].action.operation.as_str(), "jira_delete_project");
+    assert_eq!(r[6].reversal, Reversal::None);
+    // The same arguments twice give different digests: each call has its own salt.
+    assert_ne!(r[0].action.args_digest, r[2].action.args_digest);
+    let c = &s.forwarder.counters;
+    assert_eq!(
+        (
+            c.recorded.load(Ordering::Relaxed),
+            c.not_recorded.load(Ordering::Relaxed),
+            c.unmapped.load(Ordering::Relaxed)
+        ),
+        (4, 0, 1)
+    );
+
+    // Nothing the agent sent or the server answered is on the gate's disk: not the
+    // credential, not an argument value, not the reply.
+    for entry in std::fs::read_dir(s.dir.path().join("spool")).unwrap() {
+        let text = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+        for secret in ["agent-jira-token", "Refund flow", "4411", "no such issue"] {
+            assert!(!text.contains(secret), "{secret} is in the spool");
+        }
+    }
+
+    // And the chain it wrote is one an auditor can check from files alone.
+    let ledger = Ledger::new(MemoryStore::default(), scope());
+    ledger
+        .enrol_gate_key(&id("gate-1"), &gate_key().public())
+        .await
+        .unwrap();
+    let link = InProcess(ledger);
+    assert_eq!(
+        s.forwarder.gate().await.ship(&link).await.unwrap(),
+        Shipped::Advanced(8)
+    );
+    let now = link.0.store_time();
+    let witness = DirWitness::new(s.dir.path().join("witness"));
+    link.0
+        .checkpoint(&ledger_key(), &id("ledger"), now, &witness)
+        .await
+        .unwrap();
+    let reader = DirWitnessReader::new(s.dir.path().join("witness"));
+    assert_eq!(
+        s.forwarder.gate().await.trim_to_witness(&reader).unwrap(),
+        8
+    );
+    let report = verify(&Check {
+        scope: &scope(),
+        keys: &link.0.keys(&ledger_key()).await.unwrap(),
+        export: &link.0.export().await.unwrap(),
+        checkpoints: &witness.all().unwrap(),
+        interval_secs: 60,
+        now: Some(now),
+        gate_quiet_secs: None,
+        clock_skew_secs: 60,
+        retention_secs: None,
+    });
+    assert!(report.ok(), "{:?}", report.findings);
+    assert_eq!(report.receipts_verified, 8);
+}
+
+/// A tool whose definition changes after it was mapped is no longer the mapped tool (T14),
+/// and a tool called before any listing is not assumed to be.
+#[tokio::test]
+async fn a_tool_is_only_what_was_mapped_while_its_definition_is_the_one_reviewed() {
+    let s = stack(100).await;
+    // Called before the server has listed anything in this run.
+    s.call(
+        1,
+        "jira_update_issue",
+        json!({"project": "PAY", "key": "PAY-12"}),
+    )
+    .await;
+    assert_eq!(s.receipts()[0].action.kind, Kind::Unknown);
+    s.post(
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+        Some(SECRET),
+    )
+    .await;
+    s.call(
+        3,
+        "jira_update_issue",
+        json!({"project": "PAY", "key": "PAY-12"}),
+    )
+    .await;
+    assert_eq!(s.receipts()[2].action.kind, Kind::Write);
+}
+
+/// Observe mode blocks nothing: a call the server refuses, a call when the spool is full and
+/// a call when the server is gone all come back to the agent as the server (or its absence)
+/// answered, and each is accounted for.
+#[tokio::test]
+async fn observe_mode_blocks_nothing_and_says_what_it_did_not_record() {
+    let s = stack(4).await;
+    s.post(
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        Some(SECRET),
+    )
+    .await;
+
+    // No credential: the server's own refusal reaches the agent, and the outcome is failed.
+    let body = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "jira_update_issue", "arguments": {"project": "PAY", "key": "PAY-1"}}});
+    let (status, _, text) = s.post(body, None).await;
+    assert_eq!((status, text.as_str()), (401, "no token"));
+    assert_eq!(
+        s.receipts()[1].outcome.as_ref().unwrap().status,
+        OutcomeStatus::Failed
+    );
+
+    // A server error whose body still looks like a good answer is recorded as failed.
+    let s5 = stack(100).await;
+    s5.post(
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        Some(SECRET),
+    )
+    .await;
+    let (status, _) = s5
+        .call(
+            2,
+            "jira_update_issue",
+            json!({"project": "PAY", "key": "PAY-500"}),
+        )
+        .await;
+    assert_eq!(status, 500);
+    assert_eq!(
+        s5.receipts()[1].outcome.as_ref().unwrap().status,
+        OutcomeStatus::Failed
+    );
+
+    // The spool holds four; the next call fits, the one after does not. It still goes
+    // through, and is counted as not recorded.
+    s.call(
+        3,
+        "jira_update_issue",
+        json!({"project": "PAY", "key": "PAY-2"}),
+    )
+    .await;
+    let (status, text) = s
+        .call(
+            4,
+            "jira_update_issue",
+            json!({"project": "PAY", "key": "PAY-3"}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert!(text.contains("done"));
+    assert_eq!(s.receipts().len(), 4);
+    let c = &s.forwarder.counters;
+    assert_eq!(
+        (
+            c.recorded.load(Ordering::Relaxed),
+            c.not_recorded.load(Ordering::Relaxed)
+        ),
+        (2, 1)
+    );
+
+    // A batch could carry calls past the receipts; the gate does not take one, and nothing
+    // is forwarded.
+    let batch = json!([{"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "jira_delete_project", "arguments": {}}}]);
+    let (status, _, text) = s.post(batch, Some(SECRET)).await;
+    assert_eq!(status, 400);
+    assert!(text.contains("batched"));
+    assert_eq!(c.unmapped.load(Ordering::Relaxed), 0);
+}

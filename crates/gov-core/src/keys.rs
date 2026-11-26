@@ -19,6 +19,13 @@ pub fn random_id(prefix: &str) -> Result<Id> {
     Id::new(&format!("{prefix}-{hex}"))
 }
 
+/// 32 fresh random bytes from the system's random source: a digest's salt.
+pub fn random_salt() -> Result<[u8; 32]> {
+    let mut bytes = [0u8; 32];
+    aws_lc_rs::rand::fill(&mut bytes).map_err(|_| Error::Malformed("random source"))?;
+    Ok(bytes)
+}
+
 /// A private signing key. It has no `Debug`, no `Serialize` and no way to read the secret out.
 pub struct SigningKey {
     kid: Id,

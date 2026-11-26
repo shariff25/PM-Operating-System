@@ -1047,8 +1047,10 @@ name = "gov-gate"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
  "gov-core",
  "gov-ledger",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
