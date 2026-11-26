@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use gov_core::action::{self, CanonicalAction, Grant, Kind};
+use gov_core::action::{self, CanonicalAction, Grant, Kind, Reversal};
 use gov_core::countersign::{
     Approver, Class, Countersignature, Evidence, NoPasskeys, PasskeyVerifier, Requirement,
 };
@@ -866,6 +866,9 @@ fn receipt(seq: u64, prev: Option<Digest>, phase: Phase) -> Receipt {
         mandate: vec![id("m-child-1"), id("m-root")],
         policy_version: Some(id("7")),
         action: ReceiptAction::from(&update()),
+        reversal: Reversal::Restore,
+        before_digest: None,
+        reverses: None,
         decision: Decision {
             kind: DecisionKind::Allow,
             reason: Reason::Ok,
@@ -1321,15 +1324,21 @@ fn refusals_win_and_no_match_refuses() {
         )
     };
     assert_eq!(
-        policy.evaluate(&subject, &upd("PAY-12")).verdict,
+        policy
+            .evaluate(&subject, &upd("PAY-12"), Reversal::Restore)
+            .verdict,
         Verdict::Allow
     );
     assert_eq!(
-        policy.evaluate(&subject, &upd("PAY-99")).verdict,
+        policy
+            .evaluate(&subject, &upd("PAY-99"), Reversal::Restore)
+            .verdict,
         Verdict::Refuse
     );
     assert_eq!(
-        policy.evaluate(&subject, &upd("PAY-50")).verdict,
+        policy
+            .evaluate(&subject, &upd("PAY-50"), Reversal::Restore)
+            .verdict,
         Verdict::Countersign(vec![Needed {
             class: Class::Attested,
             group: id("pay-leads"),
@@ -1343,7 +1352,10 @@ fn refusals_win_and_no_match_refuses() {
         Kind::Write,
         json!({}),
     );
-    assert_eq!(policy.evaluate(&subject, &hr).verdict, Verdict::NoMatch);
+    assert_eq!(
+        policy.evaluate(&subject, &hr, Reversal::Restore).verdict,
+        Verdict::NoMatch
+    );
     // A destructive action: a signature is asked for, and the lease must be strict.
     let del = action_on(
         "jira/project/PAY/issue/PAY-12",
@@ -1351,7 +1363,7 @@ fn refusals_win_and_no_match_refuses() {
         Kind::Destructive,
         json!({}),
     );
-    let e = policy.evaluate(&subject, &del);
+    let e = policy.evaluate(&subject, &del, Reversal::Restore);
     assert_eq!(
         e.verdict,
         Verdict::Countersign(vec![Needed {
@@ -1362,7 +1374,9 @@ fn refusals_win_and_no_match_refuses() {
     );
     assert_eq!(e.freshness, Freshness::Strict);
     assert_eq!(
-        policy.evaluate(&subject, &upd("PAY-12")).freshness,
+        policy
+            .evaluate(&subject, &upd("PAY-12"), Reversal::Restore)
+            .freshness,
         Freshness::Standard
     );
     // The same action as another agent.
@@ -1372,17 +1386,23 @@ fn refusals_win_and_no_match_refuses() {
         labels: &labels,
     };
     assert_eq!(
-        policy.evaluate(&subject2, &upd("PAY-12")).verdict,
+        policy
+            .evaluate(&subject2, &upd("PAY-12"), Reversal::Restore)
+            .verdict,
         Verdict::Refuse
     );
     // A countersignature rule alone permits; without it or an allow, nothing does.
     let only_refusals = bundle(vec![rule("r", Match::default(), Effect::Refuse)]);
     assert_eq!(
-        only_refusals.evaluate(&subject, &hr).verdict,
+        only_refusals
+            .evaluate(&subject, &hr, Reversal::Restore)
+            .verdict,
         Verdict::Refuse
     );
     assert_eq!(
-        bundle(vec![]).evaluate(&subject, &hr).verdict,
+        bundle(vec![])
+            .evaluate(&subject, &hr, Reversal::Restore)
+            .verdict,
         Verdict::NoMatch
     );
 }
@@ -1404,7 +1424,7 @@ fn a_rule_may_raise_freshness_and_the_strictest_wins() {
     let mut relaxed = rule("relaxed", jira(&["issue.update"], &[]), Effect::Allow);
     relaxed.freshness = Some(Freshness::Standard);
     let policy = bundle(vec![relaxed, strict]);
-    let e = policy.evaluate(&subject, &update());
+    let e = policy.evaluate(&subject, &update(), Reversal::Restore);
     assert_eq!(e.freshness, Freshness::Strict);
     assert_eq!(e.matched, vec![id("relaxed"), id("strict-pay")]);
 }
@@ -1500,7 +1520,9 @@ fn a_refusal_of_everything_under_a_thing_refuses_the_thing() {
         json!({}),
     );
     assert_eq!(
-        policy.evaluate(&subject, &delete_project).verdict,
+        policy
+            .evaluate(&subject, &delete_project, Reversal::Restore)
+            .verdict,
         Verdict::Refuse
     );
     let inside = action_on(
@@ -1509,7 +1531,12 @@ fn a_refusal_of_everything_under_a_thing_refuses_the_thing() {
         Kind::Read,
         json!({}),
     );
-    assert_eq!(policy.evaluate(&subject, &inside).verdict, Verdict::Refuse);
+    assert_eq!(
+        policy
+            .evaluate(&subject, &inside, Reversal::Restore)
+            .verdict,
+        Verdict::Refuse
+    );
     let neighbour = action_on(
         "jira/project/SECRETS",
         "project.read",
@@ -1517,7 +1544,9 @@ fn a_refusal_of_everything_under_a_thing_refuses_the_thing() {
         json!({}),
     );
     assert_eq!(
-        policy.evaluate(&subject, &neighbour).verdict,
+        policy
+            .evaluate(&subject, &neighbour, Reversal::Restore)
+            .verdict,
         Verdict::Allow
     );
     // The same pattern as an allow, or in a grant, does not reach the prefix.
@@ -1533,7 +1562,9 @@ fn a_refusal_of_everything_under_a_thing_refuses_the_thing() {
         json!({}),
     );
     assert_eq!(
-        only_under.evaluate(&subject, &the_project).verdict,
+        only_under
+            .evaluate(&subject, &the_project, Reversal::Restore)
+            .verdict,
         Verdict::NoMatch
     );
     assert!(!action::carries(
@@ -1665,4 +1696,85 @@ fn enrolment_refuses_a_key_anyone_can_forge_for() {
     let weak = gov_core::PublicKey::from_bytes_unchecked(id("gate-9-key"), &identity);
     assert_eq!(weak.enrolable().unwrap_err(), Error::WeakKey);
     key("gate-1-key", 20).public().enrolable().unwrap();
+}
+
+// ----- undo: the fields reserved for slice G9 (spec §4.7) --------------------------------
+
+/// "What cannot be undone needs a person" is one rule.
+#[test]
+fn a_rule_can_ask_for_a_person_only_where_there_is_no_undo() {
+    let labels = BTreeSet::new();
+    let agent = id("agent-1");
+    let subject = Subject {
+        agent: &agent,
+        labels: &labels,
+    };
+    let policy = bundle(vec![
+        rule(
+            "writes",
+            jira(&["issue.update", "comment.send"], &[]),
+            Effect::Allow,
+        ),
+        rule(
+            "no-undo-needs-a-person",
+            Match {
+                reversible: Some(false),
+                ..jira(&[], &[])
+            },
+            Effect::Countersign {
+                class: Class::Attested,
+                group: id("pay-leads"),
+                issuer_may_approve: true,
+            },
+        ),
+    ]);
+    policy.validate().unwrap();
+    assert_eq!(
+        policy
+            .evaluate(&subject, &update(), Reversal::Restore)
+            .verdict,
+        Verdict::Allow
+    );
+    assert_eq!(
+        policy
+            .evaluate(&subject, &update(), Reversal::Inverse)
+            .verdict,
+        Verdict::Allow
+    );
+    let send = action_on(
+        "jira/project/PAY/issue/PAY-12",
+        "comment.send",
+        Kind::Write,
+        json!({}),
+    );
+    assert!(matches!(
+        policy.evaluate(&subject, &send, Reversal::None).verdict,
+        Verdict::Countersign(_)
+    ));
+}
+
+#[test]
+fn a_before_digest_belongs_to_the_intent_of_a_write_that_can_be_put_back() {
+    let mut r = receipt(1, None, Phase::Intent);
+    r.before_digest = Some(Digest::of(&[b"before"]));
+    r.validate().unwrap();
+    r.reversal = Reversal::None;
+    assert!(r.validate().is_err());
+    let mut r = receipt(2, Some(Digest::of(&[b"x"])), Phase::Outcome);
+    r.before_digest = Some(Digest::of(&[b"before"]));
+    assert!(r.validate().is_err());
+    // An undo names the receipt it puts back, and is a write.
+    let mut undo = receipt(1, None, Phase::Intent);
+    undo.reverses = Some(gov_core::receipt::ReceiptRef {
+        gate: id("gate-1"),
+        seq: 41,
+        hash: Digest::of(&[b"r41"]),
+    });
+    undo.validate().unwrap();
+    undo.action.kind = Kind::Read;
+    assert!(undo.validate().is_err());
+    // Every receipt says whether its operation can be put back.
+    let mut v = serde_json::to_value(receipt(1, None, Phase::Intent)).unwrap();
+    v.as_object_mut().unwrap().remove("reversal");
+    assert!(serde_json::from_value::<Receipt>(v).is_err());
 }

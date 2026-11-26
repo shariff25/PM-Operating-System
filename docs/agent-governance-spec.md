@@ -60,6 +60,8 @@ Where the build differs from the text below, or chose the more refusing reading:
 - A checkpoint carries its own rising number, so a missing checkpoint shows.
 - Not in G1: the connector map, templates and the approver roster in the bundle (G3, G4, G6);
   the revocation feed's document (G4).
+- Added on 2026-11-26 for undo (§4.7): `reversal`, `before_digest` and `reverses` on a
+  receipt, `reversible` in a rule's match, and `evaluate` takes the operation's reversal class.
 
 **G2 built before review (owner's "Go" of 2026-11-26)**, on branch `build/gov-g2`: the crates
 `crates/gov-ledger` (a library) and `crates/gov-cli` (the `gov` command). 10 tests, each of
@@ -112,7 +114,7 @@ is still not passed.**
 | Finding | Severity | What was wrong | What was done |
 |---|---|---|---|
 | GR-1 | High | A lease carried no nonce and an older lease could replace a newer one: a replayed lease turned a gate's clock and its revocations back | Fixed. A lease answers one request (a nonce); its age counts from when the request left; a lease whose Authority time or revocation number is lower than the held one is refused |
-| GR-2 | High | The claim that a compromised Authority cannot forge a **signed** approval was wrong: the Authority serves the approval page, so it can show action A and have the passkey sign action B | **Design open, not fixed.** The claim is withdrawn (§3.4, T8, §2 item 1). "Signed" proves a rostered person's key signed, not what they saw. It is not built, and stays unbuilt until the approver sees the action from something the Authority does not control (decision 8 in §11) |
+| GR-2 | High | The claim that a compromised Authority cannot forge a **signed** approval was wrong: the Authority serves the approval page, so it can show action A and have the passkey sign action B | **Design changed, not built** (owner, 2026-11-26: "Go" on the conductor's recommendation). For a signed approval the **gate** serves the page, signs the person in and checks the passkey; the Authority only tells the person where to go (§4.4). The reviewer has not yet read the new design. Nothing of it is built; it is slice G6 |
 | GR-3 | High | `gov verify` believed the Ledger's prune record on its key alone: an operator could delete every receipt, sign a record, and get "OK" | Fixed as far as a witness can: a record past what the witness covered, or whose hash ties to no checkpoint and no receipt, is a finding; `--retention-days` reports receipts pruned too soon after first being covered; the report always says what the Ledger claims to have deleted. An erasure that waits out the retention is, by design, a prune |
 | GR-4 | High | `gov verify` said OK with no witness cover: an empty witness, a gate left out of every checkpoint, a gate dropped from the export | Fixed: each is a finding, as is a receipt older than the latest checkpoint that none covers |
 | GR-5 | Medium | A revoked agent key kept its mandates; a revoked Authority key was not checked on a countersignature | Fixed |
@@ -187,9 +189,9 @@ adopts. Each is a decision the reviewer should challenge.
    the first release, which lets whoever controls the Authority approve anything. This spec has
    two classes of countersignature (§4.4): **signed**, where the approver's own passkey signs the
    exact action and the gate checks that signature itself; and **attested**, where the Authority
-   or PM OS vouches for a signed-in person. (Review finding GR-2: as long as the Authority
-   serves the page the approver reads, "signed" does not stop a compromised Authority either.
-   See §3.4 and decision 8 in §11.) Policy says which class an action needs. A receipt
+   or PM OS vouches for a signed-in person. (Review finding GR-2: an approval page served by
+   the Authority would let a compromised Authority show one action and collect a signature on
+   another. So for a signed approval the gate serves the page; §4.4.) Policy says which class an action needs. A receipt
    records which was used. Approvals from a Slack card can only ever be attested.
 2. **What the approver sees.** A person cannot approve a digest. In the self-hosted first
    release the gate sends the Authority the action's readable form for the approval screen,
@@ -262,7 +264,7 @@ attack; a slice is not done until that test exists and fails without the control
 | T5 | Approved arguments are swapped before the write | The countersignature is over the action's digest; the gate recomputes the digest from the arguments it is about to send, after every transformation | G1, G6 |
 | T6 | The target changed after approval (new commits, an edited page) | The canonical action carries `resource_version` where the system has one; the connector checks it at write time (§4.3) | G6 |
 | T7 | A countersignature is used twice, or after it expired | It names one gate, one digest, one mandate and an expiry; the gate records its use durably before the write | G6 |
-| T8 | The Authority (or its operator) forges an approval | **Not controlled yet** (review finding GR-2). For actions policy marks **signed**, the gate verifies the approver's passkey signature itself, which shows a rostered person's key signed; but the Authority serves the page they read, so it can show one action and collect a signature on another. Until the approver sees the action from something the Authority does not control, "signed" is no stronger than "attested" against a compromised Authority, and the product says so | G6, after decision 8 |
+| T8 | The Authority (or its operator) forges an approval | For actions policy marks **signed**, the gate serves the approval page itself, from the bytes it will send; signs the approver in against the customer's identity provider itself; and checks the passkey itself (§4.4, after review finding GR-2). The Authority only routes the person to the gate, so a compromised Authority can delay or withhold a signed approval but cannot obtain one. An **attested** approval is the Authority's word and it can forge one; policy says which actions accept that. Not built | G6 |
 | T9 | A taken-over gate acts and writes no receipt | Not preventable: the gate holds both the credential and the receipt key. Detected three ways: heartbeat checkpoints make a silent gate visible (§6.2); numbered chains show a gap; reconciliation compares the system's own record of writes with the receipts (§7.5). Receipts prove what the gate said, never by themselves what happened | G2, later |
 | T10 | A receipt is altered or removed in the Ledger | Receipts are signed by the gate and chained by number; checkpoints over all chain heads go to the witness on a timer. Anyone with the public keys and the witness can verify | G2 |
 | T11 | Revocation does not arrive; a gate keeps acting | A lease states the revocation sequence it covers; a gate without every revocation up to that number treats the lease as invalid. A stale lease refuses (§4.6) | G4, G6 |
@@ -286,9 +288,9 @@ These go in the product's own documentation, not only here.
   system, **custody**, **in line** or **reported**, and never claims more.
 - Observe and shadow protect nothing.
 - A compromised gate can act unrecorded; it can be detected, not prevented (T9).
-- A compromised Authority can forge an **attested** approval. As designed today it can also
-  obtain a **signed** one for an action the approver never saw, by showing them another
-  (T8, review finding GR-2). That is open until decision 8 in §11 is made.
+- A compromised Authority can forge an **attested** approval. It cannot obtain a **signed**
+  one, because the gate serves that page and checks that signature (T8). A compromised gate
+  can do anything a gate can (T9); the signed approval does not protect against it.
 - An agent acting inside its mandate under injected instructions is not stopped (T12).
 
 ## 4. The signed documents
@@ -392,10 +394,19 @@ evidence           for signed: the passkey assertion and credential id
   itself and refuses to show a request whose digest does not match what the gate sent. The
   readable form is deleted once the request is decided or expires, plus a short grace time
   (default one hour, to be decided with the owner).
-- **Signed.** The approver's browser signs, with a passkey, a challenge that is the hash of the
-  countersignature payload. The Authority checks it, then issues the countersignature with the
-  assertion inside. The gate verifies the Authority's signature **and** the passkey assertion
-  against the approver's public key in the signed approver roster. Proposed library:
+- **Signed** (design of 2026-11-26, after review finding GR-2; replaces the paragraph's first
+  version, in which the Authority served the page). The Authority tells the approver that an
+  action waits and gives them the gate's address; it is never shown the arguments. The
+  **gate**, which the customer runs, signs the approver in against the customer's identity
+  provider, shows the action rendered from the bytes it will send, and asks their passkey to
+  sign the challenge. The gate checks the passkey assertion against its own record of that
+  person's enrolled passkey, takes their groups from the sign-in it just did (not from the
+  Authority; finding GR-8a), and issues the countersignature under its own key. Consequences:
+  a passkey is enrolled at the customer's gate address, not ours; the argument values never
+  leave the customer, which also settles departure 2 of §2 for signed approvals and makes a
+  hosted Authority possible for them; the gate needs an identity-provider client of its own.
+  To be designed in G6: enrolling passkeys across several gates under one address, and what
+  the approver is shown when the gate cannot render an argument. Proposed library:
   `webauthn-rs` (to be confirmed at G6; tests use a software authenticator).
 - **Attested.** The Authority states that a signed-in person in the right group pressed
   approve. The gate verifies the Authority's signature only.
@@ -462,6 +473,62 @@ outcome: { status: ok | failed | unknown, upstream_ref?, response_digest? }
   revoked agent can keep acting is the freshness class of the action it attempts.
 - **Time.** A gate takes "now" as the last lease's `authority_time` plus its own monotonic
   clock since receiving it. A gate that has never held a lease refuses everything.
+
+### 4.7 Undo (design; fields reserved, slice G9)
+
+Owner, 2026-11-26, on the conductor's proposal: every action that passes the gate is either
+one that can be put back or one a person approved. The customer's rule becomes "approve only
+what cannot be undone; undo everything else". Nothing of undo is built. Four things are
+reserved in the formats now, while no format is released, and tested:
+
+- **A reversal class per operation,** in the signed connector map beside `kind`: `restore`
+  (the system keeps versions, and undo writes the earlier values back), `inverse` (there is an
+  opposite operation: create and archive, add and remove) or `none` (a sent message, a hard
+  delete, a payment). Every receipt states it (`reversal`).
+- **`before_digest` on an intent receipt:** the digest of the target's values before the
+  write. The values themselves stay in the gate's sealed store at the customer for the undo
+  window; the receipt and the Ledger hold only the digest.
+- **`reverses` on a receipt:** the gate, number and hash of the receipt an undo puts back.
+- **`reversible` in a policy rule's match,** so the default rule is one line: an operation
+  with no undo needs a countersignature.
+
+How undo will work (G9):
+
+1. At intent, for a `restore` or `inverse` operation, the gate reads the fields the write will
+   change through the same connector it already uses to read `resource_version`, seals them,
+   and writes their digest in the intent receipt. If that read fails, the action is treated as
+   having no undo, and policy decides whether it may still run.
+2. **Undo is a governed action.** A person with the right role asks for it. It has its own
+   mandate, its own intent and outcome receipts with `reverses` set, and policy may ask for a
+   countersignature on it like any other write.
+3. **It refuses rather than overwrite.** If the target's version is no longer the one the
+   original write left, someone has changed it since; the undo stops and says so, as a version
+   conflict does. Nothing is forced.
+4. **A task is undone as a whole:** every action under one mandate, newest first, stopping at
+   the first conflict and reporting what was and was not put back.
+5. The undo window (default seven days, a figure to decide) is how long the sealed values are
+   kept. After it the receipts remain and the undo is gone.
+6. Each system's page in the product shows its undo cover, as it shows custody: which
+   operations restore, which invert, which cannot be put back.
+
+What undo is not, to be said in the product:
+
+- It is a net under mistakes, not a control against a hostile agent. What an agent read
+  cannot be un-read.
+- It does not reach outside the system: a notification already sent, a webhook already
+  fired, a person who already acted on what they saw.
+- An undo can fail, and then a person has to repair by hand; the receipts say exactly what.
+- The sealed "before" values are content. They are restricted data at the customer's gate,
+  under the undo window, and never in a receipt.
+
+Threats this adds, for the reviewer: an undo used as a write the requester could not
+otherwise make (it is governed, and writes only values that were there before); a sealed
+store of before-values as a new place content lives (sealed, short-lived, at the customer);
+a connector that claims `restore` for an operation it cannot restore (the connector map is
+signed and reviewed; the undo cover page is drawn from what was actually put back in tests).
+
+Not surveyed: whether another product already does this. To check before it is described as
+new.
 
 ## 5. The gate
 
@@ -676,6 +743,8 @@ Each slice ends with its attack tests (§3.3) passing and its commit sent to the
 | G7 | The PM OS seam, off by default; bulk enrolment; the session mandate; attested approvals; the receipt reference in the audit log; side-by-side comparison | With the switch off, the tool server's output is identical; with it on, on the test stack, every write has an intent and an outcome receipt |
 | G8 | Console screens; Governance's own stack file and the overlay for both; health and metrics (decision time, refusals, lease age, revocation delay) | CI's deploy job starts both stacks on a real Docker host |
 
+| G9 | Undo (§4.7), after G6: before-values sealed at intent; the undo action and its receipts; refusal on a changed target; undo of a whole mandate; the undo cover page | On the fake Jira: forty issues changed by one mandate are put back by one undo with a receipt each; an issue someone edited in between is left alone and reported; a `none` operation cannot be undone and needed a person to run |
+
 After the first release, in no fixed order: reconciliation (§7.5); GitHub with tokens minted
 per repository; a key-service driver; object-storage witness with lock; SCIM; passkey approval
 inside PM OS; the HTTP gate; SDKs; runtime adapters; the log-platform stream; hosted cells;
@@ -692,11 +761,8 @@ licensing.
    (§4.4).
 6. The product's names: the six working names, and "Agent Governance" itself.
 7. Who, besides the owner, may be a Governance admin on the first stack.
-8. How an approver sees the action they sign without trusting the Authority (review finding
-   GR-2). The conductor's recommendation: the gate, which the customer runs, serves the
-   approval page and shows the action from the same bytes it will send; the Authority only
-   routes the person there. The alternative is to say plainly that "signed" adds a second
-   factor but not independence from the Authority.
+8. Decided by the owner on 2026-11-26: the gate serves the approval page for a signed
+   approval (§4.4).
 9. How an Authority key is replaced if the old one is stolen: today the old key signs the new
    one, so a thief can install their own.
 

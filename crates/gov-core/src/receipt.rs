@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::action::{CanonicalAction, Kind};
+use crate::action::{CanonicalAction, Kind, Reversal};
 use crate::countersign::Class;
 use crate::envelope::{document, Opened};
 use crate::error::{Error, Result};
@@ -147,6 +147,15 @@ impl ReceiptAction {
     }
 }
 
+/// The receipt an undo puts back: which gate's chain, which number, and its hash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReceiptRef {
+    pub gate: Id,
+    pub seq: u64,
+    pub hash: Digest,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CountersignRef {
@@ -198,6 +207,15 @@ pub struct Receipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_version: Option<Id>,
     pub action: ReceiptAction,
+    /// Whether the operation can be put back, from the connector map. Every receipt says.
+    pub reversal: Reversal,
+    /// The digest of the target's values before the write, which the gate keeps sealed for
+    /// the undo window. Only on the intent of an operation that can be put back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_digest: Option<Digest>,
+    /// Set when this action is the undo of an earlier one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reverses: Option<ReceiptRef>,
     pub decision: Decision,
     /// Shadow mode only: what enforce mode would have decided.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -240,6 +258,18 @@ impl Receipt {
         }
         if self.mode == Mode::Enforce && self.agent.proof != Proof::Proven {
             return Err(Error::Malformed("enforce mode needs a proven agent"));
+        }
+        if self.before_digest.is_some()
+            && (self.phase != Phase::Intent
+                || !self.reversal.reversible()
+                || self.action.kind == Kind::Read)
+        {
+            return Err(Error::Malformed(
+                "a before-digest belongs to the intent of a write that can be put back",
+            ));
+        }
+        if self.reverses.is_some() && self.action.kind == Kind::Read {
+            return Err(Error::Malformed("a read undoes nothing"));
         }
         if self.at < 0 {
             return Err(Error::Malformed("a receipt's time is before the epoch"));
