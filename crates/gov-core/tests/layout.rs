@@ -18,9 +18,10 @@ fn no_governance_crate_depends_on_pm_os() {
         let manifest = fs::read_to_string(dir.join("Cargo.toml")).unwrap();
         for line in manifest.lines() {
             let line = line.trim();
+            let outside = line.contains("path = \"../") && !line.contains("path = \"../gov-");
             assert!(
-                !line.starts_with("pmos-") && !line.contains("path = \"../"),
-                "{name} depends on another crate by path or on PM OS: {line}"
+                !line.starts_with("pmos-") && !outside,
+                "{name} depends on PM OS or on a crate outside Governance: {line}"
             );
         }
     }

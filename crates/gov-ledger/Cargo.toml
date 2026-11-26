@@ -1,0 +1,21 @@
+[package]
+name = "gov-ledger"
+description = "Agent Governance: the Ledger. Takes in signed receipts, keeps a chain per gate, publishes checkpoints to a witness, and verifies an export."
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+gov-core = { path = "../gov-core" }
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+uuid.workspace = true

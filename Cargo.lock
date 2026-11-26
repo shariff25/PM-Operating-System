@@ -1018,6 +1018,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "gov-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "gov-core",
+ "gov-ledger",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "gov-core"
 version = "0.1.0"
 dependencies = [
@@ -1027,6 +1040,21 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror",
+]
+
+[[package]]
+name = "gov-ledger"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "gov-core",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

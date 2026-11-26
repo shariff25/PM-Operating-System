@@ -203,6 +203,9 @@ follow-up tracking.
   before the reviewer's read. G1 is marked "built before review" in the spec; it goes to the
   reviewer with the spec, and this go-ahead covers G1 only. The work is on
   `claude/agent-governance`, with its own draft pull request.
+  Later again, asked whether G2 should wait for the reviewer or go ahead: "Go". G2 (the
+  Ledger and `gov verify`) is built before review on that word; it covers G2 only. Which
+  session is the security reviewer is still not known to the conductor.
 
 ## Where the build stands (2026-11-23)
 

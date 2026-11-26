@@ -29,8 +29,18 @@ jobs:
     env:
       # The Postgres store tests fail in CI if this is missing (see tests/common/mod.rs).
       PMOS_TEST_DATABASE_URL: postgresql://pmos:pmos@localhost:5432/pmos_test
+      # Agent Governance keeps its own database and role, never PM OS's
+      # (docs/agent-governance-spec.md §9). Its Postgres tests fail in CI without this.
+      GOV_TEST_DATABASE_URL: postgresql://governance:governance@localhost:5432/governance_test
     steps:
       - uses: actions/checkout@v4
+      - name: Agent Governance's test database
+        env:
+          PGPASSWORD: pmos
+        run: |
+          psql -h localhost -U pmos -d pmos_test -v ON_ERROR_STOP=1 \
+            -c "CREATE ROLE governance LOGIN PASSWORD 'governance'" \
+            -c "CREATE DATABASE governance_test OWNER governance"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
