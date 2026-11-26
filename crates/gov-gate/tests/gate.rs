@@ -64,6 +64,8 @@ fn observed<'a>(agent: &'a Id, action: &'a CanonicalAction) -> Observed<'a> {
     Observed {
         agent,
         proof: Proof::Claimed,
+        failure: None,
+        mandates: &[],
         action,
         reversal: Reversal::Restore,
         coverage: Coverage::InLine,

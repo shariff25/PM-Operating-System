@@ -864,6 +864,7 @@ fn receipt(seq: u64, prev: Option<Digest>, phase: Phase) -> Receipt {
         agent: ReceiptAgent {
             id: id("agent-1"),
             proof: Proof::Proven,
+            failure: None,
         },
         mandate: vec![id("m-child-1"), id("m-root")],
         policy_version: Some(id("7")),
@@ -2117,4 +2118,42 @@ fn the_lint_refuses_a_map_that_contradicts_itself() {
     );
     policy.connectors.push(jira_map());
     assert!(policy.validate().is_err());
+}
+
+/// A receipt says how its agent was known, and the three ways are kept apart (review finding
+/// GR-91): proven is about a mandate; a failed proof says why, from a closed list; and a
+/// reason never rides on a receipt whose proof did not fail.
+#[test]
+fn a_receipt_keeps_proven_claimed_and_failed_apart() {
+    use gov_core::receipt::ProofFailure;
+    let observed = |proof, failure, mandate: Vec<Id>| {
+        let mut r = receipt(1, None, Phase::Intent);
+        r.mode = Mode::Observe;
+        r.coverage = Coverage::InLine;
+        r.policy_version = None;
+        r.agent.proof = proof;
+        r.agent.failure = failure;
+        r.mandate = mandate;
+        r.validate()
+    };
+    let m = || vec![id("m-1")];
+    observed(Proof::Proven, None, m()).unwrap();
+    observed(Proof::Claimed, None, vec![]).unwrap();
+    observed(Proof::Failed, Some(ProofFailure::UnknownSession), vec![]).unwrap();
+    observed(Proof::Failed, Some(ProofFailure::BadSignature), m()).unwrap();
+    // A failed proof with no reason; a reason on a proof that did not fail; proven of nobody.
+    assert!(observed(Proof::Failed, None, m()).is_err());
+    assert!(observed(Proof::Proven, Some(ProofFailure::Replay), m()).is_err());
+    assert!(observed(Proof::Claimed, Some(ProofFailure::Replay), vec![]).is_err());
+    assert!(observed(Proof::Proven, None, vec![]).is_err());
+    // An enforced action is never one whose proof failed.
+    let mut enforced = receipt(1, None, Phase::Intent);
+    enforced.agent.proof = Proof::Failed;
+    enforced.agent.failure = Some(ProofFailure::WrongDigest);
+    assert!(enforced.validate().is_err());
+    // The reason is one of a closed list: nothing else can be written there.
+    let mut text = serde_json::to_value(receipt(1, None, Phase::Intent)).unwrap();
+    text["agent"]["proof"] = json!("failed");
+    text["agent"]["failure"] = json!("the agent was really Mallory");
+    assert!(serde_json::from_value::<Receipt>(text).is_err());
 }

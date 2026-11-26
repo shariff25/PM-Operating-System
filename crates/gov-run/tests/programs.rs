@@ -23,6 +23,13 @@ use sqlx::{ConnectOptions, Connection};
 
 const LEDGER: &str = env!("CARGO_BIN_EXE_gov-ledger");
 const GATE: &str = env!("CARGO_BIN_EXE_gov-gate");
+const SHIM: &str = env!("CARGO_BIN_EXE_gov-shim");
+
+/// How many requests the fake server has been sent.
+static UPSTREAM_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn hits() -> u64 {
+    UPSTREAM_HITS.load(std::sync::atomic::Ordering::SeqCst)
+}
 const SECRET: &str = "Bearer agent-jira-token-do-not-record";
 
 fn id(s: &str) -> Id {
@@ -96,7 +103,14 @@ fn update_tool() -> Value {
     })
 }
 
-async fn fake_jira(body: Bytes) -> Json<Value> {
+/// Set if the fake server is ever sent a header of the gate's or the shim's own.
+static GOV_HEADER_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+async fn fake_jira(headers: axum::http::HeaderMap, body: Bytes) -> Json<Value> {
+    UPSTREAM_HITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if headers.keys().any(|k| k.as_str().starts_with("x-gov-")) {
+        GOV_HEADER_SEEN.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
     let msg: Value = serde_json::from_slice(&body).unwrap();
     let result = match msg["method"].as_str().unwrap_or_default() {
         "tools/list" => json!({"tools": [update_tool()]}),
@@ -167,12 +181,20 @@ impl Site {
         c
     }
     fn gate(&self, ledger: &str) -> Command {
+        self.gate_on(ledger, "127.0.0.1:0")
+    }
+    /// The gate, on an address of the caller's choosing.
+    fn gate_on(&self, ledger: &str, listen: &str) -> Command {
         let mut c = program(GATE);
         c.args([
             "serve", "--tenant", "acme", "--env", "prod", "--gate", "gate-1",
         ])
-        .args(["--listen", "127.0.0.1:0", "--ship-interval", "1"])
+        .args(["--listen", listen, "--ship-interval", "1"])
         .args(["--operator-listen", "127.0.0.1:0"])
+        .arg("--operator-secret-file")
+        .arg(self.path("operator.secret"))
+        .arg("--mandate-issuers")
+        .arg(self.path("issuers.json"))
         .arg("--key-file")
         .arg(self.path("gate.key"))
         .arg("--spool")
@@ -186,6 +208,19 @@ impl Site {
         .args(["--ledger", ledger])
         .args(["--upstream", &format!("http://{}/mcp", self.upstream)]);
         c
+    }
+    /// The gate's counters, read as its operator.
+    async fn health(&self, operator: &str) -> Value {
+        let secret = std::fs::read_to_string(self.path("operator.secret")).unwrap();
+        reqwest::Client::new()
+            .get(format!("http://{operator}/healthz"))
+            .header("x-gov-operator-key", secret)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
     }
     /// What an auditor does: export, then check the export against the witness.
     fn audit(&self) -> Report {
@@ -316,6 +351,53 @@ async fn a_gate_and_a_ledger_run_as_programs_leave_a_record_an_auditor_can_check
         .arg(site.path("gate.key")));
     assert!(!ok && err.contains("must not exist"), "{err}");
 
+    // An agent's key, and a mandate for it from a test issuer: there is no Authority yet to
+    // issue one. The gate is given the issuer's public key.
+    let (ok, agent_public, _) = run(program(GATE)
+        .args(["keygen", "--kid", "refund-bot-k1", "--out"])
+        .arg(site.path("agent.key")));
+    assert!(ok);
+    let agent_public: PublicKey = serde_json::from_str(&agent_public).unwrap();
+    let issuer = gov_core::SigningKey::from_seed(id("issuer-k1"), &[41; 32]).unwrap();
+    let now = gov_run::now();
+    let mandate = gov_core::mandate::Mandate {
+        v: 1,
+        tenant: id("acme"),
+        env: id("prod"),
+        id: id("m-1"),
+        issuer: id("test-issuer"),
+        issued_at: now - 60,
+        expires_at: now + 3600,
+        agent: gov_core::mandate::AgentRef {
+            id: id("refund-bot"),
+            key: agent_public,
+        },
+        issued_by: gov_core::mandate::IssuedBy {
+            kind: gov_core::mandate::IssuerKind::Person,
+            id: id("ana"),
+            session: Some(id("ses-1")),
+        },
+        template: id("triage@7"),
+        grants: vec![gov_core::action::Grant {
+            system: id("jira"),
+            operations: [id("issue.update")].into(),
+            resources: vec![gov_core::ResourcePattern::new("jira/project/pay/*").unwrap()],
+        }],
+        limits: Default::default(),
+        requires: Default::default(),
+        parent: None,
+    };
+    std::fs::write(
+        site.path("mandate.json"),
+        serde_json::to_vec(&gov_core::seal(&mandate, &issuer).unwrap()).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        site.path("issuers.json"),
+        serde_json::to_vec(&[issuer.public()]).unwrap(),
+    )
+    .unwrap();
+
     std::fs::write(site.path("gate.pub"), &gate_public).unwrap();
     std::fs::write(
         site.path("ledger-keys.json"),
@@ -390,12 +472,14 @@ async fn a_gate_and_a_ledger_run_as_programs_leave_a_record_an_auditor_can_check
         .await
         .unwrap();
     assert_eq!(agents_view.status().as_u16(), 404);
-    let health: Value = reqwest::get(format!("http://{operator}/healthz"))
-        .await
-        .unwrap()
-        .json()
+    // And only with the operator's secret: an agent on this machine can reach the address
+    // too (review finding GR-98).
+    let without = reqwest::get(format!("http://{operator}/healthz"))
         .await
         .unwrap();
+    assert_eq!(without.status().as_u16(), 401);
+    assert_eq!(mode(&site.path("operator.secret")), 0o600);
+    let health = site.health(&operator).await;
     assert_eq!(
         (
             &health["mode"],
@@ -406,13 +490,112 @@ async fn a_gate_and_a_ledger_run_as_programs_leave_a_record_an_auditor_can_check
         (&json!("observe"), &json!(false), &json!(2), &json!(0))
     );
 
-    // The gate is stopped and started again on the same spool: its chain goes on from where
-    // it was, and the record is still whole.
-    drop(gate);
-    let gate = start(site.gate(&ledger_url));
-    // A tool not listed since the restart is recorded as unknown, and still recorded.
-    assert_eq!(call(&gate.addr, 4, "PAY-14").await, 200);
+    // The shim, started as an agent's runtime would start it: beside the agent, holding the
+    // agent's key and mandate, pointed at the gate.
+    let shim = start({
+        let mut c = program(SHIM);
+        c.args(["--tenant", "acme", "--env", "prod", "--gate", "gate-1"])
+            .args(["--gate-url", &format!("http://{}", gate.addr)])
+            .arg("--key-file")
+            .arg(site.path("agent.key"))
+            .arg("--mandate")
+            .arg(site.path("mandate.json"))
+            .arg("--map")
+            .arg(site.path("map.json"))
+            .arg("--secret-file")
+            .arg(site.path("shim.secret"));
+        c
+    });
+    assert_eq!(mode(&site.path("shim.secret")), 0o600);
+    let secret = std::fs::read_to_string(site.path("shim.secret")).unwrap();
+    let through_shim = |body: Value, secret: Option<&str>| {
+        let mut request = reqwest::Client::new()
+            .post(format!("http://{}/mcp", shim.addr))
+            .header("authorization", SECRET)
+            .header("content-type", "application/json");
+        if let Some(secret) = secret {
+            request = request.header("x-gov-shim-key", secret);
+        }
+        request.body(body.to_string())
+    };
+    let list = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+    let tool_call = |n: u64, key: &str| json!({"jsonrpc": "2.0", "id": n, "method": "tools/call", "params": {"name": "jira_update_issue", "arguments": {"key": key, "summary": "Refund flow"}}});
+
+    // Only its runtime may use it (review finding GR-90): not a request without the secret,
+    // not one a browser would send, not one in a form a web page can post.
+    let before = hits();
+    let no_secret = through_shim(tool_call(20, "PAY-20"), None);
+    assert_eq!(no_secret.send().await.unwrap().status().as_u16(), 401);
+    // A wrong secret, the start of the right one, and the right one with more after it.
+    let longer = format!("{secret}0");
+    for wrong in ["key-0000", &secret[..secret.len() - 1], &longer] {
+        let request = through_shim(tool_call(20, "PAY-20"), Some(wrong));
+        assert_eq!(request.send().await.unwrap().status().as_u16(), 401);
+    }
+    let from_a_page = through_shim(tool_call(20, "PAY-20"), Some(&secret))
+        .header("origin", "https://evil.example");
+    assert_eq!(from_a_page.send().await.unwrap().status().as_u16(), 403);
+    let rebound =
+        through_shim(tool_call(20, "PAY-20"), Some(&secret)).header("host", "evil.example");
+    assert_eq!(rebound.send().await.unwrap().status().as_u16(), 403);
+    let as_a_form =
+        through_shim(tool_call(20, "PAY-20"), Some(&secret)).header("content-type", "text/plain");
+    assert_eq!(as_a_form.send().await.unwrap().status().as_u16(), 415);
+    assert_eq!(hits(), before, "none of them went anywhere");
+
+    // Through the shim the agent lists the tools and makes a call: the gate records it as
+    // proven, by the agent its mandate names.
+    let listed = through_shim(list.clone(), Some(&secret));
+    assert_eq!(listed.send().await.unwrap().status().as_u16(), 200);
+    let called = through_shim(tool_call(21, "PAY-21"), Some(&secret));
+    let answer = called.send().await.unwrap();
+    assert_eq!(answer.status().as_u16(), 200);
+    // Nothing of the gate's or the shim's own reaches the agent.
+    assert!(answer
+        .headers()
+        .keys()
+        .all(|k| !k.as_str().starts_with("x-gov-")));
+    assert!(answer.text().await.unwrap().contains("done"));
     site.audited(6).await;
+    let health = site.health(&operator).await;
+    assert_eq!(
+        (
+            &health["recorded"],
+            &health["proven"],
+            &health["proof_failed"]
+        ),
+        (&json!(3), &json!(1), &json!(0))
+    );
+
+    // The gate is stopped and started again, on the same spool and the same address, while
+    // the shim stays up. Its chain goes on from where it was, and it knows no session.
+    let gate_addr = gate.addr.clone();
+    drop(gate);
+    let mut gate = start(site.gate_on(&ledger_url, &gate_addr));
+    let operator = gate.said("operator on ");
+    // A stock client's call for a tool not listed since the restart is recorded as unknown,
+    // and still recorded.
+    assert_eq!(call(&gate.addr, 4, "PAY-14").await, 200);
+
+    // The shim's next call is under a session the gate does not know. It is forwarded
+    // exactly once, and recorded as a failed proof; the shim does not send it again (review
+    // finding GR-89).
+    let before = hits();
+    let lost = through_shim(tool_call(23, "PAY-23"), Some(&secret));
+    assert_eq!(lost.send().await.unwrap().status().as_u16(), 200);
+    assert_eq!(hits(), before + 1, "the call went to the server once");
+    // The tools are listed again, as a client does after it reconnects, and the next call
+    // is proven under a new session.
+    let listed = through_shim(list.clone(), Some(&secret));
+    assert_eq!(listed.send().await.unwrap().status().as_u16(), 200);
+    let again = through_shim(tool_call(24, "PAY-24"), Some(&secret));
+    assert_eq!(again.send().await.unwrap().status().as_u16(), 200);
+    let health = site.health(&operator).await;
+    assert_eq!(
+        (&health["proven"], &health["proof_failed"]),
+        (&json!(1), &json!(1))
+    );
+    site.audited(12).await;
 
     // Nothing the agent sent is in any file either program wrote: not its credential, not an
     // argument's value, not the server's answer.
@@ -431,6 +614,16 @@ async fn a_gate_and_a_ledger_run_as_programs_leave_a_record_an_auditor_can_check
     }
     // The search reaches inside the receipts: what a receipt does hold is found.
     assert!(written.contains("triage-bot") && written.contains("issue.update"));
+    // The receipts say who was proven and who was not: the agent the mandate names with its
+    // mandate, the call under a lost session as a failed proof, never as a mere claim.
+    for held in [
+        r#""agent":{"id":"refund-bot","proof":"proven"}"#,
+        r#""mandate":["m-1"]"#,
+        r#""proof":"failed","failure":"unknown_session""#,
+        r#""agent":{"id":"triage-bot","proof":"claimed"}"#,
+    ] {
+        assert!(written.contains(held), "no receipt holds {held}");
+    }
     for secret in ["agent-jira-token", "Refund flow", "customer 4411"] {
         assert!(
             !written.contains(secret),
@@ -438,6 +631,11 @@ async fn a_gate_and_a_ledger_run_as_programs_leave_a_record_an_auditor_can_check
         );
     }
 
+    // The session, the proof, the salt, the agent's name for the gate and the shim's secret
+    // stop at the gate: the server was never sent one of them.
+    assert!(!GOV_HEADER_SEEN.load(std::sync::atomic::Ordering::SeqCst));
+
+    drop(shim);
     drop(gate);
     drop(ledger);
     site.db.drop_schema().await;
@@ -480,7 +678,9 @@ fn a_program_does_not_start_in_a_way_that_would_expose_a_key_or_a_credential() {
         .arg("--map")
         .arg(path("map.json"))
         .arg("--ledger-keys")
-        .arg(path("ledger-keys.json"));
+        .arg(path("ledger-keys.json"))
+        .arg("--operator-secret-file")
+        .arg(path("operator.secret"));
         run(&mut c)
     };
     let local = "http://127.0.0.1:1/mcp";

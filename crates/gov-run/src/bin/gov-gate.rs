@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Json;
 use clap::{Parser, Subcommand};
@@ -19,8 +20,12 @@ use gov_core::connector::ServerMap;
 use gov_core::{Id, KeySet, PublicKey, Scope};
 use gov_gate::forward::{Forwarder, ForwarderConfig};
 use gov_gate::link::HttpLedgerLink;
+use gov_gate::sessions::SessionsConfig;
 use gov_gate::{DirWitnessReader, FileSpool, Gate, GateConfig, Shipped, WitnessReader};
-use gov_run::{bind, bind_named, keygen, listen_address, now, outbound_address, read_key};
+use gov_run::{
+    bind, bind_named, carries_secret, keygen, listen_address, new_secret, now, outbound_address,
+    read_key,
+};
 use serde_json::json;
 
 #[derive(Parser)]
@@ -90,6 +95,15 @@ struct Serve {
     /// Seconds the server, or the Ledger, has to answer.
     #[arg(long, default_value_t = 60)]
     call_timeout: u64,
+    /// A file holding the public keys mandates are issued under, as a JSON list. With it the
+    /// gate opens sessions for the shim and records a proven agent as proven. Until there is
+    /// an Authority these are a test issuer's keys.
+    #[arg(long)]
+    mandate_issuers: Option<PathBuf>,
+    /// Where the secret for the operator address is written, in a new file only its owner
+    /// can read. Every request to the operator address must carry it.
+    #[arg(long)]
+    operator_secret_file: PathBuf,
     /// Listen beyond this machine, and send plain HTTP beyond it, although nothing here
     /// speaks TLS.
     #[arg(long)]
@@ -116,6 +130,20 @@ async fn serve(s: Serve) -> anyhow::Result<()> {
     let ledger_keys: Vec<PublicKey> = serde_json::from_slice(&std::fs::read(&s.ledger_keys)?)
         .context("the Ledger's public keys cannot be read")?;
     anyhow::ensure!(!ledger_keys.is_empty(), "no public key for the Ledger");
+    let sessions = match &s.mandate_issuers {
+        Some(path) => {
+            let issuers: Vec<PublicKey> = serde_json::from_slice(&std::fs::read(path)?)
+                .context("the mandate issuers' public keys cannot be read")?;
+            anyhow::ensure!(!issuers.is_empty(), "no public key for a mandate issuer");
+            Some(SessionsConfig::new(
+                scope.clone(),
+                gate.clone(),
+                KeySet::new(issuers),
+            ))
+        }
+        None => None,
+    };
+    let operator_secret = new_secret(&s.operator_secret_file)?;
     let config = GateConfig {
         scope,
         gate,
@@ -131,6 +159,8 @@ async fn serve(s: Serve) -> anyhow::Result<()> {
             upstream: s.upstream,
             map,
             call_timeout: Duration::from_secs(s.call_timeout),
+            sessions,
+            max_in_flight: gov_gate::forward::MAX_IN_FLIGHT,
         },
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -175,9 +205,15 @@ async fn serve(s: Serve) -> anyhow::Result<()> {
     // What an operator must be able to see: observe mode protects nothing, and what it did
     // not record must not be silent.
     let counted = forwarder.clone();
-    let health = get(move || {
+    let health = get(move |headers: axum::http::HeaderMap| {
         let c = counted.clone();
+        let secret = operator_secret.clone();
         async move {
+            // An agent on this machine can reach this address too; without the operator's
+            // secret it learns nothing (review finding GR-98).
+            if !carries_secret(&headers, "x-gov-operator-key", &secret) {
+                return axum::http::StatusCode::UNAUTHORIZED.into_response();
+            }
             Json(json!({
                 "mode": "observe",
                 "enforced": false,
@@ -185,7 +221,10 @@ async fn serve(s: Serve) -> anyhow::Result<()> {
                 "not_recorded": c.counters.not_recorded.load(Ordering::Relaxed),
                 "unmapped": c.counters.unmapped.load(Ordering::Relaxed),
                 "ship_no_progress": c.counters.ship_no_progress.load(Ordering::Relaxed),
+                "proven": c.counters.proven.load(Ordering::Relaxed),
+                "proof_failed": c.counters.proof_failed.load(Ordering::Relaxed),
             }))
+            .into_response()
         }
     });
     let operator = bind_named("operator", operator_addr).await?;

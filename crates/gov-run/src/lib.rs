@@ -5,6 +5,8 @@
 //! must not cross a network in the clear because of a default. An operator who puts a TLS
 //! terminator in front says so with `--plain-http-on-network`.
 
+pub mod shim;
+
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
@@ -82,6 +84,49 @@ pub fn keygen(kid: &str, out: &Path) -> anyhow::Result<PublicKey> {
     file.write_all(text.as_bytes())?;
     file.sync_all()?;
     Ok(public)
+}
+
+/// A random secret made at start, written to a new file only its owner can read, for
+/// whoever started the program to hand to the one party that may use it.
+pub fn new_secret(out: &Path) -> anyhow::Result<String> {
+    let secret = gov_core::random_id("key")
+        .map_err(|_| anyhow::anyhow!("no secret could be made"))?
+        .as_str()
+        .to_string();
+    // A file left by an earlier run is replaced: the old secret is dead with its process.
+    match std::fs::remove_file(out) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("{} cannot be replaced", out.display())),
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(out)
+        .with_context(|| format!("{} cannot be created", out.display()))?;
+    file.write_all(secret.as_bytes())?;
+    file.sync_all()?;
+    Ok(secret)
+}
+
+/// Whether a request carries `secret` in the header `name`. Compared without stopping at the
+/// first difference, so the time taken says nothing about how much of a guess was right.
+pub fn carries_secret(headers: &axum::http::HeaderMap, name: &str, secret: &str) -> bool {
+    let Some(given) = headers.get(name).map(|v| v.as_bytes()) else {
+        return false;
+    };
+    let secret = secret.as_bytes();
+    given.len() == secret.len()
+        && given
+            .iter()
+            .zip(secret)
+            .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+            == 0
 }
 
 /// Where to listen. An address beyond this machine needs the operator's word.

@@ -19,22 +19,30 @@ use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::extract::State;
-use axum::http::{HeaderMap, HeaderName, Method, StatusCode};
-use axum::response::Response;
-use axum::routing::any;
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{any, post};
 use axum::Router;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
+use gov_core::action::Salt;
 use gov_core::connector::{tool_digest, ServerMap};
-use gov_core::receipt::{Coverage, OutcomeStatus, Proof};
-use gov_core::{Digest, Id};
+use gov_core::receipt::{Coverage, OutcomeStatus, Proof, ProofFailure};
+use gov_core::{Digest, Envelope, Id};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::Semaphore;
 
+use crate::sessions::{OpenRefused, Presented, Proved, Sessions, SessionsConfig};
 use crate::{
     Gate, GateError, LedgerLink, Observed, Shipped, Spool, Trimmed, WitnessRead, WitnessReader,
 };
 
 /// The largest request, or answer the gate must read, that it will hold.
 const MAX_BODY: usize = 4 * 1024 * 1024;
+/// The most tool calls recorded at once.
+pub const MAX_IN_FLIGHT: usize = 256;
 /// The most sessions whose tool listings are remembered. Past it the oldest is forgotten: a
 /// forgotten listing only makes a tool `unknown` until it is listed again.
 pub const MAX_SESSIONS: usize = 4096;
@@ -42,7 +50,7 @@ pub const MAX_SESSIONS: usize = 4096;
 /// For each MCP session, the digest of each tool's definition as the server last listed it
 /// there, and the order the sessions were first seen in.
 #[derive(Default)]
-struct Listings {
+pub struct Listings {
     sessions: BTreeMap<String, (u64, BTreeMap<String, Digest>)>,
     /// The session ids the server itself has issued, and when. A listing is remembered only
     /// for one of these, or for no session at all: a client cannot invent the id that pushes
@@ -53,7 +61,7 @@ struct Listings {
 
 impl Listings {
     /// The server named a session in an answer.
-    fn issue(&mut self, session: &str) {
+    pub fn issue(&mut self, session: &str) {
         if self.issued.contains_key(session) {
             return;
         }
@@ -100,6 +108,79 @@ impl Listings {
             .or_insert((stamp, BTreeMap::new()))
             .1
     }
+
+    /// The digest of `tool`'s definition as the server last listed it in `session`.
+    pub fn digest(&self, session: &str, tool: &str) -> Option<Digest> {
+        self.sessions
+            .get(session)
+            .and_then(|(_, tools)| tools.get(tool))
+            .cloned()
+    }
+
+    /// Take in the server's answer to a `tools/list` request. The gate and the shim both
+    /// remember listings through this one function, so that for the same messages they
+    /// hold the same digests (spec §5.3.1).
+    pub fn remember(
+        &mut self,
+        session: &str,
+        request: &Value,
+        succeeded: bool,
+        event_stream: bool,
+        body: &[u8],
+    ) {
+        // A session id the server never issued: nothing is remembered for it.
+        if !self.known(session) {
+            return;
+        }
+        let continued = request
+            .get("params")
+            .and_then(|p| p.get("cursor"))
+            .is_some_and(|c| !c.is_null());
+        let mut seen: BTreeMap<String, Option<Digest>> = BTreeMap::new();
+        if succeeded {
+            for tool in replies(event_stream, body)
+                .iter()
+                .filter_map(|r| r.get("result")?.get("tools")?.as_array())
+                .flatten()
+            {
+                if let Some(name) = tool.get("name").and_then(Value::as_str) {
+                    // A definition with no digest is not a tool that was reviewed: it is
+                    // forgotten, never left as it was (review finding GR-64).
+                    seen.insert(name.to_string(), tool_digest(tool).ok());
+                }
+            }
+        }
+        let entry = self.entry(session.to_string());
+        // A first page replaces what was remembered, so a tool the server has dropped is
+        // forgotten; a later page adds to it.
+        if !continued {
+            entry.clear();
+        }
+        for (name, digest) in seen {
+            match digest {
+                Some(d) => entry.insert(name, d),
+                None => entry.remove(&name),
+            };
+        }
+    }
+}
+
+/// Whether an answer's headers say it is an event stream.
+pub fn is_event_stream(content_type: Option<&str>) -> bool {
+    content_type.is_some_and(|t| t.starts_with("text/event-stream"))
+}
+
+/// The JSON-RPC answers in a body: one JSON object, or the `data:` lines of an event stream.
+pub fn replies(event_stream: bool, body: &[u8]) -> Vec<Value> {
+    if event_stream {
+        String::from_utf8_lossy(body)
+            .lines()
+            .filter_map(|l| l.strip_prefix("data:"))
+            .filter_map(|d| serde_json::from_str(d.trim()).ok())
+            .collect()
+    } else {
+        serde_json::from_slice(body).ok().into_iter().collect()
+    }
 }
 
 /// What an operator must be able to see (spec §3.4: observe mode protects nothing, and what
@@ -115,6 +196,11 @@ pub struct Counters {
     pub unmapped: AtomicU64,
     /// Rounds of shipping in which the Ledger took nothing.
     pub ship_no_progress: AtomicU64,
+    /// Tool calls whose agent proved its key (through the shim).
+    pub proven: AtomicU64,
+    /// Tool calls that presented a session and did not prove the key. Kept apart from calls
+    /// that offered no proof at all (review finding GR-91).
+    pub proof_failed: AtomicU64,
 }
 
 pub struct ForwarderConfig {
@@ -123,6 +209,12 @@ pub struct ForwarderConfig {
     pub map: ServerMap,
     /// How long the server has to answer a request before the gate gives up on it.
     pub call_timeout: Duration,
+    /// Sessions with the shim. Without it the gate opens none, and every agent is recorded
+    /// as claimed.
+    pub sessions: Option<SessionsConfig>,
+    /// The most tool calls recorded at once ([`MAX_IN_FLIGHT`] unless a deployment says
+    /// otherwise).
+    pub max_in_flight: usize,
 }
 
 pub struct Forwarder<S> {
@@ -134,6 +226,10 @@ pub struct Forwarder<S> {
     listed: Mutex<Listings>,
     /// One round of shipping at a time (review finding GR-79).
     shipping: AsyncMutex<()>,
+    sessions: Option<Mutex<Sessions>>,
+    /// Calls in flight that are being recorded. Each holds its answer in memory until the
+    /// server is done, whether or not its client stays (review finding GR-99).
+    in_flight: Arc<Semaphore>,
     clock: fn() -> i64,
     pub counters: Counters,
 }
@@ -154,8 +250,10 @@ struct Answer {
 }
 
 impl<S: Spool + 'static> Forwarder<S> {
-    pub fn new(gate: Gate<S>, config: ForwarderConfig) -> Result<Arc<Self>, GateError> {
+    pub fn new(gate: Gate<S>, mut config: ForwarderConfig) -> Result<Arc<Self>, GateError> {
         config.map.validate()?;
+        let sessions = config.sessions.take().map(|c| Mutex::new(Sessions::new(c)));
+        let in_flight = Arc::new(Semaphore::new(config.max_in_flight));
         Ok(Arc::new(Forwarder {
             gate: Arc::new(AsyncMutex::new(gate)),
             config,
@@ -166,6 +264,8 @@ impl<S: Spool + 'static> Forwarder<S> {
                 .map_err(|e| GateError::Link(e.to_string()))?,
             listed: Mutex::new(Listings::default()),
             shipping: AsyncMutex::new(()),
+            sessions,
+            in_flight,
             clock: wall_clock,
             counters: Counters::default(),
         }))
@@ -232,6 +332,7 @@ impl<S: Spool + 'static> Forwarder<S> {
     pub fn router(self: Arc<Self>) -> Router {
         Router::new()
             .route("/mcp", any(handle::<S>))
+            .route("/v1/sessions", post(open_session::<S>))
             .with_state(self)
     }
 
@@ -312,8 +413,69 @@ fn passes(name: &HeaderName) -> bool {
             | "proxy-authorization"
             | "proxy-authenticate"
             | "location"
-            | "x-gov-agent"
-    )
+    ) && !name.as_str().starts_with("x-gov-")
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpenRequest {
+    mandate: Envelope,
+    request: Envelope,
+}
+
+/// Open a session for the shim. The answer to a refusal says only that it was refused, or
+/// that the agent has too many sessions waiting for their first proof.
+async fn open_session<S: Spool + 'static>(
+    State(f): State<Arc<Forwarder<S>>>,
+    body: Bytes,
+) -> Response {
+    let Some(sessions) = &f.sessions else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Ok(asked) = gov_core::strict::parse(&body).and_then(|v| {
+        serde_json::from_value::<OpenRequest>(v).map_err(|_| gov_core::Error::Malformed("session"))
+    }) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let opened = sessions.lock().expect("the sessions' lock").open(
+        &asked.mandate,
+        &asked.request,
+        (f.clock)(),
+    );
+    match opened {
+        Ok((session, challenge)) => {
+            axum::Json(json!({"session": session, "challenge": challenge})).into_response()
+        }
+        Err(OpenRefused::Busy) => StatusCode::TOO_MANY_REQUESTS.into_response(),
+        Err(OpenRefused::Invalid) => StatusCode::FORBIDDEN.into_response(),
+    }
+}
+
+/// What a call presented besides itself: a session, and for it a proof and a salt.
+struct Shim {
+    session: Id,
+    proof: Option<Envelope>,
+    salt: Option<Salt>,
+}
+
+impl Shim {
+    /// From the `x-gov-session`, `x-gov-proof` and `x-gov-salt` headers. `None` when the call
+    /// names no session: a stock client.
+    fn from(headers: &HeaderMap) -> Option<Self> {
+        let text = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+        let session = Id::new(text("x-gov-session")?).ok()?;
+        let proof = text("x-gov-proof")
+            .and_then(|p| URL_SAFE_NO_PAD.decode(p).ok())
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+        let salt = text("x-gov-salt")
+            .and_then(|s| URL_SAFE_NO_PAD.decode(s).ok())
+            .and_then(|bytes| Salt::try_from(bytes).ok());
+        Some(Shim {
+            session,
+            proof,
+            salt,
+        })
+    }
 }
 
 fn refusal(status: StatusCode, message: &str) -> Response {
@@ -343,21 +505,9 @@ fn answer(status: StatusCode, headers: &reqwest::header::HeaderMap, body: Body) 
     response.body(body).unwrap_or_else(|_| bad_gateway())
 }
 
-/// The JSON-RPC answers in a body: one JSON object, or the `data:` lines of an event stream.
 fn answers(headers: &reqwest::header::HeaderMap, body: &[u8]) -> Vec<Value> {
-    let event_stream = headers
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|t| t.starts_with("text/event-stream"));
-    if event_stream {
-        String::from_utf8_lossy(body)
-            .lines()
-            .filter_map(|l| l.strip_prefix("data:"))
-            .filter_map(|d| serde_json::from_str(d.trim()).ok())
-            .collect()
-    } else {
-        serde_json::from_slice(body).ok().into_iter().collect()
-    }
+    let content_type = headers.get("content-type").and_then(|v| v.to_str().ok());
+    replies(is_event_stream(content_type), body)
 }
 
 async fn handle<S: Spool + 'static>(
@@ -436,43 +586,14 @@ async fn list<S: Spool + 'static>(
     let Ok(a) = f.exchange(&headers, body).await else {
         return bad_gateway();
     };
-    let continued = message
-        .get("params")
-        .and_then(|p| p.get("cursor"))
-        .is_some_and(|c| !c.is_null());
-    let mut seen: BTreeMap<String, Option<Digest>> = BTreeMap::new();
-    if a.status.is_success() {
-        for tool in answers(&a.headers, &a.body)
-            .iter()
-            .filter_map(|r| r.get("result")?.get("tools")?.as_array())
-            .flatten()
-        {
-            if let Some(name) = tool.get("name").and_then(Value::as_str) {
-                // A definition with no digest is not a tool that was reviewed: it is
-                // forgotten, never left as it was (review finding GR-64).
-                seen.insert(name.to_string(), tool_digest(tool).ok());
-            }
-        }
-    }
-    let mut listed = f.listed.lock().expect("the tool list's lock");
-    if !listed.known(&session) {
-        // A session id the server never issued: forwarded, and nothing remembered for it.
-        drop(listed);
-        return answer(a.status, &a.headers, Body::from(a.body));
-    }
-    let entry = listed.entry(session);
-    // A first page replaces what was remembered, so a tool the server has dropped is
-    // forgotten; a later page adds to it.
-    if !continued {
-        entry.clear();
-    }
-    for (name, digest) in seen {
-        match digest {
-            Some(d) => entry.insert(name, d),
-            None => entry.remove(&name),
-        };
-    }
-    drop(listed);
+    let content_type = a.headers.get("content-type").and_then(|v| v.to_str().ok());
+    f.listed.lock().expect("the tool list's lock").remember(
+        &session,
+        &message,
+        a.status.is_success(),
+        is_event_stream(content_type),
+        &a.body,
+    );
     answer(a.status, &a.headers, Body::from(a.body))
 }
 
@@ -508,34 +629,87 @@ async fn call<S: Spool + 'static>(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| Id::new(v).ok())
         .unwrap_or_else(|| Id::new("unnamed-agent").expect("an identifier"));
+    // A session is only looked at where sessions are served; elsewhere the headers are
+    // dropped like any other of the gate's own.
+    let shim = f.sessions.as_ref().and_then(|_| Shim::from(&headers));
+    // No more calls are recorded at once than the gate will hold answers for. Past that,
+    // observe mode still blocks nothing: the call goes through, counted as not recorded,
+    // and held only for as long as its client stays (review finding GR-99).
+    let Ok(permit) = f.in_flight.clone().try_acquire_owned() else {
+        f.not_recorded().await;
+        return match f.exchange(&headers, body).await {
+            Ok(a) => answer(a.status, &a.headers, Body::from(a.body)),
+            Err(()) => bad_gateway(),
+        };
+    };
     let listed = f
         .listed
         .lock()
         .expect("the tool list's lock")
-        .sessions
-        .get(&session)
-        .and_then(|(_, tools)| tools.get(&tool))
-        .cloned();
+        .digest(&session, &tool);
     // From the intent receipt to the outcome receipt, the call runs in a task of its own.
     // If the client goes away at any point after this line, even between the intent being
     // written and the request being sent, or if the server never answers, the intent is
     // still closed: as failed, or as `unknown` when the gate cannot say what the server did
     // (review finding GR-63). An intent is never written by code the client can abandon.
     let task = tokio::spawn(async move {
-        // With no shim the gate draws the salt itself, fresh for this call (spec §4.3). Mapping
-        // never fails, so there is always something to record (GR-61).
-        let begun = match gov_core::random_salt() {
+        let _permit = permit;
+        let mut reopen = false;
+        // With the shim, the salt is the one it drew and signed over; with a stock client, or
+        // a salt that cannot be read, the gate draws one itself, fresh for this call (spec
+        // §4.3). Mapping never fails, so there is always something to record (GR-61).
+        let sent_salt = shim.as_ref().and_then(|s| s.salt);
+        let begun = match sent_salt.map_or_else(gov_core::random_salt, Ok) {
             Ok(salt) => {
                 let mapped = f.config.map.map(&tool, listed.as_ref(), &args, &salt);
                 if !mapped.known {
                     f.counters.unmapped.fetch_add(1, Ordering::Relaxed);
                 }
                 let now = (f.clock)();
+                // Who made the call. Proven is said by `Sessions::prove` alone, for the
+                // action computed just above from this gate's own map and listing.
+                let (agent, proof, failure, mandates) = match (&shim, &f.sessions) {
+                    (Some(shim), Some(sessions)) => {
+                        let canonical = gov_core::action::args_digest(&args, &salt).is_ok();
+                        let proved = sessions.lock().expect("the sessions' lock").prove(
+                            &shim.session,
+                            shim.proof.as_ref(),
+                            shim.salt.as_ref(),
+                            &mapped.action.digest(),
+                            canonical,
+                            now,
+                        );
+                        match proved {
+                            Proved::Proven(who) => {
+                                f.counters.proven.fetch_add(1, Ordering::Relaxed);
+                                (who.agent, Proof::Proven, None, who.mandates)
+                            }
+                            Proved::Failed { who, why } => {
+                                f.counters.proof_failed.fetch_add(1, Ordering::Relaxed);
+                                // The shim opens another session before its next call.
+                                reopen = matches!(
+                                    why,
+                                    ProofFailure::UnknownSession
+                                        | ProofFailure::MandateExpired
+                                        | ProofFailure::SessionSpent
+                                );
+                                let who = who.unwrap_or(Presented {
+                                    agent: Id::new("unknown-session").expect("an identifier"),
+                                    mandates: Vec::new(),
+                                });
+                                (who.agent, Proof::Failed, Some(why), who.mandates)
+                            }
+                        }
+                    }
+                    // A stock client only says who it is.
+                    _ => (agent, Proof::Claimed, None, Vec::new()),
+                };
                 f.with_gate(move |gate| {
                     let observed = Observed {
                         agent: &agent,
-                        // A stock client only says who it is. Proven comes with the shim.
-                        proof: Proof::Claimed,
+                        proof,
+                        failure,
+                        mandates: &mandates,
                         action: &mapped.action,
                         reversal: mapped.reversal,
                         // The agent holds its own credential; the gate is only in the path.
@@ -588,11 +762,22 @@ async fn call<S: Spool + 'static>(
                     Err(_) => f.not_recorded().await,
                 }
             }
-            result
+            (result, reopen)
         }
     });
     match task.await {
-        Ok(Ok(a)) => answer(a.status, &a.headers, Body::from(a.body)),
+        Ok((Ok(a), reopen)) => {
+            let mut response = answer(a.status, &a.headers, Body::from(a.body));
+            if reopen {
+                // The call was forwarded, once. This only tells the shim that its session is
+                // gone, so it opens another before the next call and never sends this one
+                // again (review finding GR-89).
+                response
+                    .headers_mut()
+                    .insert("x-gov-reopen", HeaderValue::from_static("1"));
+            }
+            response
+        }
         _ => bad_gateway(),
     }
 }

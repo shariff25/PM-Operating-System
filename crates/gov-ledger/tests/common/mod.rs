@@ -64,6 +64,7 @@ pub fn receipt(gate: &str, seq: u64, prev: Option<Digest>, at: i64) -> Receipt {
         agent: ReceiptAgent {
             id: id("agent-1"),
             proof: Proof::Proven,
+            failure: None,
         },
         mandate: vec![id("m-1")],
         policy_version: Some(id("7")),

@@ -232,8 +232,38 @@ Nothing of G3b is built.
   session; the map cannot fail and derives a Jira project from the issue key; shipping no
   longer holds the gate. `gov-core` has 45 attack tests and the forwarder 7; 19 controls
   broken on purpose, each caught. Not yet re-read by the reviewer.
-- Still not built after this step: the shim and proven identity (its protocol is designed in
-  §5.3.1 and waits for the reviewer's read); TLS.
+- Still not built after this step: TLS.
+
+**G3b step 5 built (2026-11-26): the shim, and sessions at the gate,** on `build/gov-shim`,
+from §5.3.1 after the reviewer cleared the design (eleventh read) and on the owner's "Build
+the shim". Not yet read by the reviewer. With it G3b is built.
+
+- **The gate** (`gov-gate`, `sessions.rs` and the forwarder) opens a session on a request
+  signed by the key a mandate names (GR-97, built in from the start), and on every call
+  checks a proof for the action it computed itself. A receipt says `proven`, `claimed` or
+  `failed`; `failed` carries one of ten reasons and nothing else. The gate serves sessions
+  only when it is given the issuers' public keys (`--mandate-issuers`).
+- **`gov-shim`** stands beside an agent with the agent's key and mandate. It listens on its
+  own machine only, with no flag to widen that; takes a request only with the secret it
+  wrote at start, with no `Origin`, its own `Host`, and exactly one content type, JSON;
+  reads strictly and forwards its own writing-out; sends tool calls one at a time with a
+  fresh salt and a proof; and never sends a call twice.
+- With the same step: the gate's operator address needs a secret (GR-98), and calls
+  recorded at once are capped, past which a call goes through counted as not recorded
+  (GR-99).
+- **Stated limits.** There is no Authority, so the mandate in every test is issued by a test
+  issuer whose public key the gate is given in a file: "proven" means "holds the key a
+  mandate from that issuer names". Revocation is not checked. After a gate restart a shim's
+  first call is a failed proof (`unknown_session`), and its calls stay failed
+  (`wrong_digest`) until the client lists the tools again, because the gate has forgotten
+  the listing the shim still remembers. The shim's secret and the operator's secret are
+  files. The shim speaks HTTP to the agent, not stdio.
+- Tests: four on sessions (who opens one; each way a proof fails; a session ending with its
+  mandate and its calls; unproven sessions never pushing out a proven one), one on the
+  receipt's rules, one on the cap, and the end-to-end test now runs three programs: an
+  agent's call through the shim and the gate is recorded as proven by the agent its mandate
+  names, and after the gate restarts the next call is forwarded once, recorded as a failed
+  proof, and the one after is proven again.
 
 **G3b step 4 built (2026-11-26): the two programs,** on `build/gov-g3b-programs`, in a new
 crate `gov-run`. Built after the eighth read's fixes; not yet read by the reviewer.
@@ -492,6 +522,25 @@ between the two left an intent open for ever. Moving file work to other threads 
 made that moment long enough for CI's disk to hit it. Fixed on `build/gov-ci-open-intent`:
 the whole call, intent receipt included, runs in the task. A test with a deliberately slow
 spool fails without the fix and passes with it.
+
+### Eleventh read, 2026-11-26, at `b97d8b3`
+
+**Verdict: the gate passes for the spec, G1, G2, G3a and G3b steps 1 to 4, in observe mode;
+G3b is done but for the shim, and the shim may be built from §5.3.1 as written.** No High or
+Critical. GR-82, GR-76, GR-84, GR-86 and GR-87 are closed; GR-88 to GR-96 are answered in the
+design; the fix for the fault CI found (the open intent) was read and found right, and
+nothing else in the forwarder can be left half-done by a client that leaves.
+
+| Finding | Severity | What it said | What is done |
+|---|---|---|---|
+| GR-97 | Low | Someone holding a copy of the chain can keep the unproven sessions full, and so stop the real shim opening one after a restart | Built into the shim's first version: the request to open a session is signed by the agent's key over the gate's name and a fresh value |
+| GR-98 | Low | Any local process, an agent on the gate's own machine included, can read the operator address | With the shim's step: a secret on the operator address |
+| GR-99 | Low | No cap on calls in flight: each holds up to 4 MB for up to the call's time limit | With the shim's step: a cap; past it, in observe mode, the call is forwarded and counted as not recorded |
+| GR-100 | Low | If the witness's newest 16 checkpoints all fail to verify, nothing is trimmed until someone removes them | Stated here. A Ledger that can write to the witness can also stop publishing, so this adds little; the gate reports the bad checkpoints each round |
+
+Open conditions on later slices, by the reviewer's list: GR-77 (listener hardening), GR-81
+(G4), GR-85 (G8), a test for each connector map (GR-65), GR-8a and GR-29 to GR-32 (G6),
+GR-34 to GR-36 (G9).
 
 ## 1. What is being built
 
