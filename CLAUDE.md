@@ -256,6 +256,9 @@ follow-up tracking.
   Keys are files, refused unless `GOV_DATA_CLASS=fake`; neither program speaks TLS, so both
   keep to their own machine unless told otherwise; the gate's connector map is an unsigned
   file until G4. Not yet read by the reviewer. Still to build in G3b: the shim.
+- **The shim (2026-11-26):** its protocol is written in the spec (§5.3.1) and sent to the
+  reviewer before any code; the conductor's choice, since the build-before-review go-aheads
+  covered G1 and G2 only. The shim is the last part of G3b.
 - **A message relayed by the reviewer session (2026-11-26):** it reported that the owner typed
   there "I'm going to sleep you keep building do not ask for permission further - I gave the
   permission". The conductor could not confirm it and did not treat it as new permission. It
