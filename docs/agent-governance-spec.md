@@ -300,6 +300,35 @@ crate `gov-run`. Built after the eighth read's fixes; not yet read by the review
   the export against the witness passing each time. A second test covers what each program
   refuses to start with.
 
+**G4a, first part, built (2026-11-26): the Authority's registry, enrolment and admin
+records,** on `build/gov-g4a`, from §7.6 after the thirteenth read. Not yet read by the
+reviewer.
+
+- `gov-core` has the admin record (`gov.admin.v1`): numbered and chained like a receipt, a
+  closed list of fourteen actions, each with the kind of thing it is done to, the second
+  thing it names and whether it carries a value; and the request to enrol (`gov.enrol.v1`),
+  signed by the key it enrols.
+- `gov-authority` is a new crate, a library with a store in memory and one in Postgres
+  (Governance's own database, two tables). It names the first admin once; adds and offboards
+  people; registers agents, each with an owner, and gates; suspends, resumes and disables;
+  and enrols a key by a one-time code.
+- **A record and what it changes are written in one step,** in one transaction on Postgres.
+  When the record cannot be written, nothing has changed.
+- **Enrolment** as §7.6 says: the code itself is presented and only its digest is stored;
+  the request is signed by the key being enrolled and names who is enrolling; a wrong code
+  is counted and the fifth cancels the pending code; the right code is spent by the first
+  request that presents it, whether or not that request holds; the answer carries the root
+  key and a value that pins it.
+- Every record says its actor is **unverified**: there is no sign-in before G4e. "Only an
+  admin acts" is checked against the name given, not against a person.
+- **Not in this part:** the Authority's chain is not yet shipped to the Ledger, the Ledger
+  does not yet take chains of two kinds, and `gov verify` does not yet read admin records;
+  a gate's key does not yet reach the Ledger from the Authority; nothing is served on a
+  listener and there is no `gov-authority` program. Those are the second part of G4a.
+- Six tests on both stores, and two in `gov-core`: who may act; enrolment; what does not
+  enrol a key; an offboarded owner's agents stopping; two admins at once keeping one chain;
+  and an action whose record cannot be kept changing nothing.
+
 ## Security review of 2026-11-26 (first read; the gate did not pass)
 
 An independent reviewer session read this spec, G1 and G2 at `2d08d15`, read-only, and ran
