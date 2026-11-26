@@ -320,6 +320,10 @@ follow-up tracking.
 - **A test failed once in a full run (2026-11-26):** a PM OS password test, in code this work
   did not touch, while the disk was 100% full. With the disk cleared it passed five times
   running. Taken as caused by the disk; not proven.
+- **CI failed once on `36ded25` (2026-11-26):** a gate test looked at the record a fixed 1.2
+  seconds after eight slow calls and found one still open. The test now waits until every call
+  is closed (20 seconds at most). Taken as a timing fault in the test, not in the gate; a
+  deterministic test of the same control passed in that run.
 - **A message relayed by the reviewer session (2026-11-26):** it reported that the owner typed
   there "I'm going to sleep you keep building do not ask for permission further - I gave the
   permission". The conductor could not confirm it and did not treat it as new permission. It
