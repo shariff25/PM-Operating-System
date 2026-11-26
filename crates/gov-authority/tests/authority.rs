@@ -481,10 +481,16 @@ async fn enrolment_attacks<S: Store>(store: S) {
         .await
         .unwrap();
     a.disable_gate(&ana, &id("gate-3"), NOW).await.unwrap();
+    // Disabling the gate dropped its code.
+    assert!(a
+        .store()
+        .code(&scope(), EnrolKind::Gate, &id("gate-3"))
+        .await
+        .unwrap()
+        .is_none());
     let asked = request(&g3, EnrolKind::Gate, "gate-3", g3.public(), &code3);
     refused(a.enrol(&code3, &asked, NOW).await);
     nothing_enrolled(&a).await;
-
     // A key id is enrolled once, and so is a key: a second key under the same id is
     // refused, and so is the same key under a second id, whoever asks.
     let code = offer(&a).await;
@@ -513,6 +519,29 @@ async fn enrolment_attacks<S: Store>(store: S) {
         .filter(|r| r.action == AdminAction::KeyEnrolled)
         .count();
     assert_eq!(enrolled, 1);
+
+    // Last, since it writes a made-up record to put a code back: were a code still there for a disabled gate (the gate disabled in the instant
+    // after the code was taken), enrolling checks the gate again and refuses.
+    let records = a.store().records_after(&scope(), 0, 1000).await.unwrap();
+    let last = records.last().unwrap();
+    let put_back = StoredRecord {
+        seq: last.seq + 1,
+        ..last.clone()
+    };
+    let lingering = Effect::PutCode(PendingCode {
+        kind: EnrolKind::Gate,
+        name: id("gate-3"),
+        digest: code_digest(&code3),
+        expires_at: NOW + CODE_SECS,
+        by: ana.clone(),
+        wrong: 0,
+    });
+    a.store()
+        .commit(&scope(), &put_back, &[lingering])
+        .await
+        .unwrap();
+    refused(a.enrol(&code3, &asked, NOW).await);
+    assert_eq!(a.store().keys(&scope()).await.unwrap().len(), 1);
 }
 both_stores!(what_does_not_enrol_a_key, enrolment_attacks);
 

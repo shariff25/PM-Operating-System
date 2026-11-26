@@ -142,6 +142,16 @@ async fn the_authoritys_chain_is_witnessed_and_a_gates_key_follows_from_it() {
     // The chain is shipped, and the Ledger's signed answer agrees with the Authority's own.
     let acked = ship(&a, &ledger, 0).await;
     assert_eq!(acked, 7);
+    // Another key offered under the enrolled key's id, before the real one has been: the
+    // record names a key by its digest, and this is not that key.
+    let impostor = SigningKey::from_seed(id("gate-1:k1"), &[21; 32]).unwrap();
+    refused(ledger.supply_key(&impostor.public()).await);
+    assert!(ledger
+        .store()
+        .gate_key(&scope(), &id("gate-1:k1"))
+        .await
+        .unwrap()
+        .is_none());
     // Now the key is backed by a witnessed record: it is enrolled for the gate's receipts,
     // for the gate the record names, whoever offers it and however often.
     ledger.supply_key(&g1.public()).await.unwrap();
@@ -228,12 +238,25 @@ async fn the_authoritys_chain_is_witnessed_and_a_gates_key_follows_from_it() {
         Err(LedgerError::Refused("retired_key"))
     ));
     refused(ledger.supply_key(&g1.public()).await);
-    // The Authority's own key is not retired by a record about a gate of the same name.
+    // A gate that an admin names like the Authority itself, and then disables: the record
+    // retires a gate's keys, never those of the Authority's own chain, which goes on.
+    a.register_gate(&id("ana"), &id("authority"), NOW)
+        .await
+        .unwrap();
+    a.disable_gate(&id("ana"), &id("authority"), NOW)
+        .await
+        .unwrap();
+    let acked = ship(&a, &ledger, acked).await;
+    assert_eq!(acked, 15);
     assert!(!ledger
         .store()
         .key_retired(&scope(), &a.admin_public().kid)
         .await
         .unwrap());
+    a.register_gate(&id("ana"), &id("gate-9"), NOW)
+        .await
+        .unwrap();
+    assert_eq!(ship(&a, &ledger, acked).await, 16);
 
     // The Authority's chain is under the same witness as the gates', and an auditor's check
     // of the export covers both, the retired gate's receipts included.
@@ -257,7 +280,7 @@ async fn the_authoritys_chain_is_witnessed_and_a_gates_key_follows_from_it() {
         retention_secs: None,
     });
     assert!(report.ok(), "{:?}", report.findings);
-    assert_eq!(report.receipts_verified, 13 + 2);
+    assert_eq!(report.receipts_verified, 16 + 2);
     // What was witnessed says which key was enrolled for which gate or agent, in order.
     let enrolled: Vec<Id> = a
         .records()
