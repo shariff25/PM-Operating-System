@@ -8,6 +8,7 @@
 //! instruction of 2026-11-26. Nothing here decides anything about a real system yet.
 
 pub mod action;
+pub mod connector;
 pub mod countersign;
 pub mod envelope;
 pub mod error;

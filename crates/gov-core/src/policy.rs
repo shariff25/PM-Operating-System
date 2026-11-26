@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 
 use crate::action::{CanonicalAction, Kind, Reversal};
+use crate::connector::ServerMap;
 use crate::countersign::Class;
 use crate::envelope::document;
 use crate::error::{Error, Result};
@@ -75,6 +76,9 @@ pub struct PolicyBundle {
     pub issued_at: i64,
     pub freshness: FreshnessLimits,
     pub rules: Vec<Rule>,
+    /// The connector map: what each upstream tool is and does.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub connectors: Vec<ServerMap>,
 }
 
 document!(PolicyBundle, "gov.policy.v1");
@@ -150,10 +154,26 @@ impl PolicyBundle {
     /// that lets something through must say which system it is about; rule ids are unique.
     pub fn validate(&self) -> Result<()> {
         self.freshness.validate()?;
+        let mut servers = BTreeSet::new();
+        for server in &self.connectors {
+            if !servers.insert(&server.server) {
+                return Err(Error::Malformed("a server is mapped twice"));
+            }
+            server.validate()?;
+        }
         let mut ids = BTreeSet::new();
         for rule in &self.rules {
             if !ids.insert(&rule.id) {
                 return Err(Error::Malformed("two rules share an id"));
+            }
+            // No rule can name the kind the map gives what it could not classify.
+            if rule
+                .matches
+                .kinds
+                .as_ref()
+                .is_some_and(|k| k.contains(&Kind::Unknown))
+            {
+                return Err(Error::Malformed("a rule names the unknown kind"));
             }
             if rule.then != Effect::Refuse && rule.matches.system.is_none() {
                 return Err(Error::Malformed("a permitting rule names no system"));
@@ -191,6 +211,14 @@ impl PolicyBundle {
         action: &CanonicalAction,
         reversal: Reversal,
     ) -> Evaluation {
+        // A tool the connector map could not classify is refused whatever the rules say.
+        if action.kind == Kind::Unknown {
+            return Evaluation {
+                verdict: Verdict::Refuse,
+                freshness: Freshness::Strict,
+                matched: Vec::new(),
+            };
+        }
         let matched: Vec<&Rule> = self
             .rules
             .iter()
@@ -206,7 +234,7 @@ impl PolicyBundle {
                 .filter_map(|r| r.freshness)
                 .max()
                 .unwrap_or(match action.kind {
-                    Kind::Destructive => Freshness::Strict,
+                    Kind::Destructive | Kind::Unknown => Freshness::Strict,
                     Kind::Read | Kind::Write => Freshness::Standard,
                 });
         let mut needed = BTreeSet::new();

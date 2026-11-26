@@ -17,6 +17,10 @@ pub enum Kind {
     Read,
     Write,
     Destructive,
+    /// The connector map does not know the tool, or the tool has changed since it was mapped.
+    /// It can be recorded where nothing is enforced, so that observe mode shows everything an
+    /// agent does; it is never allowed, and an enforced receipt cannot carry it.
+    Unknown,
 }
 
 /// Whether, and how, an operation can be put back (spec §4.7). From the signed connector map,
