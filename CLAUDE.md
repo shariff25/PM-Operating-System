@@ -178,6 +178,175 @@ follow-up tracking.
   `docs/history/commit-map-2026-11-24.txt` maps old to new. The owner merges pull request #10
   with a normal merge; GitHub shows the activity only once it is on `main`.
 
+- **Pull request #10 merged (owner, 2026-11-24):** asked whether to merge it, the owner said
+  "merge it". The conductor marked it ready and merged it into `main` with a normal merge, on
+  that one instruction. The rule "never merge a pull request" still stands for every other pull
+  request unless the owner says so again. What was merged had not been security reviewed since
+  the gate passed on 2026-11-22; that review, and the gate, are still owed before real data or
+  a pilot.
+
+## Owner's decisions of 2026-11-26
+
+- **Agent Governance, a second product (owner, 2026-11-26):** the owner's proposal "Mandate
+  Architecture" ("An agent never holds a key. It holds a mandate."): an Authority issues signed
+  mandates, a Gate holds the system credentials and decides, a Ledger keeps signed receipts.
+  PM OS stays a separate product and meets it at one seam, the tool server's write point.
+  "lets start building", after the conductor's plan: a thin first release (self-hosted, one
+  tenant, the MCP gate, Jira on the fake first, Entra sign-in, separate `gov-*` crates in this
+  repository with their own database), built in slices G1 to G8. The owner named no other cut,
+  so these are the conductor's recommended defaults. Spec and threat model first
+  (`docs/agent-governance-spec.md`); the reviewer reads it before any code, as the proposal
+  itself requires. The build-before-review instruction of 2026-11-24 does not cover it. Fake
+  data only until the gate passes.
+  Later the same day, with the spec pushed and unread by the reviewer: "PM-OS 11 keep it aside
+  and lets start building G1". Taken as: leave pull request #11 as it is, and build slice G1
+  before the reviewer's read. G1 is marked "built before review" in the spec; it goes to the
+  reviewer with the spec, and this go-ahead covers G1 only. The work is on
+  `claude/agent-governance`, with its own draft pull request.
+  Later again, asked whether G2 should wait for the reviewer or go ahead: "Go". G2 (the
+  Ledger and `gov verify`) is built before review on that word; it covers G2 only. Which
+  session is the security reviewer is still not known to the conductor.
+  Then: "You are the conductor you decided it." The conductor starts and briefs the
+  independent reviewer session itself and decides the order of work; it still never merges a
+  pull request, and the gate is still the reviewer's to pass.
+  First review of Agent Governance, 2026-11-26, at `2d08d15`: **the gate did not pass** (four
+  High: a replayable lease, a wrong claim about signed approvals, `gov verify` trusting the
+  Ledger's prune record, `gov verify` passing with no witness cover). Fixed on
+  `build/gov-review-1`, except the signed-approval design, which is open and unbuilt; the
+  reviewer's re-read is owed. Findings and what was done: the spec's "Security review" section.
+  Second read the same day, at `0175ade`: **the gate passes for the spec and for G1** (the
+  spec on the condition that the signed approval stays unbuilt until its design is reviewed)
+  and **does not pass for G2** (one High, GR-22: `gov verify` still passed a wiped chain).
+  Fixed on `build/gov-review-2`; a third read is owed.
+  Third and fourth reads the same day: **the gate passes for the spec, G1 and G2** at
+  `e7adb6b` (no open High or Critical), with the undo and approval designs in. Open Medium
+  findings are conditions on later slices: GR-10 on G3, GR-8a and GR-29 to GR-32 before G6
+  builds the signed approval, GR-34 to GR-36 before G9. The reviewer session stays open and
+  reads each commit the conductor sends it.
+- **Fifth read (2026-11-26), at `2a5655a`:** the gate still passes for the spec, G1 and G2;
+  one Medium on how the digest's salt travels (settled in the spec, §4.3, before the shim is
+  built) and three smaller findings, fixed on `build/gov-review-4`. The reviewer session
+  cannot send messages without a person's approval, so the conductor now reads its verdicts
+  from its transcript.
+- **Sixth read (2026-11-26), G3a at `5250505`:** the gate passes for G3a; three Medium and
+  five Low findings, all fixed on `build/gov-g3a-fixes` before G3b starts (a contradictory
+  record after a crash; the gate trimming on a checkpoint it was handed; the gate not noticing
+  a stuck or restored Ledger). Owner, the same day, after seeing the build map: "Build".
+- **G3a built (2026-11-26), after the spec passed the gate:** the gate's receipt chain, spool
+  and shipping in observe mode (`crates/gov-gate`), and the Ledger's signed answer to a
+  batch. It holds no credential and blocks nothing. Sent to the reviewer; not yet read. G3b
+  (the MCP front door, the shim, the shared MCP client crate, the Ledger's listener) is next.
+- **Eighth read (2026-11-26), G3b's connector map and forwarder at `b733bee`:** the gate
+  passes **for observe mode only**. Seven Medium findings (GR-61 to GR-67) let a hostile agent
+  or server escape or falsify the record; four would be High once anything is enforced, and
+  the reviewer said this code may not back shadow or enforce mode until they are closed.
+  Fixed on `build/gov-review-8` with GR-68 to GR-73 (GR-72, the gate's clock, waits for G4);
+  19 controls broken on purpose, each caught. The re-read, and the first read of the listener
+  step, are owed.
+- **Ninth read (2026-11-26), at `5c6c4e6`:** the gate passes for the spec, G1, G2, G3a and
+  G3b steps 1 to 3 **in observe mode**; the four findings that barred shadow and enforce mode
+  are closed, with a standing condition that each connector map has its own test and is read
+  by the reviewer. Two new Medium (GR-74, refusals stored without limit; GR-75, nothing
+  required an encrypted connection) and six Low; GR-77 and GR-81 stay open as conditions on
+  the listener's hardening and on G4. The rest are fixed on `build/gov-review-9`; the
+  reviewer's read of those fixes and of the programs is owed.
+- **G3b step 4 built (2026-11-26):** the two programs, `gov-ledger` and `gov-gate`, in a new
+  crate `gov-run` (`build/gov-g3b-programs`). Run as an operator would against a fake MCP
+  server and Postgres, the auditor's check of the export passes, also across a gate restart.
+  Keys are files, refused unless `GOV_DATA_CLASS=fake`; neither program speaks TLS, so both
+  keep to their own machine unless told otherwise; the gate's connector map is an unsigned
+  file until G4. Not yet read by the reviewer. Still to build in G3b: the shim.
+- **The shim (2026-11-26):** its protocol is written in the spec (§5.3.1) and sent to the
+  reviewer before any code; the conductor's choice, since the build-before-review go-aheads
+  covered G1 and G2 only. The shim is the last part of G3b.
+- **Tenth read (2026-11-26), at `09dea18`, and the shim's design at `4fba4cf`:** the gate
+  passes for the spec, G1, G2, G3a and G3b steps 1 to 4 **in observe mode**. One new Medium to
+  fix before G3b is called done (GR-82: the gate slows to a stop when the Ledger is down,
+  because every receipt reads the whole spool under one lock) and five Low. The shim may be
+  built once four Medium points in its design were answered in the text (GR-88 to GR-91: a
+  copied mandate evicting the real session, a call run twice, a signing port a web page can
+  reach, a failed proof with no mark of its own); they are, in §5.3.1. Standing condition
+  from GR-75: any other embedder of the gate's libraries (G7) must make the programs' check
+  on plain HTTP itself.
+- **Eleventh read (2026-11-26), at `b97d8b3`:** the gate passes for the spec, G1, G2, G3a and
+  G3b steps 1 to 4 in observe mode; G3b is done but for the shim, and **the shim may be built
+  from §5.3.1 as written**. Four Low findings (GR-97 to GR-100). Before it, CI had found a
+  real fault in an earlier fix (an agent leaving at the wrong instant left a receipt without
+  its outcome); fixed at `e76ab0f` and read by the reviewer.
+- **Owner, 2026-11-26: "Build the shim".** Given as the reviewer's verdict clearing it came
+  in. The shim is built from §5.3.1, on `build/gov-shim`.
+- **G3b step 5 built (2026-11-26): the shim,** `gov-shim`, and sessions at the gate
+  (`build/gov-shim`). Run as three programs with fake data, an agent's call through the shim
+  is recorded as proven by the agent its mandate names; after a gate restart the next call
+  is forwarded once and recorded as a failed proof. The mandate comes from a test issuer:
+  there is no Authority yet. With it G3b is built; the reviewer's read of the shim is owed.
+- **Twelfth read (2026-11-26), the shim at `543407a`:** **the gate passes for G3b as a
+  whole, in observe mode** (no High or Critical). Five Low findings, three fixed on
+  `build/gov-review-12` (proven can only be built from the sessions check; an overflow in a
+  time check; honest calls failing after a gate restart) and two stated as limits. To keep
+  in mind: a proven receipt says who made a call, not that the call was authorised. Next
+  slice: G4, the Authority.
+- **G4, the Authority (2026-11-26):** how the slice is cut, and eight choices that were open,
+  are written in the spec (§7.6) and sent to the reviewer before any code. Five steps, G4a to
+  G4e. One departure from the spec's wording: admin actions are recorded in a signed document
+  of their own, chained and witnessed like receipts, not as receipts.
+- **Thirteenth read (2026-11-26), the G4 design at `b2a0c74`:** no High or Critical; G4a
+  may be built once two Medium points were answered in §7.6 (how enrolment works; three
+  conditions on admin records), which they are. A third (key roles: a root key that signs
+  only the policy bundle) is settled in the text before G4b. One of the twelfth-read fixes
+  opened a new Medium in the shim (GR-112), fixed on `build/gov-review-13`.
+- **Owner, 2026-11-26: "Build don't stop and push the code as shariff25@gmail.com in
+  github".** From this point commits are authored with that address instead of the account's
+  noreply address (the instruction of 2026-11-24 is changed by this one); earlier commits are
+  not rewritten. The address is then public in the repository's history. "Don't stop" is
+  taken as: keep building the slices in order without waiting to be asked. It is not taken
+  as leave to skip the reviewer's read of a design before code, to merge a pull request, or
+  to use real data.
+- **G4a, first part, built (2026-11-26):** the Authority's registry, enrolment by one-time
+  code and its signed admin records (`crates/gov-authority`, on `build/gov-g4a`), on memory
+  and Postgres stores. A library only: nothing is served, nobody is signed in, and its chain
+  is not yet shipped to the Ledger. Not yet read by the reviewer.
+- **G4a, second part, built (2026-11-26):** the Ledger holds chains of two kinds and reads
+  each key as its own kind only; the Authority ships its admin records there, under the same
+  witness as the gates' receipts; and the Ledger enrols a gate's key only on the Authority's
+  signed word backed by a witnessed record (`build/gov-g4a2`). Still libraries: the three
+  programs do not use the Authority yet. Not yet read by the reviewer.
+- **Fourteenth read (2026-11-26), G4a's first part at `36ded25`:** no High or Critical; it
+  passes as a library nothing serves yet. Two Medium findings in enrolment (one code could
+  enrol two keys at the same moment; the value meant to authenticate the root key did not)
+  and six Low, fixed on `build/gov-g4a2` with the second part, which was changed to follow
+  the reviewer's advice: a gate's key reaches the Ledger through the witnessed record of its
+  enrolment, and a disabled gate's key is retired there.
+- **A test failed once in a full run (2026-11-26):** a PM OS password test, in code this work
+  did not touch, while the disk was 100% full. With the disk cleared it passed five times
+  running. Taken as caused by the disk; not proven.
+- **CI failed once on `36ded25` (2026-11-26):** a gate test looked at the record a fixed 1.2
+  seconds after eight slow calls and found one still open. The test now waits until every call
+  is closed (20 seconds at most). Taken as a timing fault in the test, not in the gate; a
+  deterministic test of the same control passed in that run.
+- **The auditor's check of gate keys built (2026-11-26, GR-84):** `gov verify`, given an
+  Authority's key, believes a gate's key only where a witnessed record of its enrolment bears
+  it out (`build/gov-g4a3`). With it G4a is built as libraries; nothing is served yet. Not
+  yet read by the reviewer, nor is G4a's second part (sent at `21645dd`).
+- **Owner, 2026-11-26: "Once you are done with the current tasks, push the code and merge it
+  into GitHub".** Taken as leave to merge pull request #12 (Agent Governance) into `main`
+  once the work in hand was checked and pushed; it covers that one merge. What is merged has
+  the reviewer's pass through G4a's first part; the second part and the auditor's check are
+  unread. Fake data only still holds.
+- **A message relayed by the reviewer session (2026-11-26):** it reported that the owner typed
+  there "I'm going to sleep you keep building do not ask for permission further - I gave the
+  permission". The conductor could not confirm it and did not treat it as new permission. It
+  keeps building under what the owner said in its own session ("You are the conductor you
+  decided it"): slices in order, each sent to the reviewer, no pull request merged, no real data.
+- **Undo, and who serves the approval page (owner, 2026-11-26):** asked to "build something
+  extraordinary which will help enterprises to adopt the product", the conductor proposed
+  undo: every action through the gate is either one that can be put back or one a person
+  approved. The owner's "Go" covered two things: write undo into the spec as slice G9 and
+  reserve its fields in the formats now (done; undo itself is not built and follows G6); and,
+  for review finding GR-2, the gate serves the approval page for a signed approval, not the
+  Authority (spec §4.4; not built, slice G6). Whether another product already offers undo has
+  not been checked.
+
 ## Where the build stands (2026-11-23)
 
 - Pushed and checked: `claude/web-app` (draft pull request #10).

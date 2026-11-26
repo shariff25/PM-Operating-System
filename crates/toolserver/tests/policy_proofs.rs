@@ -51,12 +51,13 @@ fn record(input: &str, env: &[(&str, &str)]) -> (i32, String, String) {
         cmd.env(k, v);
     }
     let mut child = cmd.spawn().unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input.as_bytes())
-        .unwrap();
+    // The command may refuse and exit before it reads its input; the write then fails with a
+    // broken pipe, which is not what any of these tests is about. Every other error still fails.
+    match child.stdin.take().unwrap().write_all(input.as_bytes()) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(e) => panic!("writing the command's input: {e}"),
+    }
     let out = child.wait_with_output().unwrap();
     (
         out.status.code().unwrap_or(-1),

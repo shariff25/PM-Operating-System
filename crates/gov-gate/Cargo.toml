@@ -1,0 +1,25 @@
+[package]
+name = "gov-gate"
+description = "Agent Governance: the gate. The receipt chain, the spool, shipping to the Ledger, and the MCP forwarder, in observe mode. It holds no credential and blocks nothing yet."
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+base64.workspace = true
+axum.workspace = true
+gov-core = { path = "../gov-core" }
+# "stream": a server's event stream is passed through as it arrives, never held in memory.
+reqwest = { workspace = true, features = ["stream"] }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+gov-ledger = { path = "../gov-ledger" }
+tempfile.workspace = true
+tokio.workspace = true

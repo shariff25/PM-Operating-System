@@ -1,0 +1,23 @@
+[package]
+name = "gov-authority"
+description = "Agent Governance: the Authority. The registry of people, agents and gates, enrolment of their keys, and the signed record of what its admins did."
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+base64.workspace = true
+gov-core = { path = "../gov-core" }
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+gov-ledger = { path = "../gov-ledger" }
+tempfile.workspace = true
+tokio.workspace = true
+uuid.workspace = true
