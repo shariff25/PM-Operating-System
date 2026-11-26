@@ -237,13 +237,16 @@ impl Shim {
         // goes: the gate records it as a client that offered no proof.
         let sent = self.send(headers, body, &signed.unwrap_or_default()).await;
         if let Ok((_, head, _)) = &sent {
-            if head.contains_key("x-gov-reopen") {
+            if let Some(reopen) = head.get("x-gov-reopen") {
                 *session = None;
-                // A gate that has lost the session has most likely restarted, and then it
-                // has lost its record of the tool listings too. The shim forgets its own,
-                // so that both map the next call the same way (as `unknown`, until the
-                // tools are listed again) and its proof holds (review finding GR-103).
-                *self.listed.lock().expect("the tool list's lock") = Listings::default();
+                // The gate says whether it still holds a listing for this MCP session. If it
+                // has lost it, as after a restart, the shim forgets its own, so that both map
+                // the next call the same way (as `unknown`, until the tools are listed
+                // again) and its proof holds. If the session only ran out, the gate still
+                // remembers, and so does the shim (review findings GR-103 and GR-112).
+                if reopen.as_bytes() == b"listing-lost" {
+                    *self.listed.lock().expect("the tool list's lock") = Listings::default();
+                }
             }
         }
         sent
@@ -373,6 +376,10 @@ async fn handle(
         let mut listed = shim.listed.lock().expect("the tool list's lock");
         if let Some(issued) = head.get("mcp-session-id").and_then(|v| v.to_str().ok()) {
             listed.issue(issued);
+        }
+        // As the gate does: a session the server answers under is one it knows (GR-113).
+        if !mcp_session.is_empty() && status.is_success() {
+            listed.issue(&mcp_session);
         }
         if method_name == "tools/list" {
             let content_type = head.get("content-type").and_then(|v| v.to_str().ok());

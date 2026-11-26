@@ -109,6 +109,11 @@ impl Listings {
             .1
     }
 
+    /// Whether a listing is held for `session` at all.
+    pub fn holds(&self, session: &str) -> bool {
+        self.sessions.contains_key(session)
+    }
+
     /// The digest of `tool`'s definition as the server last listed it in `session`.
     pub fn digest(&self, session: &str, tool: &str) -> Option<Digest> {
         self.sessions
@@ -271,6 +276,14 @@ impl<S: Spool + 'static> Forwarder<S> {
         }))
     }
 
+    /// Whether a tool listing is held for an MCP session.
+    pub fn holds_listing(&self, session: &str) -> bool {
+        self.listed
+            .lock()
+            .expect("the tool list's lock")
+            .holds(session)
+    }
+
     /// The gate itself, for trimming, which the gate's owner drives. While this is held,
     /// calls wait.
     pub async fn gate(&self) -> tokio::sync::MutexGuard<'_, Gate<S>> {
@@ -362,11 +375,19 @@ impl<S: Spool + 'static> Forwarder<S> {
             if status.is_redirection() {
                 return Err(());
             }
-            if let Some(session) = head.get("mcp-session-id").and_then(|v| v.to_str().ok()) {
-                self.listed
-                    .lock()
-                    .expect("the tool list's lock")
-                    .issue(session);
+            {
+                let mut listed = self.listed.lock().expect("the tool list's lock");
+                if let Some(session) = head.get("mcp-session-id").and_then(|v| v.to_str().ok()) {
+                    listed.issue(session);
+                }
+                // A server names a session only when it starts. After this gate restarts,
+                // a session that is still running is known by the server answering a
+                // request made under it (review finding GR-113). A server that does not
+                // check session ids vouches for none of them, and is one to fix.
+                let under = headers.get("mcp-session-id").and_then(|v| v.to_str().ok());
+                if let (Some(session), true) = (under, status.is_success()) {
+                    listed.issue(session);
+                }
             }
             // Read with a running cap: a hostile server cannot make the gate hold more
             // than this (GR-67).
@@ -651,6 +672,14 @@ async fn call<S: Spool + 'static>(
     // written and the request being sent, or if the server never answers, the intent is
     // still closed: as failed, or as `unknown` when the gate cannot say what the server did
     // (review finding GR-63). An intent is never written by code the client can abandon.
+    // Whether this gate still holds a listing for the client's MCP session: a shim told to
+    // open a new session forgets its own listing only when the gate has lost its own, as
+    // after a restart, and not when a session merely ran out (review finding GR-112).
+    let holds_listing = f
+        .listed
+        .lock()
+        .expect("the tool list's lock")
+        .holds(&session);
     let task = tokio::spawn(async move {
         let _permit = permit;
         let mut reopen = false;
@@ -766,9 +795,14 @@ async fn call<S: Spool + 'static>(
                 // The call was forwarded, once. This only tells the shim that its session is
                 // gone, so it opens another before the next call and never sends this one
                 // again (review finding GR-89).
+                let listing = if holds_listing {
+                    "listing-held"
+                } else {
+                    "listing-lost"
+                };
                 response
                     .headers_mut()
-                    .insert("x-gov-reopen", HeaderValue::from_static("1"));
+                    .insert("x-gov-reopen", HeaderValue::from_static(listing));
             }
             response
         }
