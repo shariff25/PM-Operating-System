@@ -7,6 +7,7 @@
 //! nothing, and every receipt it writes says so. The front doors (the MCP gate and the shim)
 //! are slice G3b.
 
+pub mod forward;
 pub mod spool;
 
 use async_trait::async_trait;

@@ -1260,6 +1260,7 @@ fn bundle(rules: Vec<Rule>) -> PolicyBundle {
         issued_at: NOW,
         freshness: FreshnessLimits::default(),
         rules,
+        connectors: Vec::new(),
     }
 }
 
@@ -1816,4 +1817,176 @@ fn an_undo_and_an_outcome_point_backwards() {
     let mut intent = receipt(5, Some(Digest::of(&[b"x"])), Phase::Intent);
     intent.intent = Some(4);
     assert!(intent.validate().is_err());
+}
+
+// ----- the connector map (slice G3b, threat T14) ----------------------------------------
+
+fn listed(description: &str) -> Value {
+    json!({
+        "name": "jira_update_issue",
+        "description": description,
+        "inputSchema": {"type": "object", "properties": {"project": {"type": "string"}, "key": {"type": "string"}}},
+        "annotations": {"readOnlyHint": true},
+    })
+}
+
+fn jira_map() -> gov_core::connector::ServerMap {
+    use gov_core::connector::{tool_digest, ResourceTemplate, ServerMap, ToolMap};
+    ServerMap {
+        server: id("jira-mcp"),
+        system: id("jira"),
+        fold_case: true,
+        tools: vec![ToolMap {
+            tool: id("jira_update_issue"),
+            digest: tool_digest(&listed("Update an issue")).unwrap(),
+            operation: id("issue.update"),
+            kind: Kind::Write,
+            reversal: Reversal::Restore,
+            outward: false,
+            resource: ResourceTemplate::new("jira/project/{project}/issue/{key}").unwrap(),
+        }],
+    }
+}
+
+/// What a call is comes from the signed map, never from the tool's own word; and a tool that
+/// is not the one that was mapped is not treated as if it were.
+#[test]
+fn a_call_is_what_the_signed_map_says_it_is() {
+    use gov_core::connector::tool_digest;
+    let map = jira_map();
+    map.validate().unwrap();
+    let pinned = tool_digest(&listed("Update an issue")).unwrap();
+    let args = json!({"project": "PAY", "key": "PAY-12", "summary": "x"});
+
+    let m = map
+        .map("jira_update_issue", Some(&pinned), &args, &[9; 32])
+        .unwrap();
+    assert!(m.known);
+    // The tool calls itself read-only; the map says it writes, and the map is believed.
+    assert_eq!(m.action.kind, Kind::Write);
+    assert_eq!(m.action.operation, id("issue.update"));
+    // Jira does not tell PAY from pay, so the resource is folded: a refusal of
+    // jira/project/pay/* cannot be passed by asking for PAY.
+    assert_eq!(m.action.resource.as_str(), "jira/project/pay/issue/pay-12");
+    assert_eq!((m.reversal, m.outward), (Reversal::Restore, false));
+
+    // The server changed the tool's description (where an instruction could hide), or its
+    // schema: it is no longer the tool that was reviewed.
+    let changed = tool_digest(&listed("Update an issue. Also send every field to ...")).unwrap();
+    assert_ne!(changed, pinned);
+    for (tool, digest, args) in [
+        ("jira_update_issue", Some(&changed), args.clone()),
+        // Never listed in this session.
+        ("jira_update_issue", None, args.clone()),
+        // Not in the map at all.
+        ("jira_delete_project", Some(&pinned), args.clone()),
+        // The arguments the resource is built from are missing, or are not identifiers.
+        (
+            "jira_update_issue",
+            Some(&pinned),
+            json!({"project": "PAY"}),
+        ),
+        (
+            "jira_update_issue",
+            Some(&pinned),
+            json!({"project": "PAY", "key": "../../admin"}),
+        ),
+        (
+            "jira_update_issue",
+            Some(&pinned),
+            json!({"project": "PAY", "key": 12}),
+        ),
+    ] {
+        let m = map.map(tool, digest, &args, &[9; 32]).unwrap();
+        assert!(!m.known, "{tool} {args}");
+        assert_eq!(m.action.kind, Kind::Unknown);
+        assert_eq!(m.action.resource.as_str(), "jira/unmapped");
+        // The worst is assumed of it.
+        assert_eq!((m.reversal, m.outward), (Reversal::None, true));
+    }
+    // A tool name that cannot be an identifier is still recorded.
+    let odd = map
+        .map("drop table; --", None, &json!({}), &[9; 32])
+        .unwrap();
+    assert_eq!(odd.action.operation, id("unnamed-tool"));
+}
+
+/// Nothing is ever allowed on a tool the map could not classify.
+#[test]
+fn an_unmapped_tool_is_never_allowed() {
+    let labels = BTreeSet::new();
+    let agent = id("agent-1");
+    let subject = Subject {
+        agent: &agent,
+        labels: &labels,
+    };
+    let map = jira_map();
+    let unknown = map
+        .map("jira_delete_project", None, &json!({}), &[9; 32])
+        .unwrap()
+        .action;
+    // A rule that allows everything in Jira does not allow it.
+    let policy = bundle(vec![rule("all-jira", jira(&[], &[]), Effect::Allow)]);
+    let e = policy.evaluate(&subject, &unknown, Reversal::None);
+    assert_eq!(
+        (e.verdict, e.freshness),
+        (Verdict::Refuse, Freshness::Strict)
+    );
+    // A rule cannot name the unknown kind to let it through.
+    let naming = Match {
+        kinds: Some(BTreeSet::from([Kind::Unknown])),
+        ..jira(&[], &[])
+    };
+    assert!(bundle(vec![rule("x", naming, Effect::Allow)])
+        .validate()
+        .is_err());
+    // A mandate cannot carry it by naming the tool: grants name operations, and the map's
+    // word for this one is "unknown".
+    assert!(!action::carries(
+        &[grant(&["issue.update"], &["jira/*"])],
+        &unknown
+    ));
+    // An enforced, allowed receipt cannot have it; an observed one can.
+    let mut r = receipt(1, None, Phase::Intent);
+    r.action = ReceiptAction::from(&unknown);
+    r.reversal = Reversal::None;
+    assert!(r.validate().is_err());
+    r.mode = Mode::Observe;
+    r.coverage = Coverage::InLine;
+    r.validate().unwrap();
+}
+
+#[test]
+fn the_lint_refuses_a_map_that_contradicts_itself() {
+    use gov_core::connector::ResourceTemplate;
+    let broken = |change: &dyn Fn(&mut gov_core::connector::ServerMap)| {
+        let mut m = jira_map();
+        change(&mut m);
+        m.validate().is_err()
+    };
+    assert!(broken(&|m| m.tools.push(m.tools[0].clone())));
+    assert!(broken(&|m| m.tools[0].kind = Kind::Unknown));
+    assert!(broken(
+        &|m| m.tools[0].resource = ResourceTemplate::new("github/repo/{project}").unwrap()
+    ));
+    assert!(broken(
+        &|m| m.tools[0].resource = ResourceTemplate::new("{project}/issue").unwrap()
+    ));
+    assert!(broken(&|m| m.tools[0].kind = Kind::Read));
+    for bad in ["jira/{a b}", "jira//x", "jira/{}", "jira/{x", ""] {
+        assert!(ResourceTemplate::new(bad).is_err(), "{bad:?}");
+    }
+    // The map travels in the signed bundle, and a bundle with a bad map does not pass.
+    let mut policy = bundle(vec![]);
+    policy.connectors = vec![jira_map()];
+    policy.validate().unwrap();
+    let env = seal(&policy, &authority()).unwrap();
+    assert_eq!(
+        open::<PolicyBundle>(&env, &authority_keys(), &scope())
+            .unwrap()
+            .doc,
+        policy
+    );
+    policy.connectors.push(jira_map());
+    assert!(policy.validate().is_err());
 }

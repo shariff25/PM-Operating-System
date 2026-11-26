@@ -171,6 +171,47 @@ Nothing of G3b is built.
   (a new value, valid only in observe and shadow receipts and refused in enforce), and the
   server as its resource. Policy drafted from such receipts must be completed by a person.
 
+**G3b step 1 built (2026-11-26): the connector map,** on `build/gov-g3b-map`, in `gov-core`
+(`connector.rs`). Not yet read by the reviewer.
+
+- Per upstream tool, in the signed bundle: the pinned digest of its definition, its
+  operation, kind, reversal class, the `outward` flag, and how its resource is built from the
+  arguments. Per server: its system, and whether identifiers fold case.
+- A call is what the map says it is, never what the tool says of itself.
+- Settled as proposed: a tool the map does not know, a tool whose definition changed, a tool
+  never listed in the session, and arguments the resource cannot be built from all give an
+  action of kind `unknown`. It can be recorded in observe and shadow mode, so the customer
+  sees everything its agents do. It is refused by policy whatever the rules say, no rule may
+  name it, and an enforced receipt cannot carry it as allowed. The worst is assumed of it:
+  not reversible, and outward.
+- Three tests; six controls broken on purpose, each caught.
+
+**G3b step 2 built (2026-11-26): the MCP forwarder in observe mode,** on
+`build/gov-g3b-forward`, in `gov-gate` (`forward.rs`). Not yet read by the reviewer.
+
+- The gate is an HTTP endpoint that stands between an agent's MCP client and one upstream MCP
+  server. Every message passes through unchanged, in both directions, including a server's
+  event stream. Around each `tools/call` it writes an intent receipt before the call goes and
+  an outcome after, with the action taken from the connector map.
+- It remembers the digest of each tool as the server last listed it, so a tool that was never
+  listed, or has changed, is recorded as `unknown`.
+- The agent's own credential passes through in the request's headers and is forwarded only:
+  the test looks for it, for argument values and for the server's reply on the gate's disk,
+  and finds none.
+- **It blocks nothing.** When the spool is full, or a receipt cannot be written, the call
+  still goes through and is counted as "not recorded"; the counters (recorded, not recorded,
+  unmapped) are there for an operator's screen (G8) and for health checks.
+- A batched request is refused: a batch could carry calls past the receipts, and the
+  protocol no longer has batches.
+- An agent's identity is what it says in the `x-gov-agent` header, recorded as **claimed**.
+  That header is not forwarded.
+- 3 tests against a small fake Jira MCP server written for them (PM OS's own fake is not
+  used: no Governance crate depends on a PM OS crate), ending in `gov verify`'s check passing
+  on the chain. Seven controls broken on purpose, each caught.
+- Not in this step: any listener hardening (timeouts, limits on open streams, TLS); the shim
+  and proven identity; the Ledger's network listener; a `gov-gate` program to run. The
+  forwarder is a library with a router.
+
 ## Security review of 2026-11-26 (first read; the gate did not pass)
 
 An independent reviewer session read this spec, G1 and G2 at `2d08d15`, read-only, and ran

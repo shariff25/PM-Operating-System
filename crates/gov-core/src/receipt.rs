@@ -297,6 +297,15 @@ impl Receipt {
             }
             (_, None) => {}
         }
+        // What the map could not classify is never something that was enforced and allowed.
+        if self.action.kind == Kind::Unknown
+            && self.mode == Mode::Enforce
+            && self.decision.kind == DecisionKind::Allow
+        {
+            return Err(Error::Malformed(
+                "an unmapped tool is never allowed in enforce mode",
+            ));
+        }
         // Custody means the gate holds the only credential, which is true only when it
         // enforces (spec §5.2; review finding GR-54).
         if self.coverage == Coverage::Custody && self.mode != Mode::Enforce {

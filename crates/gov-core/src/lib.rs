@@ -8,6 +8,7 @@
 //! instruction of 2026-11-26. Nothing here decides anything about a real system yet.
 
 pub mod action;
+pub mod connector;
 pub mod countersign;
 pub mod envelope;
 pub mod error;
@@ -24,4 +25,4 @@ pub mod revocation;
 pub use envelope::{open, seal, Document, Envelope, Opened, VERSION};
 pub use error::{Error, Result};
 pub use ids::{Digest, Id, ResourcePath, ResourcePattern, Scope};
-pub use keys::{random_id, KeySet, PublicKey, SigningKey};
+pub use keys::{random_id, random_salt, KeySet, PublicKey, SigningKey};
