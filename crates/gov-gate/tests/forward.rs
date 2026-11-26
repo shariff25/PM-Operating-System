@@ -718,21 +718,58 @@ async fn a_call_is_closed_whatever_becomes_of_the_client_or_the_server() {
     s.list().await;
 
     // The client gives up after 50 ms; the server answers after 400.
-    let impatient = reqwest::Client::builder()
-        .timeout(Duration::from_millis(50))
-        .build()
-        .unwrap();
-    let gone = impatient
-        .post(&s.gate_url)
-        .header("authorization", SECRET)
-        .body(update(2, "PAY-SLOW"))
-        .send()
-        .await;
-    assert!(gone.is_err());
+    let impatient = |ms: u64| {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(ms))
+            .build()
+            .unwrap();
+        let url = s.gate_url.clone();
+        async move {
+            client
+                .post(url)
+                .header("authorization", SECRET)
+                .body(update(2, "PAY-SLOW"))
+                .send()
+                .await
+        }
+    };
+    assert!(impatient(50).await.is_err());
     tokio::time::sleep(Duration::from_millis(900)).await;
     let r = s.receipts();
     assert_eq!(r.len(), 2);
     assert_eq!(r[1].outcome.as_ref().unwrap().status, OutcomeStatus::Ok);
+
+    // Clients that give up at every moment of a call, some of them while the intent is
+    // being written: whatever each reached, no intent is left without its outcome.
+    let s2 = stack(1000).await;
+    s2.list().await;
+    for ms in [1, 2, 3, 5, 8, 12, 20, 35] {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(ms))
+            .build()
+            .unwrap();
+        let _ = client
+            .post(&s2.gate_url)
+            .header("authorization", SECRET)
+            .body(update(2, "PAY-SLOW"))
+            .send()
+            .await;
+    }
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let r2 = s2.receipts();
+    assert!(!r2.is_empty() && r2.len() % 2 == 0, "{} receipts", r2.len());
+    let intents: Vec<u64> = r2
+        .iter()
+        .filter(|x| x.phase == Phase::Intent)
+        .map(|x| x.seq)
+        .collect();
+    for intent in &intents {
+        assert!(
+            r2.iter()
+                .any(|x| x.phase == Phase::Outcome && x.intent == Some(*intent)),
+            "intent {intent} was left open"
+        );
+    }
 
     // The server never answers: the gate gives up, tells the agent so, and records that it
     // does not know what the server did.
@@ -944,4 +981,115 @@ async fn made_up_sessions_push_nobody_out_and_a_full_table_forgets_only_the_olde
     // "first" was the oldest and is forgotten; "second", issued just after it, is not.
     assert_eq!(kind_in("first", 4).await, Kind::Unknown);
     assert_eq!(kind_in("second", 5).await, Kind::Write);
+}
+
+/// A spool that takes its time to write a receipt, as a busy disk does.
+struct SlowSpool(FileSpool);
+impl Spool for SlowSpool {
+    fn state(&self) -> Result<gov_gate::SpoolState, gov_gate::SpoolError> {
+        self.0.state()
+    }
+    fn append(
+        &mut self,
+        receipt: &gov_gate::Spooled,
+        state: &gov_gate::SpoolState,
+    ) -> Result<(), gov_gate::SpoolError> {
+        std::thread::sleep(Duration::from_millis(300));
+        self.0.append(receipt, state)
+    }
+    fn close_intent(&mut self, seq: u64) -> Result<(), gov_gate::SpoolError> {
+        self.0.close_intent(seq)
+    }
+    fn set_state(&mut self, state: &gov_gate::SpoolState) -> Result<(), gov_gate::SpoolError> {
+        self.0.set_state(state)
+    }
+    fn held(&self) -> Result<Vec<gov_gate::Spooled>, gov_gate::SpoolError> {
+        self.0.held()
+    }
+    fn get(&self, seq: u64) -> Result<Option<gov_gate::Spooled>, gov_gate::SpoolError> {
+        self.0.get(seq)
+    }
+    fn remove(&mut self, seq: u64) -> Result<(), gov_gate::SpoolError> {
+        self.0.remove(seq)
+    }
+    fn trim(&mut self, seq: u64) -> Result<(), gov_gate::SpoolError> {
+        self.0.trim(seq)
+    }
+    fn keep_checkpoint(&mut self, bytes: &[u8]) -> Result<(), gov_gate::SpoolError> {
+        self.0.keep_checkpoint(bytes)
+    }
+    fn kept_checkpoint(&self) -> Result<Option<Vec<u8>>, gov_gate::SpoolError> {
+        self.0.kept_checkpoint()
+    }
+    fn keep_alarm(&mut self, seq: u64, bytes: &[u8]) -> Result<(), gov_gate::SpoolError> {
+        self.0.keep_alarm(seq, bytes)
+    }
+    fn kept_alarms(&self) -> Result<Vec<(u64, Vec<u8>)>, gov_gate::SpoolError> {
+        self.0.kept_alarms()
+    }
+}
+
+/// The client goes away while the intent receipt is still being written, before the call has
+/// been sent at all. The call still goes, and the intent still gets its outcome: an intent
+/// is never written by code the client can abandon (review finding GR-63; found by CI on
+/// 2026-11-26, when a slower disk opened this window).
+#[tokio::test]
+async fn a_client_that_leaves_while_the_intent_is_written_leaves_no_open_intent() {
+    let dir = tempfile::tempdir().unwrap();
+    let seen = Arc::new(Upstream::default());
+    let upstream = serve(
+        Router::new()
+            .route("/mcp", any(fake_jira))
+            .with_state(seen.clone()),
+    )
+    .await;
+    let config = GateConfig {
+        scope: scope(),
+        gate: id("gate-1"),
+        ledger_keys: KeySet::new([ledger_key().public()]),
+        spool_limit: 100,
+        batch: 100,
+    };
+    let spool = SlowSpool(FileSpool::open(dir.path().join("spool")).unwrap());
+    let gate = Gate::open(config, gate_key(), spool, 0).unwrap();
+    let forwarder = Forwarder::new(
+        gate,
+        ForwarderConfig {
+            upstream: format!("http://{upstream}/mcp"),
+            map: jira_map(),
+            call_timeout: Duration::from_secs(2),
+        },
+    )
+    .unwrap();
+    let addr = serve(forwarder.router()).await;
+
+    // The intent takes 300 ms to write; the client is gone after 50.
+    let impatient = reqwest::Client::builder()
+        .timeout(Duration::from_millis(50))
+        .build()
+        .unwrap();
+    let gone = impatient
+        .post(format!("http://{addr}/mcp"))
+        .header("authorization", SECRET)
+        .body(update(2, "PAY-1"))
+        .send()
+        .await;
+    assert!(gone.is_err());
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // The server was called, and both receipts are there.
+    assert_eq!(seen.hits.load(Ordering::SeqCst), 1);
+    let keys = KeySet::new([gate_key().public()]);
+    let receipts: Vec<Receipt> = FileSpool::open(dir.path().join("spool"))
+        .unwrap()
+        .held()
+        .unwrap()
+        .iter()
+        .map(|r| open::<Receipt>(&r.envelope, &keys, &scope()).unwrap().doc)
+        .collect();
+    assert_eq!(receipts.len(), 2, "the intent was left open");
+    assert_eq!(
+        (receipts[0].phase, receipts[1].phase, receipts[1].intent),
+        (Phase::Intent, Phase::Outcome, Some(1))
+    );
 }

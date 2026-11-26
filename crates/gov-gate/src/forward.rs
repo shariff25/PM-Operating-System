@@ -497,7 +497,8 @@ async fn call<S: Spool + 'static>(
     let tool = params
         .and_then(|p| p.get("name"))
         .and_then(Value::as_str)
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .to_string();
     let args = params
         .and_then(|p| p.get("arguments"))
         .cloned()
@@ -513,48 +514,49 @@ async fn call<S: Spool + 'static>(
         .expect("the tool list's lock")
         .sessions
         .get(&session)
-        .and_then(|(_, tools)| tools.get(tool))
+        .and_then(|(_, tools)| tools.get(&tool))
         .cloned();
-    // With no shim the gate draws the salt itself, fresh for this call (spec §4.3). Mapping
-    // never fails, so there is always something to record (GR-61).
-    let begun = match gov_core::random_salt() {
-        Ok(salt) => {
-            let mapped = f.config.map.map(tool, listed.as_ref(), &args, &salt);
-            if !mapped.known {
-                f.counters.unmapped.fetch_add(1, Ordering::Relaxed);
+    // From the intent receipt to the outcome receipt, the call runs in a task of its own.
+    // If the client goes away at any point after this line, even between the intent being
+    // written and the request being sent, or if the server never answers, the intent is
+    // still closed: as failed, or as `unknown` when the gate cannot say what the server did
+    // (review finding GR-63). An intent is never written by code the client can abandon.
+    let task = tokio::spawn(async move {
+        // With no shim the gate draws the salt itself, fresh for this call (spec §4.3). Mapping
+        // never fails, so there is always something to record (GR-61).
+        let begun = match gov_core::random_salt() {
+            Ok(salt) => {
+                let mapped = f.config.map.map(&tool, listed.as_ref(), &args, &salt);
+                if !mapped.known {
+                    f.counters.unmapped.fetch_add(1, Ordering::Relaxed);
+                }
+                let now = (f.clock)();
+                f.with_gate(move |gate| {
+                    let observed = Observed {
+                        agent: &agent,
+                        // A stock client only says who it is. Proven comes with the shim.
+                        proof: Proof::Claimed,
+                        action: &mapped.action,
+                        reversal: mapped.reversal,
+                        // The agent holds its own credential; the gate is only in the path.
+                        coverage: Coverage::InLine,
+                    };
+                    gate.begin(&observed, now)
+                })
+                .await
             }
-            let now = (f.clock)();
-            f.with_gate(move |gate| {
-                let observed = Observed {
-                    agent: &agent,
-                    // A stock client only says who it is. Proven comes with the shim.
-                    proof: Proof::Claimed,
-                    action: &mapped.action,
-                    reversal: mapped.reversal,
-                    // The agent holds its own credential; the gate is only in the path.
-                    coverage: Coverage::InLine,
-                };
-                gate.begin(&observed, now)
-            })
-            .await
-        }
-        Err(e) => Err(GateError::from(e)),
-    };
-    let intent = match begun {
-        Ok(seq) => Some(seq),
-        // Observe mode blocks nothing. The call goes through and is counted as not recorded,
-        // where an operator can see it.
-        Err(_) => {
-            f.not_recorded().await;
-            None
-        }
-    };
-    // The exchange and the outcome receipt run in a task of their own. If the client goes
-    // away, or the server never answers, the intent is still closed: as failed, or as
-    // `unknown` when the gate cannot say what the server did (review finding GR-63).
-    let task = tokio::spawn({
-        let f = f.clone();
-        async move {
+            Err(e) => Err(GateError::from(e)),
+        };
+        let intent = match begun {
+            Ok(seq) => Some(seq),
+            // Observe mode blocks nothing. The call goes through and is counted as not recorded,
+            // where an operator can see it.
+            Err(_) => {
+                f.not_recorded().await;
+                None
+            }
+        };
+        {
             let result = f.exchange(&headers, body).await;
             let status = match &result {
                 Err(()) => OutcomeStatus::Unknown,
