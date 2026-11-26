@@ -286,6 +286,10 @@ follow-up tracking.
   time check; honest calls failing after a gate restart) and two stated as limits. To keep
   in mind: a proven receipt says who made a call, not that the call was authorised. Next
   slice: G4, the Authority.
+- **G4, the Authority (2026-11-26):** how the slice is cut, and eight choices that were open,
+  are written in the spec (§7.6) and sent to the reviewer before any code. Five steps, G4a to
+  G4e. One departure from the spec's wording: admin actions are recorded in a signed document
+  of their own, chained and witnessed like receipts, not as receipts.
 - **A message relayed by the reviewer session (2026-11-26):** it reported that the owner typed
   there "I'm going to sleep you keep building do not ask for permission further - I gave the
   permission". The conductor could not confirm it and did not treat it as new permission. It

@@ -1286,6 +1286,66 @@ log, GitHub's audit log) and reports any write with no matching outcome receipt,
 `outcome: unknown` it can now resolve. Until it exists the product states that an unrecorded
 write by a compromised gate would be found only by hand.
 
+### 7.6 How G4 is built (design of 2026-11-26; not built, not yet read by the reviewer)
+
+Written before code, for the reviewer, as §5.3.1 was for the shim. §7.1 to §7.5 say what the
+Authority is; this says how the slice is cut, what each step replaces, and the choices that
+were open.
+
+**What G4 replaces.** Three things in G3b are stand-ins, each stated as a limit: the gate's
+connector map and the mandate issuers' keys are unsigned files; mandates come from a test
+issuer; nothing is revoked and the gate's time is its own machine's. G4 ends each of them.
+
+**Steps, each sent to the reviewer.**
+
+| Step | Built | Ends which stand-in |
+|---|---|---|
+| G4a | `gov-authority` as a library with a store (memory and Postgres, in Governance's own database): the registry of agents and gates, enrolment by one-time code, and the Authority's own record of what its admins did | Keys reach the Ledger and the gates by enrolment, not by a file an operator copies |
+| G4b | The policy bundle: `gov policy check` and `gov policy sign`, the bundle served to gates, and the gate and shim loading their connector map and the issuers' keys from it | The unsigned map and key files |
+| G4c | Mandates: issued from a template to an enrolled agent by a person, delegated by a parent agent, listed and revoked; the numbered revocation feed | The test issuer |
+| G4d | The lease: renewed by the gate with a fresh nonce, carrying the Authority's time, the bundle's version and the revocation number; the gate's time taken from it; a session refused or closed for a revoked agent, mandate or key; key rotation for a gate | The gate's own clock (GR-72); no revocation; GR-59 |
+| G4e | People: sign-in against Entra, Governance's own roles and users table, the admin interface over HTTP, and the `gov-authority` program | Admin actions made by whoever can run a command |
+
+**Choices made here, for the reviewer to confirm or refuse.**
+
+1. **Admin records are their own document, not receipts** (a departure from §7.4's wording).
+   A receipt is about an agent's action on a system: its rules (an action's digest, a
+   reversal class, a mode, a proof) do not fit "Ana enrolled the agent `refund-bot`". Bending
+   them would weaken the receipt's own rules. So: a signed document `gov.admin.v1` (who, what,
+   on what, when, the policy version, and for a change the digest of the new value), numbered
+   and chained like receipts, signed by the Authority's own enrolled key, shipped to the
+   Ledger into the Authority's chain, listed in the same checkpoints and checked by the same
+   `gov verify`. §7.4's point stands: every admin action is covered by the witness.
+2. **The Authority's keys.** One key signs mandates, bundles, leases and the revocation feed
+   (the trust root a gate is configured with, as a public key); a second, enrolled at the
+   Ledger like a gate's, signs its admin records. Both are files under the rule of §9 until a
+   key service exists. Losing the first is losing the installation; the spec says so, and
+   rotation of it is designed in G4d with GR-59, not assumed.
+3. **Enrolment code.** 128 random bits, shown once, stored only as a digest, bound to one
+   named agent or gate and to the admin who made it, good for 15 minutes and for one use. The
+   agent's or gate's request to enrol is signed with the key being enrolled, over the code's
+   digest and the Authority's name, so the code cannot be used for another key by someone
+   who sees the request. A key anyone could forge for is refused (GR-6), as is a key or key
+   id already enrolled.
+4. **An agent has one owner, a person.** Offboarding the person suspends their agents and
+   revokes those agents' mandates in one admin action with one record each.
+5. **Revocation in observe mode.** The gate still blocks nothing. A call under a session
+   whose agent, mandate or key is revoked is forwarded and recorded as a failed proof with a
+   reason of its own (`revoked`), and the session is closed. Enforce mode (G6) refuses it.
+6. **GR-81.** The Authority lints a mandate's grants for a folded system at issue, and the
+   chain check refuses an upper-case grant for one.
+7. **GR-84.** The trusted-keys record an auditor gives `gov verify` is written by the
+   Authority from its registry at enrolment time, as admin records the witness covers, not by
+   the Ledger being audited.
+8. **Sign-in comes last (G4e).** Until then the admin interface is a library and the `gov`
+   command, usable only by someone on the Authority's machine. Whether `crates/entra` can be
+   depended on without PM OS's roles (§7.2) is checked first in G4e; if it cannot, the
+   verifier is written again in Governance, as the tool digest was.
+
+**Not in G4:** countersignatures and approvals (G6), shadow decisions (G5), the console's
+screens (G8). A mandate's grants are still not checked against an action until G5, so a
+proven receipt is still not an authorised one.
+
 ## 8. The seam in PM OS
 
 ### 8.1 Where
