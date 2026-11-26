@@ -686,3 +686,47 @@ async fn an_action_whose_record_cannot_be_kept_changes_nothing() {
         Status::Active
     );
 }
+
+async fn stale_head<S: Store>(store: S) {
+    // A store takes a record only when it is the next one, and applies nothing otherwise.
+    let a = installed(store).await;
+    let records = a.store().records_after(&scope(), 0, 100).await.unwrap();
+    let head = records.last().unwrap().clone();
+    let gate = |name: &str| {
+        Effect::PutGate(Gate {
+            id: id(name),
+            status: Status::Active,
+        })
+    };
+    // The same number again (a writer that read an old head), and a number that skips one.
+    for (seq, name) in [(head.seq, "gate-stale"), (head.seq + 2, "gate-gap")] {
+        let record = StoredRecord {
+            seq,
+            ..head.clone()
+        };
+        let refused = a.store().commit(&scope(), &record, &[gate(name)]).await;
+        assert!(matches!(refused, Err(StoreError::HeadMoved)), "{name}");
+        assert!(a.store().gate(&scope(), &id(name)).await.unwrap().is_none());
+    }
+    assert_eq!(
+        a.store().records_after(&scope(), 0, 100).await.unwrap(),
+        records
+    );
+    // Another tenant's chain is its own: it starts at 1 whatever this one holds.
+    let other = Scope::new("other", "prod").unwrap();
+    assert!(a.store().head(&other).await.unwrap().is_none());
+    assert!(a
+        .store()
+        .records_after(&other, 0, 100)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(a
+        .store()
+        .person(&other, &id("ana"))
+        .await
+        .unwrap()
+        .is_none());
+    assert!(!a.store().any_person(&other).await.unwrap());
+}
+both_stores!(a_record_that_is_not_the_next_one_is_not_stored, stale_head);
