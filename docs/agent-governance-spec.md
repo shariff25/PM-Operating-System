@@ -232,7 +232,8 @@ Nothing of G3b is built.
   session; the map cannot fail and derives a Jira project from the issue key; shipping no
   longer holds the gate. `gov-core` has 45 attack tests and the forwarder 7; 19 controls
   broken on purpose, each caught. Not yet re-read by the reviewer.
-- Still not built after this step: the shim and proven identity; TLS.
+- Still not built after this step: the shim and proven identity (its protocol is designed in
+  §5.3.1 and waits for the reviewer's read); TLS.
 
 **G3b step 4 built (2026-11-26): the two programs,** on `build/gov-g3b-programs`, in a new
 crate `gov-run`. Built after the eighth read's fixes; not yet read by the reviewer.
@@ -978,6 +979,74 @@ Every interface that reports a system's state says "not enforced" for the first 
   claimed`.
 - **The library.** The same decision code as a Rust crate with no network listener, for PM OS's
   tool server (§8).
+
+#### 5.3.1 The shim's protocol (design of 2026-11-26; not built, not yet read by the reviewer)
+
+Written before code, for the reviewer. It covers observe mode; what enforce mode adds is
+marked.
+
+**What the shim is.** A program the agent's runtime starts beside the agent. To the agent it
+is the MCP server (HTTP on this machine only, on a port of its own). It holds two files: the
+agent's private key, and the agent's mandate chain. It forwards every message to the gate
+and adds a proof to each tool call. The agent's own code and credential do not change.
+
+**Opening a session.** The shim posts its mandate chain to the gate (`POST /v1/sessions`).
+The gate verifies the chain (signatures, tenant and environment, expiry, each link inside
+its parent) against the issuer keys it trusts, makes a session id and a random challenge,
+binds the session to the one agent key the leaf mandate names, and answers with both. One
+session carries one mandate. Sessions live in the gate's memory: after a restart the gate
+answers "no such session" and the shim opens another and sends the call again. A session
+ends after an idle time and after a fixed number of calls; the number of open sessions per
+agent key is capped, and when it is reached the oldest is closed.
+
+Opening a session proves nothing about who opened it: a mandate chain is not a secret.
+Possession of the key is proven on every call, never before.
+
+**A tool call.** The shim:
+
+1. draws a fresh 32-byte salt (§4.3);
+2. maps the call to a canonical action with **the same connector map the gate uses** and the
+   tool's definition as the server last listed it in this MCP session (the shim sees the
+   listing pass through it, as the gate does);
+3. signs a request proof (`gov.request.v1`) over the gate, the session, the challenge, the
+   next counter, the mandate's id and that action's digest;
+4. sends the call to the gate with three headers: `x-gov-session`, `x-gov-proof` (the signed
+   proof) and `x-gov-salt`.
+
+The gate maps the call itself, from its own map, its own record of the listing, the
+arguments it parsed and the salt it was sent, and gives the result to `Session::accept`.
+**A receipt says `proven` only when `Session::accept` returned success for the action the
+gate itself computed**; it then names the mandate chain's ids and takes the agent's id from
+the mandate, never from a header. The gate refuses a salt it has seen in that session.
+None of the `x-gov-*` headers is sent upstream.
+
+**When the proof does not hold** (a bad signature, a counter that did not rise, a repeated
+salt, a digest that differs because the shim's map or listing is not the gate's):
+- in observe mode the call still goes through, because observe mode blocks nothing. Its
+  receipt says `claimed`, carries the reason code, and names the agent the session's mandate
+  names, marked as not proven. A counter of failed proofs is shown with the others.
+- in enforce mode (G6) the call is refused at step 1 of §5.1.
+
+**Where the map comes from.** Until the Authority exists (G4) the shim reads the connector
+map from a file, as the gate does. From G4 both read it from the signed policy bundle. If
+the two differ the proof fails for the tools that differ, and the receipts say so.
+
+**Considered and not chosen:** the gate telling the shim what action to sign (one more round
+trip per call, and the shim would sign whatever a gate, or something answering as one, told
+it); and a proof over the tool's name and arguments instead of the canonical action (it
+would change the request proof reviewed in G1, and an approval binds the action's digest).
+
+**Stated limits.**
+- The shim signs whatever is sent to its port. Anything on the machine that can reach that
+  port acts as the agent. Keeping the port to the agent's runtime alone is the integration's
+  job (a socket only the runtime's user can open, in a later step), and each integration's
+  spec says how (T13).
+- The key and the mandate are files, under the rule of §9: fake data only.
+- Until G4 the mandate is issued by a test issuer whose public key the gate is given in a
+  file. "Proven" then means "holds the key a mandate from that test issuer names", no more.
+- Revocation and the lease are not checked in observe mode before G4: there is nothing to
+  check them against.
+- A stock client with no shim still works, in observe mode only, and is recorded as claimed.
 
 ### 5.4 Custody
 
