@@ -61,6 +61,10 @@ pub enum Error {
     WeakKey,
     #[error("the approver is the person who issued the mandate")]
     ApproverIsIssuer,
+    #[error("the policy bundle is older than the one held")]
+    BundleOlder,
+    #[error("another policy bundle is held under the same number")]
+    BundleForked,
 }
 
 impl Error {
@@ -96,6 +100,8 @@ impl Error {
             Error::LeaseReplayed => "lease_replayed",
             Error::WeakKey => "weak_key",
             Error::ApproverIsIssuer => "approver_is_issuer",
+            Error::BundleOlder => "bundle_older",
+            Error::BundleForked => "bundle_forked",
         }
     }
 }
