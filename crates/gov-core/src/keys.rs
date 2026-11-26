@@ -10,6 +10,15 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::ids::Id;
 
+/// A fresh random identifier, from the system's random source: `prefix-` and 32 hex digits.
+/// For nonces and challenges.
+pub fn random_id(prefix: &str) -> Result<Id> {
+    let mut bytes = [0u8; 16];
+    aws_lc_rs::rand::fill(&mut bytes).map_err(|_| Error::Malformed("random source"))?;
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    Id::new(&format!("{prefix}-{hex}"))
+}
+
 /// A private signing key. It has no `Debug`, no `Serialize` and no way to read the secret out.
 pub struct SigningKey {
     kid: Id,

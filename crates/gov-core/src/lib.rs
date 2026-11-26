@@ -24,4 +24,4 @@ pub mod revocation;
 pub use envelope::{open, seal, Document, Envelope, Opened, VERSION};
 pub use error::{Error, Result};
 pub use ids::{Digest, Id, ResourcePath, ResourcePattern, Scope};
-pub use keys::{KeySet, PublicKey, SigningKey};
+pub use keys::{random_id, KeySet, PublicKey, SigningKey};

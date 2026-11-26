@@ -2,9 +2,10 @@
 //!
 //! Slice G3a: the part of a gate every mode shares. It signs a receipt for each call into its
 //! own numbered chain, keeps each one on disk before going on, ships them to the Ledger, and
-//! keeps them until a witnessed checkpoint covers them. In this slice it runs in **observe**
-//! mode only: it holds no credential, decides nothing and blocks nothing, and every receipt
-//! it writes says so. The front doors (the MCP gate and the shim) are slice G3b.
+//! keeps them until a checkpoint it has read from the witness itself covers them. In this
+//! slice it runs in **observe** mode only: it holds no credential, decides nothing and blocks
+//! nothing, and every receipt it writes says so. The front doors (the MCP gate and the shim)
+//! are slice G3b.
 
 pub mod spool;
 
@@ -15,9 +16,11 @@ use gov_core::receipt::{
     ChainHead, Coverage, Decision, DecisionKind, Mode, Outcome, OutcomeStatus, Phase, Proof,
     Reason, Receipt, ReceiptAction, ReceiptAgent,
 };
-use gov_core::{open, seal, Envelope, Error, Id, KeySet, Scope, SigningKey, VERSION};
+use gov_core::{open, random_id, seal, Envelope, Error, Id, KeySet, Scope, SigningKey, VERSION};
 
-pub use spool::{FileSpool, Spool, SpoolError, SpoolState, Spooled};
+pub use spool::{
+    DirWitnessReader, FileSpool, Spool, SpoolError, SpoolState, Spooled, WitnessReader,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum GateError {
@@ -36,13 +39,35 @@ pub enum GateError {
     Link(String),
     #[error("no such open intent: {0}")]
     NoSuchIntent(u64),
+    /// The Ledger holds less of this gate's chain than it acknowledged before, and this gate
+    /// no longer holds the receipts to send again.
+    #[error("the Ledger lost receipts this gate no longer holds, back to receipt {0}")]
+    LedgerLost(u64),
+    #[error("the witness could not be read: {0}")]
+    Witness(String),
+}
+
+/// What one round of shipping did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shipped {
+    /// The Ledger had already acknowledged everything this gate holds.
+    NothingToSend,
+    /// The Ledger now holds this many more receipts.
+    Advanced(u64),
+    /// Receipts were sent and the Ledger holds no more than before: it is refusing them. The
+    /// front door counts this and shows it, so a spool filling behind it is not silent.
+    NoProgress,
+    /// The Ledger holds less than it acknowledged before (restored from an older copy). The
+    /// gate sends again from this receipt.
+    LedgerBehind(u64),
 }
 
 /// How a gate reaches the Ledger. The network one comes with the listener (G3b).
 #[async_trait]
 pub trait LedgerLink: Send + Sync {
-    /// Send receipts in order; get back the Ledger's signed statement of the chain it holds.
-    async fn ship(&self, batch: &[Envelope]) -> Result<Envelope, String>;
+    /// Send receipts in order, with a nonce; get back the Ledger's signed statement of the
+    /// chain it holds, carrying that nonce.
+    async fn ship(&self, batch: &[Envelope], nonce: &Id) -> Result<Envelope, String>;
 }
 
 pub struct GateConfig {
@@ -79,11 +104,25 @@ impl<S: Spool> Gate<S> {
     pub fn open(
         config: GateConfig,
         key: SigningKey,
-        spool: S,
+        mut spool: S,
         now: i64,
     ) -> Result<Self, GateError> {
         let mut state = spool.state()?;
+        // Receipts a checkpoint already covers, left behind by a crash between moving the
+        // state and trimming (review finding GR-52).
+        spool.trim(state.covered_through)?;
         let held = spool.held()?;
+        // Nothing in the spool is trusted until it opens under this gate's own key with the
+        // number and hash the spool says it has (review finding GR-51).
+        let keys = KeySet::new([key.public()]);
+        let mut docs = Vec::with_capacity(held.len());
+        for r in &held {
+            let opened = open::<Receipt>(&r.envelope, &keys, &config.scope)?;
+            if opened.doc.seq != r.seq || opened.hash != r.hash || opened.doc.gate != config.gate {
+                return Err(GateError::Spool(SpoolError::Corrupt));
+            }
+            docs.push(opened.doc);
+        }
         // A receipt written just before a crash, which the state file does not know of yet.
         for r in &held {
             if state.head.as_ref().is_none_or(|h| r.seq > h.seq) {
@@ -101,10 +140,18 @@ impl<S: Spool> Gate<S> {
             state,
         };
         gate.spool.set_state(&gate.state)?;
-        for r in held.iter().filter(|r| r.open_intent) {
-            let keys = KeySet::new([gate.key.public()]);
-            let intent = open::<Receipt>(&r.envelope, &keys, &gate.config.scope)?.doc;
-            gate.write_outcome(&intent, OutcomeStatus::Unknown, None, now)?;
+        for (r, intent) in held.iter().zip(&docs).filter(|(r, _)| r.open_intent) {
+            // A crash after the outcome was written and before the intent was marked
+            // answered: the outcome is there. Mark the intent and write nothing more
+            // (review finding GR-48).
+            let answered = docs
+                .iter()
+                .any(|d| d.phase == Phase::Outcome && d.intent == Some(r.seq));
+            if answered {
+                gate.spool.close_intent(r.seq)?;
+            } else {
+                gate.write_outcome(intent, OutcomeStatus::Unknown, None, now)?;
+            }
         }
         Ok(gate)
     }
@@ -119,9 +166,10 @@ impl<S: Spool> Gate<S> {
     }
 
     /// A time for the next receipt: never earlier than the last one's, whatever the clock
-    /// says (review findings GR-16 and GR-42).
-    fn stamp(&self, now: i64) -> i64 {
-        now.max(self.state.last_at)
+    /// says (review findings GR-16 and GR-42). The second value says the clock read earlier
+    /// and was raised; the receipt records that (GR-53).
+    fn stamp(&self, now: i64) -> (i64, bool) {
+        (now.max(self.state.last_at), now < self.state.last_at)
     }
 
     fn append(&mut self, mut receipt: Receipt, open_intent: bool) -> Result<u64, GateError> {
@@ -164,6 +212,7 @@ impl<S: Spool> Gate<S> {
     /// Record that a call is about to pass through, before it does. Returns the intent's
     /// number, to give to [`Gate::finish`].
     pub fn begin(&mut self, call: &Observed<'_>, now: i64) -> Result<u64, GateError> {
+        let (at, at_clamped) = self.stamp(now);
         let receipt = Receipt {
             v: VERSION,
             tenant: self.config.scope.tenant.clone(),
@@ -171,7 +220,8 @@ impl<S: Spool> Gate<S> {
             gate: self.config.gate.clone(),
             seq: 0,
             prev: None,
-            at: self.stamp(now),
+            at,
+            at_clamped,
             phase: Phase::Intent,
             mode: Mode::Observe,
             coverage: call.coverage,
@@ -223,10 +273,12 @@ impl<S: Spool> Gate<S> {
         upstream_ref: Option<Id>,
         now: i64,
     ) -> Result<u64, GateError> {
+        let (at, at_clamped) = self.stamp(now);
         let receipt = Receipt {
             seq: 0,
             prev: None,
-            at: self.stamp(now),
+            at,
+            at_clamped,
             phase: Phase::Outcome,
             outcome: Some(Outcome {
                 status,
@@ -243,47 +295,75 @@ impl<S: Spool> Gate<S> {
     }
 
     /// Send the Ledger what it has not acknowledged, in order, and check its signed answer
-    /// against this gate's own chain. Returns how many receipts the Ledger now holds beyond
-    /// what it held before. Nothing is removed from the spool here.
-    pub async fn ship(&mut self, link: &dyn LedgerLink) -> Result<u64, GateError> {
-        let pending: Vec<Spooled> = self
-            .spool
-            .held()?
-            .into_iter()
+    /// against this gate's own chain. Nothing is removed from the spool here.
+    pub async fn ship(&mut self, link: &dyn LedgerLink) -> Result<Shipped, GateError> {
+        let held = self.spool.held()?;
+        let batch: Vec<Envelope> = held
+            .iter()
             .filter(|r| r.seq > self.state.acked_through)
             .take(self.config.batch)
+            .map(|r| r.envelope.clone())
             .collect();
-        if pending.is_empty() {
-            return Ok(0);
+        if batch.is_empty() {
+            return Ok(Shipped::NothingToSend);
         }
-        let batch: Vec<Envelope> = pending.iter().map(|r| r.envelope.clone()).collect();
-        let answer = link.ship(&batch).await.map_err(GateError::Link)?;
+        let nonce = random_id("ship")?;
+        let answer = link.ship(&batch, &nonce).await.map_err(GateError::Link)?;
         let ack = open::<IntakeAck>(&answer, &self.config.ledger_keys, &self.config.scope)?.doc;
         if ack.gate != self.config.gate {
             return Err(GateError::Core(Error::WrongGate));
         }
-        if ack.seq <= self.state.acked_through {
-            // The Ledger took nothing new. The receipts stay, to be sent again.
-            return Ok(0);
+        if ack.nonce != nonce {
+            // An answer to some other batch, played back (review finding GR-55).
+            return Err(GateError::Core(Error::Replay));
         }
-        // The Ledger says it holds the chain through `ack.seq`: that must be a receipt this
-        // gate wrote, with the hash this gate has for it.
-        let mine = pending.iter().find(|r| r.seq == ack.seq);
-        if mine.is_none_or(|r| r.hash != ack.hash) {
-            return Err(GateError::LedgerDisagrees(ack.seq));
+        // The Ledger says it holds the chain through `ack.seq`. Where this gate still holds
+        // that receipt, the hash must be the one it wrote. It is looked up in the whole
+        // spool, so an honest Ledger that is ahead of this batch is not taken for a liar
+        // (review finding GR-50).
+        if ack.seq > self.state.covered_through {
+            let mine = held.iter().find(|r| r.seq == ack.seq);
+            if mine.is_none_or(|r| Some(&r.hash) != ack.hash.as_ref()) {
+                return Err(GateError::LedgerDisagrees(ack.seq));
+            }
+        }
+        if ack.seq < self.state.acked_through {
+            // It holds less than it said before. Send again from there, if this gate can.
+            if ack.seq < self.state.covered_through {
+                return Err(GateError::LedgerLost(ack.seq));
+            }
+            self.state.acked_through = ack.seq;
+            self.spool.set_state(&self.state)?;
+            return Ok(Shipped::LedgerBehind(ack.seq));
+        }
+        if ack.seq == self.state.acked_through {
+            return Ok(Shipped::NoProgress);
         }
         let moved = ack.seq - self.state.acked_through;
         self.state.acked_through = ack.seq;
         self.spool.set_state(&self.state)?;
-        Ok(moved)
+        Ok(Shipped::Advanced(moved))
     }
 
-    /// A checkpoint read from the witness. If it covers this gate's chain to a receipt this
-    /// gate wrote, with the same hash, the spool is trimmed to there. A checkpoint that names
-    /// another hash for one of this gate's receipts is an alarm, and nothing is trimmed.
-    pub fn covered_by(&mut self, checkpoint: &Envelope) -> Result<u64, GateError> {
-        let cp = open::<Checkpoint>(checkpoint, &self.config.ledger_keys, &self.config.scope)?.doc;
+    /// Read the witness and trim the spool to what it covers (review finding GR-49).
+    ///
+    /// The gate reads the witness store itself: a checkpoint is believed only if it is there,
+    /// signed by the Ledger, and names the hash this gate has for the receipt it covers.
+    /// Never trimmed: anything the Ledger has not acknowledged, an intent still waiting for
+    /// its outcome, or anything after one. A checkpoint that names another hash is an alarm
+    /// and nothing is trimmed. The checkpoint trimmed on is kept with the spool.
+    pub fn trim_to_witness(&mut self, witness: &dyn WitnessReader) -> Result<u64, GateError> {
+        let all = witness.checkpoints().map_err(GateError::Witness)?;
+        let Some((file_seq, bytes)) = all.last() else {
+            return Ok(0);
+        };
+        let envelope: Envelope =
+            serde_json::from_slice(bytes).map_err(|_| GateError::Core(Error::BadEnvelope))?;
+        let cp = open::<Checkpoint>(&envelope, &self.config.ledger_keys, &self.config.scope)?.doc;
         cp.validate()?;
+        if cp.seq != *file_seq {
+            return Err(GateError::Core(Error::Malformed("checkpoint number")));
+        }
         let Some(head) = cp.heads.iter().find(|h| h.gate == self.config.gate) else {
             return Ok(0);
         };
@@ -295,18 +375,21 @@ impl<S: Spool> Gate<S> {
         if mine.is_none_or(|r| r.hash != head.hash) {
             return Err(GateError::LedgerDisagrees(head.seq));
         }
-        // An intent still waiting for its outcome stays, and so does everything after it.
         let keep_from = held
             .iter()
             .filter(|r| r.open_intent)
             .map(|r| r.seq)
             .min()
             .unwrap_or(u64::MAX);
-        let through = head.seq.min(keep_from.saturating_sub(1));
+        let through = head
+            .seq
+            .min(self.state.acked_through)
+            .min(keep_from.saturating_sub(1));
         if through <= self.state.covered_through {
             return Ok(0);
         }
         let trimmed = through - self.state.covered_through;
+        self.spool.keep_checkpoint(bytes)?;
         self.state.covered_through = through;
         self.spool.set_state(&self.state)?;
         self.spool.trim(through)?;

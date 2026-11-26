@@ -197,6 +197,11 @@ pub struct Receipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prev: Option<Digest>,
     pub at: i64,
+    /// The gate's clock read earlier than its last receipt's time, so this receipt carries
+    /// that time instead. One far-future reading shows as every later receipt being clamped
+    /// (review finding GR-53).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub at_clamped: bool,
     pub phase: Phase,
     pub mode: Mode,
     pub coverage: Coverage,
@@ -291,6 +296,11 @@ impl Receipt {
                 return Err(Error::Malformed("only an outcome names an intent"));
             }
             (_, None) => {}
+        }
+        // Custody means the gate holds the only credential, which is true only when it
+        // enforces (spec §5.2; review finding GR-54).
+        if self.coverage == Coverage::Custody && self.mode != Mode::Enforce {
+            return Err(Error::Malformed("custody belongs to enforce mode"));
         }
         if self.at < 0 {
             return Err(Error::Malformed("a receipt's time is before the epoch"));

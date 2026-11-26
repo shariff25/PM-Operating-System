@@ -228,6 +228,10 @@ follow-up tracking.
   built) and three smaller findings, fixed on `build/gov-review-4`. The reviewer session
   cannot send messages without a person's approval, so the conductor now reads its verdicts
   from its transcript.
+- **Sixth read (2026-11-26), G3a at `5250505`:** the gate passes for G3a; three Medium and
+  five Low findings, all fixed on `build/gov-g3a-fixes` before G3b starts (a contradictory
+  record after a crash; the gate trimming on a checkpoint it was handed; the gate not noticing
+  a stuck or restored Ledger). Owner, the same day, after seeing the build map: "Build".
 - **G3a built (2026-11-26), after the spec passed the gate:** the gate's receipt chain, spool
   and shipping in observe mode (`crates/gov-gate`), and the Ledger's signed answer to a
   batch. It holds no credential and blocks nothing. Sent to the reviewer; not yet read. G3b

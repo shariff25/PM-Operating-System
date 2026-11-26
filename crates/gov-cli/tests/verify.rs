@@ -73,6 +73,7 @@ async fn an_auditor_verifies_with_files_alone() {
             seq,
             prev: prev.clone(),
             at: T0,
+            at_clamped: false,
             phase: Phase::Intent,
             mode: Mode::Enforce,
             coverage: Coverage::Custody,

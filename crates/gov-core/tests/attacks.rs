@@ -857,6 +857,7 @@ fn receipt(seq: u64, prev: Option<Digest>, phase: Phase) -> Receipt {
         seq,
         prev,
         at: NOW,
+        at_clamped: false,
         phase,
         mode: Mode::Enforce,
         coverage: Coverage::Custody,
