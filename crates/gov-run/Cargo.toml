@@ -28,6 +28,7 @@ gov-core = { path = "../gov-core" }
 gov-gate = { path = "../gov-gate" }
 gov-ledger = { path = "../gov-ledger" }
 reqwest = { workspace = true, features = ["stream"] }
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 

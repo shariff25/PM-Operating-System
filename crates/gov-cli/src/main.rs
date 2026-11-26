@@ -1,6 +1,8 @@
-//! `gov`: Agent Governance's command line. For now one command, `gov verify`, which an
-//! auditor runs with nothing but files: the public keys, the witness's checkpoints and an
-//! export of receipts. It opens no database and no network connection.
+//! `gov`: Agent Governance's command line. `gov verify` is what an auditor runs with nothing
+//! but files: the public keys, the witness's checkpoints and an export of receipts.
+//! `gov policy check` and `gov policy sign` are the release step for policy (spec §7.6.1):
+//! the first needs no key, the second runs wherever the root key is kept. No command here
+//! opens a database or a network connection.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -53,6 +55,45 @@ enum Command {
         /// With --now: report a gate whose chain has not moved for this many seconds.
         #[arg(long)]
         gate_quiet: Option<u32>,
+    },
+    /// Check and sign the policy bundle.
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum PolicyCommand {
+    /// Build the bundle from a policy directory and run every check a gate would, and each
+    /// connector map's sample calls. Needs no key.
+    Check {
+        /// The policy directory, as checked out from the reviewed repository.
+        #[arg(long)]
+        dir: PathBuf,
+    },
+    /// Check a policy directory, show what changed since the bundle before, and sign it
+    /// with the root key. The directory must come from the reviewed repository, never from
+    /// the Authority's machine.
+    Sign {
+        /// The policy directory, as checked out from the reviewed repository.
+        #[arg(long)]
+        dir: PathBuf,
+        /// The root key's file. It signs bundles and nothing else.
+        #[arg(long)]
+        root_key: PathBuf,
+        /// The bundle's number: 1 for the first, then one more each time.
+        #[arg(long)]
+        number: u64,
+        /// The signed bundle before this one. Required for every number but 1.
+        #[arg(long)]
+        previous: Option<PathBuf>,
+        /// Where the signed bundle is written. It must not exist yet.
+        #[arg(long)]
+        out: PathBuf,
+        /// Sign without asking. For a release step that has shown the changes elsewhere.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -148,6 +189,79 @@ fn print(report: &Report) {
     }
 }
 
+fn policy(command: PolicyCommand) -> anyhow::Result<bool> {
+    use gov_run::policy_dir;
+    match command {
+        PolicyCommand::Check { dir } => {
+            let checked = policy_dir::check(&dir, 1, gov_run::now())?;
+            println!(
+                "The policy passes its checks: {} rules, {} connector maps, {} sample calls.",
+                checked.bundle.rules.len(),
+                checked.bundle.connectors.len(),
+                checked.samples
+            );
+            Ok(true)
+        }
+        PolicyCommand::Sign {
+            dir,
+            root_key,
+            number,
+            previous,
+            out,
+            yes,
+        } => {
+            anyhow::ensure!(
+                !out.exists(),
+                "{} exists already; a signed bundle is never written over",
+                out.display()
+            );
+            let root = gov_run::read_key(&root_key)?;
+            let previous: Option<gov_core::Envelope> = previous
+                .map(|path| {
+                    let bytes = std::fs::read(&path).context("reading --previous")?;
+                    serde_json::from_slice(&bytes).context("--previous is not a signed bundle")
+                })
+                .transpose()?;
+            let prepared = policy_dir::prepare(
+                &dir,
+                &root.public(),
+                number,
+                previous.as_ref(),
+                gov_run::now(),
+            )?;
+            println!(
+                "Bundle {number} for {}/{}, checked ({} sample calls). Since the bundle before:",
+                prepared.bundle.tenant, prepared.bundle.env, prepared.samples
+            );
+            for line in policy_dir::describe(&prepared.changes) {
+                println!("  {line}");
+            }
+            if !yes {
+                println!("Type yes to sign this with the root key:");
+                let mut answer = String::new();
+                std::io::stdin().read_line(&mut answer)?;
+                if answer.trim() != "yes" {
+                    println!("Not signed.");
+                    return Ok(false);
+                }
+            }
+            let (envelope, opened) = policy_dir::sign(&prepared, &root)?;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&out)
+                .with_context(|| format!("{} cannot be created", out.display()))?;
+            std::io::Write::write_all(&mut file, &serde_json::to_vec(&envelope)?)?;
+            file.sync_all()?;
+            println!(
+                "Signed. Digest: {}\nCompare it with the digest the Authority reports when this is published.",
+                opened.digest.as_str()
+            );
+            Ok(true)
+        }
+    }
+}
+
 fn run(cli: Cli) -> anyhow::Result<bool> {
     let Command::Verify {
         tenant,
@@ -160,7 +274,13 @@ fn run(cli: Cli) -> anyhow::Result<bool> {
         retention_days,
         clock_skew,
         gate_quiet,
-    } = cli.command;
+    } = cli.command
+    else {
+        let Command::Policy { command } = cli.command else {
+            unreachable!("a command is one or the other")
+        };
+        return policy(command);
+    };
     let now = now.or_else(|| {
         let since = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
