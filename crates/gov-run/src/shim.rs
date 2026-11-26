@@ -239,6 +239,11 @@ impl Shim {
         if let Ok((_, head, _)) = &sent {
             if head.contains_key("x-gov-reopen") {
                 *session = None;
+                // A gate that has lost the session has most likely restarted, and then it
+                // has lost its record of the tool listings too. The shim forgets its own,
+                // so that both map the next call the same way (as `unknown`, until the
+                // tools are listed again) and its proof holds (review finding GR-103).
+                *self.listed.lock().expect("the tool list's lock") = Listings::default();
             }
         }
         sent

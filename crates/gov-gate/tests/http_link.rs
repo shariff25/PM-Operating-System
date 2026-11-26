@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use gov_core::action::{CanonicalAction, Kind, Reversal};
 use gov_core::lease::{batch_digest, ShipRequest};
-use gov_core::receipt::{Coverage, OutcomeStatus, Proof};
+use gov_core::receipt::{Coverage, OutcomeStatus};
 use gov_core::{seal, Id, KeySet, ResourcePath, Scope, SigningKey};
 use gov_gate::link::HttpLedgerLink;
 use gov_gate::{FileSpool, Gate, GateConfig, GateError, Observed, Shipped, Spool};
@@ -72,10 +72,7 @@ fn call(gate: &mut Gate<FileSpool>, n: u64) {
     )
     .unwrap();
     let observed = Observed {
-        agent: &agent,
-        proof: Proof::Claimed,
-        failure: None,
-        mandates: &[],
+        who: gov_gate::Who::claimed(agent.clone()),
         action: &action,
         reversal: Reversal::Restore,
         coverage: Coverage::InLine,

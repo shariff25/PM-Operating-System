@@ -68,9 +68,22 @@ pub struct Presented {
     pub mandates: Vec<Id>,
 }
 
+/// A call whose proof held. Only [`Sessions::prove`] makes one: its field is private, so
+/// nothing outside this module can say a call was proven (review finding GR-101).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvenCall {
+    who: Presented,
+}
+
+impl ProvenCall {
+    pub fn who(&self) -> &Presented {
+        &self.who
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Proved {
-    Proven(Presented),
+    Proven(ProvenCall),
     /// `who` is absent when the gate does not know the session at all.
     Failed {
         who: Option<Presented>,
@@ -163,7 +176,9 @@ impl Sessions {
             .doc;
         if asked.gate != c.gate
             || asked.mandate != leaf.id
-            || (asked.at - now).abs() > c.open_skew_secs
+            // Compared without arithmetic that can overflow: a time at the far end of the
+            // range is refused like any other, and never panics (review finding GR-102).
+            || asked.at.abs_diff(now) > c.open_skew_secs.unsigned_abs()
             || self.nonces.contains_key(&asked.nonce)
         {
             return Err(OpenRefused::Invalid);
@@ -290,6 +305,6 @@ impl Sessions {
                 self.open.remove(&id);
             }
         }
-        Proved::Proven(who)
+        Proved::Proven(ProvenCall { who })
     }
 }

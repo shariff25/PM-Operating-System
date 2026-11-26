@@ -117,15 +117,55 @@ pub struct GateConfig {
     pub batch: usize,
 }
 
+/// Who made a call, and how the gate knows. There are two ways to make one, and no other:
+/// from what the client said of itself, which is only ever a claim; and from what
+/// [`sessions::Sessions::prove`] returned. No front door can write `proven` of its own accord
+/// (review finding GR-101).
+#[derive(Debug, Clone)]
+pub struct Who {
+    agent: Id,
+    proof: Proof,
+    failure: Option<ProofFailure>,
+    mandates: Vec<Id>,
+}
+
+impl Who {
+    /// A client that offered no proof: it is whoever it says it is, recorded as claimed.
+    pub fn claimed(agent: Id) -> Self {
+        Who {
+            agent,
+            proof: Proof::Claimed,
+            failure: None,
+            mandates: Vec::new(),
+        }
+    }
+
+    /// A call that presented a session: proven, or failed with its reason. A failed proof
+    /// under a session the gate does not know names nobody.
+    pub fn from_session(proved: &sessions::Proved) -> Self {
+        match proved {
+            sessions::Proved::Proven(call) => Who {
+                agent: call.who().agent.clone(),
+                proof: Proof::Proven,
+                failure: None,
+                mandates: call.who().mandates.clone(),
+            },
+            sessions::Proved::Failed { who, why } => Who {
+                agent: who.as_ref().map_or_else(
+                    || Id::new("unknown-session").expect("an identifier"),
+                    |w| w.agent.clone(),
+                ),
+                proof: Proof::Failed,
+                failure: Some(*why),
+                mandates: who.as_ref().map(|w| w.mandates.clone()).unwrap_or_default(),
+            },
+        }
+    }
+}
+
 /// One observed call: who said they made it, and what it was.
 pub struct Observed<'a> {
-    /// In observe mode without the shim, an agent's identity is only what it says (§5.3).
-    pub agent: &'a Id,
-    pub proof: Proof,
-    /// Why the proof did not hold; present exactly when `proof` is `failed`.
-    pub failure: Option<ProofFailure>,
-    /// The mandate chain a session presented, its own first. Empty for a stock client.
-    pub mandates: &'a [Id],
+    pub who: Who,
     pub action: &'a CanonicalAction,
     pub reversal: Reversal,
     pub coverage: Coverage,
@@ -284,11 +324,11 @@ impl<S: Spool> Gate<S> {
             mode: Mode::Observe,
             coverage: call.coverage,
             agent: ReceiptAgent {
-                id: call.agent.clone(),
-                proof: call.proof,
-                failure: call.failure,
+                id: call.who.agent.clone(),
+                proof: call.who.proof,
+                failure: call.who.failure,
             },
-            mandate: call.mandates.to_vec(),
+            mandate: call.who.mandates.clone(),
             policy_version: None,
             action: ReceiptAction::from(call.action),
             reversal: call.reversal,

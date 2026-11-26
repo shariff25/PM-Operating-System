@@ -280,6 +280,12 @@ follow-up tracking.
   is recorded as proven by the agent its mandate names; after a gate restart the next call
   is forwarded once and recorded as a failed proof. The mandate comes from a test issuer:
   there is no Authority yet. With it G3b is built; the reviewer's read of the shim is owed.
+- **Twelfth read (2026-11-26), the shim at `543407a`:** **the gate passes for G3b as a
+  whole, in observe mode** (no High or Critical). Five Low findings, three fixed on
+  `build/gov-review-12` (proven can only be built from the sessions check; an overflow in a
+  time check; honest calls failing after a gate restart) and two stated as limits. To keep
+  in mind: a proven receipt says who made a call, not that the call was authorised. Next
+  slice: G4, the Authority.
 - **A message relayed by the reviewer session (2026-11-26):** it reported that the owner typed
   there "I'm going to sleep you keep building do not ask for permission further - I gave the
   permission". The conductor could not confirm it and did not treat it as new permission. It
