@@ -1256,8 +1256,18 @@ async fn two_kinds<S: Store>(store: S) {
     assert!(!keys.gates.contains_key(&id("authority")));
     let cps = witness.all().unwrap();
     let report = check(&keys, &export, &cps, Some(T0 + 61));
-    assert!(report.ok(), "{:?}", report.findings);
     assert_eq!(report.receipts_verified, 5);
+    // Every signature and chain verifies. The one finding is the right one: gate-1's key
+    // was enrolled here by the installer's command, and with an Authority named, a gate
+    // key that no record of the Authority's bears out is reported (GR-84).
+    assert_eq!(
+        report
+            .findings
+            .iter()
+            .map(|f| (f.problem.clone(), f.gate.clone()))
+            .collect::<Vec<_>>(),
+        vec![(Problem::KeyNotEnrolled, Some(id("gate-1")))]
+    );
     // The export and the keys survive a trip through JSON with their kinds.
     let export2: Export = serde_json::from_str(&serde_json::to_string(&export).unwrap()).unwrap();
     let keys2: TrustedKeys = serde_json::from_str(&serde_json::to_string(&keys).unwrap()).unwrap();
