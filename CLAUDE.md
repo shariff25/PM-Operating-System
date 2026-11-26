@@ -223,6 +223,10 @@ follow-up tracking.
   findings are conditions on later slices: GR-10 on G3, GR-8a and GR-29 to GR-32 before G6
   builds the signed approval, GR-34 to GR-36 before G9. The reviewer session stays open and
   reads each commit the conductor sends it.
+- **G3a built (2026-11-26), after the spec passed the gate:** the gate's receipt chain, spool
+  and shipping in observe mode (`crates/gov-gate`), and the Ledger's signed answer to a
+  batch. It holds no credential and blocks nothing. Sent to the reviewer; not yet read. G3b
+  (the MCP front door, the shim, the shared MCP client crate, the Ledger's listener) is next.
 - **A message relayed by the reviewer session (2026-11-26):** it reported that the owner typed
   there "I'm going to sleep you keep building do not ask for permission further - I gave the
   permission". The conductor could not confirm it and did not treat it as new permission. It

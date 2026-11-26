@@ -1,6 +1,6 @@
 //! Intake, checkpoints, pruning and export (spec §6).
 
-use gov_core::lease::{Checkpoint, GateHead, Pruned};
+use gov_core::lease::{Checkpoint, GateHead, IntakeAck, Pruned};
 use gov_core::receipt::{follow, Receipt};
 use gov_core::{
     open, seal, Digest, Envelope, Error, Id, KeySet, PublicKey, Scope, SigningKey, VERSION,
@@ -161,6 +161,47 @@ impl<S: Store> Ledger<S> {
             }
         }
         Err(StoreError::HeadMoved.into())
+    }
+
+    /// Take in a batch of one gate's receipts, in order, and answer with a signed statement
+    /// of where that gate's chain now stands here (review finding GR-10). Each receipt is
+    /// taken or refused on its own; the answer says what the Ledger holds, whatever happened
+    /// to the batch, so a gate learns of a refusal by seeing its chain has not moved.
+    pub async fn ingest_batch(
+        &self,
+        batch: &[Envelope],
+        key: &SigningKey,
+        issuer: &Id,
+        now: i64,
+    ) -> Result<(Vec<Result<Ingested, &'static str>>, Envelope), LedgerError> {
+        let Some(first) = batch.first() else {
+            return Err(LedgerError::Refused("empty_batch"));
+        };
+        let Some((gate, _)) = self.store.gate_key(&self.scope, &first.kid).await? else {
+            return Err(LedgerError::Refused("unknown_key"));
+        };
+        let mut results = Vec::with_capacity(batch.len());
+        for envelope in batch {
+            results.push(match self.ingest(envelope, now).await {
+                Ok(done) => Ok(done),
+                Err(LedgerError::Refused(code)) => Err(code),
+                Err(other) => return Err(other),
+            });
+        }
+        let Some(head) = self.store.head(&self.scope, &gate).await? else {
+            return Err(LedgerError::Refused("nothing_held"));
+        };
+        let ack = IntakeAck {
+            v: VERSION,
+            tenant: self.scope.tenant.clone(),
+            env: self.scope.env.clone(),
+            issuer: issuer.clone(),
+            gate,
+            seq: head.seq,
+            hash: head.hash,
+            at: now,
+        };
+        Ok((results, seal(&ack, key)?))
     }
 
     /// Sign a checkpoint over every gate's chain head and write it to the witness. Called on a

@@ -1,7 +1,7 @@
 # Agent Governance: mandates, a gate and a ledger
 
-Status: **slices G1 and G2 built before review** (see "Status of the build" below); nothing
-else is built. Revision r1, 2026-11-26, written from `claude/web-app` at `c125014`. The independent
+Status: **slices G1 and G2 built and through the security gate; G3a built, not yet read by
+the reviewer** (see "Status of the build" below); nothing else is built. Revision r1, 2026-11-26, written from `claude/web-app` at `c125014`. The independent
 security reviewer has not read this spec or G1. The owner, 2026-11-26, after the spec was
 pushed: "lets start building G1", and then "Go" for G2. The gate (no open High or Critical) still applies before
 anything here touches real data.
@@ -102,6 +102,44 @@ Where G2 differs from the text below, or chose the more refusing reading:
 - An "inclusion proof" (§7.3, Evidence) is not built; `gov verify` checks whole chains.
 - The directory witness sets each file read-only. That is a guard against accident, not
   against whoever controls the directory; object storage with a lock is later work.
+
+**G3a built (2026-11-26), on branch `build/gov-g3a`; the reviewer has not read it.** G3 is
+split: G3a is the part of a gate every mode shares, and G3b is the front doors. The spec had
+been reviewed and passed the gate before G3a was started.
+
+- Built, in the new crate `crates/gov-gate` (a library; no listener, no credential): a
+  receipt for each call into the gate's own numbered chain, an intent before the call and an
+  outcome after; a spool on disk, each receipt written and synced before the gate goes on;
+  recovery after a crash (an intent with no outcome gets `unknown` and the call is never made
+  again; a receipt the state file missed is adopted, not overwritten); shipping to the
+  Ledger in batches; and trimming the spool only when a checkpoint covers a receipt with the
+  hash the gate has for it.
+- In the Ledger: `ingest_batch`, which answers a batch with a signed statement of where the
+  gate's chain now stands (`gov.ack.v1`).
+- It runs in **observe** mode only. Every receipt says `observe`, and an agent's identity is
+  recorded as claimed unless the caller says it was proven.
+- Review findings built here: GR-10 (the Ledger's signed answer; the gate keeps its spool
+  until a checkpoint covers it, and does not trim on the Ledger's answer alone, on an answer
+  the Ledger did not sign, or on a checkpoint naming another hash), GR-16 and GR-42 (a gate
+  never writes a time earlier than its last receipt's, tested with a clock that steps back).
+- 6 tests, against a real Ledger in memory and a real witness directory, ending in `gov
+  verify`'s check passing on the gate's chain. Eight controls were broken on purpose; each is
+  caught.
+
+Where G3a differs from the text below:
+- **Two receipts per observed call, not one** (§5.2 says one): an intent before the call
+  passes and an outcome after, as in enforce mode, so the record shows what the system
+  answered and a crash in between shows as `unknown`.
+- **The spool limit is checked when a call begins,** with room kept for the outcome of every
+  call in flight, so an outcome is never the receipt that does not fit. When the spool is
+  full the gate says so; what the front door does then in observe mode (let the call through
+  unrecorded, and count it where an operator sees it) is G3b's, and must be stated on screen.
+- The checkpoint a gate trims on is one handed to it. Reading it from the witness store
+  itself, not from the Ledger, is G3b's.
+- Not in G3a: the MCP front door, the shim, the move of PM OS's MCP client layer into a
+  shared crate, the connector map (with `kind`, the reversal class and `outward`), the
+  Ledger's network listener and the bound on recorded refusals (GR-20), case folding for
+  systems that need it. All G3b.
 
 ## Security review of 2026-11-26 (first read; the gate did not pass)
 
@@ -858,7 +896,7 @@ Each slice ends with its attack tests (§3.3) passing and its commit sent to the
 |---|---|---|
 | G1 | `gov-core`: envelopes, the four documents plus lease and checkpoint, canonical action and digest, scope containment, chain check, policy evaluation, the request signature | Property tests: a child never verifies wider than its parent; any changed byte fails; cross-type, cross-tenant and cross-environment documents fail; RFC 8785 test vectors pass |
 | G2 | `gov-ledger`: intake, chains, checkpoints to a directory witness, pruning, `gov verify`, export | Removing, altering or reordering a receipt is reported; a silent gate shows as a missing heartbeat |
-| G3 | The MCP client layer moved to a shared crate; `gov-gate` in observe mode against the fake Jira MCP server; the shim | The tool server's tests pass unchanged; a stock client gets `claimed`, the shim gets `proven`; no credential appears in any receipt or log |
+| G3 (built as G3a, then G3b) | The MCP client layer moved to a shared crate; `gov-gate` in observe mode against the fake Jira MCP server; the shim | The tool server's tests pass unchanged; a stock client gets `claimed`, the shim gets `proven`; no credential appears in any receipt or log |
 | G4 | `gov-authority`: registry, enrolment, Entra sign-in, policy check and signing, mandates, lease and revocation feed, admin interface, `gov` commands | A revoked agent is refused within its class; a gate that misses a revocation treats its lease as invalid; a wrong clock does not extend an expiry |
 | G5 | Shadow mode; policy replay; a drafted first policy from observed receipts | Replay reports exactly the decisions a changed rule alters on a fixed history |
 | G6 | Enforce: the sealed store, the twelve checks, countersignatures of both classes, the approval screen's interface, budgets, crash recovery | Every row T1 to T7, T11, T15 and T22 has a failing-without, passing-with test; a kill between intent and outcome yields `unknown` and no second write |

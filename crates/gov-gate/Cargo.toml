@@ -1,0 +1,20 @@
+[package]
+name = "gov-gate"
+description = "Agent Governance: the gate. Slice G3a: the receipt chain, the spool and shipping to the Ledger, in observe mode. It holds no credential and blocks nothing yet."
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+gov-core = { path = "../gov-core" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+gov-ledger = { path = "../gov-ledger" }
+tempfile.workspace = true
+tokio.workspace = true

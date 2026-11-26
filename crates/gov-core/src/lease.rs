@@ -216,3 +216,22 @@ pub struct Pruned {
 }
 
 document!(Pruned, "gov.pruned.v1");
+
+/// The Ledger's signed statement, in answer to a batch of receipts, of where it now holds a
+/// gate's chain. A gate keeps what it shipped until it has this, and keeps its spool until a
+/// witnessed checkpoint covers it (review finding GR-10).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntakeAck {
+    pub v: u32,
+    pub tenant: Id,
+    pub env: Id,
+    pub issuer: Id,
+    pub gate: Id,
+    pub seq: u64,
+    pub hash: Digest,
+    /// The Ledger's clock when it signed.
+    pub at: i64,
+}
+
+document!(IntakeAck, "gov.ack.v1");
