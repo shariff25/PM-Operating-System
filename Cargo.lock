@@ -1043,6 +1043,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "gov-gate"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "gov-core",
+ "gov-ledger",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "gov-ledger"
 version = "0.1.0"
 dependencies = [
