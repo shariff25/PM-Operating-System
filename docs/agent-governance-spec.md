@@ -1,9 +1,10 @@
 # Agent Governance: mandates, a gate and a ledger
 
-Status: **nothing built.** Revision r1, 2026-11-26, written from `claude/web-app` at `c125014`.
-The independent security reviewer reads this before any slice starts (CLAUDE.md, "How to
-work"). The owner's two-day build-before-review instruction of 2026-11-24 named other features
-and ended on 2026-11-26; it does not cover this work.
+Status: **slice G1 built before review** (see "Status of the build" below); nothing else is
+built. Revision r1, 2026-11-26, written from `claude/web-app` at `c125014`. The independent
+security reviewer has not read this spec or G1. The owner, 2026-11-26, after the spec was
+pushed: "lets start building G1". The gate (no open High or Critical) still applies before
+anything here touches real data.
 
 Source of the requirement: the owner's architecture proposal of 2026-11-26, the published page
 "Mandate Architecture" ("An agent never holds a key. It holds a mandate."), and the owner's
@@ -13,6 +14,52 @@ model and the build spec. Where it departs from the proposal it says so and why 
 
 Line numbers are not cited; file paths are. Where this spec is unsure of a fact it says "to be
 confirmed". Mandate, gate, receipt, witness, Authority and Ledger are working names.
+
+## Status of the build (2026-11-26)
+
+**G1 built before review (owner's instruction of 2026-11-26)**, on branch `build/gov-g1`: the
+crate `crates/gov-core`. It reads no file, clock or network and decides nothing about a real
+system. 39 tests. Ten controls were each broken on purpose and the tests re-run: all ten are
+caught (one, a receipt that skips a number but links to the right hash, was missed at first
+and has a test now).
+
+- Built: the envelope and its type tags; identifiers, resource paths and patterns, digests;
+  RFC 8785 canonical JSON; the canonical action and its digest; grants and "inside"; the
+  mandate and its chain check; the request proof and session counter; the countersignature
+  and its binding checks; the receipt, its rules and the chain link; the lease, freshness and
+  the gate's clock; the checkpoint; the policy bundle's rules and their evaluation; the
+  dependency rule as a test.
+- Threats with a test in G1: T1, T2, T3, T4, T5 (the digest and the request; the gate's
+  recompute before sending is G6), T7 (binding and expiry; single use is G6), T8 (an attested
+  approval never passes for a signed one; the passkey check itself is G6 and until then
+  nothing can satisfy "signed"), T10, T11, T17, T19, T20.
+- Confirmed (§12): Ed25519 through `aws-lc-rs` signs and verifies as used here. No RFC 8785
+  crate was added; a small implementation is in `gov-core/src/jcs.rs`, tested on the RFC's
+  number vectors, its sorting and serialisation examples, and 200,000 doubles read back.
+- Two faults the RFC's vectors found while building, both fixed: Rust's shortest number form
+  rounds an exact tie upwards where the RFC rounds to even; and `serde_json`'s default number
+  parser reads some decimals one unit off.
+
+Where the build differs from the text below, or chose the more refusing reading:
+- **`serde_json`'s `float_roundtrip` feature is on** for `gov-core`. Cargo unifies features
+  across the workspace, so PM OS's crates now parse decimal numbers exactly as well. The
+  whole workspace's tests were re-run with it on. It can change PM OS's `args_hash` for an
+  argument holding one of the rare decimals the old parser read wrongly.
+- A verifier checks the signature first and the tenant and environment next (§4.1 says tenant
+  first; nothing in a payload is read before its signature holds).
+- "Depth is limited to 3" (§4.2) is built as: at most four mandates in a chain, a root and
+  three delegations.
+- Digests carry a type tag (`gov.args.v1`, `gov.action.v1`, `gov.countersign.challenge.v1`).
+- An integer beyond ±2^53 in an action's arguments is refused, not digested.
+- A pattern's `/*` stands for one or more further segments; it does not match its own prefix.
+- A resource must begin with its system; so must every pattern in a grant.
+- A mandate that sets `requires.sandbox` is refused (no adapter can confirm it yet).
+- A rule's effect is written `then:`; a rule that allows or asks for a countersignature must
+  name a system; every countersignature a matching rule asks for is required.
+- Every payload refuses an unknown field.
+- A checkpoint carries its own rising number, so a missing checkpoint shows.
+- Not in G1: the connector map, templates and the approver roster in the bundle (G3, G4, G6);
+  the revocation feed's document (G4).
 
 ## 1. What is being built
 
