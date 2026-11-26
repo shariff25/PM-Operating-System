@@ -31,7 +31,7 @@ pub fn args_digest(args: &Value) -> Result<Digest> {
 /// digest of the arguments. Policy and mandates match on the first four; approvals bind
 /// [`CanonicalAction::digest`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "RawAction")]
 pub struct CanonicalAction {
     pub system: Id,
     pub operation: Id,
@@ -40,6 +40,37 @@ pub struct CanonicalAction {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_version: Option<Id>,
     pub args_digest: Digest,
+}
+
+/// What is parsed, before the rule that a resource lies in its system is applied: an action
+/// read from the wire keeps the rule too (review finding GR-19).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAction {
+    system: Id,
+    operation: Id,
+    kind: Kind,
+    resource: ResourcePath,
+    #[serde(default)]
+    resource_version: Option<Id>,
+    args_digest: Digest,
+}
+
+impl TryFrom<RawAction> for CanonicalAction {
+    type Error = Error;
+    fn try_from(raw: RawAction) -> Result<Self> {
+        if raw.resource.system() != raw.system.as_str() {
+            return Err(Error::Malformed("resource is not in its system"));
+        }
+        Ok(CanonicalAction {
+            system: raw.system,
+            operation: raw.operation,
+            kind: raw.kind,
+            resource: raw.resource,
+            resource_version: raw.resource_version,
+            args_digest: raw.args_digest,
+        })
+    }
 }
 
 impl CanonicalAction {

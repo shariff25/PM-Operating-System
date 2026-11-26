@@ -148,6 +148,13 @@ impl ResourcePattern {
         }
     }
 
+    /// Does this pattern match `path`, or is `path` the very prefix a `/*` hangs from? A
+    /// refusal reads its patterns this way: "refuse `X/*`" must not leave `X` itself open
+    /// (review finding GR-7). A grant never does.
+    pub fn covers_or_is(&self, path: &ResourcePath) -> bool {
+        self.prefix == *path || self.covers(path)
+    }
+
     /// Is every path this pattern matches also matched by `parent`?
     pub fn within(&self, parent: &ResourcePattern) -> bool {
         match (self.wildcard, parent.wildcard) {

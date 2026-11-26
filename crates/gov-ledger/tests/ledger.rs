@@ -5,7 +5,7 @@ mod common;
 
 use common::*;
 use gov_core::lease::{Checkpoint, Pruned};
-use gov_core::{seal, Envelope, Scope};
+use gov_core::{seal, Envelope, Scope, SigningKey};
 use gov_ledger::store::{StoreError, StoredReceipt};
 use gov_ledger::verify::{verify, Check, Finding, Problem, Report};
 use gov_ledger::witness::WitnessError;
@@ -31,8 +31,7 @@ async fn ledger_with_gates<S: Store>(store: S) -> Ledger<S> {
     let ledger = Ledger::new(store, scope());
     for (gate, kid, seed) in [("gate-1", "gate-1-key", 20), ("gate-2", "gate-2-key", 30)] {
         ledger
-            .store()
-            .add_gate_key(&scope(), &id(gate), &key(kid, seed).public())
+            .enrol_gate_key(&id(gate), &key(kid, seed).public())
             .await
             .unwrap();
     }
@@ -220,6 +219,7 @@ async fn stale_head<S: Store>(store: S) {
         seq: 2,
         hash: hash_of(&c[1], &g1),
         at: T0,
+        received_at: T0,
         envelope: c[1].clone(),
     };
     // A writer that read the head before receipt 1 arrived.
@@ -258,7 +258,15 @@ async fn stack<S: Store>(store: S) -> Stack<S> {
     let lk = ledger_key();
     let g1 = key("gate-1-key", 20);
     let g2 = key("gate-2-key", 30);
-    let c1 = chain("gate-1", &g1, 7, T0, 10);
+    let mut c1 = chain("gate-1", &g1, 6, T0, 10);
+    // The seventh is written after the last checkpoint, so no checkpoint should cover it yet.
+    c1.push(
+        seal(
+            &receipt("gate-1", 7, Some(hash_of(&c1[5], &g1)), T0 + 190),
+            &g1,
+        )
+        .unwrap(),
+    );
     let c2 = chain("gate-2", &g2, 3, T0, 10);
     for env in c1[..3].iter().chain(&c2[..3]) {
         ledger.ingest(env, T0).await.unwrap();
@@ -301,6 +309,7 @@ fn check(
         interval_secs: 60,
         now,
         gate_quiet_secs: None,
+        retention_secs: None,
     })
 }
 
@@ -508,6 +517,7 @@ async fn silence<S: Store>(store: S) {
         interval_secs: 600,
         now: Some(T0 + 610),
         gate_quiet_secs: Some(300),
+        retention_secs: None,
     });
     assert_eq!(
         problems(&report),
@@ -564,8 +574,23 @@ async fn crash_between_store_and_witness<S: Store>(store: S) {
         "{:?}",
         r.map(|_| ())
     );
-    // The next run publishes it before making the next one.
     let witness = DirWitness::new(dir.path().join("w"));
+    // Pruning trusts that checkpoint, so it puts it in the witness before it deletes anything
+    // (review finding GR-14).
+    let pruned = ledger
+        .prune(
+            &id("gate-1"),
+            T0 + 1_000,
+            &ledger_key(),
+            &id("ledger"),
+            T0 + 100,
+            &witness,
+        )
+        .await
+        .unwrap();
+    assert_eq!(pruned, Some(1));
+    assert_eq!(witness.all().unwrap().len(), 1);
+    // The next run makes the next one.
     ledger
         .checkpoint(&ledger_key(), &id("ledger"), T0 + 120, &witness)
         .await
@@ -583,65 +608,90 @@ both_stores!(
 
 // ----- pruning --------------------------------------------------------------------------
 
+const DAY: i64 = 86_400;
+
+fn check_days(
+    keys: &TrustedKeys,
+    export: &Export,
+    cps: &[(u64, Vec<u8>)],
+    retention_days: Option<u64>,
+) -> Report {
+    verify(&Check {
+        scope: &scope(),
+        keys,
+        export,
+        checkpoints: cps,
+        // Checkpoints in this test are days apart.
+        interval_secs: 10 * DAY as u32,
+        now: None,
+        gate_quiet_secs: None,
+        retention_secs: retention_days.map(|d| d * DAY as u64),
+    })
+}
+
 async fn pruning<S: Store>(store: S) {
     let ledger = ledger_with_gates(store).await;
     let dir = tempfile::tempdir().unwrap();
     let witness = DirWitness::new(dir.path());
     let lk = ledger_key();
+    let li = id("ledger");
     let g1 = key("gate-1-key", 20);
-    // Ten receipts, one a day.
-    let day = 86_400;
-    let c = chain("gate-1", &g1, 10, T0, day);
-    let now = T0 + 10 * day;
+    let gate = id("gate-1");
+    // Ten receipts, arriving one a day. The gate writes the same time in every one: the age
+    // that matters is when the Ledger received it, not what the gate says (finding GR-9).
+    let c = chain("gate-1", &g1, 10, T0, 0);
 
     // Nothing is pruned before a checkpoint covers it.
-    for env in &c[..6] {
-        ledger.ingest(env, now).await.unwrap();
+    for (i, env) in c[..6].iter().enumerate() {
+        ledger.ingest(env, T0 + i as i64 * DAY).await.unwrap();
     }
+    let far = T0 + 100 * DAY;
     assert_eq!(
         ledger
-            .prune(&id("gate-1"), now, &lk, &id("ledger"), now)
+            .prune(&gate, far, &lk, &li, T0 + 6 * DAY, &witness)
             .await
             .unwrap(),
         None
     );
     ledger
-        .checkpoint(&lk, &id("ledger"), now, &witness)
+        .checkpoint(&lk, &li, T0 + 6 * DAY, &witness)
         .await
         .unwrap();
-    for env in &c[6..] {
-        ledger.ingest(env, now).await.unwrap();
+    for (i, env) in c[6..].iter().enumerate() {
+        ledger.ingest(env, T0 + (6 + i as i64) * DAY).await.unwrap();
     }
     // Everything is older than the cutoff, but only six receipts are witnessed.
     assert_eq!(
         ledger
-            .prune(&id("gate-1"), now + day, &lk, &id("ledger"), now)
+            .prune(&gate, far, &lk, &li, T0 + 10 * DAY, &witness)
             .await
             .unwrap(),
         Some(6)
     );
     ledger
-        .checkpoint(&lk, &id("ledger"), now + 60, &witness)
+        .checkpoint(&lk, &li, T0 + 10 * DAY, &witness)
         .await
         .unwrap();
-    // A cutoff inside the chain: receipts 7 and 8 are older than day 8, 9 is not.
+    // A cutoff inside the chain: receipts 7 and 8 arrived before day 8, receipt 9 did not.
+    let cutoff = T0 + 8 * DAY;
+    let pruned_at = T0 + 40 * DAY;
     assert_eq!(
         ledger
-            .prune(&id("gate-1"), T0 + 8 * day, &lk, &id("ledger"), now)
+            .prune(&gate, cutoff, &lk, &li, pruned_at, &witness)
             .await
             .unwrap(),
         Some(8)
     );
     assert_eq!(
         ledger
-            .prune(&id("gate-1"), T0 + 8 * day, &lk, &id("ledger"), now)
+            .prune(&gate, cutoff, &lk, &li, pruned_at, &witness)
             .await
             .unwrap(),
         None
     );
     assert_eq!(
         ledger
-            .prune(&id("gate-2"), now, &lk, &id("ledger"), now)
+            .prune(&id("gate-2"), far, &lk, &li, pruned_at, &witness)
             .await
             .unwrap(),
         None
@@ -651,56 +701,235 @@ async fn pruning<S: Store>(store: S) {
     assert_eq!(export.gates[0].receipts.len(), 2);
     let keys = ledger.keys(&lk).await.unwrap();
     let cps = witness.all().unwrap();
-    let report = check(&keys, &export, &cps, None);
+    let report = check_days(&keys, &export, &cps, Some(30));
     assert!(report.ok(), "{:?}", report.findings);
     assert_eq!(report.gates[0].verified, Some((9, 10)));
+    assert_eq!(report.gates[0].pruned_through, 8);
     // The head is where it was, and the chain goes on from it.
     assert_eq!(
         ledger
             .store()
-            .head(&scope(), &id("gate-1"))
+            .head(&scope(), &gate)
             .await
             .unwrap()
             .unwrap()
             .seq,
         10
     );
-    let next = seal(&receipt("gate-1", 11, Some(hash_of(&c[9], &g1)), now), &g1).unwrap();
-    assert_eq!(ledger.ingest(&next, now).await.unwrap(), Ingested::Added);
+    let next = seal(&receipt("gate-1", 11, Some(hash_of(&c[9], &g1)), T0), &g1).unwrap();
+    assert_eq!(
+        ledger.ingest(&next, pruned_at).await.unwrap(),
+        Ingested::Added
+    );
     // A receipt from the pruned stretch, sent again, cannot be checked any more.
-    assert_eq!(refused(ledger.ingest(&c[2], now).await), "already_pruned");
+    assert_eq!(
+        refused(ledger.ingest(&c[2], pruned_at).await),
+        "already_pruned"
+    );
+
+    let record = |through_seq: u64, hash: &gov_core::Digest, at: i64| {
+        let doc = Pruned {
+            v: 1,
+            tenant: id("acme"),
+            env: id("prod"),
+            issuer: id("ledger"),
+            gate: id("gate-1"),
+            through_seq,
+            hash: hash.clone(),
+            at,
+        };
+        seal(&doc, &lk).unwrap()
+    };
+    let found = |export: &Export, retention: Option<u64>| {
+        let report = check_days(&keys, export, &cps, retention);
+        report
+            .findings
+            .iter()
+            .map(|f| (f.problem.clone(), f.seq))
+            .collect::<Vec<_>>()
+    };
 
     // A prune record that lies about where the chain was cut does not fit the next receipt.
     let mut lying = export.clone();
-    let record = Pruned {
-        v: 1,
-        tenant: id("acme"),
-        env: id("prod"),
-        issuer: id("ledger"),
-        gate: id("gate-1"),
-        through_seq: 8,
-        hash: hash_of(&c[0], &g1),
-        at: now,
-    };
-    lying.gates[0].pruned = Some(seal(&record, &lk).unwrap());
-    assert!(problems(&check(&keys, &lying, &cps, None)).contains(&(
-        Problem::BrokenChain,
-        Some("gate-1"),
-        Some(9)
-    )));
-    // Nor does one that claims more was pruned than the export then shows.
+    lying.gates[0].pruned = Some(record(8, &hash_of(&c[0], &g1), pruned_at));
+    assert!(found(&lying, None).contains(&(Problem::BrokenChain, Some(9))));
+    // Nor does an export that hides that anything was pruned.
     let mut hiding = export.clone();
     hiding.gates[0].pruned = None;
-    assert!(problems(&check(&keys, &hiding, &cps, None)).contains(&(
-        Problem::BrokenChain,
-        Some("gate-1"),
-        Some(1)
-    )));
-    // Nor one the Ledger's key did not sign.
+    assert!(found(&hiding, None).contains(&(Problem::BrokenChain, Some(1))));
+    // Nor a record the Ledger's key did not sign.
     let mut forged = export.clone();
-    forged.gates[0].pruned = Some(seal(&record, &g1).unwrap());
-    assert!(problems(&check(&keys, &forged, &cps, None))
+    let doc = gov_core::open::<Pruned>(
+        export.gates[0].pruned.as_ref().unwrap(),
+        &gov_core::KeySet::new([lk.public()]),
+        &scope(),
+    )
+    .unwrap()
+    .doc;
+    forged.gates[0].pruned = Some(seal(&doc, &g1).unwrap());
+    assert!(found(&forged, None)
         .iter()
-        .any(|(p, _, _)| matches!(p, Problem::BadPruneRecord(_))));
+        .any(|(p, _)| matches!(p, Problem::BadPruneRecord(_))));
+
+    // Review finding GR-3. Whoever runs the Ledger deletes every receipt and signs a record
+    // for it. Past what the witness ever covered: refused outright.
+    let mut erased = export.clone();
+    erased.gates[0].receipts.clear();
+    erased.gates[0].pruned = Some(record(9999, &hash_of(&c[9], &g1), pruned_at));
+    assert!(found(&erased, None).contains(&(Problem::PruneNotWitnessed, Some(9999))));
+    // At the witnessed head with a hash the witness does not have: refused.
+    erased.gates[0].pruned = Some(record(10, &hash_of(&c[0], &g1), pruned_at));
+    let f = found(&erased, None);
+    assert!(f.contains(&(Problem::PruneNotWitnessed, Some(10))), "{f:?}");
+    // At the witnessed head with the right hash, which the operator knows: the witness cannot
+    // tell this from an honest prune, so the customer's retention has to. Receipt 10 was
+    // first covered on day 10; "pruned" on day 12 against 30 days' retention is too soon.
+    erased.gates[0].pruned = Some(record(10, &hash_of(&c[9], &g1), T0 + 12 * DAY));
+    assert_eq!(
+        found(&erased, Some(30)),
+        vec![(Problem::PrunedTooSoon, Some(10))]
+    );
+    // The honest record above was written on day 40: 30 days after the cover on day 10.
+    assert!(found(&export, Some(30)).is_empty());
+    assert_eq!(
+        found(&export, Some(31)),
+        vec![(Problem::PrunedTooSoon, Some(8))]
+    );
+    // A prune record numbered past the largest number does not crash the check (GR-11).
+    erased.gates[0].pruned = Some(record(u64::MAX, &hash_of(&c[9], &g1), pruned_at));
+    erased.gates[0].receipts = vec![c[0].clone()];
+    assert!(found(&erased, None).contains(&(Problem::PruneNotWitnessed, Some(u64::MAX))));
 }
 both_stores!(pruning_keeps_the_chain_verifiable, pruning);
+
+// ----- the reviewer's findings of 2026-11-26 --------------------------------------------
+
+/// GR-4: with no witness cover, `verify` must not say all is well.
+async fn no_cover<S: Store>(store: S) {
+    let s = stack(store).await;
+    let good = s.ledger.export().await.unwrap();
+    let cps = DirWitness::new(s.witness_dir.path()).all().unwrap();
+
+    // (a) An empty witness.
+    assert_eq!(
+        problems(&check(&s.keys, &good, &[], None)),
+        vec![(Problem::NoCheckpoint, None, None)]
+    );
+
+    // (b) A gate the Ledger leaves out of every checkpoint: it could be erased at any time.
+    let only_gate_1: Vec<(u64, Vec<u8>)> = cps
+        .iter()
+        .map(|(n, bytes)| {
+            let env: Envelope = serde_json::from_slice(bytes).unwrap();
+            let mut doc = gov_core::open::<Checkpoint>(
+                &env,
+                &gov_core::KeySet::new([ledger_key().public()]),
+                &scope(),
+            )
+            .unwrap()
+            .doc;
+            doc.heads.retain(|h| h.gate.as_str() == "gate-1");
+            (
+                *n,
+                serde_json::to_vec(&seal(&doc, &ledger_key()).unwrap()).unwrap(),
+            )
+        })
+        .collect();
+    let report = check(&s.keys, &good, &only_gate_1, None);
+    assert!(problems(&report).contains(&(Problem::GateNotWitnessed, Some("gate-2"), None)));
+
+    // (c) That gate then dropped from the export, while the customer still holds its key.
+    let mut dropped = good.clone();
+    dropped.gates.retain(|g| g.gate.as_str() != "gate-2");
+    let report = check(&s.keys, &dropped, &only_gate_1, None);
+    assert!(problems(&report).contains(&(Problem::GateMissing, Some("gate-2"), None)));
+
+    // (d) A receipt older than the latest checkpoint that no checkpoint covers.
+    let g1 = key("gate-1-key", 20);
+    let mut late = good.clone();
+    let old = receipt(
+        "gate-1",
+        7,
+        Some(hash_of(&late.gates[0].receipts[5], &g1)),
+        T0 + 60,
+    );
+    late.gates[0].receipts[6] = seal(&old, &g1).unwrap();
+    assert_eq!(
+        problems(&check(&s.keys, &late, &cps, None)),
+        vec![(Problem::ReceiptNotWitnessed, Some("gate-1"), Some(7))]
+    );
+}
+both_stores!(
+    verify_does_not_pass_what_the_witness_does_not_cover,
+    no_cover
+);
+
+/// GR-15 and GR-12: an export that lists a gate twice or is of another version; a witness with
+/// look-alike file names; a checkpoint number that repeats.
+async fn odd_inputs<S: Store>(store: S) {
+    let s = stack(store).await;
+    let good = s.ledger.export().await.unwrap();
+    let witness = DirWitness::new(s.witness_dir.path());
+    let cps = witness.all().unwrap();
+
+    let mut twice = good.clone();
+    twice.gates.push(good.gates[0].clone());
+    assert!(problems(&check(&s.keys, &twice, &cps, None)).contains(&(
+        Problem::BadExport("gate_listed_twice"),
+        Some("gate-1"),
+        None
+    )));
+    let mut v2 = good.clone();
+    v2.v = 2;
+    assert!(problems(&check(&s.keys, &v2, &cps, None)).contains(&(
+        Problem::BadExport("unknown_version"),
+        None,
+        None
+    )));
+
+    // Files that only look like checkpoints are not read as checkpoints.
+    for name in [
+        "checkpoint-1.json",
+        "checkpoint-+0000000000000000001.json",
+        "checkpoint-00000000000000000001.json.bak",
+    ] {
+        std::fs::write(s.witness_dir.path().join(name), b"{}").unwrap();
+    }
+    assert_eq!(witness.all().unwrap(), cps);
+    // A number that repeats or falls is reported, not silently taken.
+    let mut repeated = cps.clone();
+    repeated.insert(2, cps[1].clone());
+    assert!(
+        problems(&check(&s.keys, &good, &repeated, None)).contains(&(
+            Problem::BadCheckpoint("number_repeated"),
+            None,
+            Some(2)
+        ))
+    );
+}
+both_stores!(odd_exports_and_witnesses_are_reported, odd_inputs);
+
+/// GR-6: a gate key anyone could forge for is not enrolled, nor one key under two ids.
+async fn enrolment<S: Store>(store: S) {
+    let ledger = ledger_with_gates(store).await;
+    let mut identity = [0u8; 32];
+    identity[0] = 1;
+    let weak = gov_core::PublicKey::from_bytes_unchecked(id("gate-3-key"), &identity);
+    let r = ledger.enrol_gate_key(&id("gate-3"), &weak).await;
+    assert!(
+        matches!(r, Err(LedgerError::Core(gov_core::Error::WeakKey))),
+        "{r:?}"
+    );
+    // Gate 1's key again, under a new id and for another gate.
+    let same = SigningKey::from_seed(id("gate-3-key"), &[20; 32])
+        .unwrap()
+        .public();
+    assert!(ledger.enrol_gate_key(&id("gate-3"), &same).await.is_err());
+    // And a key id that is taken.
+    assert!(ledger
+        .enrol_gate_key(&id("gate-3"), &key("gate-1-key", 77).public())
+        .await
+        .is_err());
+    assert_eq!(ledger.store().gate_keys(&scope()).await.unwrap().len(), 2);
+}
+both_stores!(a_weak_or_repeated_gate_key_is_not_enrolled, enrolment);

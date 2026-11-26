@@ -101,6 +101,37 @@ Where G2 differs from the text below, or chose the more refusing reading:
 - The directory witness sets each file read-only. That is a guard against accident, not
   against whoever controls the directory; object storage with a lock is later work.
 
+## Security review of 2026-11-26 (first read; the gate did not pass)
+
+An independent reviewer session read this spec, G1 and G2 at `2d08d15`, read-only, and ran
+probes against the built crates. **Verdict: the gate did not pass** for the spec, for G1 or for
+G2: four findings of High severity, no Critical. Nothing here touches a real system. The fixes
+below are on branch `build/gov-review-1`; **the reviewer has not yet re-read them, so the gate
+is still not passed.**
+
+| Finding | Severity | What was wrong | What was done |
+|---|---|---|---|
+| GR-1 | High | A lease carried no nonce and an older lease could replace a newer one: a replayed lease turned a gate's clock and its revocations back | Fixed. A lease answers one request (a nonce); its age counts from when the request left; a lease whose Authority time or revocation number is lower than the held one is refused |
+| GR-2 | High | The claim that a compromised Authority cannot forge a **signed** approval was wrong: the Authority serves the approval page, so it can show action A and have the passkey sign action B | **Design open, not fixed.** The claim is withdrawn (§3.4, T8, §2 item 1). "Signed" proves a rostered person's key signed, not what they saw. It is not built, and stays unbuilt until the approver sees the action from something the Authority does not control (decision 8 in §11) |
+| GR-3 | High | `gov verify` believed the Ledger's prune record on its key alone: an operator could delete every receipt, sign a record, and get "OK" | Fixed as far as a witness can: a record past what the witness covered, or whose hash ties to no checkpoint and no receipt, is a finding; `--retention-days` reports receipts pruned too soon after first being covered; the report always says what the Ledger claims to have deleted. An erasure that waits out the retention is, by design, a prune |
+| GR-4 | High | `gov verify` said OK with no witness cover: an empty witness, a gate left out of every checkpoint, a gate dropped from the export | Fixed: each is a finding, as is a receipt older than the latest checkpoint that none covers |
+| GR-5 | Medium | A revoked agent key kept its mandates; a revoked Authority key was not checked on a countersignature | Fixed |
+| GR-6 | Medium | A small-order public key, for which anyone can forge, was accepted | Fixed: refused when parsed (the known encodings) and at enrolment (a check that needs no list); one key cannot be enrolled under two ids |
+| GR-7 | Medium | "Refuse `X/*`" left `X` itself allowed | Fixed: a refusal's `X/*` covers `X`. A grant's and an allow's do not |
+| GR-8 | Medium | (a) the approver's groups are the Authority's word even for "signed"; (b) "the issuer may not approve" could not be checked by the gate; (c) class and issue time were not in what a passkey signs | (b) and (c) fixed: a rule says `issuer_may_approve` (default no) and the gate compares. (a) is for G6: groups for "signed" come from the signed roster |
+| GR-9 | Medium | Pruning went by the time the gate wrote in a receipt | Fixed: by the Ledger's own intake time |
+| GR-10 | Medium | A gate gets no proof the Ledger kept what it shipped; checkpoint times are the Ledger's own | For G3: the Ledger returns a signed head on intake and the gate keeps its spool until a witnessed checkpoint covers it. `gov verify` now defaults `--now` to the clock. Using the witness store's own write times waits for the object-storage witness |
+| GR-11 to GR-17, GR-19, GR-21 | Low | Unchecked arithmetic; look-alike witness file names and repeated numbers; a short file after a crash; pruning before the witness had the checkpoint; a gate listed twice in an export; an enforced allow with no mandate; a session not tied to a key; an action read from the wire without its rule; the dependency rule read from manifests | Fixed, each with a test |
+| GR-18 | Low | Limits are per mandate, so children multiply a parent's limit | For G6: the gate charges an action to every mandate in the chain (§4.2) |
+| GR-20 | Low | Anyone who reaches intake can fill the refusals table; a gate key cannot be retired | For G3, with the listener |
+
+Each fix has a test, and each test was shown to fail with its fix taken out. Also noted by
+the reviewer, for the slices named: the gate must send the arguments it digested,
+re-serialised, never the bytes it received (G6); the gate's monotonic clock must count time
+while suspended (G6); resource identifiers are case-sensitive, so a connector for a system
+that is not must fold case (G3); "the old Authority key signs the new one" has no recovery if
+the old key is stolen (open, §11).
+
 ## 1. What is being built
 
 Agent Governance is a second product, separate from PM OS. It has three parts.
@@ -156,7 +187,9 @@ adopts. Each is a decision the reviewer should challenge.
    the first release, which lets whoever controls the Authority approve anything. This spec has
    two classes of countersignature (§4.4): **signed**, where the approver's own passkey signs the
    exact action and the gate checks that signature itself; and **attested**, where the Authority
-   or PM OS vouches for a signed-in person. Policy says which class an action needs. A receipt
+   or PM OS vouches for a signed-in person. (Review finding GR-2: as long as the Authority
+   serves the page the approver reads, "signed" does not stop a compromised Authority either.
+   See §3.4 and decision 8 in §11.) Policy says which class an action needs. A receipt
    records which was used. Approvals from a Slack card can only ever be attested.
 2. **What the approver sees.** A person cannot approve a digest. In the self-hosted first
    release the gate sends the Authority the action's readable form for the approval screen,
@@ -229,7 +262,7 @@ attack; a slice is not done until that test exists and fails without the control
 | T5 | Approved arguments are swapped before the write | The countersignature is over the action's digest; the gate recomputes the digest from the arguments it is about to send, after every transformation | G1, G6 |
 | T6 | The target changed after approval (new commits, an edited page) | The canonical action carries `resource_version` where the system has one; the connector checks it at write time (§4.3) | G6 |
 | T7 | A countersignature is used twice, or after it expired | It names one gate, one digest, one mandate and an expiry; the gate records its use durably before the write | G6 |
-| T8 | The Authority (or its operator) forges an approval | For actions policy marks **signed**, the gate verifies the approver's passkey signature itself. Changes to the approver roster are receipts in the witnessed Ledger, so a planted key is detectable. It is not preventable in this design; the spec says so on screen | G6 |
+| T8 | The Authority (or its operator) forges an approval | **Not controlled yet** (review finding GR-2). For actions policy marks **signed**, the gate verifies the approver's passkey signature itself, which shows a rostered person's key signed; but the Authority serves the page they read, so it can show one action and collect a signature on another. Until the approver sees the action from something the Authority does not control, "signed" is no stronger than "attested" against a compromised Authority, and the product says so | G6, after decision 8 |
 | T9 | A taken-over gate acts and writes no receipt | Not preventable: the gate holds both the credential and the receipt key. Detected three ways: heartbeat checkpoints make a silent gate visible (§6.2); numbered chains show a gap; reconciliation compares the system's own record of writes with the receipts (§7.5). Receipts prove what the gate said, never by themselves what happened | G2, later |
 | T10 | A receipt is altered or removed in the Ledger | Receipts are signed by the gate and chained by number; checkpoints over all chain heads go to the witness on a timer. Anyone with the public keys and the witness can verify | G2 |
 | T11 | Revocation does not arrive; a gate keeps acting | A lease states the revocation sequence it covers; a gate without every revocation up to that number treats the lease as invalid. A stale lease refuses (§4.6) | G4, G6 |
@@ -253,8 +286,9 @@ These go in the product's own documentation, not only here.
   system, **custody**, **in line** or **reported**, and never claims more.
 - Observe and shadow protect nothing.
 - A compromised gate can act unrecorded; it can be detected, not prevented (T9).
-- A compromised Authority cannot forge a **signed** approval without planting an approver key,
-  which is recorded; it can forge an **attested** one (T8).
+- A compromised Authority can forge an **attested** approval. As designed today it can also
+  obtain a **signed** one for an action the approver never saw, by showing them another
+  (T8, review finding GR-2). That is open until decision 8 in §11 is made.
 - An agent acting inside its mandate under injected instructions is not stopped (T12).
 
 ## 4. The signed documents
@@ -306,7 +340,9 @@ parent: <the parent's full signed mandate, or absent>
   parent agent's signed request, and embeds the parent's whole signed mandate. The gate checks
   each link: signature, tenant, expiry inside the parent's, grants inside the parent's, not
   revoked. Depth is limited to 3. Delegation without calling the Authority is later work.
-- **Limits** are counted by the gate the session is on. They are a brake, not an exact quota,
+- **Limits** are charged to every mandate in the chain, so a parent's limit bounds all its
+  children together (review finding GR-18; built in G6). They are counted by the gate the
+  session is on. They are a brake, not an exact quota,
   when an agent uses several gates.
 
 ### 4.3 Canonical action and its digest
@@ -411,8 +447,11 @@ outcome: { status: ok | failed | unknown, upstream_ref?, response_digest? }
   group) | refuse`, refusals win, and no match means refuse. Cedar and Open Policy Agent were
   considered; the reason for not using them yet is to keep the decision path small enough to
   review whole. To revisit when a customer needs their own policy language.
-- **Lease.** A signed document `{ gate, authority_time, policy_version, revocation_seq,
-  valid_for }`, renewed on a timer. A gate may decide only while it holds the bundle the lease
+- **Lease.** A signed document `{ gate, nonce, authority_time, policy_version,
+  revocation_seq, valid_for }`, renewed on a timer. The gate sends a fresh random nonce with
+  each renewal and accepts only the lease that carries it; a lease's age counts from when its
+  request left; and a lease whose Authority time or revocation number is lower than the one
+  held is refused (review finding GR-1). A gate may decide only while it holds the bundle the lease
   names and every revocation up to `revocation_seq`.
 - **Freshness classes.** Policy gives each rule a class: `strict` or `standard`. Defaults, to
   be measured before they are called findings: strict 10 seconds, standard 120 seconds. An
@@ -653,6 +692,13 @@ licensing.
    (§4.4).
 6. The product's names: the six working names, and "Agent Governance" itself.
 7. Who, besides the owner, may be a Governance admin on the first stack.
+8. How an approver sees the action they sign without trusting the Authority (review finding
+   GR-2). The conductor's recommendation: the gate, which the customer runs, serves the
+   approval page and shows the action from the same bytes it will send; the Authority only
+   routes the person there. The alternative is to say plainly that "signed" adds a second
+   factor but not independence from the Authority.
+9. How an Authority key is replaced if the old one is stolen: today the old key signs the new
+   one, so a thief can install their own.
 
 ## 12. To be confirmed before or during the build
 

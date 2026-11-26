@@ -38,9 +38,13 @@ enum Command {
         /// How often the Ledger publishes a checkpoint, in seconds.
         #[arg(long, default_value_t = 60)]
         interval: u32,
-        /// Now, in seconds since the epoch, to also report a Ledger that has stopped since.
+        /// Now, in seconds since the epoch. Defaults to this machine's clock, so that a Ledger
+        /// that has stopped publishing is always reported.
         #[arg(long)]
         now: Option<i64>,
+        /// The retention the Ledger is meant to keep, in days: report receipts pruned sooner.
+        #[arg(long)]
+        retention_days: Option<u64>,
         /// With --now: report a gate whose chain has not moved for this many seconds.
         #[arg(long)]
         gate_quiet: Option<u32>,
@@ -67,6 +71,21 @@ fn describe(problem: &Problem) -> String {
         }
         Problem::LedgerSilent => "no checkpoint for more than twice the interval".into(),
         Problem::GateQuiet => "the gate's chain has not moved for longer than allowed".into(),
+        Problem::NoCheckpoint => {
+            "the witness holds no checkpoint: nothing in the export is covered".into()
+        }
+        Problem::GateMissing => "a gate with trusted keys is not in the export".into(),
+        Problem::GateNotWitnessed => {
+            "the gate has receipts and the latest checkpoint does not list it".into()
+        }
+        Problem::ReceiptNotWitnessed => {
+            "a receipt older than the latest checkpoint is covered by none".into()
+        }
+        Problem::PruneNotWitnessed => {
+            "the prune record reaches past the witness, or ties to nothing".into()
+        }
+        Problem::PrunedTooSoon => "receipts were pruned sooner than the retention allows".into(),
+        Problem::BadExport(code) => format!("the export cannot be read as one ({code})"),
     }
 }
 
@@ -82,6 +101,12 @@ fn print(report: &Report) {
                 g.gate, g.unwitnessed
             ),
             None => println!("gate {}: no receipt verified", g.gate),
+        }
+        if g.pruned_through > 0 {
+            println!(
+                "gate {}: the Ledger says it deleted receipts 1 to {}",
+                g.gate, g.pruned_through
+            );
         }
     }
     for f in &report.findings {
@@ -109,8 +134,15 @@ fn run(cli: Cli) -> anyhow::Result<bool> {
         witness,
         interval,
         now,
+        retention_days,
         gate_quiet,
     } = cli.command;
+    let now = now.or_else(|| {
+        let since = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        i64::try_from(since.as_secs()).ok()
+    });
     let scope = Scope::new(&tenant, &env).map_err(|e| anyhow::anyhow!("--tenant or --env: {e}"))?;
     let keys: TrustedKeys =
         serde_json::from_slice(&std::fs::read(&keys).context("reading --keys")?)
@@ -130,6 +162,7 @@ fn run(cli: Cli) -> anyhow::Result<bool> {
         interval_secs: interval,
         now,
         gate_quiet_secs: gate_quiet,
+        retention_secs: retention_days.map(|d| d.saturating_mul(86_400)),
     });
     print(&report);
     Ok(report.ok())

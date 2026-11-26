@@ -9,7 +9,7 @@ use gov_core::receipt::{
     ReceiptAgent,
 };
 use gov_core::{open, seal, Id, KeySet, ResourcePath, Scope, SigningKey};
-use gov_ledger::{DirWitness, Ledger, MemoryStore, Store};
+use gov_ledger::{DirWitness, Ledger, MemoryStore};
 use serde_json::json;
 
 const T0: i64 = 1_800_000_000;
@@ -47,8 +47,7 @@ async fn an_auditor_verifies_with_files_alone() {
     let ledger_key = SigningKey::from_seed(id("ledger-1"), &[50; 32]).unwrap();
     let ledger = Ledger::new(MemoryStore::default(), scope.clone());
     ledger
-        .store()
-        .add_gate_key(&scope, &id("gate-1"), &gate.public())
+        .enrol_gate_key(&id("gate-1"), &gate.public())
         .await
         .unwrap();
 
@@ -117,7 +116,9 @@ async fn an_auditor_verifies_with_files_alone() {
     )
     .unwrap();
 
-    let (code, out) = gov(dir.path(), &[]);
+    // `--now` defaults to this machine's clock; the tests name the time they mean.
+    let soon = (T0 + 70).to_string();
+    let (code, out) = gov(dir.path(), &["--now", &soon]);
     assert_eq!(code, 0, "{out}");
     assert!(
         out.contains("3 receipts and 1 checkpoints verified"),
@@ -138,6 +139,34 @@ async fn an_auditor_verifies_with_files_alone() {
         "{out}"
     );
 
+    // With no --now the command uses the clock, so a witness that ends in the past is never
+    // passed as current. (The test's checkpoint is dated in 2027; skip once that has passed.)
+    let today = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    if today > T0 + 600 {
+        let (code, out) = gov(dir.path(), &[]);
+        assert_eq!(code, 1, "{out}");
+    }
+
+    // An empty witness is a failure, not "nothing to check".
+    let empty = tempfile::tempdir().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_gov"))
+        .args([
+            "verify", "--tenant", "acme", "--env", "prod", "--now", &soon,
+        ])
+        .arg("--keys")
+        .arg(dir.path().join("keys.json"))
+        .arg("--export")
+        .arg(dir.path().join("export.json"))
+        .arg("--witness")
+        .arg(empty.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("the witness holds no checkpoint"));
+
     // A receipt removed from the export.
     let mut cut = export.clone();
     cut.gates[0].receipts.remove(1);
@@ -156,7 +185,7 @@ async fn an_auditor_verifies_with_files_alone() {
 
     // Files that are not what they should be: an error, not a verdict.
     std::fs::write(dir.path().join("export.json"), b"{}").unwrap();
-    let (code, out) = gov(dir.path(), &[]);
+    let (code, out) = gov(dir.path(), &["--now", &soon]);
     assert_eq!(code, 2, "{out}");
     assert!(!out.contains("OK:"), "{out}");
 }

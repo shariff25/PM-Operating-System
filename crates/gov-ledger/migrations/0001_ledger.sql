@@ -10,6 +10,9 @@ CREATE TABLE gate_keys (
     PRIMARY KEY (tenant, env, kid)
 );
 
+-- One key, one gate: a key enrolled under two ids could be disowned under either.
+CREATE UNIQUE INDEX gate_keys_one_key ON gate_keys (tenant, env, (key ->> 'key'));
+
 -- The last receipt of each gate's chain. Kept apart from the receipts so that pruning them
 -- does not lose where the chain stands.
 CREATE TABLE chain_heads (
@@ -28,6 +31,8 @@ CREATE TABLE receipts (
     seq      BIGINT NOT NULL CHECK (seq >= 1),
     hash     TEXT NOT NULL,
     at       BIGINT NOT NULL,
+    -- The Ledger's own clock at intake. Pruning goes by this, not by the gate's "at".
+    received_at BIGINT NOT NULL,
     envelope JSONB NOT NULL,
     PRIMARY KEY (tenant, env, gate, seq)
 );

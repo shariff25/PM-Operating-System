@@ -9,7 +9,9 @@ use gov_core::action::{self, CanonicalAction, Grant, Kind};
 use gov_core::countersign::{
     Approver, Class, Countersignature, Evidence, NoPasskeys, PasskeyVerifier, Requirement,
 };
-use gov_core::lease::{Checkpoint, Freshness, FreshnessLimits, GateHead, HeldLease, Lease};
+use gov_core::lease::{
+    Checkpoint, Freshness, FreshnessLimits, GateHead, HeldLease, Lease, LeaseRequest,
+};
 use gov_core::mandate::{
     verify_chain, AgentRef, ChainCheck, IssuedBy, IssuerKind, Limits, Mandate, Requires, MAX_CHAIN,
 };
@@ -560,7 +562,12 @@ fn proof(counter: u64, digest: &Digest, mandate: &str) -> RequestProof {
     }
 }
 fn session() -> Session {
-    Session::new(id("gate-1"), id("s-1"), id("c-4f9a"))
+    Session::new(
+        id("gate-1"),
+        id("s-1"),
+        id("c-4f9a"),
+        key("agent-1-key", 11).public(),
+    )
 }
 
 #[test]
@@ -632,12 +639,12 @@ fn a_request_belongs_to_one_gate_session_and_mandate() {
     let sc = scope();
     let good = seal(&proof(1, &digest, "m-child-1"), &agent).unwrap();
 
-    let mut other_gate = Session::new(id("gate-2"), id("s-1"), id("c-4f9a"));
+    let mut other_gate = Session::new(id("gate-2"), id("s-1"), id("c-4f9a"), agent.public());
     assert_eq!(
         other_gate.accept(&good, &leaf, &digest, &sc).unwrap_err(),
         Error::WrongGate
     );
-    let mut other_challenge = Session::new(id("gate-1"), id("s-1"), id("c-0000"));
+    let mut other_challenge = Session::new(id("gate-1"), id("s-1"), id("c-0000"), agent.public());
     assert_eq!(
         other_challenge
             .accept(&good, &leaf, &digest, &sc)
@@ -690,6 +697,8 @@ struct Want {
     mandate: Id,
     digest: Digest,
     group: Id,
+    signed_by: Id,
+    not_approver: Option<Id>,
 }
 impl Want {
     fn new() -> Self {
@@ -698,6 +707,8 @@ impl Want {
             mandate: id("m-child-1"),
             digest: update().digest(),
             group: id("pay-leads"),
+            signed_by: id("authority-1"),
+            not_approver: None,
         }
     }
     fn of(&self, class: Class, now: i64) -> Requirement<'_> {
@@ -707,6 +718,8 @@ impl Want {
             action_digest: &self.digest,
             class,
             group: &self.group,
+            not_approver: self.not_approver.as_ref(),
+            signed_by: &self.signed_by,
             now,
         }
     }
@@ -1014,6 +1027,7 @@ fn lease() -> Lease {
         env: id("prod"),
         issuer: id("authority"),
         gate: id("gate-1"),
+        nonce: id("n-1"),
         authority_time: NOW,
         policy_version: id("7"),
         revocation_seq: 41,
@@ -1021,10 +1035,104 @@ fn lease() -> Lease {
     }
 }
 
+fn asked(mono_ms: u64) -> LeaseRequest {
+    LeaseRequest {
+        gate: id("gate-1"),
+        nonce: id("n-1"),
+        sent_mono_ms: mono_ms,
+    }
+}
+/// A first lease, asked for at `mono_ms`.
+fn held_at(lease: Lease, mono_ms: u64) -> HeldLease {
+    HeldLease::accept(None, lease, &asked(mono_ms)).unwrap()
+}
+
+/// Review finding GR-1: a lease is the answer to one request, and never moves a gate back.
+#[test]
+fn a_replayed_or_older_lease_is_refused() {
+    let first = held_at(lease(), 5_000);
+    // A newer lease arrives in answer to the gate's next request.
+    let mut newer = lease();
+    newer.nonce = id("n-2");
+    newer.authority_time = NOW + 10_000;
+    newer.revocation_seq = 57;
+    let next = LeaseRequest {
+        gate: id("gate-1"),
+        nonce: id("n-2"),
+        sent_mono_ms: 10_005_000,
+    };
+    let held = HeldLease::accept(Some(&first), newer.clone(), &next).unwrap();
+    assert_eq!(held.now(10_005_000).unwrap(), NOW + 10_000);
+
+    // The old lease, kept by someone and played back: it answers no request the gate made.
+    let third = LeaseRequest {
+        gate: id("gate-1"),
+        nonce: id("n-3"),
+        sent_mono_ms: 10_006_000,
+    };
+    assert_eq!(
+        HeldLease::accept(Some(&held), lease(), &third).unwrap_err(),
+        Error::LeaseReplayed
+    );
+    // Even with the right nonce (a hostile network replaying into a guessed request), a lease
+    // that would turn the clock or the revocations back is refused.
+    let mut back_in_time = lease();
+    back_in_time.nonce = id("n-3");
+    assert_eq!(
+        HeldLease::accept(Some(&held), back_in_time, &third).unwrap_err(),
+        Error::LeaseReplayed
+    );
+    let mut fewer_revocations = newer.clone();
+    fewer_revocations.nonce = id("n-3");
+    fewer_revocations.authority_time = NOW + 10_001;
+    fewer_revocations.revocation_seq = 41;
+    assert_eq!(
+        HeldLease::accept(Some(&held), fewer_revocations, &third).unwrap_err(),
+        Error::LeaseReplayed
+    );
+    // Each check alone: a lease that is newer in every way but answers another request...
+    let mut wrong_nonce = newer.clone();
+    wrong_nonce.nonce = id("n-9");
+    wrong_nonce.authority_time = NOW + 20_000;
+    wrong_nonce.revocation_seq = 60;
+    assert_eq!(
+        HeldLease::accept(Some(&held), wrong_nonce, &third).unwrap_err(),
+        Error::LeaseReplayed
+    );
+    // ...and one that answers this request, with every revocation, but an older clock.
+    let mut older_clock = newer.clone();
+    older_clock.nonce = id("n-3");
+    older_clock.authority_time = NOW + 9_999;
+    older_clock.revocation_seq = 60;
+    assert_eq!(
+        HeldLease::accept(Some(&held), older_clock, &third).unwrap_err(),
+        Error::LeaseReplayed
+    );
+    // Another gate's lease.
+    let mut other_gate = newer.clone();
+    other_gate.nonce = id("n-3");
+    other_gate.gate = id("gate-2");
+    assert_eq!(
+        HeldLease::accept(Some(&held), other_gate, &third).unwrap_err(),
+        Error::LeaseReplayed
+    );
+    // A lease held up on the way is as old as its request, not as young as its arrival: asked
+    // for at 10_006_000, it is already past the strict class by 10_016_001 however late it came.
+    let mut delayed = newer;
+    delayed.nonce = id("n-3");
+    let held = HeldLease::accept(Some(&held), delayed, &third).unwrap();
+    let limits = FreshnessLimits::default();
+    assert_eq!(
+        held.permits(10_016_001, Freshness::Strict, &limits, &id("7"), 57)
+            .unwrap_err(),
+        Error::LeaseStale
+    );
+}
+
 #[test]
 fn a_stale_or_incomplete_lease_refuses() {
     let limits = FreshnessLimits::default();
-    let held = HeldLease::new(lease(), 5_000);
+    let held = held_at(lease(), 5_000);
     let v7 = id("7");
 
     held.permits(15_000, Freshness::Strict, &limits, &v7, 41)
@@ -1045,7 +1153,7 @@ fn a_stale_or_incomplete_lease_refuses() {
     // The lease's own life caps every class.
     let mut short = lease();
     short.valid_for_secs = 3;
-    let short = HeldLease::new(short, 0);
+    let short = held_at(short, 0);
     assert_eq!(
         short
             .permits(3_001, Freshness::Standard, &limits, &v7, 41)
@@ -1075,7 +1183,7 @@ fn a_stale_or_incomplete_lease_refuses() {
 /// Authority's clock whatever the gate's wall clock says.
 #[test]
 fn expiry_runs_on_the_authoritys_clock() {
-    let held = HeldLease::new(lease(), 1_000_000);
+    let held = held_at(lease(), 1_000_000);
     assert_eq!(held.now(1_000_000).unwrap(), NOW);
     assert_eq!(held.now(1_059_999).unwrap(), NOW + 59);
     let (env, _, _) = chain();
@@ -1160,10 +1268,12 @@ fn refusals_win_and_no_match_refuses() {
     let lead = Effect::Countersign {
         class: Class::Attested,
         group: id("pay-leads"),
+        issuer_may_approve: false,
     };
     let sec = Effect::Countersign {
         class: Class::Signed,
         group: id("security"),
+        issuer_may_approve: true,
     };
 
     let policy = bundle(vec![
@@ -1222,7 +1332,8 @@ fn refusals_win_and_no_match_refuses() {
         policy.evaluate(&subject, &upd("PAY-50")).verdict,
         Verdict::Countersign(vec![Needed {
             class: Class::Attested,
-            group: id("pay-leads")
+            group: id("pay-leads"),
+            issuer_may_approve: false,
         }])
     );
     // Another project: nothing matches, which refuses.
@@ -1245,7 +1356,8 @@ fn refusals_win_and_no_match_refuses() {
         e.verdict,
         Verdict::Countersign(vec![Needed {
             class: Class::Signed,
-            group: id("security")
+            group: id("security"),
+            issuer_may_approve: true,
         }])
     );
     assert_eq!(e.freshness, Freshness::Strict);
@@ -1336,4 +1448,221 @@ fn the_lint_refuses_a_rule_that_permits_everything() {
     let mut v = serde_json::to_value(&policy).unwrap();
     v["overrides"] = json!([]);
     assert!(serde_json::from_value::<PolicyBundle>(v).is_err());
+}
+
+// ----- the reviewer's findings of 2026-11-26 --------------------------------------------
+
+/// GR-5: a stolen agent key, revoked, does not keep its old mandates alive; nor does a
+/// countersignature signed by a revoked Authority key pass.
+#[test]
+fn a_revoked_key_stops_what_it_signed_or_holds() {
+    let (env, _, _) = chain();
+    let keys = authority_keys();
+    let sc = scope();
+    for kid in ["agent-1-key", "agent-0-key"] {
+        let mut revoked = RevocationSet::default();
+        revoked.revoke(Revocable::Key, id(kid));
+        let r = verify_chain(&env, &check(&sc, &keys, &revoked));
+        assert_eq!(r.unwrap_err(), Error::Revoked, "{kid}");
+    }
+    let mut revoked = RevocationSet::default();
+    revoked.revoke(Revocable::Key, id("authority-1"));
+    let cs = countersignature(Class::Attested);
+    let w = Want::new();
+    assert_eq!(
+        cs.satisfies(&w.of(Class::Attested, NOW), &NoPasskeys, &revoked)
+            .unwrap_err(),
+        Error::Revoked
+    );
+}
+
+/// GR-7: "refuse X/*" refuses X itself; a grant of X/* still does not reach X.
+#[test]
+fn a_refusal_of_everything_under_a_thing_refuses_the_thing() {
+    let labels = BTreeSet::new();
+    let agent = id("agent-1");
+    let subject = Subject {
+        agent: &agent,
+        labels: &labels,
+    };
+    let policy = bundle(vec![
+        rule("all-jira", jira(&[], &[]), Effect::Allow),
+        rule(
+            "secret",
+            jira(&[], &["jira/project/SECRET/*"]),
+            Effect::Refuse,
+        ),
+    ]);
+    let delete_project = action_on(
+        "jira/project/SECRET",
+        "project.delete",
+        Kind::Destructive,
+        json!({}),
+    );
+    assert_eq!(
+        policy.evaluate(&subject, &delete_project).verdict,
+        Verdict::Refuse
+    );
+    let inside = action_on(
+        "jira/project/SECRET/issue/S-1",
+        "issue.read",
+        Kind::Read,
+        json!({}),
+    );
+    assert_eq!(policy.evaluate(&subject, &inside).verdict, Verdict::Refuse);
+    let neighbour = action_on(
+        "jira/project/SECRETS",
+        "project.read",
+        Kind::Read,
+        json!({}),
+    );
+    assert_eq!(
+        policy.evaluate(&subject, &neighbour).verdict,
+        Verdict::Allow
+    );
+    // The same pattern as an allow, or in a grant, does not reach the prefix.
+    let only_under = bundle(vec![rule(
+        "under",
+        jira(&[], &["jira/project/PAY/*"]),
+        Effect::Allow,
+    )]);
+    let the_project = action_on(
+        "jira/project/PAY",
+        "project.delete",
+        Kind::Destructive,
+        json!({}),
+    );
+    assert_eq!(
+        only_under.evaluate(&subject, &the_project).verdict,
+        Verdict::NoMatch
+    );
+    assert!(!action::carries(
+        &[grant(&["project.delete"], &["jira/project/PAY/*"])],
+        &the_project
+    ));
+}
+
+/// GR-8: the gate itself refuses the mandate's issuer as approver, unless the rule allows it;
+/// and the challenge a passkey signs covers the class and the issue time.
+#[test]
+fn the_issuer_does_not_approve_their_own_agents_action() {
+    let none = RevocationSet::default();
+    let cs = countersignature(Class::Attested);
+    let mut w = Want::new();
+    w.not_approver = Some(id("bo"));
+    assert_eq!(
+        cs.satisfies(&w.of(Class::Attested, NOW), &NoPasskeys, &none)
+            .unwrap_err(),
+        Error::ApproverIsIssuer
+    );
+    w.not_approver = Some(id("ana"));
+    cs.satisfies(&w.of(Class::Attested, NOW), &NoPasskeys, &none)
+        .unwrap();
+
+    let signed = countersignature(Class::Signed);
+    let mut relabelled = signed.clone();
+    relabelled.class = Class::Attested;
+    assert_ne!(relabelled.challenge(), signed.challenge());
+    let mut redated = signed.clone();
+    redated.issued_at -= 1;
+    assert_ne!(redated.challenge(), signed.challenge());
+    // A rule says whether the issuer may approve; by default they may not.
+    let parsed: Effect = serde_json::from_value(json!({
+        "effect": "countersign", "class": "attested", "group": "pay-leads"
+    }))
+    .unwrap();
+    assert_eq!(
+        parsed,
+        Effect::Countersign {
+            class: Class::Attested,
+            group: id("pay-leads"),
+            issuer_may_approve: false
+        }
+    );
+}
+
+/// GR-16: an enforced allow names its mandate and its policy; a receipt's time is not negative.
+#[test]
+fn an_enforced_allow_names_its_mandate_and_policy() {
+    let mut r = receipt(1, None, Phase::Intent);
+    r.mandate.clear();
+    assert!(r.validate().is_err());
+    let mut r = receipt(1, None, Phase::Intent);
+    r.policy_version = None;
+    assert!(r.validate().is_err());
+    let mut r = receipt(1, None, Phase::Intent);
+    r.at = -1;
+    assert!(r.validate().is_err());
+}
+
+/// GR-17: a session belongs to the agent key that opened it.
+#[test]
+fn another_agent_cannot_sign_into_a_session() {
+    // agent-0 holds the root mandate and its own key; the session was opened by agent-1.
+    let a0 = key("agent-0-key", 10);
+    let r = root(&a0, "agent-0");
+    let digest = update().digest();
+    let mut s = session();
+    let intruder = seal(&proof(u64::MAX, &digest, "m-root"), &a0).unwrap();
+    assert_eq!(
+        s.accept(&intruder, &r, &digest, &scope()).unwrap_err(),
+        Error::WrongSession
+    );
+    // The session's own agent is not locked out by the attempt.
+    let (_, leaf, a1) = chain();
+    s.accept(
+        &seal(&proof(1, &digest, "m-child-1"), &a1).unwrap(),
+        &leaf,
+        &digest,
+        &scope(),
+    )
+    .unwrap();
+}
+
+/// GR-19: an action read from the wire keeps the rule that its resource lies in its system,
+/// and so does a policy rule.
+#[test]
+fn a_resource_outside_its_system_is_refused_wherever_it_is_read() {
+    let mut v = serde_json::to_value(update()).unwrap();
+    assert!(serde_json::from_value::<CanonicalAction>(v.clone()).is_ok());
+    v["resource"] = json!("github/repo/pay");
+    assert!(serde_json::from_value::<CanonicalAction>(v.clone()).is_err());
+    v["resource"] = json!("jira/project/PAY");
+    v["note"] = json!("x");
+    assert!(serde_json::from_value::<CanonicalAction>(v).is_err());
+    let crossed = Match {
+        resources: Some(vec![ResourcePattern::new("github/repo/*").unwrap()]),
+        ..jira(&[], &[])
+    };
+    assert!(bundle(vec![rule("x", crossed, Effect::Allow)])
+        .validate()
+        .is_err());
+}
+
+/// GR-11: a chain head at the largest number has no next receipt; nothing overflows.
+#[test]
+fn the_last_possible_number_has_no_successor() {
+    let gate = key("gate-1-key", 20);
+    let keys = KeySet::new([gate.public()]);
+    let head = ChainHead {
+        seq: u64::MAX,
+        hash: Digest::of(&[b"h"]),
+    };
+    let r = receipt(1, None, Phase::Intent);
+    let opened = open::<Receipt>(&seal(&r, &gate).unwrap(), &keys, &scope()).unwrap();
+    assert_eq!(
+        follow(Some(&head), &opened).unwrap_err(),
+        Error::BrokenChain
+    );
+}
+
+/// GR-6: a verifier handed a small-order key by some other route still gains nothing useful
+/// from it at enrolment, which refuses it.
+#[test]
+fn enrolment_refuses_a_key_anyone_can_forge_for() {
+    let mut identity = [0u8; 32];
+    identity[0] = 1;
+    let weak = gov_core::PublicKey::from_bytes_unchecked(id("gate-9-key"), &identity);
+    assert_eq!(weak.enrolable().unwrap_err(), Error::WeakKey);
+    key("gate-1-key", 20).public().enrolable().unwrap();
 }
