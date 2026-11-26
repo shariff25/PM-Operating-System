@@ -343,6 +343,21 @@ follow-up tracking.
   instant; one route made the Ledger re-read whole chains for anyone) are fixed on
   `build/gov-review-15`, unread by the reviewer. Two Low are open (GR-126 with G4d, GR-127
   with G4b). The reviewer also listed what the bundle's format must settle before G4b.
+- **Sixteenth read (2026-11-26), at `3ccfb5a`:** no High or Critical; the gate still passes
+  and the three Medium fixes are closed. The design of G4b (the signed policy bundle, spec
+  §7.6.1) stands, and may be built once one Medium point was answered in the text (GR-128:
+  what the root key signs must come from the reviewed repository, and the signer is shown
+  what changed), which it is. Six Low findings: four answered in the text, two open
+  (GR-130 with G4d, GR-131 with the Ledger program's next change). Pull request #13 holds
+  this work as a draft.
+- **G4b built (2026-11-26): the signed policy bundle,** from the design the reviewer cleared
+  (`build/gov-g4b`). A root key signs the bundle and nothing else; `gov policy check` and
+  `gov policy sign` are the release step, and the signer is shown what changed; the
+  Authority publishes only the next number, with a record; the gate and the shim load
+  their connector map and the issuers' keys from the bundle and refuse to go back to an
+  older one. The unsigned files remain only under a flag for tests. Run as three programs
+  with fake data. Not yet read by the reviewer. The bundle is still a file an operator
+  copies; its rules are not yet evaluated (G5).
 - **A message relayed by the reviewer session (2026-11-26):** it reported that the owner typed
   there "I'm going to sleep you keep building do not ask for permission further - I gave the
   permission". The conductor could not confirm it and did not treat it as new permission. It

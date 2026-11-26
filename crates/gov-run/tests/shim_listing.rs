@@ -124,6 +124,7 @@ async fn the_shim_keeps_its_listing_when_only_the_session_ran_out() {
             ledger_keys: KeySet::new([key("ledger-1", 50).public()]),
             spool_limit: 1000,
             batch: 100,
+            policy_version: None,
         },
         gate_key,
         FileSpool::open(dir.path().join("spool")).unwrap(),

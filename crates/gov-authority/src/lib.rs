@@ -27,8 +27,8 @@ use gov_core::{
 };
 
 pub use store::{
-    Agent, Effect, EnrolledKey, Gate, MemoryStore, PendingCode, Person, Role, Status, Store,
-    StoreError, StoredRecord,
+    Agent, Effect, EnrolledKey, Gate, MemoryStore, PendingCode, Person, Published, Role, Status,
+    Store, StoreError, StoredRecord,
 };
 
 /// How long a one-time code is good for, in seconds.
@@ -48,6 +48,9 @@ pub enum AuthorityError {
     Unknown(&'static str),
     #[error("{0} exists already")]
     Exists(&'static str),
+    /// A bundle offered for publishing does not carry the next number, which is this one.
+    #[error("the next bundle is number {0}")]
+    NotNext(u64),
     /// A request to enrol was refused. It says no more: the caller may be anyone.
     #[error("refused")]
     Refused,
@@ -293,6 +296,11 @@ impl<S: Store> Authority<S> {
             if self.store.agent(&self.scope, agent).await?.is_some() {
                 return Err(AuthorityError::Exists("agent"));
             }
+            // A key's id is under the name it is for, so an agent may not take a gate's
+            // name, nor the Authority's own (review finding GR-127).
+            if agent == &self.name || self.store.gate(&self.scope, agent).await?.is_some() {
+                return Err(AuthorityError::Exists("name"));
+            }
             match self.store.person(&self.scope, owner).await? {
                 Some(p) if p.active => {}
                 _ => return Err(AuthorityError::Unknown("owner")),
@@ -317,6 +325,9 @@ impl<S: Store> Authority<S> {
             self.admin(actor).await?;
             if self.store.gate(&self.scope, gate).await?.is_some() {
                 return Err(AuthorityError::Exists("gate"));
+            }
+            if gate == &self.name || self.store.agent(&self.scope, gate).await?.is_some() {
+                return Err(AuthorityError::Exists("name"));
             }
             let registered = Gate {
                 id: gate.clone(),
@@ -393,6 +404,43 @@ impl<S: Store> Authority<S> {
             let did = Did::to(AdminAction::GateDisabled, SubjectKind::Gate, gate);
             self.commit(head, actor, did, &effects, now).await
         })
+    }
+
+    /// Publish a policy bundle (spec §7.6.1, point 4). It was signed elsewhere, with the root
+    /// key, from the reviewed repository; here it is opened under that root, must be this
+    /// Authority's and carry the next number, and is kept together with a record of its
+    /// number and digest. Returns the digest, for whoever signed it to compare.
+    pub async fn publish_bundle(&self, actor: &Id, signed: &Envelope, now: i64) -> Result<Digest> {
+        on_head!(self, head, {
+            self.admin(actor).await?;
+            let opened = gov_core::policy::open_bundle(signed, &self.root, &self.scope)?;
+            if opened.bundle.issuer != self.name {
+                return Err(AuthorityError::Unknown("bundle for this Authority"));
+            }
+            let latest = self.store.latest_bundle(&self.scope).await?;
+            let next = latest.map_or(1, |b| b.number.saturating_add(1));
+            if opened.bundle.number != next {
+                return Err(AuthorityError::NotNext(next));
+            }
+            let number = Id::new(&opened.bundle.number.to_string())?;
+            let did = Did {
+                value: Some(opened.digest.clone()),
+                ..Did::to(AdminAction::PolicyPublished, SubjectKind::Policy, &number)
+            };
+            let kept = Published {
+                number: opened.bundle.number,
+                digest: opened.digest.clone(),
+                envelope: signed.clone(),
+            };
+            self.commit(head, actor, did, &[Effect::PutBundle(kept)], now)
+                .await?;
+            Ok(opened.digest)
+        })
+    }
+
+    /// The bundle gates are to hold: the last one published, as it was signed.
+    pub async fn latest_bundle(&self) -> Result<Option<Published>> {
+        Ok(self.store.latest_bundle(&self.scope).await?)
     }
 
     /// Whether an agent may act: it is active, and so is the person who answers for it.

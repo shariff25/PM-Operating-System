@@ -193,14 +193,17 @@ impl Site {
         .args(["--operator-listen", "127.0.0.1:0"])
         .arg("--operator-secret-file")
         .arg(self.path("operator.secret"))
-        .arg("--mandate-issuers")
-        .arg(self.path("issuers.json"))
+        .arg("--bundle")
+        .arg(self.path("bundle.json"))
+        .arg("--root-key")
+        .arg(self.path("root.pub.json"))
+        .arg("--bundle-state")
+        .arg(self.path("gate.bundle-state"))
+        .args(["--server", "jira-mcp"])
         .arg("--key-file")
         .arg(self.path("gate.key"))
         .arg("--spool")
         .arg(self.path("spool"))
-        .arg("--map")
-        .arg(self.path("map.json"))
         .arg("--ledger-keys")
         .arg(self.path("ledger-keys.json"))
         .arg("--witness")
@@ -392,11 +395,6 @@ async fn a_gate_and_a_ledger_run_as_programs_leave_a_record_an_auditor_can_check
         serde_json::to_vec(&gov_core::seal(&mandate, &issuer).unwrap()).unwrap(),
     )
     .unwrap();
-    std::fs::write(
-        site.path("issuers.json"),
-        serde_json::to_vec(&[issuer.public()]).unwrap(),
-    )
-    .unwrap();
 
     std::fs::write(site.path("gate.pub"), &gate_public).unwrap();
     std::fs::write(
@@ -418,7 +416,37 @@ async fn a_gate_and_a_ledger_run_as_programs_leave_a_record_an_auditor_can_check
             resource: ResourceTemplate::new("jira/project/{key:before(-)}/issue/{key}").unwrap(),
         }],
     };
-    std::fs::write(site.path("map.json"), serde_json::to_vec(&map).unwrap()).unwrap();
+    // The policy bundle, signed by the root key: it carries the connector map and the key
+    // mandates are issued under. The gate and the shim are given the root's public key.
+    let root = gov_core::SigningKey::from_seed(id("root-1"), &[70; 32]).unwrap();
+    let lease_key = gov_core::SigningKey::from_seed(id("authority:leases-1"), &[72; 32]).unwrap();
+    let bundle = |number: u64, version: &str| {
+        let bundle = gov_core::policy::PolicyBundle {
+            v: 1,
+            tenant: id("acme"),
+            env: id("prod"),
+            issuer: id("authority"),
+            version: id(version),
+            number,
+            issued_at: now,
+            keys: gov_core::policy::OnlineKeys {
+                mandates: vec![issuer.public()],
+                leases: vec![lease_key.public()],
+            },
+            freshness: Default::default(),
+            rules: Vec::new(),
+            connectors: vec![map.clone()],
+        };
+        serde_json::to_vec(&gov_core::seal(&bundle, &root).unwrap()).unwrap()
+    };
+    std::fs::write(site.path("bundle.json"), bundle(2, "v2")).unwrap();
+    std::fs::write(site.path("bundle-older.json"), bundle(1, "v1")).unwrap();
+    std::fs::write(site.path("bundle-forked.json"), bundle(2, "v2-other")).unwrap();
+    std::fs::write(
+        site.path("root.pub.json"),
+        serde_json::to_vec(&root.public()).unwrap(),
+    )
+    .unwrap();
 
     // The gate is enrolled once; a second time is refused.
     let enrol = |site: &Site| {
@@ -500,8 +528,13 @@ async fn a_gate_and_a_ledger_run_as_programs_leave_a_record_an_auditor_can_check
             .arg(site.path("agent.key"))
             .arg("--mandate")
             .arg(site.path("mandate.json"))
-            .arg("--map")
-            .arg(site.path("map.json"))
+            .arg("--bundle")
+            .arg(site.path("bundle.json"))
+            .arg("--root-key")
+            .arg(site.path("root.pub.json"))
+            .arg("--bundle-state")
+            .arg(site.path("shim.bundle-state"))
+            .args(["--server", "jira-mcp"])
             .arg("--secret-file")
             .arg(site.path("shim.secret"));
         c
@@ -623,6 +656,25 @@ async fn a_gate_and_a_ledger_run_as_programs_leave_a_record_an_auditor_can_check
     ] {
         assert!(written.contains(held), "no receipt holds {held}");
     }
+    // Every receipt names the bundle the gate ran on: its number and the start of its
+    // digest (review finding GR-129).
+    let held: gov_core::policy::HeldBundle =
+        serde_json::from_slice(&std::fs::read(site.path("gate.bundle-state")).unwrap()).unwrap();
+    assert_eq!(held.number, 2);
+    let version = format!(r#""policy_version":"2-{}""#, &held.digest.as_str()[..16]);
+    // The export and the spool both hold the receipts, so each is found more than once;
+    // none carries any other policy version, or none.
+    let with_version = written.matches(&version).count();
+    assert!(with_version >= 12, "{with_version} of {version}");
+    assert_eq!(
+        written.matches(r#""policy_version":"#).count(),
+        with_version
+    );
+    assert_eq!(written.matches(r#""phase":"#).count(), with_version);
+    assert_eq!(
+        std::fs::read(site.path("shim.bundle-state")).unwrap(),
+        std::fs::read(site.path("gate.bundle-state")).unwrap()
+    );
     for secret in ["agent-jira-token", "Refund flow", "customer 4411"] {
         assert!(
             !written.contains(secret),
@@ -636,6 +688,22 @@ async fn a_gate_and_a_ledger_run_as_programs_leave_a_record_an_auditor_can_check
 
     drop(shim);
     drop(gate);
+
+    // The gate does not go back: started again on an older bundle, or on another bundle
+    // under the number it holds, it refuses to start, and what it holds is unchanged.
+    let state = std::fs::read(site.path("gate.bundle-state")).unwrap();
+    for (file, says) in [
+        ("bundle-older.json", "older than number 2"),
+        ("bundle-forked.json", "ALARM"),
+    ] {
+        std::fs::copy(site.path(file), site.path("bundle.json")).unwrap();
+        let (ok, _, err) = run(&mut site.gate_on(&ledger_url, "127.0.0.1:0"));
+        assert!(!ok && err.contains(says), "{file}: {err}");
+        assert_eq!(
+            std::fs::read(site.path("gate.bundle-state")).unwrap(),
+            state
+        );
+    }
     drop(ledger);
     site.db.drop_schema().await;
 }
@@ -674,6 +742,7 @@ fn a_program_does_not_start_in_a_way_that_would_expose_a_key_or_a_credential() {
         .arg(path("gate.key"))
         .arg("--spool")
         .arg(path("spool"))
+        .arg("--unsigned-policy-for-tests")
         .arg("--map")
         .arg(path("map.json"))
         .arg("--ledger-keys")

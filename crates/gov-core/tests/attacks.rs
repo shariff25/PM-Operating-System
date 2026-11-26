@@ -15,7 +15,10 @@ use gov_core::lease::{
 use gov_core::mandate::{
     verify_chain, AgentRef, ChainCheck, IssuedBy, IssuerKind, Limits, Mandate, Requires, MAX_CHAIN,
 };
-use gov_core::policy::{Effect, Match, Needed, PolicyBundle, Rule, Subject, Verdict};
+use gov_core::policy::{
+    changes, may_replace, open_bundle, Effect, HeldBundle, KeyRole, Match, Needed, OnlineKeys,
+    PolicyBundle, Rule, Subject, Verdict,
+};
 use gov_core::receipt::{
     follow, ChainHead, Coverage, Decision, DecisionKind, Mode, Outcome, OutcomeStatus, Phase,
     Proof, Reason, Receipt, ReceiptAction, ReceiptAgent,
@@ -1258,7 +1261,12 @@ fn bundle(rules: Vec<Rule>) -> PolicyBundle {
         env: id("prod"),
         issuer: id("authority"),
         version: id("7"),
+        number: 1,
         issued_at: NOW,
+        keys: OnlineKeys {
+            mandates: vec![key("authority:mandates-1", 71).public()],
+            leases: vec![key("authority:leases-1", 72).public()],
+        },
         freshness: FreshnessLimits::default(),
         rules,
         connectors: Vec::new(),
@@ -2347,4 +2355,222 @@ fn an_enrolment_code_names_the_root_key_to_pin() {
     let stranger = key("stranger", 10);
     let forged = seal(&request, &stranger).unwrap();
     assert!(open::<EnrolRequest>(&forged, &own, &scope()).is_err());
+}
+
+// ----- G4b: the signed policy bundle (spec §7.6.1) ----------------------------------------
+
+fn root_key() -> SigningKey {
+    key("root-1", 70)
+}
+
+/// The root key signs the bundle and nothing else, and a bundle opens under nothing else
+/// (GR-109).
+#[test]
+fn a_bundle_opens_under_the_root_key_and_no_other() {
+    let policy = bundle(vec![rule(
+        "read",
+        jira(&["issue.read"], &[]),
+        Effect::Allow,
+    )]);
+    let signed = seal(&policy, &root_key()).unwrap();
+    let opened = open_bundle(&signed, &root_key().public(), &scope()).unwrap();
+    assert_eq!(opened.bundle, policy);
+    // What a receipt carries: the number and the start of the digest (GR-129).
+    let version = opened.policy_version();
+    assert_eq!(
+        version.as_str(),
+        format!("1-{}", &opened.digest.as_str()[..16])
+    );
+
+    // Signed by an online key the bundle itself names, or by any other key: not a bundle.
+    for signer in [
+        key("authority:mandates-1", 71),
+        key("authority:leases-1", 72),
+    ] {
+        let forged = seal(&policy, &signer).unwrap();
+        assert!(open_bundle(&forged, &root_key().public(), &scope()).is_err());
+        // Nor does it open for someone who takes that online key as the root: a bundle
+        // may not list its own signer.
+        assert!(open_bundle(&forged, &signer.public(), &scope()).is_err());
+    }
+    // The root key under another id among the online keys is still the root key.
+    let mut names_root = policy.clone();
+    names_root
+        .keys
+        .leases
+        .push(key("authority:leases-2", 70).public());
+    let signed = seal(&names_root, &root_key()).unwrap();
+    assert!(open_bundle(&signed, &root_key().public(), &scope()).is_err());
+    // So is a key listed under the root's id, whatever key it is.
+    let mut names_root_id = policy.clone();
+    names_root_id.keys.leases.push(key("root-1", 74).public());
+    let signed = seal(&names_root_id, &root_key()).unwrap();
+    assert!(open_bundle(&signed, &root_key().public(), &scope()).is_err());
+    // A bundle that breaks its own rules is refused however well it is signed.
+    let mut unnumbered = policy.clone();
+    unnumbered.number = 0;
+    let signed = seal(&unnumbered, &root_key()).unwrap();
+    assert!(open_bundle(&signed, &root_key().public(), &scope()).is_err());
+    // Another tenant's bundle is not this one's.
+    let other = Scope::new("other", "prod").unwrap();
+    assert!(open_bundle(
+        &seal(&policy, &root_key()).unwrap(),
+        &root_key().public(),
+        &other
+    )
+    .is_err());
+
+    // The root's signature over another kind of document opens nowhere as a bundle, and a
+    // bundle opens nowhere as another kind of document: the type tag is signed.
+    let receipt_like = seal(&mandate_for_tag_test(), &root_key()).unwrap();
+    assert!(open_bundle(&receipt_like, &root_key().public(), &scope()).is_err());
+    let root_keys = KeySet::new([root_key().public()]);
+    let signed = seal(&policy, &root_key()).unwrap();
+    assert!(open::<Mandate>(&signed, &root_keys, &scope()).is_err());
+}
+
+fn mandate_for_tag_test() -> Mandate {
+    root(&key("agent-1", 5), "agent-1")
+}
+
+/// What a bundle must say of its keys and its number before it is a bundle.
+#[test]
+fn a_bundle_keeps_its_key_roles_apart() {
+    let good = bundle(Vec::new());
+    good.validate().unwrap();
+    let with = |change: &dyn Fn(&mut PolicyBundle)| {
+        let mut b = good.clone();
+        change(&mut b);
+        b.validate()
+    };
+    // The number starts at 1.
+    assert!(with(&|b| b.number = 0).is_err());
+    // Each role has a key.
+    assert!(with(&|b| b.keys.mandates.clear()).is_err());
+    assert!(with(&|b| b.keys.leases.clear()).is_err());
+    // One key under two roles, by id or by the key itself.
+    assert!(with(&|b| b.keys.leases.push(b.keys.mandates[0].clone())).is_err());
+    assert!(with(&|b| b.keys.leases.push(key("authority:leases-9", 71).public())).is_err());
+    assert!(with(&|b| b.keys.leases.push(key("authority:mandates-1", 99).public())).is_err());
+    // A second key for a role is fine.
+    with(&|b| b.keys.leases.push(key("authority:leases-2", 73).public())).unwrap();
+    // A bundle without the new fields is not read as one.
+    for gone in ["number", "keys"] {
+        let mut v = serde_json::to_value(&good).unwrap();
+        v.as_object_mut().unwrap().remove(gone);
+        assert!(serde_json::from_value::<PolicyBundle>(v).is_err(), "{gone}");
+    }
+}
+
+/// A gate does not go back to an older bundle, and two bundles under one number is an
+/// alarm, not a choice (spec §7.6.1, point 3).
+#[test]
+fn a_bundle_does_not_go_back() {
+    let held = |number, seed: u8| HeldBundle {
+        number,
+        digest: gov_core::Digest::of(&[&[seed]]),
+    };
+    // Nothing held: anything validly signed is taken (a stated limit, GR-132).
+    may_replace(None, &held(3, 1)).unwrap();
+    // The same bundle again, the next, and one several releases on.
+    may_replace(Some(&held(3, 1)), &held(3, 1)).unwrap();
+    may_replace(Some(&held(3, 1)), &held(4, 2)).unwrap();
+    may_replace(Some(&held(3, 1)), &held(9, 2)).unwrap();
+    // An older one, even the very one held before.
+    assert_eq!(
+        may_replace(Some(&held(3, 1)), &held(2, 7)),
+        Err(gov_core::Error::BundleOlder)
+    );
+    // Another bundle under the number held.
+    assert_eq!(
+        may_replace(Some(&held(3, 1)), &held(3, 2)),
+        Err(gov_core::Error::BundleForked)
+    );
+    // The state a gate keeps survives a trip through JSON, and nothing extra rides in it.
+    let text = serde_json::to_string(&held(3, 1)).unwrap();
+    assert_eq!(
+        serde_json::from_str::<HeldBundle>(&text).unwrap(),
+        held(3, 1)
+    );
+    assert!(serde_json::from_str::<HeldBundle>(&text.replace('}', ",\"x\":1}")).is_err());
+}
+
+/// What the signer is shown before signing (GR-128): every key, rule and map that was
+/// added, removed or changed since the bundle before.
+#[test]
+fn the_signer_is_shown_what_changed() {
+    let read = || rule("read", jira(&["issue.read"], &[]), Effect::Allow);
+    let before = PolicyBundle {
+        connectors: vec![jira_map()],
+        ..bundle(vec![
+            read(),
+            rule("no-pay", jira(&[], &["jira/project/pay/*"]), Effect::Refuse),
+        ])
+    };
+    // Nothing before: everything is new.
+    let first = changes(None, &before);
+    assert_eq!(first.rules_added, vec![id("read"), id("no-pay")]);
+    assert_eq!(first.maps_added, vec![before.connectors[0].server.clone()]);
+    assert_eq!(
+        first.keys_added,
+        vec![
+            (KeyRole::Mandates, id("authority:mandates-1")),
+            (KeyRole::Leases, id("authority:leases-1"))
+        ]
+    );
+    assert!(first.keys_removed.is_empty() && !first.freshness_changed);
+    // The same bundle with a new number: nothing to show.
+    let mut same = before.clone();
+    same.number = 2;
+    assert!(changes(Some(&before), &same).is_empty());
+
+    // An attacker's key slipped in under `mandates`, a refusal dropped, a rule loosened, a
+    // map altered, a key swapped under its old id: each is shown.
+    let mut after = same.clone();
+    after
+        .keys
+        .mandates
+        .push(key("authority:mandates-2", 66).public());
+    after.keys.leases = vec![key("authority:leases-1", 67).public()];
+    after.rules.retain(|r| r.id != id("no-pay"));
+    after.rules[0] = rule(
+        "read",
+        jira(&["issue.read", "issue.update"], &[]),
+        Effect::Allow,
+    );
+    after
+        .rules
+        .push(rule("new", jira(&["issue.read"], &[]), Effect::Refuse));
+    after.connectors[0].fold_case = !after.connectors[0].fold_case;
+    after.freshness.strict_secs += 1;
+    let shown = changes(Some(&before), &after);
+    assert_eq!(
+        shown.keys_added,
+        vec![
+            (KeyRole::Mandates, id("authority:mandates-2")),
+            (KeyRole::Leases, id("authority:leases-1"))
+        ]
+    );
+    assert_eq!(
+        shown.keys_removed,
+        vec![(KeyRole::Leases, id("authority:leases-1"))]
+    );
+    assert_eq!(shown.rules_removed, vec![id("no-pay")]);
+    assert_eq!(shown.rules_changed, vec![id("read")]);
+    assert_eq!(shown.rules_added, vec![id("new")]);
+    assert_eq!(
+        shown.maps_changed,
+        vec![before.connectors[0].server.clone()]
+    );
+    assert!(shown.freshness_changed && !shown.is_empty());
+    // A map removed, and a key moved from one role to the other.
+    let mut moved = same.clone();
+    moved.connectors.clear();
+    std::mem::swap(&mut moved.keys.mandates, &mut moved.keys.leases);
+    let shown = changes(Some(&before), &moved);
+    assert_eq!(
+        shown.maps_removed,
+        vec![before.connectors[0].server.clone()]
+    );
+    assert_eq!((shown.keys_added.len(), shown.keys_removed.len()), (2, 2));
 }

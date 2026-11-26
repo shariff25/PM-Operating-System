@@ -55,6 +55,7 @@ fn gate(dir: &std::path::Path) -> Gate<FileSpool> {
         ledger_keys: KeySet::new([ledger_key().public()]),
         spool_limit: 100,
         batch: 100,
+        policy_version: None,
     };
     Gate::open(config, gate_key(), FileSpool::open(dir).unwrap(), T0).unwrap()
 }

@@ -238,25 +238,10 @@ async fn the_authoritys_chain_is_witnessed_and_a_gates_key_follows_from_it() {
         Err(LedgerError::Refused("retired_key"))
     ));
     refused(ledger.supply_key(&g1.public()).await);
-    // A gate that an admin names like the Authority itself, and then disables: the record
-    // retires a gate's keys, never those of the Authority's own chain, which goes on.
-    a.register_gate(&id("ana"), &id("authority"), NOW)
-        .await
-        .unwrap();
-    a.disable_gate(&id("ana"), &id("authority"), NOW)
-        .await
-        .unwrap();
-    let acked = ship(&a, &ledger, acked).await;
-    assert_eq!(acked, 15);
-    assert!(!ledger
-        .store()
-        .key_retired(&scope(), &a.admin_public().kid)
-        .await
-        .unwrap());
     a.register_gate(&id("ana"), &id("gate-9"), NOW)
         .await
         .unwrap();
-    assert_eq!(ship(&a, &ledger, acked).await, 16);
+    assert_eq!(ship(&a, &ledger, acked).await, 14);
 
     // The Authority's chain is under the same witness as the gates', and an auditor's check
     // of the export covers both, the retired gate's receipts included.
@@ -280,7 +265,7 @@ async fn the_authoritys_chain_is_witnessed_and_a_gates_key_follows_from_it() {
         retention_secs: None,
     });
     assert!(report.ok(), "{:?}", report.findings);
-    assert_eq!(report.receipts_verified, 16 + 2);
+    assert_eq!(report.receipts_verified, 14 + 2);
 
     // The auditor's check believes a gate's key only as far as a witnessed record of its
     // enrolment bears it out (GR-84). The keys file comes from the Ledger being audited.
@@ -577,4 +562,45 @@ async fn a_record_sent_again_is_acted_on_and_the_authoritys_chain_is_kept() {
         .unwrap();
     assert_eq!(held.len() as u64, acked);
     assert_eq!(held[0].seq, 1);
+}
+
+/// A record that disables "a gate" of the Authority's own name retires a gate's keys only,
+/// never those of the Authority's chain. The Authority no longer registers such a gate
+/// (GR-127), so the record here is made by hand, as a faulty or taken-over Authority's
+/// would be: the Ledger's rule does not lean on the Authority's.
+#[tokio::test]
+async fn a_record_about_a_gate_never_retires_the_authoritys_own_key() {
+    use gov_core::admin::{Actor, AdminRecord, Subject, SubjectKind};
+    let (a, ledger) = installed().await;
+    let acked = ship(&a, &ledger, 0).await;
+    let batch = a.shipment(0, 100).await.unwrap().unwrap().batch;
+    let admin_keys = KeySet::new([a.admin_public()]);
+    let last = gov_core::open::<AdminRecord>(batch.last().unwrap(), &admin_keys, &scope()).unwrap();
+    let by_hand = AdminRecord {
+        v: 1,
+        tenant: id("acme"),
+        env: id("prod"),
+        authority: id("authority"),
+        seq: acked + 1,
+        prev: Some(last.hash),
+        at: NOW,
+        actor: Actor {
+            id: id("ana"),
+            verified: false,
+        },
+        action: AdminAction::GateDisabled,
+        subject: Subject {
+            kind: SubjectKind::Gate,
+            id: id("authority"),
+        },
+        about: None,
+        value: None,
+    };
+    let envelope = seal(&by_hand, &admin_key()).unwrap();
+    ledger.ingest(&envelope, NOW).await.unwrap();
+    assert!(!ledger
+        .store()
+        .key_retired(&scope(), &a.admin_public().kid)
+        .await
+        .unwrap());
 }

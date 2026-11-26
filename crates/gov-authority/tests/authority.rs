@@ -688,6 +688,16 @@ impl Store for Failing {
     async fn keys(&self, scope: &Scope) -> StoreResult<Vec<EnrolledKey>> {
         self.inner.keys(scope).await
     }
+    async fn latest_bundle(&self, scope: &Scope) -> StoreResult<Option<gov_authority::Published>> {
+        self.inner.latest_bundle(scope).await
+    }
+    async fn bundle(
+        &self,
+        scope: &Scope,
+        number: u64,
+    ) -> StoreResult<Option<gov_authority::Published>> {
+        self.inner.bundle(scope, number).await
+    }
     async fn code(
         &self,
         scope: &Scope,
@@ -918,3 +928,139 @@ async fn time_forward<S: Store>(store: S) {
     assert_eq!(*times.last().unwrap(), NOW + 100);
 }
 both_stores!(a_records_time_does_not_go_back, time_forward);
+
+fn root_key() -> SigningKey {
+    key("authority-root-1", 61)
+}
+
+/// A signed bundle with this number, for `issuer`, with one rule per id given.
+fn signed_bundle(number: u64, issuer: &str, rules: &[&str], signer: &SigningKey) -> Envelope {
+    use gov_core::policy::{Effect as Then, Match, OnlineKeys, PolicyBundle, Rule};
+    let bundle = PolicyBundle {
+        v: 1,
+        tenant: id("acme"),
+        env: id("prod"),
+        issuer: id(issuer),
+        version: id("v"),
+        number,
+        issued_at: NOW,
+        keys: OnlineKeys {
+            mandates: vec![key("authority:mandates-1", 71).public()],
+            leases: vec![key("authority:leases-1", 72).public()],
+        },
+        freshness: Default::default(),
+        rules: rules
+            .iter()
+            .map(|r| Rule {
+                id: id(r),
+                matches: Match::default(),
+                then: Then::Refuse,
+                freshness: None,
+            })
+            .collect(),
+        connectors: Vec::new(),
+    };
+    seal(&bundle, signer).unwrap()
+}
+
+/// Publishing a bundle (spec §7.6.1, point 4): it opens under the root key, is this
+/// Authority's, carries the next number, and is kept with a record of its digest.
+async fn publishing<S: Store>(store: S) {
+    let a = installed(store).await;
+    let ana = id("ana");
+    let before = chain(&a).await.len();
+    assert!(a.latest_bundle().await.unwrap().is_none());
+    let first = signed_bundle(1, "authority", &["a"], &root_key());
+    // Only an admin publishes.
+    assert!(matches!(
+        a.publish_bundle(&id("ben"), &first, NOW).await,
+        Err(AuthorityError::NotAllowed)
+    ));
+    // Not signed by the root: by the admin-record key, or by an online key it names.
+    for signer in [admin_key(), key("authority:mandates-1", 71)] {
+        let forged = signed_bundle(1, "authority", &["a"], &signer);
+        assert!(a.publish_bundle(&ana, &forged, NOW).await.is_err());
+    }
+    // Another Authority's bundle, and a first bundle that is not number 1.
+    let elsewhere = signed_bundle(1, "another", &["a"], &root_key());
+    assert!(a.publish_bundle(&ana, &elsewhere, NOW).await.is_err());
+    let early = signed_bundle(2, "authority", &["a"], &root_key());
+    assert!(matches!(
+        a.publish_bundle(&ana, &early, NOW).await,
+        Err(AuthorityError::NotNext(1))
+    ));
+    assert!(a.latest_bundle().await.unwrap().is_none());
+    assert_eq!(chain(&a).await.len(), before);
+
+    // Published: kept as it was signed, with a record carrying its number and digest.
+    let digest = a.publish_bundle(&ana, &first, NOW).await.unwrap();
+    let opened = gov_core::policy::open_bundle(&first, &root(), &scope()).unwrap();
+    assert_eq!(digest, opened.digest);
+    let kept = a.latest_bundle().await.unwrap().unwrap();
+    assert_eq!(
+        (kept.number, &kept.digest, &kept.envelope),
+        (1, &digest, &first)
+    );
+    let records = chain(&a).await;
+    let last = records.last().unwrap();
+    assert_eq!(records.len(), before + 1);
+    assert_eq!(
+        (last.action, last.subject.kind, last.subject.id.as_str()),
+        (AdminAction::PolicyPublished, SubjectKind::Policy, "1")
+    );
+    assert_eq!(last.value.as_ref(), Some(&digest));
+
+    // The same number again, with other content or the same, and a number skipped: only
+    // the next is taken.
+    for (number, rules) in [(1, vec!["a"]), (1, vec!["b"]), (3, vec!["a"])] {
+        let offered = signed_bundle(number, "authority", &rules, &root_key());
+        assert!(matches!(
+            a.publish_bundle(&ana, &offered, NOW).await,
+            Err(AuthorityError::NotNext(2))
+        ));
+    }
+    assert_eq!(chain(&a).await.len(), before + 1);
+    let second = signed_bundle(2, "authority", &["a", "b"], &root_key());
+    let digest_2 = a.publish_bundle(&ana, &second, NOW).await.unwrap();
+    assert_ne!(digest_2, digest);
+    assert_eq!(a.latest_bundle().await.unwrap().unwrap().envelope, second);
+    // The earlier one is still held under its number.
+    let held = a.store().bundle(&scope(), 1).await.unwrap().unwrap();
+    assert_eq!(held.envelope, first);
+    assert!(a.store().bundle(&scope(), 3).await.unwrap().is_none());
+    // Ten and more: the latest is the highest number, not the last in the order of text.
+    let mut latest = 2;
+    for number in 3..=11 {
+        let b = signed_bundle(number, "authority", &["a"], &root_key());
+        a.publish_bundle(&ana, &b, NOW).await.unwrap();
+        latest = number;
+    }
+    assert_eq!(a.latest_bundle().await.unwrap().unwrap().number, latest);
+}
+both_stores!(
+    a_bundle_is_published_under_the_root_key_and_the_next_number,
+    publishing
+);
+
+/// An agent and a gate may not share a name, nor take the Authority's (GR-127): a key's
+/// id is under the name it is for.
+async fn names_apart<S: Store>(store: S) {
+    let a = installed(store).await;
+    let ana = id("ana");
+    let before = chain(&a).await.len();
+    let exists = |r: Result<u64, AuthorityError>| {
+        assert!(matches!(r, Err(AuthorityError::Exists("name"))), "{r:?}");
+    };
+    exists(a.register_gate(&ana, &id("refund-bot"), NOW).await);
+    exists(a.register_gate(&ana, &id("authority"), NOW).await);
+    exists(
+        a.register_agent(&ana, &id("gate-1"), &id("ben"), BTreeSet::new(), NOW)
+            .await,
+    );
+    exists(
+        a.register_agent(&ana, &id("authority"), &id("ben"), BTreeSet::new(), NOW)
+            .await,
+    );
+    assert_eq!(chain(&a).await.len(), before);
+}
+both_stores!(an_agent_and_a_gate_do_not_share_a_name, names_apart);
