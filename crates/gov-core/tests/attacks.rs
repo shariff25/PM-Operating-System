@@ -2157,3 +2157,180 @@ fn a_receipt_keeps_proven_claimed_and_failed_apart() {
     text["agent"]["failure"] = json!("the agent was really Mallory");
     assert!(serde_json::from_value::<Receipt>(text).is_err());
 }
+
+// ----- the Authority's admin records and enrolment (slice G4a) --------------------------
+
+fn admin(
+    seq: u64,
+    prev: Option<Digest>,
+    action: gov_core::admin::AdminAction,
+) -> gov_core::admin::AdminRecord {
+    use gov_core::admin::{Actor, AdminAction as A, AdminRecord, Subject, SubjectKind as K};
+    let subject = |kind, name: &str| Subject { kind, id: id(name) };
+    let (what, about, value) = match action {
+        A::AgentRegistered => (
+            subject(K::Agent, "refund-bot"),
+            Some(subject(K::Person, "ana")),
+            None,
+        ),
+        A::KeyEnrolled => (
+            subject(K::Key, "refund-bot-k1"),
+            Some(subject(K::Agent, "refund-bot")),
+            Some(Digest::of(&[b"a key"])),
+        ),
+        A::MandateIssued => (
+            subject(K::Mandate, "m-1"),
+            Some(subject(K::Agent, "refund-bot")),
+            Some(Digest::of(&[b"a mandate"])),
+        ),
+        A::PolicyPublished => (
+            subject(K::Policy, "7"),
+            None,
+            Some(Digest::of(&[b"a bundle"])),
+        ),
+        A::Revoked => (subject(K::Mandate, "m-1"), None, None),
+        _ => (subject(K::Person, "ana"), None, None),
+    };
+    AdminRecord {
+        v: 1,
+        tenant: id("acme"),
+        env: id("prod"),
+        authority: id("authority"),
+        seq,
+        prev,
+        at: NOW,
+        actor: Actor {
+            id: id("ana"),
+            verified: false,
+        },
+        action,
+        subject: what,
+        about,
+        value,
+    }
+}
+
+/// An admin record keeps its own rules, carries no free text, and is not a receipt: neither
+/// kind of document verifies as the other, whichever key signed it.
+#[test]
+fn an_admin_record_keeps_its_rules_and_is_never_a_receipt() {
+    use gov_core::admin::{AdminAction as A, AdminRecord, Subject, SubjectKind as K};
+    let key = authority();
+    let keys = authority_keys();
+    for action in [
+        A::PersonAdded,
+        A::AgentRegistered,
+        A::KeyEnrolled,
+        A::MandateIssued,
+        A::PolicyPublished,
+        A::Revoked,
+    ] {
+        admin(1, None, action).validate().unwrap();
+    }
+    // What each action is done to, what else it names, and whether it carries a value.
+    let mut wrong = admin(1, None, A::AgentRegistered);
+    wrong.subject.kind = K::Gate;
+    assert!(wrong.validate().is_err());
+    let mut wrong = admin(1, None, A::AgentRegistered);
+    wrong.about = None;
+    assert!(wrong.validate().is_err(), "an agent with no owner");
+    let mut wrong = admin(1, None, A::KeyEnrolled);
+    wrong.value = None;
+    assert!(wrong.validate().is_err(), "a key enrolled with no key");
+    let mut wrong = admin(1, None, A::PersonAdded);
+    wrong.value = Some(Digest::of(&[b"x"]));
+    assert!(wrong.validate().is_err());
+    let mut wrong = admin(1, None, A::MandateIssued);
+    wrong.about = Some(Subject {
+        kind: K::Gate,
+        id: id("gate-1"),
+    });
+    assert!(wrong.validate().is_err());
+    // No free text: the action is one of a closed list, and nothing is a sentence.
+    let mut text = serde_json::to_value(admin(1, None, A::PersonAdded)).unwrap();
+    text["action"] = json!("did something else entirely");
+    assert!(serde_json::from_value::<AdminRecord>(text).is_err());
+    let mut text = serde_json::to_value(admin(1, None, A::PersonAdded)).unwrap();
+    text["note"] = json!("ana said it was fine");
+    assert!(serde_json::from_value::<AdminRecord>(text).is_err());
+    let mut text = serde_json::to_value(admin(1, None, A::PersonAdded)).unwrap();
+    text["subject"]["id"] = json!("ana, who is leaving on Friday");
+    assert!(serde_json::from_value::<AdminRecord>(text).is_err());
+
+    // The chain: a gap, a repeat and a fork are refused.
+    let first = seal(&admin(1, None, A::PersonAdded), &key).unwrap();
+    let opened = open::<AdminRecord>(&first, &keys, &scope()).unwrap();
+    let head = gov_core::admin::follow(None, &opened).unwrap();
+    let second = seal(&admin(2, Some(head.hash.clone()), A::AgentRegistered), &key).unwrap();
+    let second_opened = open::<AdminRecord>(&second, &keys, &scope()).unwrap();
+    let head2 = gov_core::admin::follow(Some(&head), &second_opened).unwrap();
+    assert_eq!(head2.seq, 2);
+    assert!(
+        gov_core::admin::follow(Some(&head2), &second_opened).is_err(),
+        "a repeat"
+    );
+    assert!(
+        gov_core::admin::follow(None, &second_opened).is_err(),
+        "a start that is not one"
+    );
+    let gap = seal(&admin(4, Some(head2.hash.clone()), A::Revoked), &key).unwrap();
+    assert!(gov_core::admin::follow(
+        Some(&head2),
+        &open::<AdminRecord>(&gap, &keys, &scope()).unwrap()
+    )
+    .is_err());
+    let fork = seal(&admin(3, Some(head.hash.clone()), A::Revoked), &key).unwrap();
+    assert!(gov_core::admin::follow(
+        Some(&head2),
+        &open::<AdminRecord>(&fork, &keys, &scope()).unwrap()
+    )
+    .is_err());
+
+    // A receipt signed by the same key is not an admin record, nor the other way round.
+    let receipt_env = seal(&receipt(1, None, Phase::Intent), &key).unwrap();
+    assert!(open::<AdminRecord>(&receipt_env, &keys, &scope()).is_err());
+    assert!(open::<Receipt>(&first, &keys, &scope()).is_err());
+}
+
+/// The code enrols, never its digest; and the answer's pin holds only for the root key the
+/// code's holder was meant to get (review finding GR-107).
+#[test]
+fn an_enrolment_code_and_its_pin() {
+    use gov_core::enrol::{code_digest, new_code, pin, EnrolKind, EnrolRequest};
+    let (a, b) = (new_code().unwrap(), new_code().unwrap());
+    assert_ne!(a, b);
+    assert!(a.len() >= 22, "128 bits as text");
+    assert_ne!(code_digest(&a), code_digest(&b));
+    // The digest is not the code: what the Authority stores does not hash to itself.
+    assert_ne!(code_digest(code_digest(&a).as_str()), code_digest(&a));
+
+    let root = authority().public();
+    let other_root = key("another-root", 77).public();
+    let tag = pin(&a, &root).unwrap();
+    assert_eq!(tag, pin(&a, &root).unwrap());
+    assert_ne!(tag, pin(&a, &other_root).unwrap(), "another root key");
+    assert_ne!(tag, pin(&b, &root).unwrap(), "another code");
+
+    // The request is signed by the key it enrols, and names who is enrolling.
+    let agent = key("refund-bot-k1", 9);
+    let request = EnrolRequest {
+        v: 1,
+        tenant: id("acme"),
+        env: id("prod"),
+        authority: id("authority"),
+        kind: EnrolKind::Agent,
+        name: id("refund-bot"),
+        key: agent.public(),
+        code: code_digest(&a),
+    };
+    let sealed = seal(&request, &agent).unwrap();
+    let own = KeySet::new([agent.public()]);
+    assert_eq!(
+        open::<EnrolRequest>(&sealed, &own, &scope()).unwrap().doc,
+        request
+    );
+    // Signed by some other key, it is not that key's request.
+    let stranger = key("stranger", 10);
+    let forged = seal(&request, &stranger).unwrap();
+    assert!(open::<EnrolRequest>(&forged, &own, &scope()).is_err());
+}
