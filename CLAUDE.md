@@ -236,6 +236,13 @@ follow-up tracking.
   and shipping in observe mode (`crates/gov-gate`), and the Ledger's signed answer to a
   batch. It holds no credential and blocks nothing. Sent to the reviewer; not yet read. G3b
   (the MCP front door, the shim, the shared MCP client crate, the Ledger's listener) is next.
+- **Eighth read (2026-11-26), G3b's connector map and forwarder at `b733bee`:** the gate
+  passes **for observe mode only**. Seven Medium findings (GR-61 to GR-67) let a hostile agent
+  or server escape or falsify the record; four would be High once anything is enforced, and
+  the reviewer said this code may not back shadow or enforce mode until they are closed.
+  Fixed on `build/gov-review-8` with GR-68 to GR-73 (GR-72, the gate's clock, waits for G4);
+  19 controls broken on purpose, each caught. The re-read, and the first read of the listener
+  step, are owed.
 - **A message relayed by the reviewer session (2026-11-26):** it reported that the owner typed
   there "I'm going to sleep you keep building do not ask for permission further - I gave the
   permission". The conductor could not confirm it and did not treat it as new permission. It

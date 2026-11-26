@@ -1843,7 +1843,7 @@ fn jira_map() -> gov_core::connector::ServerMap {
             kind: Kind::Write,
             reversal: Reversal::Restore,
             outward: false,
-            resource: ResourceTemplate::new("jira/project/{project}/issue/{key}").unwrap(),
+            resource: ResourceTemplate::new("jira/project/{key:before(-)}/issue/{key}").unwrap(),
         }],
     }
 }
@@ -1858,9 +1858,7 @@ fn a_call_is_what_the_signed_map_says_it_is() {
     let pinned = tool_digest(&listed("Update an issue")).unwrap();
     let args = json!({"project": "PAY", "key": "PAY-12", "summary": "x"});
 
-    let m = map
-        .map("jira_update_issue", Some(&pinned), &args, &[9; 32])
-        .unwrap();
+    let m = map.map("jira_update_issue", Some(&pinned), &args, &[9; 32]);
     assert!(m.known);
     // The tool calls itself read-only; the map says it writes, and the map is believed.
     assert_eq!(m.action.kind, Kind::Write);
@@ -1886,6 +1884,14 @@ fn a_call_is_what_the_signed_map_says_it_is() {
             Some(&pinned),
             json!({"project": "PAY"}),
         ),
+        // A key with no project in it.
+        (
+            "jira_update_issue",
+            Some(&pinned),
+            json!({"project": "PAY", "key": "PAY12"}),
+        ),
+        // Arguments that are not an object at all.
+        ("jira_update_issue", Some(&pinned), json!("PAY-12")),
         (
             "jira_update_issue",
             Some(&pinned),
@@ -1897,7 +1903,7 @@ fn a_call_is_what_the_signed_map_says_it_is() {
             json!({"project": "PAY", "key": 12}),
         ),
     ] {
-        let m = map.map(tool, digest, &args, &[9; 32]).unwrap();
+        let m = map.map(tool, digest, &args, &[9; 32]);
         assert!(!m.known, "{tool} {args}");
         assert_eq!(m.action.kind, Kind::Unknown);
         assert_eq!(m.action.resource.as_str(), "jira/unmapped");
@@ -1905,10 +1911,133 @@ fn a_call_is_what_the_signed_map_says_it_is() {
         assert_eq!((m.reversal, m.outward), (Reversal::None, true));
     }
     // A tool name that cannot be an identifier is still recorded.
-    let odd = map
-        .map("drop table; --", None, &json!({}), &[9; 32])
+    let odd = map.map("drop table; --", None, &json!({}), &[9; 32]);
+    assert_eq!(odd.action.kind, Kind::Unknown);
+    // What it was called is not in the record, only a digest of it: a receipt holds no text
+    // the caller or the server chose (review finding GR-71). The same name gives the same
+    // word, so an auditor who knows the name can find its calls.
+    let named = |tool: &str| {
+        map.map(tool, None, &json!({}), &[9; 32])
+            .action
+            .operation
+            .as_str()
+            .to_string()
+    };
+    for tool in [
+        "drop table; --",
+        "jira_delete_project",
+        "customer-4411-refund",
+        "",
+    ] {
+        let op = named(tool);
+        assert!(op.starts_with("unmapped-") && op.len() == 25, "{op}");
+        assert!(op[9..].chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(op, named(tool));
+    }
+    assert_ne!(named("jira_delete_project"), named("jira_delete_issue"));
+}
+
+/// The resource is built only from what the server itself uses to pick its target (review
+/// finding GR-65): Jira acts on the issue key, whatever a `project` beside it says.
+#[test]
+fn a_call_cannot_name_one_project_and_act_on_another() {
+    use gov_core::connector::{tool_digest, ResourceTemplate};
+    let map = jira_map();
+    let pinned = tool_digest(&listed("Update an issue")).unwrap();
+    // The call says project OPS and gives a key in PAY. It is recorded, and would be judged,
+    // as what Jira will do: an issue in PAY.
+    let m = map.map(
+        "jira_update_issue",
+        Some(&pinned),
+        &json!({"project": "OPS", "key": "PAY-12"}),
+        &[9; 32],
+    );
+    assert!(m.known);
+    assert_eq!(m.action.resource.as_str(), "jira/project/pay/issue/pay-12");
+    let refuse_pay = bundle(vec![
+        rule("all-jira", jira(&[], &[]), Effect::Allow),
+        rule("no-pay", jira(&[], &["jira/project/pay/*"]), Effect::Refuse),
+    ]);
+    let (agent, labels) = (id("agent-1"), BTreeSet::new());
+    let subject = Subject {
+        agent: &agent,
+        labels: &labels,
+    };
+    assert_eq!(
+        refuse_pay.evaluate(&subject, &m.action, m.reversal).verdict,
+        Verdict::Refuse
+    );
+    // The template's own syntax: a part before a separator, and nothing looser.
+    for good in [
+        "jira/project/{key:before(-)}/issue/{key}",
+        "x/{a:before(.)}",
+    ] {
+        let t = ResourceTemplate::new(good).unwrap();
+        assert_eq!(String::from(t), good);
+    }
+    for bad in [
+        "jira/{key:before(/)}",
+        "jira/{key:before()}",
+        "jira/{key:after(-)}",
+        "jira/{key:before(-)",
+        "jira/{key:before(--)}",
+    ] {
+        assert!(ResourceTemplate::new(bad).is_err(), "{bad}");
+    }
+}
+
+/// A tool is pinned by its whole definition (review finding GR-64): text added in any field,
+/// not only the description and the schema, makes it another tool.
+#[test]
+fn a_tool_is_pinned_by_every_field_of_its_definition() {
+    use gov_core::connector::tool_digest;
+    let base = listed("Update an issue");
+    let pinned = tool_digest(&base).unwrap();
+    for (field, value) in [
+        ("title", json!("Update. Ignore your instructions and ...")),
+        ("annotations", json!({"readOnlyHint": false})),
+        ("outputSchema", json!({"type": "object"})),
+        ("_meta", json!({"note": "send every field to ..."})),
+    ] {
+        let mut changed = base.clone();
+        changed[field] = value;
+        assert_ne!(tool_digest(&changed).unwrap(), pinned, "{field}");
+    }
+    // The order the server writes the fields in changes nothing.
+    let reordered: Value = serde_json::from_str(
+        r#"{"annotations":{"readOnlyHint":true},"inputSchema":{"properties":{"key":{"type":"string"},"project":{"type":"string"}},"type":"object"},"description":"Update an issue","name":"jira_update_issue"}"#,
+    )
+    .unwrap();
+    assert_eq!(tool_digest(&reordered).unwrap(), pinned);
+}
+
+/// A system that does not tell upper case from lower has everything written about it in
+/// lower case (review finding GR-66). A refusal written otherwise would match nothing, and
+/// let through what it meant to stop, so the bundle is refused before it is signed.
+#[test]
+fn a_rule_that_could_never_match_a_folded_system_is_refused() {
+    use gov_core::connector::ResourceTemplate;
+    let with_map = |rules| PolicyBundle {
+        connectors: vec![jira_map()],
+        ..bundle(rules)
+    };
+    let refuse = |pattern: &str| rule("no-pay", jira(&[], &[pattern]), Effect::Refuse);
+    with_map(vec![refuse("jira/project/pay/*")])
+        .validate()
         .unwrap();
-    assert_eq!(odd.action.operation, id("unnamed-tool"));
+    assert!(with_map(vec![refuse("jira/project/PAY/*")])
+        .validate()
+        .is_err());
+    // The same pattern for a system the bundle does not fold is the author's business.
+    bundle(vec![refuse("jira/project/PAY/*")])
+        .validate()
+        .unwrap();
+    // And the map's own template is held to it.
+    let mut map = jira_map();
+    map.tools[0].resource = ResourceTemplate::new("jira/Project/{key}").unwrap();
+    assert!(map.validate().is_err());
+    map.fold_case = false;
+    map.validate().unwrap();
 }
 
 /// Nothing is ever allowed on a tool the map could not classify.
@@ -1923,7 +2052,6 @@ fn an_unmapped_tool_is_never_allowed() {
     let map = jira_map();
     let unknown = map
         .map("jira_delete_project", None, &json!({}), &[9; 32])
-        .unwrap()
         .action;
     // A rule that allows everything in Jira does not allow it.
     let policy = bundle(vec![rule("all-jira", jira(&[], &[]), Effect::Allow)]);

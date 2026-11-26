@@ -63,6 +63,15 @@ pub fn args_digest(args: &Value, salt: &Salt) -> Result<Digest> {
     ]))
 }
 
+/// The digest of arguments that have no canonical form (an integer beyond 2^53 is the usual
+/// cause): over the salt and the arguments as the gate will send them. It cannot be
+/// reproduced by another implementation, and is only ever on an action of kind `unknown`; it
+/// exists so that no call goes without a receipt (review finding GR-61).
+pub fn raw_args_digest(args: &Value, salt: &Salt) -> Digest {
+    let bytes = serde_json::to_vec(args).unwrap_or_default();
+    Digest::of(&[b"gov.args.raw.v1\0", salt, &bytes])
+}
+
 /// The digest of a target's values before a write, salted for the same reason (spec §4.7).
 pub fn before_digest(values: &Value, salt: &Salt) -> Result<Digest> {
     Ok(Digest::of(&[

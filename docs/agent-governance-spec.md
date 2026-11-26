@@ -154,8 +154,8 @@ Nothing of G3b is built.
   code the gate would mostly not use, and it would make Governance depend on PM OS's shapes.
   So the gate gets its own small forwarder, and the dependency rule stays without exceptions:
   no `gov-*` crate depends on a `pmos-*` crate. The one idea worth sharing, a digest over a
-  tool's name, description and input schema that pins it, is a few dozen lines and is written
-  again in `gov-core`. In the "both together" install the tool server still loads the gate
+  tool's definition that pins it, is a few dozen lines and is written again in `gov-core`
+  (over the whole definition since the eighth read). In the "both together" install the tool server still loads the gate
   as a library (G7); that needs nothing from this.
 - **Order of G3b:** (1) the connector map in the signed bundle: per upstream tool, its pinned
   digest and its system, operation, kind, reversal class, `outward` flag, how the resource is
@@ -226,6 +226,12 @@ Nothing of G3b is built.
 - With it, the seventh read's five findings (below) are fixed.
 - 14 gate tests, one of them over real HTTP between a gate and a Ledger. Eight controls
   broken on purpose, each caught.
+- **After the eighth read** (`build/gov-review-8`, findings GR-61 to GR-73 below): the
+  forwarder reads a request strictly and forwards its own writing-out of it; a call's
+  receipts are closed whatever becomes of the client or the server; listings are per MCP
+  session; the map cannot fail and derives a Jira project from the issue key; shipping no
+  longer holds the gate. `gov-core` has 45 attack tests and the forwarder 7; 19 controls
+  broken on purpose, each caught. Not yet re-read by the reviewer.
 - Still not built: programs to run (`gov-ledger`, `gov-gate`) with their configuration, a
   timer for checkpoints, TLS and timeouts on the listeners; the shim and proven identity.
 
@@ -368,9 +374,33 @@ sixth reads is closed. Five new Low findings, fixed on `build/gov-g3b-listener`:
 | GR-59 | After a key rotation the gate would refuse to start on its own older receipts | Not fixed: to be decided with key rotation in G4 |
 | GR-60 | A refusal such as "outcome without intent" ends a gate's chain at the Ledger, and the gate saw only "no progress" | The Ledger's reason is passed on to the gate and shown. Stated here: an honest gate never writes such a receipt, so this bites only a gate with a fault, and then someone must act |
 
-**The reviewer has not read G3b (the connector map, the forwarder, the listener).** Its
-session cannot send messages without a person's approval, so the conductor reads its verdicts
-from its transcript.
+The reviewer's session cannot send messages without a person's approval, so the conductor
+reads its verdicts from its transcript.
+
+### Eighth read, 2026-11-26, G3b steps 1 and 2 at `b733bee`
+
+**Verdict: the gate passes for the connector map and the forwarder, for observe mode only.**
+No High or Critical while nothing is enforced. Seven Medium findings let a hostile agent or
+server escape the record or falsify it; the reviewer said four of them (GR-61, 62, 64, 65)
+would be High the moment anything is enforced, and that none of this code may back shadow or
+enforce mode until they are closed. All but one line of this table is fixed on
+`build/gov-review-8`; the reviewer's re-read is owed.
+
+| Finding | What it said | What was done |
+|---|---|---|
+| GR-61 | Arguments or a tool name could make mapping fail, and a call that cannot be mapped left no receipt | Mapping cannot fail: it always gives an action, `unknown` at worst, with a digest of the arguments as they arrived when they have no canonical form |
+| GR-62 | The gate read a request one way and forwarded the original bytes, so a body with a repeated member name was one call to the gate and another to the server | A body is parsed strictly (no repeated names, nothing after the value, no number that changes when read) or refused; what is forwarded is the gate's own writing-out of what it read. Only POST, GET and DELETE are taken, and GET and DELETE carry no body upstream |
+| GR-63 | A client that went away mid-call, or a server that never answered, left an intent open for ever | The exchange and the outcome receipt run in a task that outlives the client, under a time limit; a call the gate cannot account for is closed as `unknown` |
+| GR-64 | One list of tools for every client: one session's listing vouched for another's, a dropped tool stayed known, and the digest covered only the description and schema | Listings are kept per MCP session; a fresh listing replaces the old one (a later page adds to it); a definition with no digest is forgotten; the digest covers the whole definition. Clients that send no session header share one listing: stated, and settled with the shim |
+| GR-65 | A resource built from two arguments (`project` and `key`) let a call name one project and act on another | A template may derive one part from another (`{key:before(-)}`), and the rule is written in the code and here: build a resource only from what the server itself uses to pick its target |
+| GR-66 | For a system that folds case, a refusal written in upper case matched nothing | Refused by lint, for a rule's patterns and for the map's own template, before a bundle is signed and when a gate loads it |
+| GR-67 | The gate was held while the Ledger was waited for, and a server's answer was read whole whatever its size | Shipping is split: collect the batch, send without holding the gate, apply the answer. A time limit on the Ledger. Answers are read with a running cap of 4 MB |
+| GR-68 | The client's `accept-encoding` was forwarded, so a compressed answer was unreadable to the gate and recorded as failed | The gate asks the server for an uncompressed answer |
+| GR-69 | A redirect from the server was passed to the client, which would follow it with its credential | A redirect is answered with the gate's own 502, and `location` is never copied |
+| GR-70 | A tool call with no id had no answer to match | Refused |
+| GR-71 | An unmapped tool's name went into the receipt, text the server or caller chose | The receipt carries `unmapped-` and 16 hex digits of a digest of the name |
+| GR-72 | Receipts are stamped from the gate machine's clock | Not changed: stated in the code; the lease's time is used once there is an Authority (G4) |
+| GR-73 | The count of unrecorded calls was lost at a restart | Kept in the spool's state as well |
 
 ## 1. What is being built
 
@@ -885,10 +915,11 @@ Every interface that reports a system's state says "not enforced" for the first 
 
 ### 5.3 Front doors
 
-- **The MCP gate.** The gate is an MCP server to the agent and an MCP client to the upstream
-  server. It reuses PM OS's MCP client layer, moved into a crate both products depend on
-  (slice G3; `crates/toolserver/src/mcp_client/` today), with the tool server's own tests
-  passing unchanged before and after the move.
+- **The MCP gate.** The gate stands between the agent's MCP client and one upstream MCP
+  server, with its own small forwarder (the status notes say why PM OS's MCP client layer is
+  not shared). What the gate reads is what the server gets: a request is parsed strictly and
+  written out again, never forwarded as it arrived. A connector map builds a call's resource
+  only from the arguments the server itself uses to pick its target.
 - **The shim.** A small program the agent's runtime starts as a local MCP server. It holds the
   agent's private key and current mandate, opens a session with the gate (receiving the
   challenge), signs every call and forwards it. The agent's MCP client is pointed at the shim by
