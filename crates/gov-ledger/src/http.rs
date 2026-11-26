@@ -50,9 +50,31 @@ struct Shipment {
 pub fn router<S: Store + 'static>(listener: Arc<Listener<S>>) -> Router {
     Router::new()
         .route("/v1/receipts", post(receipts::<S>))
+        .route("/v1/keys", post(keys::<S>))
         .route("/healthz", get(health::<S>))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(listener)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Grant {
+    grant: Envelope,
+}
+
+/// A gate's key, enrolled on the Authority's signed word. Whatever is wrong with a grant,
+/// the answer is the same refusal.
+async fn keys<S: Store + 'static>(
+    State(l): State<Arc<Listener<S>>>,
+    Json(asked): Json<Grant>,
+) -> Response {
+    match l.ledger.grant_key(&asked.grant).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(LedgerError::Refused(_)) | Err(LedgerError::Core(_)) => {
+            StatusCode::FORBIDDEN.into_response()
+        }
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 
 /// Up, and publishing checkpoints. A Ledger whose checkpoints keep failing answers 503: its

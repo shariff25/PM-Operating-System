@@ -65,3 +65,27 @@ pub fn pin(code: &str, root: &PublicKey) -> Result<Digest> {
         &key,
     ]))
 }
+
+/// The digest of a public key, as an admin record carries it for an enrolled key. Whoever
+/// holds the key itself can check it against the record; the record alone gives no key.
+pub fn key_digest(key: &PublicKey) -> Result<Digest> {
+    let bytes = serde_json::to_vec(key).map_err(|_| Error::Malformed("key"))?;
+    Ok(Digest::of(&[b"gov.key.v1\0", &bytes]))
+}
+
+/// The Authority's word to the Ledger that a gate's key is enrolled, signed with the key
+/// its admin records are signed with. The Ledger takes the key for the gate's receipts only
+/// when its copy of the Authority's chain holds the record of that enrolment (spec §7.6,
+/// choice 3): a gate's key reaches the Ledger from the Authority, and only a witnessed one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyGrant {
+    pub v: u32,
+    pub tenant: Id,
+    pub env: Id,
+    pub authority: Id,
+    pub gate: Id,
+    pub key: PublicKey,
+}
+
+document!(KeyGrant, "gov.keygrant.v1");

@@ -321,13 +321,37 @@ reviewer.
   key and a value that pins it.
 - Every record says its actor is **unverified**: there is no sign-in before G4e. "Only an
   admin acts" is checked against the name given, not against a person.
-- **Not in this part:** the Authority's chain is not yet shipped to the Ledger, the Ledger
-  does not yet take chains of two kinds, and `gov verify` does not yet read admin records;
-  a gate's key does not yet reach the Ledger from the Authority; nothing is served on a
-  listener and there is no `gov-authority` program. Those are the second part of G4a.
+- **Not in this part:** shipping the Authority's chain to the Ledger and the rest of what
+  follows from it, which is the second part, below.
 - Six tests on both stores, and two in `gov-core`: who may act; enrolment; what does not
   enrol a key; an offboarded owner's agents stopping; two admins at once keeping one chain;
   and an action whose record cannot be kept changing nothing.
+
+**G4a, second part, built (2026-11-26): the Authority's chain at the Ledger,** on
+`build/gov-g4a2`. Built while the reviewer read the first part; not yet read.
+
+- **A chain holds one kind of document** (GR-108). At the Ledger a key is enrolled for a
+  gate's receipts or for an Authority's admin records, and every key of a chain is of that
+  chain's kind. At intake a key is read as its own kind only, so the Authority's key on a
+  receipt, or a gate's key on an admin record, is refused. `gov verify`'s trusted keys are
+  kept per kind in the same way, and it follows either kind of chain.
+- **The Authority ships its chain** to the Ledger as a gate does, under a request signed
+  with its admin-record key, and checks the Ledger's signed answer against its own chain.
+  The chain is then in the same checkpoints as the gates', and under the same witness.
+- **A gate's key reaches the Ledger from the Authority** (GR-107). The Authority signs its
+  word that a key is a gate's; the Ledger enrols the key only when its own copy of the
+  Authority's chain holds the record of that enrolment, for that gate and a key with that
+  digest, with no later record disabling the gate or revoking the key. So the keys a
+  Ledger takes receipts under are the ones the witness has seen enrolled. The Ledger is
+  given one key at installation: the Authority's admin-record key.
+- **Still not built in G4a:** nothing is served by the Authority on a listener and there is
+  no `gov-authority` program, so none of this is yet reachable from the three programs,
+  which still use the stand-ins of G3b; `gov verify`, the command, does not yet take an
+  Authority's keys; the auditor's check that each gate key matches a witnessed enrolment
+  (GR-84) is not yet written. The Ledger finds an enrolment by reading the Authority's
+  whole chain, which is fine at this size and is to be indexed before it is not.
+- One more test on both of the Ledger's stores (a chain holds one kind of document), and
+  two with an Authority and a Ledger together.
 
 ## Security review of 2026-11-26 (first read; the gate did not pass)
 

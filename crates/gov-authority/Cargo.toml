@@ -17,5 +17,7 @@ sqlx.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+gov-ledger = { path = "../gov-ledger" }
+tempfile.workspace = true
 tokio.workspace = true
 uuid.workspace = true

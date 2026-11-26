@@ -1,6 +1,7 @@
 //! Intake, checkpoints, pruning and export (spec §6).
 
-use gov_core::admin::AdminRecord;
+use gov_core::admin::{AdminAction, AdminRecord, SubjectKind};
+use gov_core::enrol::{key_digest, KeyGrant};
 use gov_core::lease::{batch_digest, Checkpoint, GateHead, IntakeAck, Pruned, ShipRequest};
 use gov_core::receipt::{follow, Phase, Receipt};
 use gov_core::{
@@ -203,6 +204,76 @@ impl<S: Store> Ledger<S> {
             }
         }
         Err(StoreError::HeadMoved.into())
+    }
+
+    /// Enrol a gate's receipt key on the Authority's word (spec §7.6, choice 3). The grant
+    /// is signed by a key enrolled here for that Authority's admin records, and that is not
+    /// enough: this Ledger's own copy of the Authority's chain must hold the record of the
+    /// enrolment, for that gate and for a key with that digest, with nothing after it that
+    /// disables the gate or revokes the key. So the keys a Ledger takes receipts under are
+    /// exactly the ones the witness has seen enrolled.
+    pub async fn grant_key(&self, grant: &Envelope) -> Result<(), LedgerError> {
+        let refused = || LedgerError::Refused("grant_refused");
+        let Some((authority, signer)) = self.store.gate_key(&self.scope, &grant.kid).await? else {
+            return Err(refused());
+        };
+        if self.store.chain_kind(&self.scope, &authority).await? != Some(ChainKind::Admin) {
+            return Err(refused());
+        }
+        let keys = KeySet::new([signer]);
+        let asked = open::<KeyGrant>(grant, &keys, &self.scope)
+            .map_err(|_| refused())?
+            .doc;
+        if asked.authority != authority {
+            return Err(refused());
+        }
+        let digest = key_digest(&asked.key)?;
+        let mut enrolled = false;
+        // The chain's own keys, not only the grant's signer: a record signed before a
+        // rotation is still the Authority's.
+        let chain_keys = KeySet::new(
+            self.store
+                .gate_keys(&self.scope)
+                .await?
+                .remove(&authority)
+                .unwrap_or_default(),
+        );
+        for stored in self.store.receipts(&self.scope, &authority).await? {
+            let record = open::<AdminRecord>(&stored.envelope, &chain_keys, &self.scope)?.doc;
+            let about_gate = record
+                .about
+                .as_ref()
+                .is_some_and(|s| s.kind == SubjectKind::Gate && s.id == asked.gate);
+            match record.action {
+                AdminAction::KeyEnrolled
+                    if record.subject.id == asked.key.kid
+                        && about_gate
+                        && record.value.as_ref() == Some(&digest) =>
+                {
+                    enrolled = true;
+                }
+                AdminAction::GateDisabled if record.subject.id == asked.gate => enrolled = false,
+                AdminAction::Revoked
+                    if record.subject.kind == SubjectKind::Key
+                        && record.subject.id == asked.key.kid =>
+                {
+                    enrolled = false;
+                }
+                _ => {}
+            }
+        }
+        if !enrolled {
+            return Err(refused());
+        }
+        // Asked twice, it is enrolled once.
+        if let Some((gate, held)) = self.store.gate_key(&self.scope, &asked.key.kid).await? {
+            return if gate == asked.gate && held == asked.key {
+                Ok(())
+            } else {
+                Err(refused())
+            };
+        }
+        self.enrol_gate_key(&asked.gate, &asked.key).await
     }
 
     /// Take in one of an Authority's admin records: signed by a key enrolled for admin

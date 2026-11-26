@@ -306,6 +306,11 @@ follow-up tracking.
   code and its signed admin records (`crates/gov-authority`, on `build/gov-g4a`), on memory
   and Postgres stores. A library only: nothing is served, nobody is signed in, and its chain
   is not yet shipped to the Ledger. Not yet read by the reviewer.
+- **G4a, second part, built (2026-11-26):** the Ledger holds chains of two kinds and reads
+  each key as its own kind only; the Authority ships its admin records there, under the same
+  witness as the gates' receipts; and the Ledger enrols a gate's key only on the Authority's
+  signed word backed by a witnessed record (`build/gov-g4a2`). Still libraries: the three
+  programs do not use the Authority yet. Not yet read by the reviewer.
 - **A message relayed by the reviewer session (2026-11-26):** it reported that the owner typed
   there "I'm going to sleep you keep building do not ask for permission further - I gave the
   permission". The conductor could not confirm it and did not treat it as new permission. It

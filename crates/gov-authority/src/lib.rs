@@ -14,13 +14,24 @@ use std::collections::BTreeSet;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use gov_core::admin::{Actor, AdminAction, AdminRecord, Subject, SubjectKind};
-use gov_core::enrol::{code_digest, new_code, pin, EnrolKind, EnrolRequest};
+use gov_core::enrol::{code_digest, key_digest, new_code, pin, EnrolKind, EnrolRequest, KeyGrant};
+use gov_core::lease::{batch_digest, IntakeAck, ShipRequest};
+use gov_core::random_id;
 use gov_core::{open, seal, Digest, Envelope, Id, KeySet, PublicKey, Scope, SigningKey, VERSION};
 
 pub use store::{
     Agent, Effect, EnrolledKey, Gate, MemoryStore, PendingCode, Person, Role, Status, Store,
     StoreError, StoredRecord,
 };
+
+/// A batch of this Authority's records for the Ledger, under a request signed with the key
+/// the records are signed with.
+#[derive(Debug, Clone)]
+pub struct Shipment {
+    pub request: Envelope,
+    pub batch: Vec<Envelope>,
+    nonce: Id,
+}
 
 /// How long a one-time code is good for, in seconds.
 pub const CODE_SECS: i64 = 15 * 60;
@@ -40,6 +51,9 @@ pub enum AuthorityError {
     /// A request to enrol was refused. It says no more: the caller may be anyone.
     #[error("refused")]
     Refused,
+    /// The Ledger's answer does not agree with this Authority's own chain at this record.
+    #[error("the Ledger disagrees with this Authority's chain at record {0}")]
+    LedgerDisagrees(u64),
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error("{0}")]
@@ -506,7 +520,6 @@ impl<S: Store> Authority<S> {
         {
             return Err(AuthorityError::Refused);
         }
-        let key_bytes = serde_json::to_vec(&asked.key).map_err(|_| AuthorityError::Refused)?;
         let enrolled = EnrolledKey {
             kind,
             name: name.clone(),
@@ -518,7 +531,7 @@ impl<S: Store> Authority<S> {
                 action: AdminAction::KeyEnrolled,
                 on: subject(SubjectKind::Key, &asked.key.kid),
                 about: Some(subject(of(kind), &name)),
-                value: Some(Digest::of(&[b"gov.key.v1\0", &key_bytes])),
+                value: Some(key_digest(&asked.key)?),
             },
             &[Effect::PutKey(enrolled)],
             now,
@@ -528,5 +541,111 @@ impl<S: Store> Authority<S> {
             root: self.root.clone(),
             pin: pin(code, &self.root)?,
         })
+    }
+
+    /// Every record of this Authority's chain, opened under its own key, in order.
+    pub async fn store_records(&self) -> Vec<AdminRecord> {
+        let keys = KeySet::new([self.admin_key.public()]);
+        let mut out = Vec::new();
+        let mut after = 0;
+        while let Ok(page) = self.store.records_after(&self.scope, after, 500).await {
+            let Some(last) = page.last() else { break };
+            after = last.seq;
+            for stored in &page {
+                if let Ok(opened) = open::<AdminRecord>(&stored.envelope, &keys, &self.scope) {
+                    out.push(opened.doc);
+                }
+            }
+        }
+        out
+    }
+
+    /// The records after `acked`, as a shipment for the Ledger. `None` when there are none.
+    /// The Authority's chain goes to the Ledger as a gate's does, and is witnessed with it.
+    pub async fn shipment(&self, acked: u64, limit: usize) -> Result<Option<Shipment>> {
+        let batch: Vec<Envelope> = self
+            .store
+            .records_after(&self.scope, acked, limit)
+            .await?
+            .into_iter()
+            .map(|r| r.envelope)
+            .collect();
+        if batch.is_empty() {
+            return Ok(None);
+        }
+        let nonce = random_id("ship")?;
+        let request = seal(
+            &ShipRequest {
+                v: VERSION,
+                tenant: self.scope.tenant.clone(),
+                env: self.scope.env.clone(),
+                gate: self.name.clone(),
+                nonce: nonce.clone(),
+                count: batch.len() as u64,
+                batch: batch_digest(&batch),
+            },
+            &self.admin_key,
+        )?;
+        Ok(Some(Shipment {
+            request,
+            batch,
+            nonce,
+        }))
+    }
+
+    /// Check the Ledger's signed answer to `shipment` against this Authority's own chain:
+    /// it is the Ledger's, for this chain and this request, and the record it says it holds
+    /// last is the one this Authority wrote under that number. Returns that number.
+    pub async fn check_answer(
+        &self,
+        shipment: &Shipment,
+        ack: &Envelope,
+        ledger_keys: &KeySet,
+    ) -> Result<u64> {
+        let ack = open::<IntakeAck>(ack, ledger_keys, &self.scope)?.doc;
+        if ack.gate != self.name {
+            return Err(gov_core::Error::WrongGate.into());
+        }
+        if ack.nonce != shipment.nonce {
+            return Err(gov_core::Error::Replay.into());
+        }
+        let mine = match ack.seq {
+            0 => None,
+            seq => self
+                .store
+                .records_after(&self.scope, seq - 1, 1)
+                .await?
+                .into_iter()
+                .find(|r| r.seq == seq)
+                .map(|r| r.hash),
+        };
+        if mine != ack.hash {
+            return Err(AuthorityError::LedgerDisagrees(ack.seq));
+        }
+        Ok(ack.seq)
+    }
+
+    /// The Authority's word to the Ledger that `kid` is a gate's enrolled key. The Ledger
+    /// acts on it only once it holds the record of that enrolment.
+    pub async fn grant(&self, kid: &Id) -> Result<Envelope> {
+        let enrolled = match self.store.key(&self.scope, kid).await? {
+            Some(e) if e.kind == EnrolKind::Gate => e,
+            _ => return Err(AuthorityError::Unknown("gate key")),
+        };
+        match self.store.gate(&self.scope, &enrolled.name).await? {
+            Some(g) if g.status == Status::Active => {}
+            _ => return Err(AuthorityError::Unknown("gate")),
+        }
+        Ok(seal(
+            &KeyGrant {
+                v: VERSION,
+                tenant: self.scope.tenant.clone(),
+                env: self.scope.env.clone(),
+                authority: self.name.clone(),
+                gate: enrolled.name,
+                key: enrolled.key,
+            },
+            &self.admin_key,
+        )?)
     }
 }
