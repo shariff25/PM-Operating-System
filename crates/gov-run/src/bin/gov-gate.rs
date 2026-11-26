@@ -2,9 +2,10 @@
 //! at it instead of at the server; every tool call leaves a receipt, and nothing is blocked.
 //! It ships its receipts to the Ledger on a timer and trims its spool to the witness.
 //!
-//! Until there is an Authority (G4), the connector map and the Ledger's public keys are
-//! files the operator supplies. They are not signed: whoever can change those files can
-//! change what this gate records a call as. That is a stated limit of this step.
+//! The connector map and the mandate issuers' keys come from a policy bundle signed by the
+//! root key (spec §7.6.1); the unsigned files of the first steps work only under a flag
+//! for tests. The Ledger's public keys stay a local file: who witnesses is not for whoever
+//! signs policy to choose (review finding GR-134).
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -16,7 +17,6 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Json;
 use clap::{Parser, Subcommand};
-use gov_core::connector::ServerMap;
 use gov_core::{Id, KeySet, PublicKey, Scope};
 use gov_gate::forward::{Forwarder, ForwarderConfig};
 use gov_gate::link::HttpLedgerLink;
@@ -72,9 +72,8 @@ struct Serve {
     /// The one MCP server this gate stands in front of.
     #[arg(long)]
     upstream: String,
-    /// The connector map for that server, as JSON.
-    #[arg(long)]
-    map: PathBuf,
+    #[command(flatten)]
+    policy: gov_run::policy_source::PolicyArgs,
     /// The Ledger's address.
     #[arg(long)]
     ledger: String,
@@ -95,11 +94,6 @@ struct Serve {
     /// Seconds the server, or the Ledger, has to answer.
     #[arg(long, default_value_t = 60)]
     call_timeout: u64,
-    /// A file holding the public keys mandates are issued under, as a JSON list. With it the
-    /// gate opens sessions for the shim and records a proven agent as proven. Until there is
-    /// an Authority these are a test issuer's keys.
-    #[arg(long)]
-    mandate_issuers: Option<PathBuf>,
     /// Where the secret for the operator address is written, in a new file only its owner
     /// can read. Every request to the operator address must carry it.
     #[arg(long)]
@@ -125,24 +119,19 @@ async fn serve(s: Serve) -> anyhow::Result<()> {
     let gate =
         Id::new(&s.gate).map_err(|_| anyhow::anyhow!("the gate's name is not an identifier"))?;
     let key = read_key(&s.key_file)?;
-    let map: ServerMap = serde_json::from_slice(&std::fs::read(&s.map)?)
-        .context("the connector map cannot be read")?;
+    let policy = s.policy.load(&scope)?;
     let ledger_keys: Vec<PublicKey> = serde_json::from_slice(&std::fs::read(&s.ledger_keys)?)
         .context("the Ledger's public keys cannot be read")?;
     anyhow::ensure!(!ledger_keys.is_empty(), "no public key for the Ledger");
-    let sessions = match &s.mandate_issuers {
-        Some(path) => {
-            let issuers: Vec<PublicKey> = serde_json::from_slice(&std::fs::read(path)?)
-                .context("the mandate issuers' public keys cannot be read")?;
-            anyhow::ensure!(!issuers.is_empty(), "no public key for a mandate issuer");
-            Some(SessionsConfig::new(
-                scope.clone(),
-                gate.clone(),
-                KeySet::new(issuers),
-            ))
-        }
-        None => None,
-    };
+    // With issuers' keys the gate opens sessions for the shim and records a proven agent
+    // as proven. Until the Authority issues mandates (G4c) these are a test issuer's keys.
+    let sessions = (!policy.mandate_issuers.is_empty()).then(|| {
+        SessionsConfig::new(
+            scope.clone(),
+            gate.clone(),
+            KeySet::new(policy.mandate_issuers.clone()),
+        )
+    });
     let operator_secret = new_secret(&s.operator_secret_file)?;
     let config = GateConfig {
         scope,
@@ -150,6 +139,7 @@ async fn serve(s: Serve) -> anyhow::Result<()> {
         ledger_keys: KeySet::new(ledger_keys),
         spool_limit: s.spool_limit,
         batch: s.batch,
+        policy_version: Some(policy.version.clone()),
     };
     let spool = FileSpool::open(&s.spool).map_err(|e| anyhow::anyhow!("the spool: {e}"))?;
     let gate = Gate::open(config, key, spool, now()).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -157,7 +147,7 @@ async fn serve(s: Serve) -> anyhow::Result<()> {
         gate,
         ForwarderConfig {
             upstream: s.upstream,
-            map,
+            map: policy.map,
             call_timeout: Duration::from_secs(s.call_timeout),
             sessions,
             max_in_flight: gov_gate::forward::MAX_IN_FLIGHT,

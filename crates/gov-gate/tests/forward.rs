@@ -216,6 +216,7 @@ async fn stack_holding(spool_limit: usize, max_in_flight: usize) -> Stack {
         ledger_keys: KeySet::new([ledger_key().public()]),
         spool_limit,
         batch: 100,
+        policy_version: None,
     };
     let spool = FileSpool::open(dir.path().join("spool")).unwrap();
     let gate = Gate::open(config, gate_key(), spool, 0).unwrap();
@@ -1077,6 +1078,7 @@ async fn a_client_that_leaves_while_the_intent_is_written_leaves_no_open_intent(
         ledger_keys: KeySet::new([ledger_key().public()]),
         spool_limit: 100,
         batch: 100,
+        policy_version: None,
     };
     let spool = SlowSpool(FileSpool::open(dir.path().join("spool")).unwrap());
     let gate = Gate::open(config, gate_key(), spool, 0).unwrap();

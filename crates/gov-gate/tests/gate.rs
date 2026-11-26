@@ -37,6 +37,7 @@ fn config(spool_limit: usize) -> GateConfig {
         ledger_keys: KeySet::new([ledger_key().public()]),
         spool_limit,
         batch: 100,
+        policy_version: None,
     }
 }
 fn gate_at(dir: &Path, limit: usize, now: i64) -> Gate<FileSpool> {
@@ -565,6 +566,7 @@ async fn the_gate_notices_a_ledger_that_is_stuck_behind_or_ahead() {
     let mut small = Gate::open(
         GateConfig {
             batch: 2,
+            policy_version: None,
             ..config(100)
         },
         gate_key(),

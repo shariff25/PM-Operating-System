@@ -115,6 +115,10 @@ pub struct GateConfig {
     pub spool_limit: usize,
     /// The most receipts in one batch to the Ledger.
     pub batch: usize,
+    /// What every receipt carries as its policy version: the bundle the gate's connector
+    /// map came from, or a word saying it came from no bundle. Absent where nothing loaded
+    /// a policy at all.
+    pub policy_version: Option<Id>,
 }
 
 /// Who made a call, and how the gate knows. There are two ways to make one, and no other:
@@ -329,7 +333,7 @@ impl<S: Spool> Gate<S> {
                 failure: call.who.failure,
             },
             mandate: call.who.mandates.clone(),
-            policy_version: None,
+            policy_version: self.config.policy_version.clone(),
             action: ReceiptAction::from(call.action),
             reversal: call.reversal,
             before_digest: None,

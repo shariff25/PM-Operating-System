@@ -10,7 +10,6 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::Parser;
-use gov_core::connector::ServerMap;
 use gov_core::{Envelope, Id, Scope};
 use gov_run::shim::{Shim, ShimConfig};
 use gov_run::{bind, listen_address, new_secret, outbound_address, read_key};
@@ -40,9 +39,10 @@ struct Cli {
     /// The agent's mandate, as issued.
     #[arg(long)]
     mandate: PathBuf,
-    /// The connector map: the same one the gate uses.
-    #[arg(long)]
-    map: PathBuf,
+    /// The policy: the same bundle the gate runs on. A shim on another bundle fails its
+    /// proofs for every tool whose map differs.
+    #[command(flatten)]
+    policy: gov_run::policy_source::PolicyArgs,
     /// Where the shim's secret is written, in a new file only its owner can read.
     #[arg(long)]
     secret_file: PathBuf,
@@ -67,8 +67,7 @@ async fn main() -> anyhow::Result<()> {
     let key = read_key(&cli.key_file)?;
     let mandate: Envelope = serde_json::from_slice(&std::fs::read(&cli.mandate)?)
         .context("the mandate cannot be read")?;
-    let map: ServerMap = serde_json::from_slice(&std::fs::read(&cli.map)?)
-        .context("the connector map cannot be read")?;
+    let map = cli.policy.load(&scope)?.map;
     // The secret is in its file before the shim says it is listening: whoever reads that
     // line can read the secret at once.
     let secret = new_secret(&cli.secret_file)?;
