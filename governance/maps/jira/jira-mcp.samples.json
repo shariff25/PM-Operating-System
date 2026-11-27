@@ -255,7 +255,7 @@
   "expect": {
    "operation": "project.dependencies.read",
    "kind": "read",
-   "resource": "jira/project/pay"
+   "resource": "jira/dependencies"
   }
  },
  {

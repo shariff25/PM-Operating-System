@@ -33,6 +33,14 @@ pub struct Reviewed {
     pub reversal: Reversal,
     pub outward: bool,
     pub resource: ResourceTemplate,
+    /// The tool of this same server that takes the call back: the opposite tool for an
+    /// `inverse`, the tool that writes the old value again for a `restore`. A tool marked
+    /// as one that can be put back must name it, and it must be in the map: a reversal
+    /// class is a promise that the gate can undo the action through this connector, and
+    /// a server with no tool to do it cannot keep that promise (review finding GR-158).
+    /// For the reader and the build; it is not in the map.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub undo_with: Option<String>,
     /// Whether what the tool returns can be trusted to steer an agent. Left out, it cannot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub results: Option<gov_core::label::Integrity>,
@@ -142,6 +150,29 @@ pub fn build(listing: &[Value], review: &Review) -> anyhow::Result<ServerMap> {
             listed.contains_key(name),
             "{name} is set aside, but the server does not list it"
         );
+    }
+    for (name, reviewed) in &review.tools {
+        match (&reviewed.undo_with, reviewed.reversal.reversible()) {
+            (None, false) => {}
+            (None, true) => bail!(
+                "{name} is marked as one that can be put back, and names no tool that does it"
+            ),
+            (Some(_), false) => {
+                bail!(
+                    "{name} names a tool that takes it back, and is not marked as one that can be"
+                )
+            }
+            (Some(undo), true) => {
+                let Some(with) = review.tools.get(undo) else {
+                    bail!("{name} is to be put back with {undo}, which is not in the map");
+                };
+                // Something that only reads puts nothing back.
+                ensure!(
+                    with.kind != Kind::Read,
+                    "{name} is to be put back with {undo}, which only reads"
+                );
+            }
+        }
     }
     let mut tools = Vec::new();
     for (name, definition) in &listed {

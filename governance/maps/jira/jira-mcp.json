@@ -8,7 +8,7 @@
       "digest": "138c0befc5c39637fa446bc281a307468f8249db8fb2f739002591b2b7e88e69",
       "operation": "comment.add",
       "kind": "write",
-      "reversal": "inverse",
+      "reversal": "none",
       "outward": true,
       "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}"
     },
@@ -17,7 +17,7 @@
       "digest": "3d4d5dc0338acbd79b8bb0f48e14504e663536429620131217adda419dc5a89d",
       "operation": "sprint.issues.add",
       "kind": "write",
-      "reversal": "inverse",
+      "reversal": "none",
       "outward": false,
       "resource": "jira/sprint/{sprint_id}"
     },
@@ -35,8 +35,8 @@
       "digest": "f9806f219cbeb30fa1026c1ddfd94ae8b660518a6e1d778bc87d6513446e7d2c",
       "operation": "worklog.add",
       "kind": "write",
-      "reversal": "inverse",
-      "outward": false,
+      "reversal": "none",
+      "outward": true,
       "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}"
     },
     {
@@ -45,7 +45,7 @@
       "operation": "issue.assign",
       "kind": "write",
       "reversal": "restore",
-      "outward": false,
+      "outward": true,
       "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}"
     },
     {
@@ -54,7 +54,7 @@
       "operation": "issue.batch-create",
       "kind": "write",
       "reversal": "inverse",
-      "outward": false,
+      "outward": true,
       "resource": "jira/batch"
     },
     {
@@ -62,8 +62,8 @@
       "digest": "b952c64d8afc5736e6241a0fb40a1c1da95bbffcb1ecf2db8e29a654b98ed451",
       "operation": "version.batch-create",
       "kind": "write",
-      "reversal": "inverse",
-      "outward": false,
+      "reversal": "none",
+      "outward": true,
       "resource": "jira/project/{project_key}"
     },
     {
@@ -90,7 +90,7 @@
       "operation": "issue.create",
       "kind": "write",
       "reversal": "inverse",
-      "outward": false,
+      "outward": true,
       "resource": "jira/project/{project_key}"
     },
     {
@@ -98,8 +98,8 @@
       "digest": "1569e4e4819b85ff009d0679459498ee2a757e2063adc7bab23826b7536a95ac",
       "operation": "issuelink.create",
       "kind": "write",
-      "reversal": "inverse",
-      "outward": false,
+      "reversal": "none",
+      "outward": true,
       "resource": "jira/project/{inward_issue_key:before(-)}/issue/{inward_issue_key}"
     },
     {
@@ -107,8 +107,8 @@
       "digest": "bda31ffc69307fa809347c9ee40263b852df8e9795b51da836e5af57d8d505b8",
       "operation": "remotelink.create",
       "kind": "write",
-      "reversal": "inverse",
-      "outward": false,
+      "reversal": "none",
+      "outward": true,
       "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}"
     },
     {
@@ -116,8 +116,8 @@
       "digest": "9064dacc8b7769db20753ee83c321f83762906ff7ba2d8edcbf25025e286f829",
       "operation": "sprint.create",
       "kind": "write",
-      "reversal": "inverse",
-      "outward": false,
+      "reversal": "none",
+      "outward": true,
       "resource": "jira/board/{board_id}"
     },
     {
@@ -125,8 +125,8 @@
       "digest": "718dceba10426aa878d4694a56d39458db8f5b6169c504b3ad530d2ef806bdb1",
       "operation": "version.create",
       "kind": "write",
-      "reversal": "inverse",
-      "outward": false,
+      "reversal": "none",
+      "outward": true,
       "resource": "jira/project/{project_key}"
     },
     {
@@ -199,7 +199,7 @@
       "kind": "read",
       "reversal": "none",
       "outward": false,
-      "resource": "jira/project/{project_key}"
+      "resource": "jira/dependencies"
     },
     {
       "tool": "jira_get_field_options",
@@ -449,7 +449,7 @@
       "digest": "cc77f185023d025cb8837ccddb3fa0ec42509b7df45c131380bce31436f21898",
       "operation": "issue.epic.link",
       "kind": "write",
-      "reversal": "restore",
+      "reversal": "none",
       "outward": false,
       "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}"
     },
@@ -467,7 +467,7 @@
       "digest": "f271a0fb13214d934f62b5ba46b44d6961b5f8c19297dbb432a1ac21e3da0039",
       "operation": "backlog.issues.move",
       "kind": "write",
-      "reversal": "inverse",
+      "reversal": "none",
       "outward": false,
       "resource": "jira/batch"
     },
@@ -476,7 +476,7 @@
       "digest": "afa22b796bf0db511f28ea09d9160782715b1f900111bbecb4396203d9ae0f08",
       "operation": "issuelink.remove",
       "kind": "write",
-      "reversal": "inverse",
+      "reversal": "restore",
       "outward": false,
       "resource": "jira/issuelink/{link_id}"
     },
@@ -531,7 +531,7 @@
       "operation": "issue.transition",
       "kind": "write",
       "reversal": "none",
-      "outward": false,
+      "outward": true,
       "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}"
     },
     {
@@ -549,7 +549,7 @@
       "operation": "issue.form.update",
       "kind": "write",
       "reversal": "restore",
-      "outward": false,
+      "outward": true,
       "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}"
     },
     {
@@ -557,8 +557,8 @@
       "digest": "d8bc200171cf20a291de6054b00105e17d7f22f4b7f845b286fe08197c96a63b",
       "operation": "sprint.update",
       "kind": "write",
-      "reversal": "restore",
-      "outward": false,
+      "reversal": "none",
+      "outward": true,
       "resource": "jira/sprint/{sprint_id}"
     },
     {
@@ -566,8 +566,8 @@
       "digest": "beada2a62686ddb2982756fcb43d86cbdddef308ce7b9e65053eb92b5f3eea12",
       "operation": "version.update",
       "kind": "write",
-      "reversal": "restore",
-      "outward": false,
+      "reversal": "none",
+      "outward": true,
       "resource": "jira/version/{version_id}"
     }
   ]

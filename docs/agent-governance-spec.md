@@ -893,14 +893,14 @@ the listings, not a live system. The builder and the drift command were found so
 
 | Id | Severity | What | Done |
 |---|---|---|---|
-| GR-158 | Medium, before shadow or enforce | A tool was marked as undoable (`inverse`) where the server has no tool to undo it with: six in Jira, four in GitHub, all three Slack writes | To fix on `build/gov-review-21` |
-| GR-159 | Medium, before shadow or enforce | `jira_transition_issue` can set fields and post a comment and was not marked outward; `jira_create_issue_link` posts a comment too | To fix |
-| GR-160 | Medium, before shadow or enforce | "Outward" had no tight rule and was applied unevenly | To fix: one rule in the library's README, every write checked against it |
-| GR-161 | Medium, before enforce | A moved Jira issue answers to its old key and a renamed GitHub repository to its old name, so a call by a former name is placed where the thing no longer is | To state as a limit; before enforce mode the gate must compare the name it was given with the one the system answers under |
-| GR-162 | Low | `jira_get_cross_project_dependencies` returns other projects' issues under one project's resource | To fix |
-| GR-163 | Low | GitHub's secret-scanning alerts and job logs sit under the bare repository, so any read grant on it reaches them | To fix: a last segment by area |
-| GR-164 | Low | `fork_repository` writes into an account named in a second argument | To add to the stated limits |
-| GR-165 | Low | The listings were taken with made-up settings; if a listing depends on settings, every tool reads as unknown in a real deployment | To say in each `source` which settings were used, and to run `gov map drift` against the real server first |
+| GR-158 | Medium, before shadow or enforce | A tool was marked as undoable (`inverse`) where the server has no tool to undo it with: six in Jira, four in GitHub, all three Slack writes | Fixed on `build/gov-review-21`: each is now `none`, and so are six more found the same way (a link whose comment stays, an epic that cannot be unlinked, sprints, a version). `gov map build` refuses a tool marked as one that can be put back unless its review names the tool that does it, which must be in the map and not a read. Jira keeps 8 such tools, GitHub 10, Slack none |
+| GR-159 | Medium, before shadow or enforce | `jira_transition_issue` can set fields and post a comment and was not marked outward; `jira_create_issue_link` posts a comment too | Fixed: both are outward |
+| GR-160 | Medium, before shadow or enforce | "Outward" had no tight rule and was applied unevenly | Fixed: the rule is in `governance/maps/README.md` (text people see, a person told, access widened, something started). Every write was checked against it: 13 more Jira tools and 3 GitHub tools are now outward. A test holds every write that takes free text to it |
+| GR-161 | Medium, before enforce | A moved Jira issue answers to its old key and a renamed GitHub repository to its old name, so a call by a former name is placed where the thing no longer is | Stated as a limit in the README. **Open: to be designed before enforce mode** (G6): the gate compares the name it was given with the one the system answers under |
+| GR-162 | Low | `jira_get_cross_project_dependencies` returns other projects' issues under one project's resource | Fixed: a resource of its own, `jira/dependencies` |
+| GR-163 | Low | GitHub's secret-scanning alerts and job logs sit under the bare repository, so any read grant on it reaches them | Fixed: a repository's resource ends in `code`, `issues`, `pulls`, `actions`, `security`, `discussions` or `settings`; no tool is left on the bare repository |
+| GR-164 | Low | `fork_repository` writes into an account named in a second argument | Added, in the README and the tool's note |
+| GR-165 | Low | The listings were taken with made-up settings; if a listing depends on settings, every tool reads as unknown in a real deployment | Each `source` now says so, and the README |
 
 ### Twenty-second read, 2026-11-27: the G4d design and the twentieth-read fixes at `c1b2c0e`
 
