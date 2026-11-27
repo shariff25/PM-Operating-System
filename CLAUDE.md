@@ -470,6 +470,14 @@ follow-up tracking.
   changes; receipts already written still verify. Three defaults are the conductor's
   choice, for the reviewer: an unlabelled resource is restricted, cleared for public
   only, and an unmarked tool's results are untrusted. Not yet read by the reviewer.
+- **Twenty-first and twenty-second reads (2026-11-27), at `f18b857` and `c1b2c0e`:** no
+  High or Critical. The map library passes **for observe mode only**: three Medium
+  findings in the maps (GR-158: undo claimed where the server has no tool to undo with;
+  GR-159: two Jira tools mapped too narrowly; GR-160: "outward" applied unevenly) are to
+  be fixed and the maps read again before any backs shadow or enforce mode, and GR-161 (a
+  thing called by a former name) is to be designed before enforce. **G4d may be built
+  from §7.6.3**; four additions to its text are made. The twentieth read's fixes are
+  closed.
 
 ## Where the build stands (2026-11-23)
 

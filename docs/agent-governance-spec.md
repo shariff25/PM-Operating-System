@@ -883,6 +883,40 @@ restart; separate reasons for closing a session (GR-110); key rotation (GR-59, G
 that `gov verify` orders receipts after a retirement by the witness, not by the gate's own
 time (GR-130). CM1 and CM2 were called sound as slices; each map is read when it is sent.
 
+### Twenty-first read, 2026-11-27: the connector-map library at `f18b857`
+
+**Verdict: no High or Critical; CM1 and CM2's command pass, for observe mode. The three
+maps may not back shadow or enforce mode until GR-158, GR-159 and GR-160 are fixed and the
+fixed maps are read; GR-161 is to be designed before enforce mode.** The reviewer tabulated
+all 162 tools against the listings and their arguments. Like the maps, its read is against
+the listings, not a live system. The builder and the drift command were found sound.
+
+| Id | Severity | What | Done |
+|---|---|---|---|
+| GR-158 | Medium, before shadow or enforce | A tool was marked as undoable (`inverse`) where the server has no tool to undo it with: six in Jira, four in GitHub, all three Slack writes | To fix on `build/gov-review-21` |
+| GR-159 | Medium, before shadow or enforce | `jira_transition_issue` can set fields and post a comment and was not marked outward; `jira_create_issue_link` posts a comment too | To fix |
+| GR-160 | Medium, before shadow or enforce | "Outward" had no tight rule and was applied unevenly | To fix: one rule in the library's README, every write checked against it |
+| GR-161 | Medium, before enforce | A moved Jira issue answers to its old key and a renamed GitHub repository to its old name, so a call by a former name is placed where the thing no longer is | To state as a limit; before enforce mode the gate must compare the name it was given with the one the system answers under |
+| GR-162 | Low | `jira_get_cross_project_dependencies` returns other projects' issues under one project's resource | To fix |
+| GR-163 | Low | GitHub's secret-scanning alerts and job logs sit under the bare repository, so any read grant on it reaches them | To fix: a last segment by area |
+| GR-164 | Low | `fork_repository` writes into an account named in a second argument | To add to the stated limits |
+| GR-165 | Low | The listings were taken with made-up settings; if a listing depends on settings, every tool reads as unknown in a real deployment | To say in each `source` which settings were used, and to run `gov map drift` against the real server first |
+
+### Twenty-second read, 2026-11-27: the G4d design and the twentieth-read fixes at `c1b2c0e`
+
+**Verdict: no High or Critical; the gate still passes. G4d may be built from §7.6.3**, with
+four additions to its text (GR-166 to GR-169), which are made. The reviewer confirmed the
+one departure (point 11: the `gov-authority` program in G4d, with one listener for gates'
+renewals). GR-152 to GR-156 are closed, and the unmapped-tool count was found sound. The
+reviewer ran the tests of `gov-core`, `gov-authority` and `gov-gate` without Postgres.
+
+| Id | Severity | What | Done |
+|---|---|---|---|
+| GR-166 | Low | After the record naming a new admin-record key, the old key must be refused for later records | §7.6.3, point 9 |
+| GR-167 | Low | What happens to a disabled gate was not said | §7.6.3, point 1: no answer, so no fresh lease |
+| GR-168 | Low | An Authority whose clock or database goes back has its leases refused by every gate; right, but unsaid and unshown | §7.6.3, point 2: stated, with a reason of its own on the operator's address |
+| GR-169 | Low | The renewal listener needs the Ledger listener's hardening, and the text should say what is not on it | §7.6.3, point 11 |
+
 ## 1. What is being built
 
 Agent Governance is a second product, separate from PM OS. It has three parts.
@@ -1959,7 +1993,7 @@ limit on how many mandates may be issued in a time, which belongs with the liste
 screens (G8). A mandate's grants are still not checked against an action until G5, so a
 proven receipt is still not an authorised one.
 
-#### 7.6.3 G4d, the lease at the gate (design of 2026-11-27; not built; for the reviewer)
+#### 7.6.3 G4d, the lease at the gate (design of 2026-11-27; read by the reviewer, who cleared it to be built; not built)
 
 Makes revocation take effect and ends the gate's own clock. It settles what the reviewer's
 twentieth read asked to be in the text first. The lease, the held lease and the freshness
@@ -1970,7 +2004,9 @@ check exist in `gov-core` since G1 (§4.6); nothing has used them yet.
    digest, or none) and the revocation number it has read through. It is signed with a key
    enrolled for that gate. It carries no time: a gate may not have one yet.
    The Authority answers a gate that is not disabled, for a key that is its own and not
-   revoked, with three things made from one reading of its store:
+   revoked. **A disabled gate gets no answer** (GR-167): it then has no fresh lease, so
+   its calls are recorded as `no_lease` in observe mode (point 5) and refused in enforce
+   mode. The answer is three things made from one reading of its store:
    - a **lease** (§4.6), signed with a leases key of the latest published bundle, carrying
      the request's nonce, the Authority's time, that bundle's version (number and digest)
      and the newest revocation number;
@@ -1991,9 +2027,15 @@ check exist in `gov-core` since G1 (§4.6); nothing has used them yet.
      its `after` is the number the gate asked for; its `through` is not lower than the
      lease's revocation number; its entries are numbered in order, and entries and the
      count of those left out account for every number between `after` and `through`.
-   Then the bundle is put in use (point 6), the entries are added to the gate's revoked
+   Then the bundle is put in use (point 7), the entries are added to the gate's revoked
    set, and the lease is held. If any check fails nothing is changed, the gate keeps what
    it had, and the operator's address says which check failed.
+   **An Authority that has gone back** (GR-168). If the Authority's clock is set back, or
+   its database is put back from an older copy, its leases carry a time or a revocation
+   number below what gates hold, and every gate refuses them until the Authority has
+   caught up. That is meant: nothing may turn a gate's clock or its revocations back. The
+   operator's address shows it under a reason of its own, `authority_behind`, so that it
+   is not read as the Authority being down.
 3. **Entries left out.** The Authority leaves out an entry once what it names expired more
    than five minutes ago by its own clock. The gate's clock is the Authority's (point 4),
    so the gate already refuses that mandate as expired: nothing is missing. Entries for an
@@ -2074,7 +2116,9 @@ check exist in `gov-core` since G1 (§4.6); nothing has used them yet.
 9. **Replacing the Authority's admin-record key** (GR-126). A planned change is a record
    in the Authority's own chain, signed with the old key, that names the new one; records
    after it are signed with the new key, and the Ledger and `gov verify` follow the chain
-   across it. A **taken** admin-record key cannot be repaired this way, since whoever
+   across it. **From that record on, the old key is refused for every later record**
+   (GR-166), by the Ledger and by `gov verify`: otherwise whoever still holds it could
+   continue the chain beside the new one. A **taken** admin-record key cannot be repaired this way, since whoever
    holds it can write the same record: that is repaired by the operator at the Ledger and
    by giving auditors the new key out of band, like the first installation, and is stated
    as a limit beside the loss of the root key (owner's decision 9).
@@ -2094,6 +2138,12 @@ check exist in `gov-core` since G1 (§4.6); nothing has used them yet.
     document signed with an enrolled gate key; it takes no admin action and no sign-in,
     which stay with G4e (choice 8). It follows the programs' connection rule (HTTPS, or a
     literal loopback address) and their key-file rule (fake data only).
+    It is hardened as the Ledger's listener is (GR-169, with GR-77): a sender it does not
+    know gets a bare refusal and nothing is written; the request and the answer have a
+    size cap; and a limit for each source address applies before any signature is
+    checked. **Enrolment, issuing and delegation are not on this listener**: they stay
+    library calls on the Authority's machine, so a gate on another machine cannot enrol
+    until G4e.
 
 **Steps.** G4d-1: the renewal document, the Authority's answer and the gate's check of it
 (points 1 to 3), as libraries. G4d-2: the gate's time, proof under a lease, and revoked
