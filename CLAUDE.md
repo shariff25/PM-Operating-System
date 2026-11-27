@@ -122,6 +122,11 @@ follow-up tracking.
   no later command can leave it off.
 - **An independent reviewer session is the security gate.** Send it the commit for each batch;
   the gate passes only with no open finding of High or Critical severity.
+- **Few comments in code (owner, 2026-11-27):** "You are writing way too many comments in
+  the code for explanation and duplicate comments." A comment says only what the code
+  cannot: a reason that is not obvious, once, in one place. No comment restates the code,
+  the spec, a test's name or another comment; a review finding is named at most once, where
+  the control is. The spec holds the long explanation.
 - **Report honestly:** say what was verified and what was not. Nothing counts as measured
   against a model until an eval run has happened.
 
