@@ -44,6 +44,7 @@ fn policy() -> Value {
 
 fn jira_map() -> ServerMap {
     let tool = |name: &str, operation: &str, kind, reversal| ToolMap {
+        results: None,
         tool: id(name),
         digest: tool_digest(&json!({"name": name, "inputSchema": {"type": "object"}})).unwrap(),
         operation: id(operation),
@@ -53,6 +54,8 @@ fn jira_map() -> ServerMap {
         resource: ResourceTemplate::new("jira/project/{key:before(-)}/issue/{key}").unwrap(),
     };
     ServerMap {
+        labels: Vec::new(),
+        clearances: Vec::new(),
         server: id("jira-mcp"),
         system: id("jira"),
         fold_case: true,

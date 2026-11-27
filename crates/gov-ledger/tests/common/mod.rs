@@ -46,6 +46,10 @@ pub fn receipt(gate: &str, seq: u64, prev: Option<Digest>, at: i64) -> Receipt {
     )
     .unwrap();
     Receipt {
+        session: None,
+        cause: None,
+        rule: None,
+        labels: None,
         v: 1,
         tenant: id("acme"),
         env: id("prod"),

@@ -316,6 +316,10 @@ impl<S: Spool> Gate<S> {
     pub fn begin(&mut self, call: &Observed<'_>, now: i64) -> Result<u64, GateError> {
         let (at, at_clamped) = self.stamp(now);
         let receipt = Receipt {
+            session: None,
+            cause: None,
+            rule: None,
+            labels: None,
             v: VERSION,
             tenant: self.config.scope.tenant.clone(),
             env: self.config.scope.env.clone(),
@@ -379,6 +383,10 @@ impl<S: Spool> Gate<S> {
     ) -> Result<u64, GateError> {
         let (at, at_clamped) = self.stamp(now);
         let receipt = Receipt {
+            session: None,
+            cause: None,
+            rule: None,
+            labels: None,
             seq: 0,
             prev: None,
             at,

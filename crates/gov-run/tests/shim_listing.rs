@@ -60,10 +60,13 @@ async fn serve(router: Router) -> SocketAddr {
 
 fn map() -> ServerMap {
     ServerMap {
+        labels: Vec::new(),
+        clearances: Vec::new(),
         server: id("jira-mcp"),
         system: id("jira"),
         fold_case: true,
         tools: vec![ToolMap {
+            results: None,
             tool: id("jira_update_issue"),
             digest: tool_digest(&update_tool()).unwrap(),
             operation: id("issue.update"),

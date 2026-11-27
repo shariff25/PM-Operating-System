@@ -22,10 +22,13 @@ fn scope() -> Scope {
 }
 fn map(server: &str) -> ServerMap {
     ServerMap {
+        labels: Vec::new(),
+        clearances: Vec::new(),
         server: id(server),
         system: id("jira"),
         fold_case: true,
         tools: vec![ToolMap {
+            results: None,
             tool: id("jira_get_issue"),
             digest: tool_digest(&json!({"name": "jira_get_issue"})).unwrap(),
             operation: id("issue.read"),
