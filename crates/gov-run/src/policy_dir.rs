@@ -168,7 +168,7 @@ pub fn check(dir: &Path, number: u64, now: i64) -> anyhow::Result<Checked> {
 
 /// Run a map's sample calls: every tool of the map has at least one, and each is read as
 /// the action it says.
-fn run_samples(map: &ServerMap, path: &Path) -> anyhow::Result<usize> {
+pub fn run_samples(map: &ServerMap, path: &Path) -> anyhow::Result<usize> {
     let samples: Vec<Sample> = read(path)?;
     let mut covered = BTreeSet::new();
     for (n, sample) in samples.iter().enumerate() {

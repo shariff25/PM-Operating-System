@@ -432,6 +432,29 @@ reviewer.
     yet checked against a call (G5).
 - One more test on both of the Ledger's stores (a chain holds one kind of document), and
   two with an Authority and a Ledger together.
+- **CM1, first map, and CM2's command built (2026-11-27), on `build/gov-cm1`; not yet read
+  by the reviewer.** The library is `governance/maps/` (its `README.md` says what a map
+  claims). A map is built, never written by hand: `gov map build` joins the server's own
+  `tools/list` answer with a review file, and refuses unless every listed tool is reviewed
+  or set aside by name with a reason. `gov map drift` names tools a later listing added,
+  removed or changed in any field, and exits non-zero.
+  - **Jira:** `mcp-atlassian` 0.24.8, 63 Jira tools, all mapped. The listing was got by
+    starting the server with made-up settings; **no Jira was contacted and no tool has
+    been run against one, so the map is not verified**, only reviewed against the listing.
+  - Choices a reader should know: an issue is placed in the project its own key names;
+    `jira_update_issue` is mapped as not undoable and reaching outside, because one call
+    can also comment, move the issue through its workflow and attach files;
+    `jira_move_issue` and `jira_delete_issue` are destructive; a search, and every tool
+    that takes a list of issues, has a resource of its own outside any project, so a grant
+    on one project never reaches it.
+  - **Limits:** `jira_move_issue` names its target project in an argument the resource
+    does not carry, and `jira_create_issue_link` and `jira_add_issues_to_sprint` can name
+    issues of other projects: a grant on the source is enough for each. A resource holds
+    one place; a rule on a second argument waits for G5.
+  - Eleven controls of the builder and the drift check removed one at a time; each
+    removal fails a test.
+  - Still to build: the GitHub and Slack maps (CM1), and the gate's count of calls to
+    unmapped tools by digest (CM2).
 
 ## Security review of 2026-11-26 (first read; the gate did not pass)
 
