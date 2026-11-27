@@ -220,6 +220,12 @@ fn the_signer_checks_the_directory_itself_and_sees_what_changed() {
         describe(&again.changes),
         vec!["nothing changed but the number"]
     );
+    // A difference the list does not name is said in capitals, not left out (GR-135).
+    let unnamed = gov_core::policy::Changes {
+        other: true,
+        ..Default::default()
+    };
+    assert!(describe(&unnamed)[0].starts_with("OTHER CHANGES"));
 
     // What review finding GR-128 is about: a key of an attacker's added under `mandates`,
     // and a refusal dropped. The signer is shown both, by id.

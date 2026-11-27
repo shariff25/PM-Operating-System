@@ -71,6 +71,9 @@ enum PolicyCommand {
         /// The policy directory, as checked out from the reviewed repository.
         #[arg(long)]
         dir: PathBuf,
+        /// The time the bundle would carry, in seconds since the epoch. Defaults to now.
+        #[arg(long)]
+        issued_at: Option<i64>,
     },
     /// Check a policy directory, show what changed since the bundle before, and sign it
     /// with the root key. The directory must come from the reviewed repository, never from
@@ -88,10 +91,17 @@ enum PolicyCommand {
         /// The signed bundle before this one. Required for every number but 1.
         #[arg(long)]
         previous: Option<PathBuf>,
+        /// The time the bundle carries, in seconds since the epoch. Given, not read from
+        /// this machine's clock, so that a second person who builds the bundle from the same
+        /// commit with the same number and time gets the same digest (for example the
+        /// commit's own time).
+        #[arg(long)]
+        issued_at: i64,
         /// Where the signed bundle is written. It must not exist yet.
         #[arg(long)]
         out: PathBuf,
-        /// Sign without asking. For a release step that has shown the changes elsewhere.
+        /// Sign without asking. The changes are still printed. Only for a release step in
+        /// which a person has already been shown these changes elsewhere and agreed to them.
         #[arg(long)]
         yes: bool,
     },
@@ -192,8 +202,8 @@ fn print(report: &Report) {
 fn policy(command: PolicyCommand) -> anyhow::Result<bool> {
     use gov_run::policy_dir;
     match command {
-        PolicyCommand::Check { dir } => {
-            let checked = policy_dir::check(&dir, 1, gov_run::now())?;
+        PolicyCommand::Check { dir, issued_at } => {
+            let checked = policy_dir::check(&dir, 1, issued_at.unwrap_or_else(gov_run::now))?;
             println!(
                 "The policy passes its checks: {} rules, {} connector maps, {} sample calls.",
                 checked.bundle.rules.len(),
@@ -207,9 +217,11 @@ fn policy(command: PolicyCommand) -> anyhow::Result<bool> {
             root_key,
             number,
             previous,
+            issued_at,
             out,
             yes,
         } => {
+            anyhow::ensure!(issued_at > 0, "--issued-at is seconds since the epoch");
             anyhow::ensure!(
                 !out.exists(),
                 "{} exists already; a signed bundle is never written over",
@@ -222,13 +234,8 @@ fn policy(command: PolicyCommand) -> anyhow::Result<bool> {
                     serde_json::from_slice(&bytes).context("--previous is not a signed bundle")
                 })
                 .transpose()?;
-            let prepared = policy_dir::prepare(
-                &dir,
-                &root.public(),
-                number,
-                previous.as_ref(),
-                gov_run::now(),
-            )?;
+            let prepared =
+                policy_dir::prepare(&dir, &root.public(), number, previous.as_ref(), issued_at)?;
             println!(
                 "Bundle {number} for {}/{}, checked ({} sample calls). Since the bundle before:",
                 prepared.bundle.tenant, prepared.bundle.env, prepared.samples
