@@ -453,8 +453,19 @@ reviewer.
     one place; a rule on a second argument waits for G5.
   - Eleven controls of the builder and the drift check removed one at a time; each
     removal fails a test.
-  - Still to build: the GitHub and Slack maps (CM1), and the gate's count of calls to
-    unmapped tools by digest (CM2).
+  - **GitHub:** `github-mcp-server` v1.14.0 with every toolset, 91 tools, all mapped.
+    **Slack:** `@modelcontextprotocol/server-slack` 2025.4.25, 8 tools, all mapped. Both
+    listings were got with a made-up token and no network: **neither map is verified.**
+  - GitHub choices: a call is held to the repository its `owner` and `repo` name, and no
+    finer, because an issue's or a pull request's number is not a string a resource can
+    be built from; a tool with several methods is mapped as the widest (so
+    `pull_request_review_write`, which can approve, and `actions_run_trigger`, which runs
+    whatever a workflow holds, are destructive and reach outside); searches, projects,
+    rulesets, gists and notifications have resources outside any repository. The review
+    and the server's own read-only hint agree on all 91 tools, and a test holds them to it.
+  - Slack choices: every tool that posts reaches people; a channel is its id, and a
+    channel given by name is recorded as unknown.
+  - Still to build: the gate's count of calls to unmapped tools by digest (CM2).
 
 ## Security review of 2026-11-26 (first read; the gate did not pass)
 

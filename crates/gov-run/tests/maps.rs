@@ -156,12 +156,19 @@ fn only_a_tool_named_for_reading_is_mapped_as_a_read() {
 
 // ----- Jira: the choices that matter ----------------------------------------------------
 
-fn jira() -> gov_core::connector::ServerMap {
-    read_map(&library().join("jira/jira-mcp.json")).unwrap()
+fn shelf(dir: &str, server: &str) -> gov_core::connector::ServerMap {
+    read_map(&library().join(dir).join(format!("{server}.json"))).unwrap()
 }
 
-fn read_as(tool: &str, arguments: Value) -> gov_core::connector::Mapped {
-    let map = jira();
+fn jira() -> gov_core::connector::ServerMap {
+    shelf("jira", "jira-mcp")
+}
+
+fn read_with(
+    map: &gov_core::connector::ServerMap,
+    tool: &str,
+    arguments: Value,
+) -> gov_core::connector::Mapped {
     let digest = map
         .tools
         .iter()
@@ -170,6 +177,10 @@ fn read_as(tool: &str, arguments: Value) -> gov_core::connector::Mapped {
         .digest
         .clone();
     map.map(tool, Some(&digest), &arguments, &[0; 32])
+}
+
+fn read_as(tool: &str, arguments: Value) -> gov_core::connector::Mapped {
+    read_with(&jira(), tool, arguments)
 }
 
 #[test]
@@ -241,6 +252,131 @@ fn a_jira_call_that_names_no_single_project_is_not_placed_in_one() {
             !resource.starts_with("jira/project/"),
             "{tool} is placed at {resource}"
         );
+    }
+}
+
+// ----- GitHub and Slack: the choices that matter ---------------------------------------
+
+#[test]
+fn a_github_call_is_held_to_the_repository_its_arguments_name() {
+    let map = shelf("github", "github-mcp");
+    let mapped = read_with(
+        &map,
+        "merge_pull_request",
+        json!({"owner": "Acme", "repo": "Payments", "pullNumber": 7}),
+    );
+    assert!(mapped.known);
+    assert_eq!(mapped.action.resource.as_str(), "github/repo/acme/payments");
+    // A name that is not a plain identifier is not guessed at, and neither is a missing one.
+    for arguments in [
+        json!({"owner": "acme", "repo": "payments/../other", "pullNumber": 7}),
+        json!({"owner": "acme/payments", "repo": "", "pullNumber": 7}),
+        json!({"owner": "acme", "pullNumber": 7}),
+        json!({"owner": ["acme"], "repo": "payments", "pullNumber": 7}),
+    ] {
+        let mapped = read_with(&map, "merge_pull_request", arguments.clone());
+        assert!(!mapped.known, "{arguments} was read as a repository");
+        assert_eq!(mapped.action.kind, Kind::Unknown);
+    }
+}
+
+#[test]
+fn a_github_call_that_names_no_single_repository_is_not_placed_in_one() {
+    let map = shelf("github", "github-mcp");
+    for tool in &map.tools {
+        let name = tool.tool.as_str();
+        let crosses = name.starts_with("search_")
+            || name.starts_with("projects_")
+            || name.contains("ruleset")
+            || name.contains("custom_properties")
+            || name.contains("notification") && !name.contains("repository")
+            || name == "create_repository"
+            || name == "discussion_comment_write";
+        if !crosses {
+            continue;
+        }
+        // Even when the agent names a repository in its arguments.
+        let mapped = read_with(
+            &map,
+            name,
+            json!({"owner": "acme", "repo": "payments", "query": "repo:acme/payments",
+                   "name": "x", "org": "acme"}),
+        );
+        assert!(mapped.known, "{name}");
+        assert!(
+            !mapped.action.resource.as_str().starts_with("github/repo/"),
+            "{name} is placed at {}",
+            mapped.action.resource.as_str()
+        );
+    }
+}
+
+#[test]
+fn the_github_tools_that_act_for_others_or_cannot_be_taken_back_say_so() {
+    let map = shelf("github", "github-mcp");
+    let tool = |name: &str| map.tools.iter().find(|t| t.tool.as_str() == name).unwrap();
+    // These change what others see or set something else running, and none is undone.
+    for name in [
+        "merge_pull_request",
+        "actions_run_trigger",
+        "pull_request_review_write",
+        "assign_copilot_to_issue",
+        "assign_copilot_to_issue_with_intent",
+        "request_copilot_review",
+        "update_pull_request",
+        "issue_write",
+        "create_repository",
+        "fork_repository",
+        "create_gist",
+    ] {
+        assert!(tool(name).outward, "{name}");
+        assert_eq!(tool(name).reversal, Reversal::None, "{name}");
+    }
+    // A push can start a workflow.
+    for name in ["create_or_update_file", "push_files", "delete_file"] {
+        assert!(tool(name).outward, "{name}");
+    }
+    // One tool, several methods, one of which deletes: mapped as the widest.
+    for name in [
+        "label_write",
+        "projects_write",
+        "discussion_comment_write",
+        "actions_run_trigger",
+        "pull_request_review_write",
+    ] {
+        assert_eq!(tool(name).kind, Kind::Destructive, "{name}");
+    }
+    // Nothing the server marks as changing something is mapped as a read, and the other
+    // way about: the server's own hint and the review agree on every tool.
+    let listing = read_listing(&library().join("github/listing.json")).unwrap();
+    for listed in &listing {
+        let name = listed["name"].as_str().unwrap();
+        let read_only = listed["annotations"]["readOnlyHint"].as_bool().unwrap();
+        assert_eq!(tool(name).kind == Kind::Read, read_only, "{name}");
+    }
+}
+
+#[test]
+fn every_slack_tool_that_posts_reaches_people_and_is_held_to_its_channel() {
+    let map = shelf("slack", "slack-mcp");
+    for name in [
+        "slack_post_message",
+        "slack_reply_to_thread",
+        "slack_add_reaction",
+    ] {
+        let tool = map.tools.iter().find(|t| t.tool.as_str() == name).unwrap();
+        assert!(tool.outward, "{name}");
+        assert_eq!(tool.kind, Kind::Write, "{name}");
+        let mapped = read_with(
+            &map,
+            name,
+            json!({"channel_id": "C0123ABCD", "text": "in #general", "thread_ts": "1.2",
+                   "timestamp": "1.2", "reaction": "eyes"}),
+        );
+        assert_eq!(mapped.action.resource.as_str(), "slack/channel/c0123abcd");
+        // A channel given by name, as a person would, is not an id: not guessed at.
+        let mapped = read_with(&map, name, json!({"channel_id": "#general", "text": "x"}));
+        assert!(!mapped.known, "{name}");
     }
 }
 

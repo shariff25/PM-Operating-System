@@ -1,0 +1,69 @@
+{
+ "server": "slack-mcp",
+ "system": "slack",
+ "fold_case": true,
+ "source": "@modelcontextprotocol/server-slack 2025.4.25 from npm (server name \"Slack MCP Server\", version 1.0.0). Listing taken on 2026-11-27 over stdio with a made-up token and no network; Slack was not contacted, so no tool here has been run against Slack.",
+ "tools": {
+  "slack_add_reaction": {
+   "operation": "reaction.add",
+   "kind": "write",
+   "reversal": "inverse",
+   "outward": true,
+   "resource": "slack/channel/{channel_id}",
+   "note": "Seen by everyone in the channel. The server offers no tool to remove one."
+  },
+  "slack_get_channel_history": {
+   "operation": "channel.history.read",
+   "kind": "read",
+   "reversal": "none",
+   "outward": false,
+   "resource": "slack/channel/{channel_id}"
+  },
+  "slack_get_thread_replies": {
+   "operation": "thread.read",
+   "kind": "read",
+   "reversal": "none",
+   "outward": false,
+   "resource": "slack/channel/{channel_id}"
+  },
+  "slack_get_user_profile": {
+   "operation": "user.read",
+   "kind": "read",
+   "reversal": "none",
+   "outward": false,
+   "resource": "slack/user/{user_id}"
+  },
+  "slack_get_users": {
+   "operation": "user.list",
+   "kind": "read",
+   "reversal": "none",
+   "outward": false,
+   "resource": "slack/user",
+   "note": "Everyone in the workspace, with profile details."
+  },
+  "slack_list_channels": {
+   "operation": "channel.list",
+   "kind": "read",
+   "reversal": "none",
+   "outward": false,
+   "resource": "slack/channel"
+  },
+  "slack_post_message": {
+   "operation": "message.post",
+   "kind": "write",
+   "reversal": "inverse",
+   "outward": true,
+   "resource": "slack/channel/{channel_id}",
+   "note": "People are notified and may have read it before it is deleted; deleting takes the message away, not the reading of it. The server offers no delete tool."
+  },
+  "slack_reply_to_thread": {
+   "operation": "thread.reply",
+   "kind": "write",
+   "reversal": "inverse",
+   "outward": true,
+   "resource": "slack/channel/{channel_id}",
+   "note": "As for a message."
+  }
+ },
+ "unmapped": {}
+}
