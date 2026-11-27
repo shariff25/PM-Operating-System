@@ -6,6 +6,7 @@
 use async_trait::async_trait;
 use gov_core::enrol::EnrolKind;
 use gov_core::receipt::ChainHead;
+use gov_core::revocation::RevocationEntry;
 use gov_core::{Digest, Envelope, Id, Scope};
 use serde::de::DeserializeOwned;
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
@@ -13,8 +14,8 @@ use sqlx::types::Json;
 use sqlx::Row;
 
 use crate::store::{
-    Agent, Effect, EnrolledKey, Gate, PendingCode, Person, Published, Store, StoreError,
-    StoreResult, StoredRecord,
+    Agent, Effect, EnrolledKey, Gate, IssuedMandate, PendingCode, Person, Published, Store,
+    StoreError, StoreResult, StoredRecord,
 };
 
 impl From<sqlx::Error> for StoreError {
@@ -108,6 +109,13 @@ fn row(effect: &Effect) -> (String, String, Option<String>, Option<serde_json::V
         Effect::PutGate(g) => ("gate".into(), g.id.to_string(), None, Some(json(g))),
         Effect::AddKey(e) => ("key".into(), e.key.kid.to_string(), None, Some(json(e))),
         Effect::PutBundle(b) => ("bundle".into(), b.number.to_string(), None, Some(json(b))),
+        Effect::PutMandate(m) => (
+            "mandate".into(),
+            m.id.to_string(),
+            Some(m.agent.to_string()),
+            Some(json(m)),
+        ),
+        Effect::AddRevocation(e) => ("revocation".into(), e.seq.to_string(), None, Some(json(e))),
         Effect::PutCode(c) => (
             format!("code-{}", kind_text(c.kind)),
             c.name.to_string(),
@@ -192,6 +200,26 @@ impl Store for PgStore {
         .await?;
         if inserted.rows_affected() != 1 {
             return Err(StoreError::HeadMoved);
+        }
+        // A revocation takes the next number, and no other. The record's own primary key
+        // already lets only one of two writers in, so the number read here is the one kept.
+        let newest: Option<i64> = sqlx::query_scalar(
+            "SELECT MAX((doc ->> 'seq')::bigint) FROM authority_registry \
+             WHERE tenant = $1 AND env = $2 AND kind = 'revocation'",
+        )
+        .bind(scope.tenant.as_str())
+        .bind(scope.env.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+        let mut next =
+            u64::try_from(newest.unwrap_or(0)).map_err(|_| bad("revocation number"))? + 1;
+        for effect in effects {
+            if let Effect::AddRevocation(e) = effect {
+                if e.seq != next {
+                    return Err(StoreError::HeadMoved);
+                }
+                next += 1;
+            }
         }
         for effect in effects {
             let (kind, name, owner, doc) = row(effect);
@@ -311,6 +339,45 @@ impl Store for PgStore {
 
     async fn key(&self, scope: &Scope, kid: &Id) -> StoreResult<Option<EnrolledKey>> {
         self.entry(scope, "key", kid.as_str()).await
+    }
+
+    async fn mandate(&self, scope: &Scope, id: &Id) -> StoreResult<Option<IssuedMandate>> {
+        self.entry(scope, "mandate", id.as_str()).await
+    }
+
+    async fn mandates(&self, scope: &Scope) -> StoreResult<Vec<IssuedMandate>> {
+        let rows = sqlx::query(
+            "SELECT doc FROM authority_registry \
+             WHERE tenant = $1 AND env = $2 AND kind = 'mandate' ORDER BY name",
+        )
+        .bind(scope.tenant.as_str())
+        .bind(scope.env.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| Ok(r.try_get::<Json<IssuedMandate>, _>("doc")?.0))
+            .collect()
+    }
+
+    async fn revocations_after(
+        &self,
+        scope: &Scope,
+        after: u64,
+    ) -> StoreResult<Vec<RevocationEntry>> {
+        let after = i64::try_from(after).map_err(|_| bad("revocation number"))?;
+        let rows = sqlx::query(
+            "SELECT doc FROM authority_registry \
+             WHERE tenant = $1 AND env = $2 AND kind = 'revocation' \
+               AND (doc ->> 'seq')::bigint > $3 ORDER BY (doc ->> 'seq')::bigint",
+        )
+        .bind(scope.tenant.as_str())
+        .bind(scope.env.as_str())
+        .bind(after)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| Ok(r.try_get::<Json<RevocationEntry>, _>("doc")?.0))
+            .collect()
     }
 
     async fn latest_bundle(&self, scope: &Scope) -> StoreResult<Option<Published>> {

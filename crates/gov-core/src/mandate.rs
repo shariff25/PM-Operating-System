@@ -172,6 +172,33 @@ pub struct Mandate {
 
 document!(Mandate, "gov.mandate.v1");
 
+/// A parent agent's request that the Authority issue a narrower mandate to another agent
+/// (spec §7.6.2, point 4). Signed with the key the parent mandate is bound to. It names the
+/// Authority it is for, so it cannot be used at another; the mandate issued for it takes
+/// its id from the request, so the same request is never served twice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegateRequest {
+    pub v: u32,
+    pub tenant: Id,
+    pub env: Id,
+    pub authority: Id,
+    /// The id of the mandate being delegated from.
+    pub parent: Id,
+    /// The agent to receive it, and which of its enrolled keys the new mandate is bound to.
+    pub agent: Id,
+    pub key: Id,
+    pub grants: Vec<Grant>,
+    pub expires_at: i64,
+    #[serde(default)]
+    pub limits: Limits,
+    pub nonce: Id,
+    /// Seconds since the epoch, by the asking agent's clock.
+    pub at: i64,
+}
+
+document!(DelegateRequest, "gov.delegate.v1");
+
 /// What a gate checks a chain against.
 pub struct ChainCheck<'a> {
     pub scope: &'a Scope,

@@ -27,8 +27,8 @@ use gov_core::{
 };
 
 pub use store::{
-    Agent, Effect, EnrolledKey, Gate, MemoryStore, PendingCode, Person, Published, Role, Status,
-    Store, StoreError, StoredRecord,
+    Agent, Effect, EnrolledKey, Gate, IssuedMandate, MemoryStore, PendingCode, Person, Published,
+    Role, Status, Store, StoreError, StoredRecord,
 };
 
 /// How long a one-time code is good for, in seconds.
@@ -83,7 +83,51 @@ pub struct Authority<S> {
     admin_key: SigningKey,
     /// The root key gates and agents pin when they enrol. This step only hands it out.
     root: PublicKey,
+    /// Signs mandates, and nothing else. Absent until the installation has one; an
+    /// Authority without it issues nothing.
+    mandates_key: Option<SigningKey>,
+    /// Signs the revocation feed (and leases, G4d), and nothing else.
+    leases_key: Option<SigningKey>,
 }
+
+/// Where a mandate being issued comes from: the person at the root of its chain, and the
+/// mandate it is delegated from, if it is.
+struct Origin<'a> {
+    root_person: &'a Id,
+    parent: Option<Id>,
+}
+
+/// What a person asks for when they ask for a mandate (spec §7.6.2, point 2).
+#[derive(Debug, Clone)]
+pub struct MandateAsk {
+    pub agent: Id,
+    /// Which of the agent's enrolled keys the mandate is bound to.
+    pub key: Id,
+    /// The template's id, as the latest published bundle names it.
+    pub template: Id,
+    /// At most the template's. Nothing is granted by default.
+    pub grants: Vec<gov_core::action::Grant>,
+    pub life_secs: u64,
+    /// Absent ceilings take the template's.
+    pub limits: gov_core::mandate::Limits,
+}
+
+/// What listing shows of a mandate: never its grants' resources.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MandateInfo {
+    pub id: Id,
+    pub agent: Id,
+    pub issued_by: Id,
+    pub root_person: Id,
+    pub template: Id,
+    pub issued_at: i64,
+    pub expires_at: i64,
+    pub revoked: bool,
+}
+
+/// How far an asking agent's clock may be from this Authority's, and how long past its
+/// expiry a revocation stays in the feed.
+pub const CLOCK_ALLOWANCE_SECS: i64 = 300;
 
 /// What a record says was done: the action, what it was done to, the second thing it
 /// names, and the digest of what was set.
@@ -143,7 +187,17 @@ impl<S: Store> Authority<S> {
             name,
             admin_key,
             root,
+            mandates_key: None,
+            leases_key: None,
         }
+    }
+
+    /// Give the Authority its two online keys. Each must be listed under its own role in the
+    /// latest published bundle before it is of any use: that is checked when it signs.
+    pub fn with_online_keys(mut self, mandates: SigningKey, leases: SigningKey) -> Self {
+        self.mandates_key = Some(mandates);
+        self.leases_key = Some(leases);
+        self
     }
 
     pub fn store(&self) -> &S {
@@ -348,6 +402,17 @@ impl<S: Store> Authority<S> {
         to: Status,
         now: i64,
     ) -> Result<u64> {
+        // Stopping an agent revokes its live mandates first, each with its own record
+        // (spec §7.6.2, point 6).
+        if to != Status::Active {
+            self.admin(actor).await?;
+            match self.store.agent(&self.scope, agent).await? {
+                Some(a) if from.contains(&a.status) => {}
+                Some(_) => return Err(AuthorityError::Unknown("agent in that state")),
+                None => return Err(AuthorityError::Unknown("agent")),
+            }
+            self.revoke_agents_mandates(actor, agent, now).await?;
+        }
         on_head!(self, head, {
             self.admin(actor).await?;
             let Some(mut found) = self.store.agent(&self.scope, agent).await? else {
@@ -361,6 +426,24 @@ impl<S: Store> Authority<S> {
             let mut effects = vec![Effect::PutAgent(found)];
             if to != Status::Active {
                 effects.push(Effect::DropCode(EnrolKind::Agent, agent.clone()));
+            }
+            // The feed only adds, so only what is for good goes in it: a disabled agent's
+            // id, never a suspended one's (review finding GR-140).
+            if to == Status::Disabled {
+                let seq = self
+                    .store
+                    .revocations_after(&self.scope, 0)
+                    .await?
+                    .last()
+                    .map_or(1, |e| e.seq + 1);
+                effects.push(Effect::AddRevocation(
+                    gov_core::revocation::RevocationEntry {
+                        seq,
+                        kind: gov_core::revocation::Revocable::Agent,
+                        id: agent.clone(),
+                        until: i64::MAX,
+                    },
+                ));
             }
             let did = Did::to(action, SubjectKind::Agent, agent);
             self.commit(head, actor, did, &effects, now).await
@@ -436,6 +519,421 @@ impl<S: Store> Authority<S> {
                 .await?;
             Ok(opened.digest)
         })
+    }
+
+    /// The latest published bundle, opened, and the key mandates are signed with, only if
+    /// that bundle lists it under `mandates`: an Authority whose mandates key the root has
+    /// not named issues nothing.
+    async fn issuing(&self) -> Result<(gov_core::policy::OpenedBundle, &SigningKey)> {
+        let latest = self
+            .store
+            .latest_bundle(&self.scope)
+            .await?
+            .ok_or(AuthorityError::Unknown("published bundle"))?;
+        let opened = gov_core::policy::open_bundle(&latest.envelope, &self.root, &self.scope)?;
+        let key = self
+            .mandates_key
+            .as_ref()
+            .ok_or(AuthorityError::Unknown("mandates key"))?;
+        if !opened.bundle.keys.mandates.contains(&key.public()) {
+            return Err(AuthorityError::Unknown("mandates key in the bundle"));
+        }
+        Ok((opened, key))
+    }
+
+    /// Everything revoked so far, for checking a chain.
+    async fn revoked(&self) -> Result<gov_core::revocation::RevocationSet> {
+        let mut set = gov_core::revocation::RevocationSet::default();
+        for e in self.store.revocations_after(&self.scope, 0).await? {
+            set.revoke(e.kind, e.id);
+        }
+        Ok(set)
+    }
+
+    /// The agent's enrolled key of this id, if the agent is usable and the key is its own.
+    async fn agent_key(&self, agent: &Id, kid: &Id) -> Result<PublicKey> {
+        if !self.agent_usable(agent).await? {
+            return Err(AuthorityError::Unknown("usable agent"));
+        }
+        match self.store.key(&self.scope, kid).await? {
+            Some(k) if k.kind == EnrolKind::Agent && &k.name == agent => Ok(k.key),
+            _ => Err(AuthorityError::Unknown("key of that agent")),
+        }
+    }
+
+    /// Sign `mandate`, check it as a gate holding the same bundle would, and write it with
+    /// its `MandateIssued` record in one step.
+    async fn issue(
+        &self,
+        head: Option<ChainHead>,
+        actor: &Id,
+        mandate: gov_core::mandate::Mandate,
+        origin: Origin<'_>,
+        with: (&gov_core::policy::OpenedBundle, &SigningKey),
+        now: i64,
+    ) -> Result<Envelope> {
+        use gov_core::mandate::{verify_chain, ChainCheck};
+        let (opened, key) = with;
+        let Origin {
+            root_person,
+            parent,
+        } = origin;
+        let envelope = seal(&mandate, key)?;
+        let issuers = KeySet::new(opened.bundle.keys.mandates.iter().cloned());
+        let revoked = self.revoked().await?;
+        // The gate's own check, made here first: nothing is issued that a gate would refuse.
+        verify_chain(
+            &envelope,
+            &ChainCheck {
+                scope: &self.scope,
+                authority: &issuers,
+                now,
+                revoked: &revoked,
+                templates: Some(&opened.bundle.templates),
+            },
+        )?;
+        let digest = open::<gov_core::mandate::Mandate>(&envelope, &issuers, &self.scope)?.hash;
+        let kept = IssuedMandate {
+            id: mandate.id.clone(),
+            agent: mandate.agent.id.clone(),
+            issued_by: mandate.issued_by.id.clone(),
+            root_person: root_person.clone(),
+            parent,
+            template: mandate.template.clone(),
+            issued_at: mandate.issued_at,
+            expires_at: mandate.expires_at,
+            revoked: false,
+            envelope: envelope.clone(),
+        };
+        let did = Did {
+            about: Some(subject(SubjectKind::Agent, &mandate.agent.id)),
+            value: Some(digest),
+            ..Did::to(
+                AdminAction::MandateIssued,
+                SubjectKind::Mandate,
+                &mandate.id,
+            )
+        };
+        self.commit(head, actor, did, &[Effect::PutMandate(kept)], now)
+            .await?;
+        Ok(envelope)
+    }
+
+    /// Issue a mandate to a person's request (spec §7.6.2, point 2). The person is the
+    /// agent's owner, or one the template names; being an admin is not enough. Nobody is
+    /// signed in before G4e, so the mandate carries no session, and an enforcing gate will
+    /// refuse it (point 3).
+    pub async fn issue_mandate(&self, person: &Id, ask: &MandateAsk, now: i64) -> Result<Envelope> {
+        use gov_core::mandate::{AgentRef, IssuedBy, IssuerKind, Limits, Mandate, Requires};
+        on_head!(self, head, {
+            let (opened, key) = self.issuing().await?;
+            match self.store.person(&self.scope, person).await? {
+                Some(p) if p.active => {}
+                _ => return Err(AuthorityError::NotAllowed),
+            }
+            let agent = self
+                .store
+                .agent(&self.scope, &ask.agent)
+                .await?
+                .ok_or(AuthorityError::Unknown("agent"))?;
+            let agent_key = self.agent_key(&ask.agent, &ask.key).await?;
+            let template = opened
+                .bundle
+                .templates
+                .iter()
+                .find(|t| t.id == ask.template)
+                .ok_or(AuthorityError::Unknown("template"))?;
+            if &agent.owner != person && !template.people.contains(person) {
+                return Err(AuthorityError::NotAllowed);
+            }
+            let life = i64::try_from(ask.life_secs).map_err(|_| AuthorityError::Refused)?;
+            if life == 0 {
+                return Err(AuthorityError::Refused);
+            }
+            let mandate = Mandate {
+                v: VERSION,
+                tenant: self.scope.tenant.clone(),
+                env: self.scope.env.clone(),
+                id: random_id("m")?,
+                issuer: self.name.clone(),
+                issued_at: now,
+                expires_at: now.saturating_add(life),
+                agent: AgentRef {
+                    id: ask.agent.clone(),
+                    key: agent_key,
+                },
+                issued_by: IssuedBy {
+                    kind: IssuerKind::Person,
+                    id: person.clone(),
+                    session: None,
+                },
+                template: Id::new(&format!("{}@{}", template.id, opened.bundle.number))?,
+                grants: ask.grants.clone(),
+                limits: Limits {
+                    max_actions: ask.limits.max_actions.or(template.limits.max_actions),
+                    max_writes: ask.limits.max_writes.or(template.limits.max_writes),
+                },
+                requires: Requires::default(),
+                parent: None,
+            };
+            let origin = Origin {
+                root_person: person,
+                parent: None,
+            };
+            self.issue(head, person, mandate, origin, (&opened, key), now)
+                .await
+        })
+    }
+
+    /// Issue a narrower mandate to another agent, at the signed request of the agent that
+    /// holds the parent (spec §7.6.2, point 4).
+    pub async fn delegate(&self, request: &Envelope, now: i64) -> Result<Envelope> {
+        use gov_core::mandate::{
+            verify_chain, AgentRef, ChainCheck, DelegateRequest, IssuedBy, IssuerKind, Limits,
+            Mandate, MAX_CHAIN,
+        };
+        on_head!(self, head, {
+            let (opened, key) = self.issuing().await?;
+            // The request is signed with an enrolled agent key: which one is in the open.
+            let signer = match self.store.key(&self.scope, &request.kid).await? {
+                Some(k) if k.kind == EnrolKind::Agent => k,
+                _ => return Err(AuthorityError::Refused),
+            };
+            let asked =
+                open::<DelegateRequest>(request, &KeySet::new([signer.key.clone()]), &self.scope)
+                    .map_err(|_| AuthorityError::Refused)?;
+            let ask = asked.doc;
+            if ask.authority != self.name || ask.at.abs_diff(now) > CLOCK_ALLOWANCE_SECS as u64 {
+                return Err(AuthorityError::Refused);
+            }
+            // The same request is never served twice: the mandate's id is the request's.
+            let id = Id::new(&format!("m-{}", &asked.hash.as_str()[..32]))?;
+            if self.store.mandate(&self.scope, &id).await?.is_some() {
+                return Err(AuthorityError::Refused);
+            }
+            let parent = match self.store.mandate(&self.scope, &ask.parent).await? {
+                Some(p) if !p.revoked => p,
+                _ => return Err(AuthorityError::Refused),
+            };
+            // The parent verifies now, as a gate would check it, and the request is signed
+            // with the very key the parent mandate is bound to.
+            let issuers = KeySet::new(opened.bundle.keys.mandates.iter().cloned());
+            let revoked = self.revoked().await?;
+            let chain = verify_chain(
+                &parent.envelope,
+                &ChainCheck {
+                    scope: &self.scope,
+                    authority: &issuers,
+                    now,
+                    revoked: &revoked,
+                    templates: Some(&opened.bundle.templates),
+                },
+            )
+            .map_err(|_| AuthorityError::Refused)?;
+            let held = chain.leaf();
+            if held.agent.key != signer.key || held.agent.id != signer.name {
+                return Err(AuthorityError::Refused);
+            }
+            if chain.links().len() >= MAX_CHAIN || ask.agent == held.agent.id {
+                return Err(AuthorityError::Refused);
+            }
+            // The receiving side agrees: the child's owner is the person at the root, or
+            // one the template names (review finding GR-139).
+            let child = self
+                .store
+                .agent(&self.scope, &ask.agent)
+                .await?
+                .ok_or(AuthorityError::Refused)?;
+            let child_key = self
+                .agent_key(&ask.agent, &ask.key)
+                .await
+                .map_err(|_| AuthorityError::Refused)?;
+            let template = opened
+                .bundle
+                .templates
+                .iter()
+                .find(|t| t.id.as_str() == gov_core::mandate::template_id(&held.template))
+                .ok_or(AuthorityError::Refused)?;
+            if child.owner != parent.root_person && !template.receivers.contains(&child.owner) {
+                return Err(AuthorityError::Refused);
+            }
+            let mandate = Mandate {
+                id,
+                issued_at: now,
+                expires_at: ask.expires_at,
+                agent: AgentRef {
+                    id: ask.agent.clone(),
+                    key: child_key,
+                },
+                issued_by: IssuedBy {
+                    kind: IssuerKind::Agent,
+                    id: held.agent.id.clone(),
+                    session: None,
+                },
+                grants: ask.grants.clone(),
+                limits: Limits {
+                    max_actions: ask.limits.max_actions.or(held.limits.max_actions),
+                    max_writes: ask.limits.max_writes.or(held.limits.max_writes),
+                },
+                parent: Some(Box::new(parent.envelope.clone())),
+                ..held.clone()
+            };
+            let actor = held.agent.id.clone();
+            // Wider than the parent in grants, time or limits: the gate's check refuses it,
+            // and so nothing is written.
+            let origin = Origin {
+                root_person: &parent.root_person,
+                parent: Some(parent.id.clone()),
+            };
+            self.issue(head, &actor, mandate, origin, (&opened, key), now)
+                .await
+                .map_err(|e| match e {
+                    AuthorityError::Core(_) => AuthorityError::Refused,
+                    other => other,
+                })
+        })
+    }
+
+    /// The mandates a person may see (point 5): those of agents they own; every one for an
+    /// admin or an auditor. Never a grant's resources.
+    pub async fn list_mandates(&self, person: &Id) -> Result<Vec<MandateInfo>> {
+        let viewer = match self.store.person(&self.scope, person).await? {
+            Some(p) if p.active => p,
+            _ => return Err(AuthorityError::NotAllowed),
+        };
+        let all = matches!(viewer.role, Role::Admin | Role::Auditor);
+        let mut out = Vec::new();
+        for m in self.store.mandates(&self.scope).await? {
+            let owned = match self.store.agent(&self.scope, &m.agent).await? {
+                Some(a) => &a.owner == person,
+                None => false,
+            };
+            if all || owned {
+                out.push(MandateInfo {
+                    id: m.id,
+                    agent: m.agent,
+                    issued_by: m.issued_by,
+                    root_person: m.root_person,
+                    template: m.template,
+                    issued_at: m.issued_at,
+                    expires_at: m.expires_at,
+                    revoked: m.revoked,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Revoke one mandate (point 6): its number in the feed is returned. One entry covers
+    /// its descendants, since a gate checks every link of a chain. `by_right` skips the
+    /// check of who asks, for the Authority's own use when an agent is stopped.
+    async fn revoke(&self, actor: &Id, mandate: &Id, by_right: bool, now: i64) -> Result<u64> {
+        use gov_core::revocation::{Revocable, RevocationEntry};
+        on_head!(self, head, {
+            let Some(mut found) = self.store.mandate(&self.scope, mandate).await? else {
+                return Err(AuthorityError::Unknown("mandate"));
+            };
+            if found.revoked {
+                return Err(AuthorityError::Unknown("mandate in that state"));
+            }
+            if !by_right {
+                let asker = match self.store.person(&self.scope, actor).await? {
+                    Some(p) if p.active => p,
+                    _ => return Err(AuthorityError::NotAllowed),
+                };
+                let owner = self
+                    .store
+                    .agent(&self.scope, &found.agent)
+                    .await?
+                    .map(|a| a.owner);
+                let may = asker.role == Role::Admin
+                    || actor == &found.root_person
+                    || owner.as_ref() == Some(actor);
+                if !may {
+                    return Err(AuthorityError::NotAllowed);
+                }
+            }
+            let seq = self
+                .store
+                .revocations_after(&self.scope, 0)
+                .await?
+                .last()
+                .map_or(1, |e| e.seq + 1);
+            let entry = RevocationEntry {
+                seq,
+                kind: Revocable::Mandate,
+                id: mandate.clone(),
+                until: found.expires_at,
+            };
+            found.revoked = true;
+            let did = Did::to(AdminAction::Revoked, SubjectKind::Mandate, mandate);
+            let effects = [Effect::PutMandate(found), Effect::AddRevocation(entry)];
+            self.commit(head, actor, did, &effects, now).await?;
+            Ok(seq)
+        })
+    }
+
+    pub async fn revoke_mandate(&self, actor: &Id, mandate: &Id, now: i64) -> Result<u64> {
+        self.revoke(actor, mandate, false, now).await
+    }
+
+    /// Revoke every live mandate of an agent, each with its own record. Done **before** the
+    /// change that stops the agent, so that a stop between the two leaves an agent with
+    /// less authority than it should have, never more.
+    async fn revoke_agents_mandates(&self, actor: &Id, agent: &Id, now: i64) -> Result<()> {
+        for m in self.store.mandates(&self.scope).await? {
+            if &m.agent == agent && !m.revoked && m.expires_at > now {
+                match self.revoke(actor, &m.id, true, now).await {
+                    Ok(_) | Err(AuthorityError::Unknown(_)) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Everything revoked after number `after`, signed with the leases key (point 7). An
+    /// entry whose subject expired longer ago than the clock allowance is left out and
+    /// counted, so the asker sees that every number is accounted for.
+    pub async fn revocation_feed(&self, after: u64, now: i64) -> Result<Envelope> {
+        use gov_core::revocation::RevocationFeed;
+        let latest = self
+            .store
+            .latest_bundle(&self.scope)
+            .await?
+            .ok_or(AuthorityError::Unknown("published bundle"))?;
+        let opened = gov_core::policy::open_bundle(&latest.envelope, &self.root, &self.scope)?;
+        let key = self
+            .leases_key
+            .as_ref()
+            .ok_or(AuthorityError::Unknown("leases key"))?;
+        if !opened.bundle.keys.leases.contains(&key.public()) {
+            return Err(AuthorityError::Unknown("leases key in the bundle"));
+        }
+        let all = self.store.revocations_after(&self.scope, 0).await?;
+        let through = all.last().map_or(0, |e| e.seq);
+        if after > through {
+            return Err(AuthorityError::Refused);
+        }
+        let later: Vec<_> = all.into_iter().filter(|e| e.seq > after).collect();
+        let total = later.len() as u64;
+        let entries: Vec<_> = later
+            .into_iter()
+            .filter(|e| e.until.saturating_add(CLOCK_ALLOWANCE_SECS) >= now)
+            .collect();
+        let feed = RevocationFeed {
+            v: VERSION,
+            tenant: self.scope.tenant.clone(),
+            env: self.scope.env.clone(),
+            issuer: self.name.clone(),
+            after,
+            through,
+            dropped: total - entries.len() as u64,
+            at: now,
+            entries,
+        };
+        feed.validate()?;
+        Ok(seal(&feed, key)?)
     }
 
     /// The bundle gates are to hold: the last one published, as it was signed.
