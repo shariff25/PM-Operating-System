@@ -167,6 +167,26 @@ impl Who {
     }
 }
 
+/// A time for a receipt, and where it came from. The two travel together, so that no
+/// receipt carries the lease's time without saying so, or the machine's time while saying
+/// it is the lease's (review finding GR-177).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct When {
+    pub at: i64,
+    /// The time is the Authority's: a held lease's time counted on by the gate's own clock.
+    pub from_lease: bool,
+}
+
+impl When {
+    /// This machine's clock.
+    pub fn here(at: i64) -> Self {
+        When {
+            at,
+            from_lease: false,
+        }
+    }
+}
+
 /// One observed call: who said they made it, and what it was.
 pub struct Observed<'a> {
     pub who: Who,
@@ -185,9 +205,6 @@ pub struct Gate<S> {
     /// read the spool to learn what is in it (review finding GR-82).
     index: BTreeMap<u64, Digest>,
     open_intents: BTreeSet<u64>,
-    /// The times this gate is given are the Authority's, from a lease it holds: its
-    /// receipts say so. False until its first lease in this run, and true from then on.
-    lease_time: bool,
 }
 
 impl<S: Spool> Gate<S> {
@@ -236,7 +253,6 @@ impl<S: Spool> Gate<S> {
                 .filter(|r| r.open_intent)
                 .map(|r| r.seq)
                 .collect(),
-            lease_time: false,
         };
         gate.spool.set_state(&gate.state)?;
         for (r, intent) in held.iter().zip(&docs).filter(|(r, _)| r.open_intent) {
@@ -250,7 +266,8 @@ impl<S: Spool> Gate<S> {
                 gate.spool.close_intent(r.seq)?;
                 gate.open_intents.remove(&r.seq);
             } else {
-                gate.write_outcome(intent, OutcomeStatus::Unknown, None, now)?;
+                // The gate has no lease yet when it opens: this is its machine's time.
+                gate.write_outcome(intent, OutcomeStatus::Unknown, None, When::here(now))?;
             }
         }
         Ok(gate)
@@ -263,13 +280,6 @@ impl<S: Spool> Gate<S> {
     /// Receipts no witnessed checkpoint covers yet.
     pub fn uncovered(&self) -> Result<usize, GateError> {
         Ok(self.index.len())
-    }
-
-    /// From now on the times this gate is given come from a lease (spec §7.6.3, point 4).
-    /// There is no way back in one run: an old lease still gives a better clock than the
-    /// machine's.
-    pub fn stamp_from_lease(&mut self) {
-        self.lease_time = true;
     }
 
     /// A call passed through with no receipt. Counted where it outlives a restart.
@@ -326,7 +336,7 @@ impl<S: Spool> Gate<S> {
     /// number, to give to [`Gate::finish`].
     pub fn begin(&mut self, call: &Observed<'_>, now: i64) -> Result<u64, GateError> {
         let policy = self.config.policy_version.clone();
-        self.begin_under(call, now, policy)
+        self.begin_under(call, When::here(now), policy)
     }
 
     /// As [`Gate::begin`], for a gate whose policy bundle can change while it runs: the
@@ -336,10 +346,10 @@ impl<S: Spool> Gate<S> {
     pub fn begin_under(
         &mut self,
         call: &Observed<'_>,
-        now: i64,
+        when: When,
         policy_version: Option<Id>,
     ) -> Result<u64, GateError> {
-        let (at, at_clamped) = self.stamp(now);
+        let (at, at_clamped) = self.stamp(when.at);
         let receipt = Receipt {
             session: None,
             cause: None,
@@ -353,7 +363,7 @@ impl<S: Spool> Gate<S> {
             prev: None,
             at,
             at_clamped,
-            at_from_lease: self.lease_time,
+            at_from_lease: when.from_lease,
             phase: Phase::Intent,
             mode: Mode::Observe,
             coverage: call.coverage,
@@ -388,6 +398,17 @@ impl<S: Spool> Gate<S> {
         upstream_ref: Option<Id>,
         now: i64,
     ) -> Result<u64, GateError> {
+        self.finish_at(intent, status, upstream_ref, When::here(now))
+    }
+
+    /// As [`Gate::finish`], with a time that says where it came from.
+    pub fn finish_at(
+        &mut self,
+        intent: u64,
+        status: OutcomeStatus,
+        upstream_ref: Option<Id>,
+        when: When,
+    ) -> Result<u64, GateError> {
         if !self.open_intents.contains(&intent) {
             return Err(GateError::NoSuchIntent(intent));
         }
@@ -397,7 +418,7 @@ impl<S: Spool> Gate<S> {
             .ok_or(GateError::NoSuchIntent(intent))?;
         let keys = KeySet::new([self.key.public()]);
         let doc = open::<Receipt>(&held.envelope, &keys, &self.config.scope)?.doc;
-        self.write_outcome(&doc, status, upstream_ref, now)
+        self.write_outcome(&doc, status, upstream_ref, when)
     }
 
     fn write_outcome(
@@ -405,9 +426,9 @@ impl<S: Spool> Gate<S> {
         intent: &Receipt,
         status: OutcomeStatus,
         upstream_ref: Option<Id>,
-        now: i64,
+        when: When,
     ) -> Result<u64, GateError> {
-        let (at, at_clamped) = self.stamp(now);
+        let (at, at_clamped) = self.stamp(when.at);
         let receipt = Receipt {
             session: None,
             cause: None,
@@ -417,7 +438,7 @@ impl<S: Spool> Gate<S> {
             prev: None,
             at,
             at_clamped,
-            at_from_lease: self.lease_time,
+            at_from_lease: when.from_lease,
             phase: Phase::Outcome,
             outcome: Some(Outcome {
                 status,

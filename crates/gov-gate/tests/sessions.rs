@@ -30,11 +30,15 @@ fn agent() -> SigningKey {
 }
 
 fn mandate(agent: &SigningKey, expires_at: i64) -> Envelope {
+    mandate_named("m-1", agent, expires_at)
+}
+
+fn mandate_named(name: &str, agent: &SigningKey, expires_at: i64) -> Envelope {
     let m = Mandate {
         v: 1,
         tenant: id("acme"),
         env: id("prod"),
-        id: id("m-1"),
+        id: id(name),
         issuer: id("authority"),
         issued_at: NOW - 60,
         expires_at,
@@ -174,7 +178,16 @@ fn only_the_keys_holder_opens_a_session() {
     assert!(s.is_empty());
     // The asker is told nothing of why; the operator's count says (finding GR-155).
     let count = |s: &Sessions, why: &str| s.refusals().get(why).copied().unwrap_or(0);
-    assert_eq!((count(&s, why::REQUEST), count(&s, why::MANDATE)), (4, 2));
+    // Two were not the mandate's agent or were for another gate; two were properly signed
+    // and too far from this gate's time, which has a reason of its own (finding GR-178).
+    assert_eq!(
+        (
+            count(&s, why::REQUEST),
+            count(&s, why::CLOCK),
+            count(&s, why::MANDATE)
+        ),
+        (2, 2, 2)
+    );
 
     // The real one opens; the same signed request played again does not.
     let request = ask(&agent(), "gate-1", "n-7", NOW);
@@ -190,6 +203,19 @@ fn only_the_keys_holder_opens_a_session() {
         let extreme = ask(&agent(), "gate-1", &format!("x-{n}"), at);
         assert_eq!(s.open(&m, &extreme, NOW), Err(OpenRefused::Invalid));
     }
+    assert_eq!(count(&s, why::CLOCK), 5);
+    // Just inside what an opening allows, and just outside it.
+    let mut s = sessions();
+    s.open(&m, &ask(&agent(), "gate-1", "e-1", NOW - 120), NOW)
+        .unwrap();
+    s.open(&m, &ask(&agent(), "gate-1", "e-2", NOW + 120), NOW)
+        .unwrap();
+    for (n, at) in [NOW - 121, NOW + 121].into_iter().enumerate() {
+        let off = ask(&agent(), "gate-1", &format!("o-{n}"), at);
+        assert_eq!(s.open(&m, &off, NOW), Err(OpenRefused::Invalid));
+    }
+    assert_eq!(s.refusals().get(why::CLOCK), Some(&2));
+    assert_eq!(s.refusals().len(), 1);
 }
 
 /// Proven is said only for a proof that holds for the action the gate computed, and each
@@ -915,5 +941,88 @@ mod with_an_authority {
             why(call(&mut s, &sid, &chal, 2, true, &set)),
             ProofFailure::MandateRevoked
         );
+    }
+
+    /// A marker is not among the proven sessions that are closed to make room for a new
+    /// one: its calls would then lose the agent's name (review finding GR-180). The agent
+    /// goes on working under another mandate, and the old session still says what it is.
+    #[test]
+    fn a_marker_is_not_closed_to_make_room_for_new_sessions() {
+        let none = RevocationSet::default();
+        let set = revoked(&[(Revocable::Mandate, "m-1")]);
+        let mut s = sessions();
+        // A session under the first mandate proves a call, and the mandate is revoked.
+        let old = mandate(&agent(), NOW + 3600);
+        let (marker, marker_chal) = s
+            .open(&old, &ask(&agent(), "gate-1", "n-1", NOW), NOW)
+            .unwrap();
+        assert!(matches!(
+            call(&mut s, &marker, &marker_chal, 1, true, &none),
+            Proved::Proven(_)
+        ));
+        assert_eq!(s.revoke(&set, NOW), 1);
+
+        // The same key opens and proves as many sessions as a key may hold, and one more,
+        // under a second mandate. Each proof is for that mandate and that session.
+        let new = mandate_named("m-2", &agent(), NOW + 3600);
+        let mut sessions_of_new = Vec::new();
+        for n in 0..5u64 {
+            let request = seal(
+                &SessionOpen {
+                    v: 1,
+                    tenant: id("acme"),
+                    env: id("prod"),
+                    gate: id("gate-1"),
+                    mandate: id("m-2"),
+                    nonce: id(&format!("m2-{n}")),
+                    at: NOW,
+                },
+                &agent(),
+            )
+            .unwrap();
+            let trust = Trust {
+                fresh: true,
+                revoked: &set,
+            };
+            let (sid, chal) = s.open_with(&new, &request, NOW, Some(&trust)).unwrap();
+            let d = action(100 + n, 50);
+            let good = seal(
+                &RequestProof {
+                    v: 1,
+                    tenant: id("acme"),
+                    env: id("prod"),
+                    gate: id("gate-1"),
+                    session: sid.clone(),
+                    challenge: chal.clone(),
+                    counter: 1,
+                    mandate: id("m-2"),
+                    action_digest: d.clone(),
+                },
+                &agent(),
+            )
+            .unwrap();
+            let proved = s.prove_with(
+                &sid,
+                &Call {
+                    proof: Some(&good),
+                    salt: Some(&[50; 32]),
+                    digest: &d,
+                    canonical: true,
+                },
+                // Each a second after the last, so that "unused longest" has an order.
+                NOW + i64::try_from(n).unwrap(),
+                Some(&trust),
+            );
+            assert!(matches!(proved, Proved::Proven(_)), "session {n}");
+            sessions_of_new.push(sid);
+        }
+        // Four proven sessions are kept for the key, and the oldest of the five made room.
+        assert!(!s.holds(&sessions_of_new[0]));
+        assert!(sessions_of_new[1..].iter().all(|sid| s.holds(sid)));
+        // The marker was older than all of them, and is still there, saying what it is.
+        assert!(s.holds(&marker));
+        let after = call(&mut s, &marker, &marker_chal, 2, true, &set);
+        assert_eq!(who(&after), Some(id("triage-bot")));
+        assert_eq!(why(after), ProofFailure::MandateRevoked);
     }
 }

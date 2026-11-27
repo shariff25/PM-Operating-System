@@ -159,6 +159,12 @@ pub mod why {
     /// The request is not signed by the mandate's agent, or is for another gate, mandate
     /// or time.
     pub const REQUEST: &str = "request";
+    /// The request is properly signed, and its time is further from this gate's than a
+    /// session's opening allows. The request's time is the shim's machine's; this gate's is
+    /// its Authority's once it holds a lease, and its own machine's before. Two clocks more
+    /// than that apart open no session (review finding GR-178). An old request played back
+    /// is counted here too.
+    pub const CLOCK: &str = "clock";
     /// The request has been seen before.
     pub const REPLAY: &str = "replay";
     /// The agent key has as many unproven sessions as it may.
@@ -276,13 +282,13 @@ impl Sessions {
         };
         let asked = asked.doc;
         let c = &self.config;
-        if asked.gate != c.gate
-            || asked.mandate != leaf.id
-            // Compared without arithmetic that can overflow: a time at the far end of the
-            // range is refused like any other, and never panics (review finding GR-102).
-            || asked.at.abs_diff(now) > c.open_skew_secs.unsigned_abs()
-        {
+        if asked.gate != c.gate || asked.mandate != leaf.id {
             return Err(self.refuse(why::REQUEST));
+        }
+        // Compared without arithmetic that can overflow: a time at the far end of the
+        // range is refused like any other, and never panics (review finding GR-102).
+        if asked.at.abs_diff(now) > c.open_skew_secs.unsigned_abs() {
+            return Err(self.refuse(why::CLOCK));
         }
         if self.nonces.contains_key(&asked.nonce) {
             return Err(self.refuse(why::REPLAY));
@@ -531,7 +537,9 @@ impl Sessions {
             let mut proven: Vec<(i64, Id)> = self
                 .open
                 .iter()
-                .filter(|(id, e)| e.proven && e.key == key && *id != session)
+                // A marker is not among them: it is not closed to make room, since its
+                // calls would then lose the agent's name (review finding GR-180).
+                .filter(|(id, e)| e.proven && e.revoked.is_none() && e.key == key && *id != session)
                 .map(|(id, e)| (e.used_at, id.clone()))
                 .collect();
             proven.sort();

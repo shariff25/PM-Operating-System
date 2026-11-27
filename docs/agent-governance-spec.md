@@ -1076,10 +1076,10 @@ its verdicts rest on its own test runs.
 
 | Id | Severity | What | Done |
 |---|---|---|---|
-| GR-177 | Low | A receipt's time and the mark saying where it came from are set in two steps, so around the first lease a receipt can carry the lease's time without the mark, or the machine's time with it | To fix on `build/gov-review-25`: the source is passed with the time |
-| GR-178 | Low | With a lease held, a shim's request to open is compared with the Authority's time while the shim stamps it from its own machine: a shim more than two minutes off opens no session | Stated in G4d-2's limits; the refusal to get a reason of its own |
+| GR-177 | Low | A receipt's time and the mark saying where it came from are set in two steps, so around the first lease a receipt can carry the lease's time without the mark, or the machine's time with it | Fixed on `build/gov-review-25`: a receipt's time is given to the gate together with where it came from (`When`), for the intent and for the outcome each; the separate switch is gone |
+| GR-178 | Low | With a lease held, a shim's request to open is compared with the Authority's time while the shim stamps it from its own machine: a shim more than two minutes off opens no session | Stated in G4d-2's limits. Fixed: a request that is properly signed and too far from the gate's time is counted under `clock`, apart from `request` |
 | GR-179 | Low | After a renewal brings a newer bundle and before it is swapped in, every proof is `no_lease`; to be said, so that it is not read as the Authority being down | No longer so since G4d-3: the bundle is swapped in the same step as the lease is taken |
-| GR-180 | Low | A marker that had proven a call still counts among its key's proven sessions and can be the one closed to make room, after which its calls lose the agent's name | To fix: markers are kept out of that count |
+| GR-180 | Low | A marker that had proven a call still counts among its key's proven sessions and can be the one closed to make room, after which its calls lose the agent's name | Fixed: a marker is not among the proven sessions closed to make room |
 
 ## 1. What is being built
 
