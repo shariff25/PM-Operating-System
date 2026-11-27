@@ -410,6 +410,20 @@ follow-up tracking.
   pasted them. The PRD's architecture image was never given and is not in the repository.
   Where the PRD and the spec differ, the spec is what is built from.
 
+- **Nineteenth read (2026-11-27), at `96c7c1c`:** no High or Critical; the access governance
+  spec passes the gate as a design, and G4c may be built from the main spec as it stands.
+  Four Medium points on labels, answered in the spec's §11 (clearance applies to what any
+  call sends, not only writes; label tokens merge without numbers; how gates learn each
+  other's token keys; one label per agent key across its live mandates). One decision left
+  to the owner: whether a gate may ask the Authority at the moment of an outward call, to
+  close the window in which an agent reads at one gate and writes at another.
+- **Research for a patent (owner, 2026-11-27):** "Governance graphs is the most of this
+  product ... do deep research and come back with unique idea. I want to patent it". The
+  report is in `reports/` on the conductor's machine and was sent to the owner; it and its
+  notes are kept out of git on purpose, and the ideas it shortlists are **not to be written
+  into any committed file** until the owner has decided about filing. The owner then:
+  "Continue building G4c".
+
 ## Where the build stands (2026-11-23)
 
 - Pushed and checked: `claude/web-app` (draft pull request #10).
