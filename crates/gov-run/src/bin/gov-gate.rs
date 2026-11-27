@@ -149,6 +149,7 @@ async fn serve(s: Serve) -> anyhow::Result<()> {
     let forwarder = Forwarder::new(
         gate,
         ForwarderConfig {
+            authority: None,
             upstream: s.upstream,
             map: policy.map,
             call_timeout: Duration::from_secs(s.call_timeout),

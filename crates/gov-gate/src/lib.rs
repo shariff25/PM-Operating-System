@@ -185,6 +185,9 @@ pub struct Gate<S> {
     /// read the spool to learn what is in it (review finding GR-82).
     index: BTreeMap<u64, Digest>,
     open_intents: BTreeSet<u64>,
+    /// The times this gate is given are the Authority's, from a lease it holds: its
+    /// receipts say so. False until its first lease in this run, and true from then on.
+    lease_time: bool,
 }
 
 impl<S: Spool> Gate<S> {
@@ -233,6 +236,7 @@ impl<S: Spool> Gate<S> {
                 .filter(|r| r.open_intent)
                 .map(|r| r.seq)
                 .collect(),
+            lease_time: false,
         };
         gate.spool.set_state(&gate.state)?;
         for (r, intent) in held.iter().zip(&docs).filter(|(r, _)| r.open_intent) {
@@ -259,6 +263,13 @@ impl<S: Spool> Gate<S> {
     /// Receipts no witnessed checkpoint covers yet.
     pub fn uncovered(&self) -> Result<usize, GateError> {
         Ok(self.index.len())
+    }
+
+    /// From now on the times this gate is given come from a lease (spec §7.6.3, point 4).
+    /// There is no way back in one run: an old lease still gives a better clock than the
+    /// machine's.
+    pub fn stamp_from_lease(&mut self) {
+        self.lease_time = true;
     }
 
     /// A call passed through with no receipt. Counted where it outlives a restart.
@@ -328,6 +339,7 @@ impl<S: Spool> Gate<S> {
             prev: None,
             at,
             at_clamped,
+            at_from_lease: self.lease_time,
             phase: Phase::Intent,
             mode: Mode::Observe,
             coverage: call.coverage,
@@ -391,6 +403,7 @@ impl<S: Spool> Gate<S> {
             prev: None,
             at,
             at_clamped,
+            at_from_lease: self.lease_time,
             phase: Phase::Outcome,
             outcome: Some(Outcome {
                 status,

@@ -87,6 +87,17 @@ pub enum ProofFailure {
     NoCanonicalForm,
     /// The session has made as many calls as one session may.
     SessionSpent,
+    /// The proof held, and the gate had no complete, fresh lease from its Authority: it
+    /// could not say whether the agent was revoked, and does not guess (spec §7.6.3,
+    /// point 5).
+    NoLease,
+    /// The proof held, and the key it was made with has been revoked. The caller did hold
+    /// the key: these three say so, where a failed signature would not (finding GR-110).
+    KeyRevoked,
+    /// The proof held, and the agent, or one further up its mandate chain, is revoked.
+    AgentRevoked,
+    /// The proof held, and a mandate in the chain, or the key that signed one, is revoked.
+    MandateRevoked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,6 +248,11 @@ pub struct Receipt {
     /// (review finding GR-53).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub at_clamped: bool,
+    /// The time is the Authority's: the gate's held lease plus its own count since. Left
+    /// out when false, as on every receipt written before a gate had a lease, which was
+    /// stamped from the gate machine's own clock (spec §7.6.3, point 4; finding GR-72).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub at_from_lease: bool,
     pub phase: Phase,
     pub mode: Mode,
     pub coverage: Coverage,

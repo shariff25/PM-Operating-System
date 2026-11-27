@@ -506,6 +506,39 @@ reviewer.
     under the root key before it is compared. (4) A gate's revoked key is not yet
     refused a renewal: no key can be revoked before G4d-4. (5) The limit of one answer a
     second is kept in memory and is each Authority process's own.
+- **G4d-2 built (2026-11-27), from §7.6.3 points 4 to 6; not yet read by the reviewer.**
+  On `build/gov-g4d2`. The gate program is not wired to an Authority yet (G4d-5): this is
+  the gate's library, run in tests with answers made by hand.
+  - *The gate's time.* With a lease held, "now" for sessions and receipts is the lease's
+    time counted on by the gate's own clock, and every receipt from the first lease on
+    carries `at_from_lease`. Before the first lease, and with no Authority, nothing
+    changes: the machine's clock, and no mark. The clock that counts suspension is given
+    to the forwarder as a function; the real one comes with the program (G4d-5).
+  - *Proof under a lease.* With an Authority, a session is opened only under a complete,
+    fresh lease and for a chain nothing in which is revoked (refusals counted as
+    `no_lease` and `revoked`). A proof that holds is recorded as proven only under such a
+    lease; otherwise as the agent's failed proof with the reason `no_lease`. Complete, at
+    the forwarder, also means the lease names the bundle the forwarder's map came from.
+  - *Revoked sessions.* When an answer is taken that revokes something, every open
+    session's chain is checked again as a new one would be. One that no longer holds is
+    kept as a marker: a later call whose proof holds is recorded as that agent's, failed,
+    with `key_revoked`, `agent_revoked` or `mandate_revoked` (the nearest thing revoked:
+    the session's key, then an agent of the chain, then a mandate or the key that signed
+    one). A proof that does not hold keeps its own reason. A marker is never counted as
+    proven, pushes out no proven session, and is swept when its session would have been.
+  - Run with a gate and a shim in one process: a bare claim before the first lease; proven
+    under it, at the Authority's time; `no_lease` once it is two minutes old; proven again
+    after a renewal; `mandate_revoked`, twice, after the mandate is revoked, with the shim
+    keeping its session. 18 controls removed one at a time; each removal fails a test.
+  - **Limits.** (1) A bundle that changes while the gate runs is not put in use until
+    G4d-3: the lease then names a bundle the forwarder does not decide from, so the gate
+    has no complete lease and proves nothing until it is restarted on the new bundle.
+    (2) The shim's clock and the Authority's must agree to within the time a session's
+    opening allows (two minutes), since the gate's time is now the Authority's. (3) During
+    a long loss of the Authority a session runs out; the shim's next opening is refused
+    and its calls are then recorded as a client's bare claim, not as `no_lease`. (4) The
+    new reasons are new words in the receipt's closed list: a `gov verify` built before
+    this slice refuses a receipt that carries one.
 
 ## Security review of 2026-11-26 (first read; the gate did not pass)
 
