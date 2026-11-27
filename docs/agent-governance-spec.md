@@ -963,9 +963,9 @@ stated.
 
 | Id | Severity | What | Done |
 |---|---|---|---|
-| GR-170 | Low | A `restore` needs the earlier value, and the build checks only that a tool exists to write it back. GitHub's two subscription tools are marked `restore` and the listing has no tool that reads a subscription | To fix on `build/gov-review-23` |
-| GR-171 | Low | A receipt's cause may point at receipt number 0; receipts are numbered from 1 | To fix |
-| GR-172 | Low | A call whose proof failed is still forwarded in observe and shadow modes, so the agent may have read the data, yet its receipt raises no label: the shadow flow check under-counts such reads | To state in the access governance spec |
+| GR-170 | Low | A `restore` needs the earlier value, and the build checks only that a tool exists to write it back. GitHub's two subscription tools are marked `restore` and the listing has no tool that reads a subscription | Fixed on `build/gov-review-23`: a `restore` also names, in `read_with`, a tool of the map that reads the old value, and `gov map build` refuses one that does not. The two subscription tools are `none`, and so are two more that can only be named by an id nothing reads (`update_issue_comment`, `jira_remove_issue_link`). What still claims an undo: Jira 7 tools, GitHub 7, Slack none |
+| GR-171 | Low | A receipt's cause may point at receipt number 0; receipts are numbered from 1 | Fixed: refused |
+| GR-172 | Low | A call whose proof failed is still forwarded in observe and shadow modes, so the agent may have read the data, yet its receipt raises no label: the shadow flow check under-counts such reads | Stated in the access governance spec's status note |
 | GR-173 | Info | The library's maps carry no labels, so every read raises a mandate to restricted and untrusted until a deployment labels its resources: the shadow flow check will flag nearly everything at first | Noted in the access governance spec |
 
 ## 1. What is being built

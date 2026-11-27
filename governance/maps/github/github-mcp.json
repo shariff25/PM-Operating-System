@@ -584,7 +584,7 @@
       "digest": "bee22306d13b32e554e39d5475d67d25fdfac50496c9a8fd809e0d4314ece3a9",
       "operation": "notification.subscription.write",
       "kind": "write",
-      "reversal": "restore",
+      "reversal": "none",
       "outward": false,
       "resource": "github/notification"
     },
@@ -593,7 +593,7 @@
       "digest": "121f36b1f56def4f32c173b4ea9ba1b90777655d74e59bf1eac07eab6f0f8b7f",
       "operation": "repo.subscription.write",
       "kind": "write",
-      "reversal": "restore",
+      "reversal": "none",
       "outward": false,
       "resource": "github/repo/{owner}/{repo}/settings"
     },
@@ -800,7 +800,7 @@
       "digest": "e2158aaeb4133c7cba13c7125c0122767bf96be598033b93a2a6ac7b22f813ea",
       "operation": "issue.comment.update",
       "kind": "write",
-      "reversal": "restore",
+      "reversal": "none",
       "outward": true,
       "resource": "github/repo/{owner}/{repo}/issues"
     },

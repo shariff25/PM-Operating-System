@@ -90,7 +90,8 @@
    "outward": true,
    "resource": "github/repo/{owner}/{repo}/code",
    "note": "A commit on any branch, the default branch included. Put back by another commit; the first stays in history, and a push can start workflows (a deploy) and notify people.",
-   "undo_with": "create_or_update_file"
+   "undo_with": "create_or_update_file",
+   "read_with": "get_file_contents"
   },
   "create_pull_request": {
    "operation": "pull.create",
@@ -140,7 +141,8 @@
    "outward": true,
    "resource": "github/repo/{owner}/{repo}/code",
    "note": "A commit that removes a file. Mapped as a write, not as destructive: the file stays in the repository's history and another commit puts it back.",
-   "undo_with": "create_or_update_file"
+   "undo_with": "create_or_update_file",
+   "read_with": "get_file_contents"
   },
   "discussion_comment_write": {
    "operation": "discussion.comment.write",
@@ -487,20 +489,18 @@
   "manage_notification_subscription": {
    "operation": "notification.subscription.write",
    "kind": "write",
-   "reversal": "restore",
+   "reversal": "none",
    "outward": false,
    "resource": "github/notification",
-   "undo_with": "manage_notification_subscription",
-   "note": "Put back by setting the subscription to what it was before, with the same tool."
+   "note": "Put back by setting the subscription to what it was before, with the same tool. The server lists no tool that reads a subscription as it is, so there is no earlier value to put back: not marked as one that can be (GR-170)."
   },
   "manage_repository_notification_subscription": {
    "operation": "repo.subscription.write",
    "kind": "write",
-   "reversal": "restore",
+   "reversal": "none",
    "outward": false,
    "resource": "github/repo/{owner}/{repo}/settings",
-   "undo_with": "manage_repository_notification_subscription",
-   "note": "Put back by setting the subscription to what it was before, with the same tool."
+   "note": "Put back by setting the subscription to what it was before, with the same tool. The server lists no tool that reads a subscription as it is, so there is no earlier value to put back: not marked as one that can be (GR-170)."
   },
   "mark_all_notifications_read": {
    "operation": "notification.mark-all-read",
@@ -564,7 +564,8 @@
    "outward": true,
    "resource": "github/repo/{owner}/{repo}/code",
    "note": "Several files in one commit on any branch; as for a single file.",
-   "undo_with": "push_files"
+   "undo_with": "push_files",
+   "read_with": "get_file_contents"
   },
   "repository_ruleset_read": {
    "operation": "ruleset.read",
@@ -677,15 +678,16 @@
    "reversal": "restore",
    "outward": true,
    "resource": "github/gist/{gist_id}",
-   "undo_with": "update_gist"
+   "undo_with": "update_gist",
+   "read_with": "get_gist"
   },
   "update_issue_comment": {
    "operation": "issue.comment.update",
    "kind": "write",
-   "reversal": "restore",
+   "reversal": "none",
    "outward": true,
    "resource": "github/repo/{owner}/{repo}/issues",
-   "undo_with": "update_issue_comment"
+   "note": "The call names only the comment's id, and no tool reads a comment by its id, so its earlier text cannot be read: not marked as one that can be put back (GR-170)."
   },
   "update_pull_request": {
    "operation": "pull.update",

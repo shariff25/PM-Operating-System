@@ -350,7 +350,7 @@ impl Receipt {
             if cause
                 .prev
                 .as_ref()
-                .is_some_and(|p| p.gate != self.gate || p.seq >= self.seq)
+                .is_some_and(|p| p.gate != self.gate || p.seq == 0 || p.seq >= self.seq)
             {
                 return Err(Error::Malformed(
                     "a cause is an earlier receipt of the same gate",
