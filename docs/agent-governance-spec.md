@@ -506,6 +506,11 @@ reviewer.
     under the root key before it is compared. (4) A gate's revoked key is not yet
     refused a renewal: no key can be revoked before G4d-4. (5) The limit of one answer a
     second is kept in memory and is each Authority process's own.
+  - **How long "proven" lags a revocation** (GR-176). A lease is good for the bundle's
+    `standard` limit, 120 seconds unless the bundle says otherwise. Until the gate's next
+    renewal brings the feed, or the lease runs out, a revoked agent's calls are still
+    recorded as proven: for at most that limit after the revocation, and in practice for
+    the time between two renewals. A proven receipt is to be read with that delay in mind.
 - **G4d-2 built (2026-11-27), from §7.6.3 points 4 to 6; not yet read by the reviewer.**
   On `build/gov-g4d2`. The gate program is not wired to an Authority yet (G4d-5): this is
   the gate's library, run in tests with answers made by hand.
@@ -1000,6 +1005,23 @@ stated.
 | GR-171 | Low | A receipt's cause may point at receipt number 0; receipts are numbered from 1 | Fixed: refused |
 | GR-172 | Low | A call whose proof failed is still forwarded in observe and shadow modes, so the agent may have read the data, yet its receipt raises no label: the shadow flow check under-counts such reads | Stated in the access governance spec's status note |
 | GR-173 | Info | The library's maps carry no labels, so every read raises a mandate to restricted and untrusted until a deployment labels its resources: the shadow flow check will flag nearly everything at first | Noted in the access governance spec |
+
+### Twenty-fourth read, 2026-11-27: G4d-1 and the fixes for GR-170 and GR-171 at `25f0801`
+
+**Verdict: no High or Critical; the gate still passes. G4d-1 passes as built, and G4d-2
+may be built.** The reviewer confirmed all five departures and limits of G4d-1's status
+note: the limit that compares for the same second only; a gate naming a higher revocation
+number being answered from where the Authority stands; the lease naming the bundle by
+number and the first 16 hex digits of its digest ("enough, since only the root's holder
+could make two"); a revoked gate key not yet refused a renewal, **which must return with
+key rotation in G4d-4, with its test**; and the limit being each process's own. GR-170 and
+GR-171 are closed. It ran the Authority's tests without Postgres.
+
+| Id | Severity | What | Done |
+|---|---|---|---|
+| GR-174 | Low, with G4d-5 | The limit for each gate is applied after the key is looked up and the signature checked, so a caller with no valid key still costs a database read each time | Open: the listener limits by source before any of that work (G4d-5, with GR-169) |
+| GR-175 | Low | Every renewal opens the latest bundle again and checks each online key again: the Authority's main cost once several gates renew every few seconds | Open: to keep the opened bundle until another is published |
+| GR-176 | Low | A lease is good for the bundle's `standard` limit, two minutes by default, so a revoked agent's calls can be recorded as proven for up to that long after the revocation, plus the time between renewals | Stated in G4d-1's status note |
 
 ## 1. What is being built
 
