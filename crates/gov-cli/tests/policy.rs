@@ -90,6 +90,8 @@ fn policy_is_checked_without_a_key_and_signed_with_the_root_key() {
             number,
             "--out",
             out,
+            "--issued-at",
+            "1800000000",
         ];
         let key = at("root.key");
         args[4] = &key;
@@ -124,6 +126,15 @@ fn policy_is_checked_without_a_key_and_signed_with_the_root_key() {
     assert_eq!(first.bundle.number, 1);
     // The digest it signed is printed, for the publisher to compare.
     assert!(said.contains(first.digest.as_str()), "{said}");
+
+    // The time is the one given, not this machine's: a second person signing the same
+    // directory with the same number and time gets the same bundle, digest and all (GR-136).
+    assert_eq!(first.bundle.issued_at, 1_800_000_000);
+    let (code, said_again) = sign("1", &at("b1-again.json"), &["--yes"], Some("fake"), "");
+    assert_eq!(code, 0, "{said_again}");
+    assert_eq!(open("b1-again.json").digest, first.digest);
+    // Told not to ask, it still prints what changed (GR-137).
+    assert!(said_again.contains("rule added: no-pay"), "{said_again}");
 
     // A signed bundle is never written over.
     let before = std::fs::read(site.path().join("b1.json")).unwrap();

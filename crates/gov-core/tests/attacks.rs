@@ -2563,6 +2563,14 @@ fn the_signer_is_shown_what_changed() {
         vec![before.connectors[0].server.clone()]
     );
     assert!(shown.freshness_changed && !shown.is_empty());
+    // Something the list does not name: here, whom the bundle is from. It is not passed
+    // over in silence (GR-135).
+    assert!(!shown.other);
+    let mut renamed = same.clone();
+    renamed.issuer = id("another-authority");
+    let shown_other = changes(Some(&before), &renamed);
+    assert!(shown_other.other && !shown_other.is_empty());
+    assert!(!changes(None, &renamed).other);
     // A map removed, and a key moved from one role to the other.
     let mut moved = same.clone();
     moved.connectors.clear();

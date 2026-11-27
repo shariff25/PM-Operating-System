@@ -435,6 +435,10 @@ pub struct Changes {
     pub maps_changed: Vec<Id>,
     /// The freshness limits differ.
     pub freshness_changed: bool,
+    /// The two bundles differ in something this list does not name (review finding GR-135):
+    /// who the bundle is for or from, or a field added to the format after this list was
+    /// written. The signer is told, so that nothing changes unseen.
+    pub other: bool,
 }
 
 impl Changes {
@@ -488,5 +492,20 @@ pub fn changes(previous: Option<&PolicyBundle>, next: &PolicyBundle) -> Changes 
         }
     }
     out.freshness_changed = previous.is_some_and(|p| p.freshness != next.freshness);
+    // Whatever is left once everything named above, and what differs by design (the
+    // number, the time, the label people read), is set equal.
+    out.other = previous.is_some_and(|p| {
+        let levelled = PolicyBundle {
+            number: next.number,
+            issued_at: next.issued_at,
+            version: next.version.clone(),
+            keys: next.keys.clone(),
+            rules: next.rules.clone(),
+            connectors: next.connectors.clone(),
+            freshness: next.freshness,
+            ..p.clone()
+        };
+        &levelled != next
+    });
     out
 }

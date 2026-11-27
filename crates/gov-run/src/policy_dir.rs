@@ -299,6 +299,12 @@ pub fn describe(changes: &Changes) -> Vec<String> {
     if changes.freshness_changed {
         out.push("the freshness limits changed".into());
     }
+    if changes.other {
+        out.push(
+            "OTHER CHANGES: the bundles differ in something this list does not name; compare them before signing"
+                .into(),
+        );
+    }
     if out.is_empty() {
         out.push("nothing changed but the number".into());
     }
