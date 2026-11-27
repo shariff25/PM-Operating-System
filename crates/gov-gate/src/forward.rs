@@ -37,7 +37,8 @@ use tokio::sync::Semaphore;
 
 use crate::sessions::{Call, OpenRefused, Proved, Sessions, SessionsConfig, Trust};
 use crate::{
-    Gate, GateError, LedgerLink, Observed, Shipped, Spool, Trimmed, Who, WitnessRead, WitnessReader,
+    Gate, GateError, LedgerLink, Observed, Shipped, Spool, Trimmed, When, Who, WitnessRead,
+    WitnessReader,
 };
 
 /// The largest request, or answer the gate must read, that it will hold.
@@ -365,19 +366,24 @@ impl<S: Spool + 'static> Forwarder<S> {
         }))
     }
 
-    /// Now. With a lease held, the Authority's time counted on by this gate's own clock;
-    /// before the first lease, and with no Authority, this machine's clock (spec §7.6.3,
-    /// point 4).
-    fn now(&self) -> i64 {
-        self.authority
-            .as_ref()
-            .and_then(|a| {
-                a.standing
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .now((a.mono)())
-            })
-            .unwrap_or_else(self.clock)
+    /// Now, and where it comes from. With a lease held, the Authority's time counted on by
+    /// this gate's own clock; before the first lease, and with no Authority, this machine's
+    /// clock (spec §7.6.3, point 4). Once a lease has been held it is used however old it
+    /// is: an old lease still gives a better clock than the machine's.
+    fn now(&self) -> When {
+        let leased = self.authority.as_ref().and_then(|a| {
+            a.standing
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .now((a.mono)())
+        });
+        match leased {
+            Some(at) => When {
+                at,
+                from_lease: true,
+            },
+            None => When::here((self.clock)()),
+        }
     }
 
     /// The map and bundle version in use now.
@@ -496,9 +502,6 @@ impl<S: Spool + 'static> Forwarder<S> {
             }
             taken
         };
-        if taken.is_ok() {
-            self.with_gate(Gate::stamp_from_lease).await;
-        }
         Some(taken)
     }
 
@@ -685,7 +688,7 @@ async fn open_session<S: Spool + 'static>(
     }) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    let now = f.now();
+    let now = f.now().at;
     let opened = f.with_trust(|trust| {
         sessions
             .lock()
@@ -981,7 +984,8 @@ async fn call<S: Spool + 'static>(
                         .unmapped_by_tool
                         .add(mapped.action.operation.as_str());
                 }
-                let now = f.now();
+                let when = f.now();
+                let now = when.at;
                 // Who made the call. Proven is said by `Sessions::prove` alone, for the
                 // action computed just above from this gate's own map and listing.
                 let who = match (&shim, &f.sessions) {
@@ -1031,7 +1035,7 @@ async fn call<S: Spool + 'static>(
                         // The agent holds its own credential; the gate is only in the path.
                         coverage: Coverage::InLine,
                     };
-                    gate.begin_under(&observed, now, in_use.version.clone())
+                    gate.begin_under(&observed, when, in_use.version.clone())
                 })
                 .await
             }
@@ -1069,7 +1073,7 @@ async fn call<S: Spool + 'static>(
             if let Some(seq) = intent {
                 let now = f.now();
                 let finished = f
-                    .with_gate(move |gate| gate.finish(seq, status, None, now))
+                    .with_gate(move |gate| gate.finish_at(seq, status, None, now))
                     .await;
                 match finished {
                     Ok(_) => {

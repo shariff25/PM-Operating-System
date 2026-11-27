@@ -524,6 +524,10 @@ follow-up tracking.
   its source mark to travel together; a shim's clock more than two minutes from the
   Authority's opens no session; markers not to count among proven sessions. The reviewer
   noted that its verdicts rest on its own test runs and have never vouched for the lint.
+- **Twenty-fifth-read fixes built (2026-11-27), on `build/gov-review-25`:** GR-177 (a
+  receipt's time and its source travel together), GR-178 (a clock mismatch at a session's
+  opening is counted under its own reason) and GR-180 (a marker is not closed to make room
+  for new sessions). Not yet read by the reviewer.
 
 ## Where the build stands (2026-11-23)
 
