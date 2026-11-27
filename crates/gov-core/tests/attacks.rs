@@ -1095,7 +1095,7 @@ fn a_replayed_or_older_lease_is_refused() {
     back_in_time.nonce = id("n-3");
     assert_eq!(
         HeldLease::accept(Some(&held), back_in_time, third()).unwrap_err(),
-        Error::LeaseReplayed
+        Error::AuthorityBehind
     );
     let mut fewer_revocations = newer.clone();
     fewer_revocations.nonce = id("n-3");
@@ -1103,7 +1103,7 @@ fn a_replayed_or_older_lease_is_refused() {
     fewer_revocations.revocation_seq = 41;
     assert_eq!(
         HeldLease::accept(Some(&held), fewer_revocations, third()).unwrap_err(),
-        Error::LeaseReplayed
+        Error::AuthorityBehind
     );
     // Each check alone: a lease that is newer in every way but answers another request...
     let mut wrong_nonce = newer.clone();
@@ -1121,7 +1121,7 @@ fn a_replayed_or_older_lease_is_refused() {
     older_clock.revocation_seq = 60;
     assert_eq!(
         HeldLease::accept(Some(&held), older_clock, third()).unwrap_err(),
-        Error::LeaseReplayed
+        Error::AuthorityBehind
     );
     // Another gate's lease.
     let mut other_gate = newer.clone();

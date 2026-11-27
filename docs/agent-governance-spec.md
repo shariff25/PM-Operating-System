@@ -472,6 +472,40 @@ reviewer.
     the tool's name). `gov map drift` prints the same name beside each tool it reports,
     so an operator can tell which tool a count is for. The count holds 256 names and
     adds the rest together; it is lost at a restart (the receipts are not).
+- **G4d-1 built (2026-11-27), from §7.6.3 points 1 to 3 after the twenty-second read; not
+  yet read by the reviewer.** Libraries only, on `build/gov-g4d1`: nothing is served and
+  no gate uses it yet.
+  - *The renewal* (`gov-core/src/renew.rs`): `gov.renew.v1`, signed with the gate's key,
+    with its name, the Authority's name, a fresh nonce, the bundle held and the
+    revocation number read through. It carries no time.
+  - *The Authority's answer* (`Authority::renew`): a lease with the request's nonce, the
+    Authority's time, the latest bundle's version and the newest revocation number, good
+    for the bundle's own `standard` limit; the feed from the number the gate named; the
+    bundle unless the gate says it holds that very one. Only a key enrolled for a gate,
+    asking in that gate's own name, for this Authority, while the gate is not disabled,
+    is answered; anyone else gets a bare refusal. One answer a second for each gate. It
+    writes nothing and makes no record.
+  - *What a gate holds and checks* (`Standing`, `Standing::take`): the checks of point 2,
+    in that order, with a closed list of reasons for the operator (`bundle`,
+    `bundle_older`, `bundle_forked`, `wrong_bundle`, `lease`, `not_this_request`,
+    `authority_behind`, `feed`). An answer that fails any check changes nothing. The
+    gate's time is the lease's plus its own count since the request left; a lease is
+    fresh for as long as it says.
+  - Run together on both of the Authority's stores: a first renewal brings the bundle; a
+    revoked mandate and a disabled agent reach the gate's revoked set; a new bundle
+    arrives with its lease; a gate started again is told everything from nothing; a
+    disabled gate is not answered. An Authority put back from an older copy, or with its
+    clock set back, is refused as `authority_behind` and taken again once it has caught
+    up. 23 controls removed one at a time; each removal fails a test.
+  - **Departures and limits.** (1) "At most once a second" compares for the same second
+    only: an Authority whose clock was set back still answers, so that the gate can say
+    it is behind. (2) A gate that names a higher revocation number than the Authority
+    has is answered from where the Authority stands, not refused, for the same reason.
+    (3) The lease names the bundle by `<number>-<first 16 hex of its digest>`, the
+    version a receipt carries, not by the whole digest; the bundle itself is opened
+    under the root key before it is compared. (4) A gate's revoked key is not yet
+    refused a renewal: no key can be revoked before G4d-4. (5) The limit of one answer a
+    second is kept in memory and is each Authority process's own.
 
 ## Security review of 2026-11-26 (first read; the gate did not pass)
 

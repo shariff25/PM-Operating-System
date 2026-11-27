@@ -22,6 +22,7 @@ pub mod lease;
 pub mod mandate;
 pub mod policy;
 pub mod receipt;
+pub mod renew;
 pub mod request;
 pub mod revocation;
 pub mod strict;

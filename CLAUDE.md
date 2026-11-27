@@ -485,6 +485,11 @@ follow-up tracking.
   resource ends in an area. The changed maps are not yet read again, so none may back
   shadow or enforce mode. GR-161 (a thing called by a former name) is open, to be
   designed before enforce mode.
+- **G4d-1 built (2026-11-27), on `build/gov-g4d1`:** the gate's signed renewal, the
+  Authority's answer (lease, revocation feed, bundle) and the gate's check of it, as
+  libraries; nothing is served and no gate uses it yet. An Authority that has gone back
+  is refused under a reason of its own. Not yet read by the reviewer. Next: G4d-2 (the
+  gate's time, proof only under a fresh lease, revoked sessions).
 
 ## Where the build stands (2026-11-23)
 

@@ -98,17 +98,22 @@ pub struct HeldLease {
 impl HeldLease {
     /// Take `lease` as the answer to `request`, in place of `held` (review finding GR-1). It
     /// must be for this gate and carry the request's nonce, so a lease recorded earlier and
-    /// played back is refused; and neither its Authority time nor its revocation number may be
-    /// lower than the held one's, so nothing can turn a gate's clock or its revocations back.
+    /// played back is refused ([`Error::LeaseReplayed`]); and neither its Authority time nor
+    /// its revocation number may be lower than the held one's, so nothing can turn a gate's
+    /// clock or its revocations back ([`Error::AuthorityBehind`]).
     pub fn accept(held: Option<&HeldLease>, lease: Lease, request: LeaseRequest) -> Result<Self> {
         if lease.gate != request.gate || lease.nonce != request.nonce {
             return Err(Error::LeaseReplayed);
         }
         if let Some(held) = held {
+            // The answer to this very request, and still behind: the Authority's clock was
+            // set back, or its database put back from an older copy. Refused like a replay,
+            // and told apart from one, so that it is not read as the Authority being down
+            // (review finding GR-168).
             if lease.authority_time < held.lease.authority_time
                 || lease.revocation_seq < held.lease.revocation_seq
             {
-                return Err(Error::LeaseReplayed);
+                return Err(Error::AuthorityBehind);
             }
         }
         Ok(HeldLease {
@@ -135,6 +140,12 @@ impl HeldLease {
             .authority_time
             .checked_add(age)
             .ok_or(Error::LeaseStale)
+    }
+
+    /// Is the lease no older than it says it is good for, whatever the class?
+    pub fn within_its_life(&self, mono_ms: u64) -> bool {
+        self.age_ms(mono_ms)
+            .is_ok_and(|age| age <= u64::from(self.lease.valid_for_secs).saturating_mul(1000))
     }
 
     /// May an action of `class` be decided now? Only if the gate is deciding from the bundle
