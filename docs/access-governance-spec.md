@@ -12,7 +12,8 @@ data only, and a control is not built until removing it fails a test.
   answer was "You assess where it make sense". This spec is that assessment: the PRD's
   requirements, the departures from it (§2), and where the work sits among the slices
   still open (§8).
-- **Not yet read by the reviewer. Nothing is built.**
+- **Read by the reviewer on 2026-11-27 (its nineteenth read): the spec passes the gate as a
+  design**, with conditions answered in §11. **Nothing is built.**
 - The PRD is `docs/prd-access-governance.md` and the graph explorer's design source is
   `docs/design/graph-explorer-design.dc.html`, both committed on 2026-11-27 at the owner's
   word, as the owner pasted them. The design file is a component source that does not run
@@ -108,15 +109,19 @@ Each is a place where the PRD, built as written, would not do what it says.
   records reads or shows flow cover as partial.
 - **CG-4, labels come from the signed bundle.** The connector map gains a confidentiality
   label per resource pattern, an integrity label per tool's results, and an audience
-  clearance per resource pattern written to. `outward` is already there. A value that
+  clearance per resource pattern **called**, for every kind of operation (review finding
+  GR-144): a read sends its arguments somewhere too, a search query or an address to
+  fetch. `outward` is already there. A value that
   looks like a label in arguments or results is data.
 - **CG-5, the mandate's label** (changed by D1 to D3). Confidentiality: public, internal,
   confidential, restricted. Integrity: trusted, untrusted. The label is the join of
   everything read under the root mandate, at any gate whose token was presented. It never
   goes down.
-- **CG-6, the flow check**, between policy and grants in the main spec's §5.1. It asks
-  for a countersignature or refuses, as policy says, when an outward write's audience
-  clearance is below the label's confidentiality, or when a destructive or outward action
+- **CG-6, the flow check**, between policy and grants in the main spec's §5.1. It applies
+  to proven calls only: a call from a stock client has no mandate, so no label and no
+  cause, and those fields are absent from a claimed receipt (GR-151). It asks for a
+  countersignature or refuses, as policy says, when the clearance of **where a call's
+  arguments go**, read or write, is below the label's confidentiality (GR-144), or when a destructive or outward action
   runs under an untrusted label. New reasons: `label_exceeds_clearance`,
   `untrusted_control`. In shadow mode the answer goes in `would_decide`.
 - **CG-7, declassifying** needs a countersignature bound to the action's digest, of class
@@ -239,3 +244,30 @@ security certifiers are, how long the reviewer's free text is kept (7 days), the
 names, and what happens to undecided items (suspended). Added here: the window over which
 a standing label is kept (CG-11), and the architecture image the PRD refers to, which the
 conductor does not have.
+
+## 11. Review
+
+### Nineteenth read, 2026-11-27, at `96c7c1c`
+
+**Verdict: no High or Critical; the spec passes the gate as a design.** The reviewer agreed
+with the departures, D3, D4, D5, D7 and D8 in particular, and that "shadow only until the
+standing label exists" is the right line. CG0a may be built after G4c with GR-144 answered,
+which it is above.
+
+| Id | Severity | What | Done |
+|---|---|---|---|
+| GR-144 | Medium, before CG0a | Clearance covered writes only, so confidential data could leave in the arguments of a read | CG-4 and CG-6: clearance is per resource pattern called, for every kind of operation |
+| GR-145 | Medium, before CG1 | A "number that rises" on label tokens cannot be ordered across gates | D1 is changed: no numbers. A gate takes the join of its own record, any token shown, and what the Authority last reported for the mandate; a label only rises, so order does not matter |
+| GR-146 | Medium, before CG1 | Gates do not hold each other's keys: the bundle lists the Authority's keys, not gates' | A gate signs tokens with a key apart from its receipt key; the list of gates' token keys is signed with the leases key and delivered with the lease |
+| GR-147 | Medium, before CG3 enforces | An agent with two live root mandates reads under one and writes under the other | The label is kept per agent key across all its live mandates wherever the flow check enforces |
+| GR-148 | Low | `proof_failures` can be an honest fault or caused by others | Only bad signatures and replays count toward a suspension |
+| GR-149 | Low | Classes are compared by order in the code; `agent` must not sit in that order | CG0b changes the check to membership in the classes a rule lists |
+| GR-150 | Low | Changing the receipt format in place breaks exports made before | Accepted before any release; to be said in the status note when CG0a lands |
+| GR-151 | Low | A stock client's call has no mandate, so no label | CG-6: label and cause are absent on a claimed receipt, and the flow check applies to proven calls |
+
+**A stated limit, and a decision for the owner** (from GR-145). An agent can read at one
+gate and write at another before the first gate's report reaches the second, and
+withholding a token costs it nothing in that window. Closing it means a gate asking the
+Authority at the moment of an outward call, which puts the Authority in the path of that
+call; the main spec keeps it out of every call's path. Default until the owner decides:
+the window stays, is as long as a lease, and is shown on screen as the label's age.

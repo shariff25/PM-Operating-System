@@ -410,6 +410,39 @@ follow-up tracking.
   pasted them. The PRD's architecture image was never given and is not in the repository.
   Where the PRD and the spec differ, the spec is what is built from.
 
+- **Nineteenth read (2026-11-27), at `96c7c1c`:** no High or Critical; the access governance
+  spec passes the gate as a design, and G4c may be built from the main spec as it stands.
+  Four Medium points on labels, answered in the spec's §11 (clearance applies to what any
+  call sends, not only writes; label tokens merge without numbers; how gates learn each
+  other's token keys; one label per agent key across its live mandates). One decision left
+  to the owner: whether a gate may ask the Authority at the moment of an outward call, to
+  close the window in which an agent reads at one gate and writes at another.
+- **Research for a patent (owner, 2026-11-27):** "Governance graphs is the most of this
+  product ... do deep research and come back with unique idea. I want to patent it". The
+  report is in `reports/` on the conductor's machine and was sent to the owner; it and its
+  notes are kept out of git on purpose, and the ideas it shortlists are **not to be written
+  into any committed file** until the owner has decided about filing. The owner then:
+  "Continue building G4c".
+
+- **What makes the product hard to replace (owner, 2026-11-27):** asked how to build a moat,
+  the conductor answered: a library of reviewed connector maps, being the record outsiders
+  accept (with proof that it is complete), the gate holding the credential, and undo and
+  access reviews as recurring work; and recommended narrowing. The owner chose otherwise:
+  "Keep the exiting feature and build and add the new things you suggested". So nothing is
+  dropped, and three slices are added to the main spec's §10: CM1 (connector maps for Jira,
+  GitHub and Slack), CM2 (drift) and CP (proof about the record). CP's design stays out of
+  every committed file until the owner decides about filing; the repository answered a
+  request with no login on 2026-11-27, so it is taken to be public until the owner says
+  otherwise. Not buildable by the conductor: design partners and a real deployment.
+- **G4c built (2026-11-27), on `build/gov-g4c`:** mandates from the Authority. Templates
+  are in the signed bundle and a gate holds every mandate to its template; the Authority
+  issues to an agent's owner, delegates narrower at the holder's signed request, lists,
+  revokes, and signs a numbered revocation feed; `gov verify` reports a mandate nobody
+  issued. Run as three programs with fake data on a mandate the Authority issued; a mandate
+  signed with a stolen mandates key but wider than its template is not recorded as proven.
+  Not yet read by the reviewer. The gate does not read the feed yet (G4d), and nothing is
+  served (G4e).
+
 ## Where the build stands (2026-11-23)
 
 - Pushed and checked: `claude/web-app` (draft pull request #10).

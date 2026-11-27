@@ -54,6 +54,7 @@ fn bundle(dir: &Path, name: &str, number: u64, label: &str, signer: &SigningKey)
         freshness: Default::default(),
         rules: Vec::new(),
         connectors: vec![map("jira-mcp"), map("other-mcp")],
+        templates: Vec::new(),
     };
     std::fs::write(
         dir.join(name),

@@ -30,6 +30,9 @@ pub struct Policy {
     pub map: ServerMap,
     /// The keys mandates are issued under.
     pub mandate_issuers: Vec<PublicKey>,
+    /// The bundle's templates, which every mandate is held to. `None` on the unsigned
+    /// path: no bundle, so nothing to hold a mandate to, and the receipts say `unsigned`.
+    pub templates: Option<Vec<gov_core::mandate::Template>>,
     /// What every receipt carries: the bundle's number and the start of its digest, or
     /// `unsigned`.
     pub version: Id,
@@ -145,6 +148,7 @@ impl PolicyArgs {
         Ok(Policy {
             map,
             mandate_issuers: opened.bundle.keys.mandates.clone(),
+            templates: Some(opened.bundle.templates.clone()),
             version: opened.policy_version(),
         })
     }
@@ -170,6 +174,7 @@ impl PolicyArgs {
         Ok(Policy {
             map,
             mandate_issuers,
+            templates: None,
             version: Id::new(UNSIGNED).expect("a word is an identifier"),
         })
     }

@@ -21,6 +21,10 @@ pub struct SessionsConfig {
     /// The keys mandates are issued under. Until there is an Authority (G4) these are a test
     /// issuer's, from a file.
     pub issuers: KeySet,
+    /// The templates of the policy bundle held: every mandate a session is opened for is
+    /// held to the one it names (review finding GR-138). `None` only where no bundle was
+    /// loaded.
+    pub templates: Option<Vec<gov_core::mandate::Template>>,
     /// Sessions one agent key may hold that have proven a call.
     pub max_proven: usize,
     /// Sessions one agent key may hold that have not yet.
@@ -41,6 +45,7 @@ impl SessionsConfig {
             scope,
             gate,
             issuers,
+            templates: None,
             max_proven: 4,
             max_unproven: 2,
             unproven_secs: 30,
@@ -166,6 +171,7 @@ impl Sessions {
                 authority: &c.issuers,
                 now,
                 revoked: &none_revoked,
+                templates: c.templates.as_deref(),
             },
         )
         .map_err(|_| OpenRefused::Invalid)?;

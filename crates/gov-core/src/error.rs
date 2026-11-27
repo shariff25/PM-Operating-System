@@ -61,6 +61,10 @@ pub enum Error {
     WeakKey,
     #[error("the approver is the person who issued the mandate")]
     ApproverIsIssuer,
+    #[error("the mandate's template is not in the policy bundle held")]
+    UnknownTemplate,
+    #[error("a mandate is wider than its template: {0}")]
+    WiderThanTemplate(&'static str),
     #[error("the policy bundle is older than the one held")]
     BundleOlder,
     #[error("another policy bundle is held under the same number")]
@@ -100,6 +104,8 @@ impl Error {
             Error::LeaseReplayed => "lease_replayed",
             Error::WeakKey => "weak_key",
             Error::ApproverIsIssuer => "approver_is_issuer",
+            Error::UnknownTemplate => "unknown_template",
+            Error::WiderThanTemplate(_) => "wider_than_template",
             Error::BundleOlder => "bundle_older",
             Error::BundleForked => "bundle_forked",
         }

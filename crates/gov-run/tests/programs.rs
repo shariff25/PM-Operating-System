@@ -354,47 +354,14 @@ async fn a_gate_and_a_ledger_run_as_programs_leave_a_record_an_auditor_can_check
         .arg(site.path("gate.key")));
     assert!(!ok && err.contains("must not exist"), "{err}");
 
-    // An agent's key, and a mandate for it from a test issuer: there is no Authority yet to
-    // issue one. The gate is given the issuer's public key.
+    // An agent's key. Its mandate comes from the Authority, further down, once there is a
+    // published bundle to issue it from.
     let (ok, agent_public, _) = run(program(GATE)
-        .args(["keygen", "--kid", "refund-bot-k1", "--out"])
+        .args(["keygen", "--kid", "refund-bot:k1", "--out"])
         .arg(site.path("agent.key")));
     assert!(ok);
     let agent_public: PublicKey = serde_json::from_str(&agent_public).unwrap();
-    let issuer = gov_core::SigningKey::from_seed(id("issuer-k1"), &[41; 32]).unwrap();
     let now = gov_run::now();
-    let mandate = gov_core::mandate::Mandate {
-        v: 1,
-        tenant: id("acme"),
-        env: id("prod"),
-        id: id("m-1"),
-        issuer: id("test-issuer"),
-        issued_at: now - 60,
-        expires_at: now + 3600,
-        agent: gov_core::mandate::AgentRef {
-            id: id("refund-bot"),
-            key: agent_public,
-        },
-        issued_by: gov_core::mandate::IssuedBy {
-            kind: gov_core::mandate::IssuerKind::Person,
-            id: id("ana"),
-            session: Some(id("ses-1")),
-        },
-        template: id("triage@7"),
-        grants: vec![gov_core::action::Grant {
-            system: id("jira"),
-            operations: [id("issue.update")].into(),
-            resources: vec![gov_core::ResourcePattern::new("jira/project/pay/*").unwrap()],
-        }],
-        limits: Default::default(),
-        requires: Default::default(),
-        parent: None,
-    };
-    std::fs::write(
-        site.path("mandate.json"),
-        serde_json::to_vec(&gov_core::seal(&mandate, &issuer).unwrap()).unwrap(),
-    )
-    .unwrap();
 
     std::fs::write(site.path("gate.pub"), &gate_public).unwrap();
     std::fs::write(
@@ -420,6 +387,22 @@ async fn a_gate_and_a_ledger_run_as_programs_leave_a_record_an_auditor_can_check
     // mandates are issued under. The gate and the shim are given the root's public key.
     let root = gov_core::SigningKey::from_seed(id("root-1"), &[70; 32]).unwrap();
     let lease_key = gov_core::SigningKey::from_seed(id("authority:leases-1"), &[72; 32]).unwrap();
+    let mandates_key =
+        gov_core::SigningKey::from_seed(id("authority:mandates-1"), &[71; 32]).unwrap();
+    let grants = vec![gov_core::action::Grant {
+        system: id("jira"),
+        operations: [id("issue.update")].into(),
+        resources: vec![gov_core::ResourcePattern::new("jira/project/pay/*").unwrap()],
+    }];
+    let triage = gov_core::mandate::Template {
+        id: id("triage"),
+        grants: grants.clone(),
+        max_life_secs: 3600,
+        limits: Default::default(),
+        delegable: false,
+        people: Default::default(),
+        receivers: Default::default(),
+    };
     let bundle = |number: u64, version: &str| {
         let bundle = gov_core::policy::PolicyBundle {
             v: 1,
@@ -430,12 +413,13 @@ async fn a_gate_and_a_ledger_run_as_programs_leave_a_record_an_auditor_can_check
             number,
             issued_at: now,
             keys: gov_core::policy::OnlineKeys {
-                mandates: vec![issuer.public()],
+                mandates: vec![mandates_key.public()],
                 leases: vec![lease_key.public()],
             },
             freshness: Default::default(),
             rules: Vec::new(),
             connectors: vec![map.clone()],
+            templates: vec![triage.clone()],
         };
         serde_json::to_vec(&gov_core::seal(&bundle, &root).unwrap()).unwrap()
     };
@@ -445,6 +429,85 @@ async fn a_gate_and_a_ledger_run_as_programs_leave_a_record_an_auditor_can_check
     std::fs::write(
         site.path("root.pub.json"),
         serde_json::to_vec(&root.public()).unwrap(),
+    )
+    .unwrap();
+
+    // The Authority, as a library (no program serves it yet): the bundles are published to
+    // it in order, the agent is registered to its owner and enrols its own key, and the
+    // owner is issued a mandate from the template. That mandate, not a test issuer's, is
+    // what the shim presents and the gate holds to the bundle it loaded.
+    let authority = gov_authority::Authority::new(
+        gov_authority::MemoryStore::default(),
+        gov_core::Scope::new("acme", "prod").unwrap(),
+        id("authority"),
+        gov_core::SigningKey::from_seed(id("authority-admin-1"), &[60; 32]).unwrap(),
+        root.public(),
+    )
+    .with_online_keys(
+        gov_core::SigningKey::from_seed(id("authority:mandates-1"), &[71; 32]).unwrap(),
+        gov_core::SigningKey::from_seed(id("authority:leases-1"), &[72; 32]).unwrap(),
+    );
+    let (ana, ben) = (id("ana"), id("ben"));
+    authority.bootstrap(&ana, now).await.unwrap();
+    authority
+        .add_person(&ana, &ben, gov_authority::Role::Owner, now)
+        .await
+        .unwrap();
+    authority
+        .register_agent(&ana, &id("refund-bot"), &ben, Default::default(), now)
+        .await
+        .unwrap();
+    for (number, version) in [(1, "v1"), (2, "v2")] {
+        let signed: gov_core::Envelope = serde_json::from_slice(&bundle(number, version)).unwrap();
+        authority.publish_bundle(&ana, &signed, now).await.unwrap();
+    }
+    let agent_key = gov_core::SigningKey::from_file_text(
+        &std::fs::read_to_string(site.path("agent.key")).unwrap(),
+    )
+    .unwrap();
+    let code = authority
+        .offer_enrolment(
+            &ana,
+            gov_core::enrol::EnrolKind::Agent,
+            &id("refund-bot"),
+            now,
+        )
+        .await
+        .unwrap();
+    let asked = gov_core::seal(
+        &gov_core::enrol::EnrolRequest {
+            v: 1,
+            tenant: id("acme"),
+            env: id("prod"),
+            authority: id("authority"),
+            kind: gov_core::enrol::EnrolKind::Agent,
+            name: id("refund-bot"),
+            key: agent_public.clone(),
+            code: gov_core::enrol::code_digest(&code),
+        },
+        &agent_key,
+    )
+    .unwrap();
+    authority.enrol(&code, &asked, now).await.unwrap();
+    let issued = authority
+        .issue_mandate(
+            &ben,
+            &gov_authority::MandateAsk {
+                agent: id("refund-bot"),
+                key: id("refund-bot:k1"),
+                template: id("triage"),
+                grants,
+                life_secs: 3600,
+                limits: Default::default(),
+            },
+            now,
+        )
+        .await
+        .unwrap();
+    let mandate_id = authority.list_mandates(&ben).await.unwrap()[0].id.clone();
+    std::fs::write(
+        site.path("mandate.json"),
+        serde_json::to_vec(&issued).unwrap(),
     )
     .unwrap();
 
@@ -650,7 +713,7 @@ async fn a_gate_and_a_ledger_run_as_programs_leave_a_record_an_auditor_can_check
     // mandate, the call under a lost session as a failed proof, never as a mere claim.
     for held in [
         r#""agent":{"id":"refund-bot","proof":"proven"}"#,
-        r#""mandate":["m-1"]"#,
+        &format!(r#""mandate":["{mandate_id}"]"#),
         r#""proof":"failed","failure":"unknown_session""#,
         r#""agent":{"id":"triage-bot","proof":"claimed"}"#,
     ] {
@@ -685,6 +748,77 @@ async fn a_gate_and_a_ledger_run_as_programs_leave_a_record_an_auditor_can_check
     // The session, the proof, the salt, the agent's name for the gate and the shim's secret
     // stop at the gate: the server was never sent one of them.
     assert!(!GOV_HEADER_SEEN.load(std::sync::atomic::Ordering::SeqCst));
+
+    // The key mandates are signed with is taken, and used to sign a mandate for the same
+    // agent that is wider than the template allows: every project, not one. The signature
+    // is good. The gate holds it to the template in the bundle it loaded and opens no
+    // session for it, so the call it carries is never recorded as proven (review finding
+    // GR-138).
+    let issuers = gov_core::KeySet::new([gov_core::SigningKey::from_seed(
+        id("authority:mandates-1"),
+        &[71; 32],
+    )
+    .unwrap()
+    .public()]);
+    let honest = gov_core::open::<gov_core::mandate::Mandate>(
+        &issued,
+        &issuers,
+        &gov_core::Scope::new("acme", "prod").unwrap(),
+    )
+    .unwrap()
+    .doc;
+    let mut wider = honest.clone();
+    wider.id = id("m-wider");
+    wider.grants[0].resources = vec![gov_core::ResourcePattern::new("jira/*").unwrap()];
+    let stolen = gov_core::SigningKey::from_seed(id("authority:mandates-1"), &[71; 32]).unwrap();
+    std::fs::write(
+        site.path("mandate-wider.json"),
+        serde_json::to_vec(&gov_core::seal(&wider, &stolen).unwrap()).unwrap(),
+    )
+    .unwrap();
+    let second = start({
+        let mut c = program(SHIM);
+        c.args(["--tenant", "acme", "--env", "prod", "--gate", "gate-1"])
+            .args(["--gate-url", &format!("http://{}", gate.addr)])
+            .arg("--key-file")
+            .arg(site.path("agent.key"))
+            .arg("--mandate")
+            .arg(site.path("mandate-wider.json"))
+            .arg("--bundle")
+            .arg(site.path("bundle.json"))
+            .arg("--root-key")
+            .arg(site.path("root.pub.json"))
+            .arg("--bundle-state")
+            .arg(site.path("shim2.bundle-state"))
+            .args(["--server", "jira-mcp"])
+            .arg("--secret-file")
+            .arg(site.path("shim2.secret"));
+        c
+    });
+    let second_secret = std::fs::read_to_string(site.path("shim2.secret")).unwrap();
+    let before = site.health(&operator).await;
+    let sent = reqwest::Client::new()
+        .post(format!("http://{}/mcp", second.addr))
+        .header("authorization", SECRET)
+        .header("content-type", "application/json")
+        .header("x-gov-shim-key", &second_secret)
+        .body(tool_call(30, "OPS-30").to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sent.status().as_u16(), 200);
+    let after = site.health(&operator).await;
+    assert_eq!(
+        after["proven"], before["proven"],
+        "a wider mandate was proven"
+    );
+    // The call still went through, since nothing is blocked in observe mode, and was still
+    // recorded: as a client's bare claim, with no session behind it.
+    assert_eq!(
+        after["recorded"].as_u64().unwrap(),
+        before["recorded"].as_u64().unwrap() + 1
+    );
+    drop(second);
 
     drop(shim);
     drop(gate);

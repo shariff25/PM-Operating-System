@@ -105,6 +105,26 @@ pub struct Published {
     pub envelope: Envelope,
 }
 
+/// A mandate the Authority issued, as it keeps it: enough to list it and to revoke it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IssuedMandate {
+    pub id: Id,
+    pub agent: Id,
+    /// Who asked: a person, or for a delegated mandate the parent agent.
+    pub issued_by: Id,
+    /// The person at the root of its chain.
+    pub root_person: Id,
+    /// The mandate it was delegated from, if it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<Id>,
+    pub template: Id,
+    pub issued_at: i64,
+    pub expires_at: i64,
+    pub revoked: bool,
+    pub envelope: Envelope,
+}
+
 /// One change to the registry, applied with the record that stands for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
@@ -119,6 +139,10 @@ pub enum Effect {
     AddKey(EnrolledKey),
     /// Keep a published bundle under its number.
     PutBundle(Published),
+    PutMandate(IssuedMandate),
+    /// Add one numbered revocation. Its number must be the next one: if it is not, the
+    /// whole commit fails with [`StoreError::HeadMoved`] and nothing is written.
+    AddRevocation(gov_core::revocation::RevocationEntry),
 }
 
 /// One admin record as stored.
@@ -156,6 +180,15 @@ pub trait Store: Send + Sync {
     async fn agents_of(&self, scope: &Scope, owner: &Id) -> StoreResult<Vec<Agent>>;
     async fn gate(&self, scope: &Scope, id: &Id) -> StoreResult<Option<Gate>>;
     async fn key(&self, scope: &Scope, kid: &Id) -> StoreResult<Option<EnrolledKey>>;
+    async fn mandate(&self, scope: &Scope, id: &Id) -> StoreResult<Option<IssuedMandate>>;
+    /// Every mandate issued, in order of id.
+    async fn mandates(&self, scope: &Scope) -> StoreResult<Vec<IssuedMandate>>;
+    /// Every revocation after number `after`, in order.
+    async fn revocations_after(
+        &self,
+        scope: &Scope,
+        after: u64,
+    ) -> StoreResult<Vec<gov_core::revocation::RevocationEntry>>;
     /// The published bundle with the highest number.
     async fn latest_bundle(&self, scope: &Scope) -> StoreResult<Option<Published>>;
     async fn bundle(&self, scope: &Scope, number: u64) -> StoreResult<Option<Published>>;
@@ -199,6 +232,8 @@ struct State {
     keys: BTreeMap<(Key, Id), EnrolledKey>,
     codes: BTreeMap<(Key, EnrolKind, Id), PendingCode>,
     bundles: BTreeMap<(Key, u64), Published>,
+    mandates: BTreeMap<(Key, Id), IssuedMandate>,
+    revocations: BTreeMap<(Key, u64), gov_core::revocation::RevocationEntry>,
 }
 
 /// A store in memory, for tests and for the library's own use where nothing must outlive
@@ -247,6 +282,20 @@ impl Store for MemoryStore {
                 }
             }
         }
+        // A revocation takes the next number, and no other.
+        let mut next = s
+            .revocations
+            .range((key.clone(), 0)..=(key.clone(), u64::MAX))
+            .next_back()
+            .map_or(1, |(_, e)| e.seq + 1);
+        for effect in effects {
+            if let Effect::AddRevocation(e) = effect {
+                if e.seq != next {
+                    return Err(StoreError::HeadMoved);
+                }
+                next += 1;
+            }
+        }
         s.records
             .entry(key.clone())
             .or_default()
@@ -273,6 +322,12 @@ impl Store for MemoryStore {
                 }
                 Effect::PutBundle(b) => {
                     s.bundles.insert((key.clone(), b.number), b);
+                }
+                Effect::PutMandate(m) => {
+                    s.mandates.insert((key.clone(), m.id.clone()), m);
+                }
+                Effect::AddRevocation(e) => {
+                    s.revocations.insert((key.clone(), e.seq), e);
                 }
             }
         }
@@ -354,6 +409,38 @@ impl Store for MemoryStore {
             .keys
             .get(&(k(scope), kid.clone()))
             .cloned())
+    }
+
+    async fn mandate(&self, scope: &Scope, id: &Id) -> StoreResult<Option<IssuedMandate>> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .mandates
+            .get(&(k(scope), id.clone()))
+            .cloned())
+    }
+
+    async fn mandates(&self, scope: &Scope) -> StoreResult<Vec<IssuedMandate>> {
+        let s = self.0.lock().unwrap();
+        Ok(s.mandates
+            .iter()
+            .filter(|((scope_key, _), _)| *scope_key == k(scope))
+            .map(|(_, m)| m.clone())
+            .collect())
+    }
+
+    async fn revocations_after(
+        &self,
+        scope: &Scope,
+        after: u64,
+    ) -> StoreResult<Vec<gov_core::revocation::RevocationEntry>> {
+        let s = self.0.lock().unwrap();
+        Ok(s.revocations
+            .iter()
+            .filter(|((scope_key, seq), _)| *scope_key == k(scope) && *seq > after)
+            .map(|(_, e)| e.clone())
+            .collect())
     }
 
     async fn latest_bundle(&self, scope: &Scope) -> StoreResult<Option<Published>> {

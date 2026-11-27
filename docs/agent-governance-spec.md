@@ -395,6 +395,41 @@ reviewer.
   gate ran on was published by the Authority (`gov verify` reporting a policy version with
   no `PolicyPublished` record is not written); the `gov` command now links the programs'
   library to read a key file, though no command of it opens a network connection.
+- **G4c built (2026-11-27), from §7.6.2 after the eighteenth read; not yet read by the
+  reviewer.** Mandates from the Authority, on `build/gov-g4c`:
+  - *templates* are in the root-signed bundle, shown to the signer like rules, and a gate
+    holds every chain's root mandate to the template of that name in the bundle it holds
+    (GR-138); a child stays under its parent's template;
+  - *issuing*: to the agent's owner or a person the template names, from the latest
+    published bundle, signed with a key that bundle lists for mandates, checked as a gate
+    would check it, and written with its `MandateIssued` record in one step. The mandate
+    carries no session, since nobody is signed in before G4e;
+  - *delegating*: at the signed request (`gov.delegate.v1`) of the agent holding the
+    parent, narrower, to an agent whose owner is the person at the root or one the template
+    names, once;
+  - *listing* by ownership, *revoking* by the issuer, the owner or an admin, and the
+    numbered *revocation feed* (`gov.revocations.v1`) signed with the leases key;
+  - `gov verify`, with an Authority named, reports a proven receipt whose mandate no
+    witnessed record says was issued.
+  Run as three programs with fake data, the agent's mandate is now the Authority's and not
+  a test issuer's: its call is recorded as proven, and a mandate signed with the same
+  mandates key but wider than its template is not. About fifty controls removed one at a
+  time; each removal fails a test, after two that only repeated the chain check were taken
+  out.
+  **Departures from §7.6.2, and limits:**
+  - "The same request is never served twice" is kept by taking the child mandate's id from
+    the request's own hash, not by remembering nonces: a second copy asks for an id that
+    exists.
+  - Stopping an agent revokes its mandates **before** the record that stops it, as
+    separate records, not in one step: a stop between the two leaves an agent with less
+    authority than it should have, never more.
+  - The Authority is still a library. The gate does not read the revocation feed, so a
+    revoked mandate still opens a session until G4d; nothing is served until G4e.
+  - A call under a mandate the gate will not open a session for is forwarded, as
+    everything is in observe mode, and recorded as a client's bare claim, not as a failed
+    proof. The marker for such calls is G4d's (§7.6, choice 5).
+  - Limits are carried and compared, not yet charged (G6). A mandate's grants are not
+    yet checked against a call (G5).
 - One more test on both of the Ledger's stores (a chain holds one kind of document), and
   two with an Authority and a Ledger together.
 
@@ -1956,6 +1991,22 @@ Each slice ends with its attack tests (§3.3) passing and its commit sent to the
 | G8 | Console screens; Governance's own stack file and the overlay for both; health and metrics (decision time, refusals, lease age, revocation delay) | CI's deploy job starts both stacks on a real Docker host |
 
 | G9 | Undo (§4.7), after G6: before-values sealed at intent; the undo action and its receipts; refusal on a changed target; undo of a whole mandate; the undo cover page | On the fake Jira: forty issues changed by one mandate are put back by one undo with a receipt each; an issue someone edited in between is left alone and reported; a `none` operation cannot be undone and needed a person to run |
+
+**Added by the owner on 2026-11-27** ("Keep the existing feature and build and add the new
+things you suggested"). Nothing above is dropped or reordered: G4c to G9 and the access
+governance slices stand as they are. Three things are added, from the conductor's answer
+on what would make the product hard to replace.
+
+| Slice | Built | Done when |
+|---|---|---|
+| CM1 | **A library of connector maps** for the three systems to start with: Jira, GitHub and Slack. Each map is a directory in `governance/maps/<system>/` holding the map for one named MCP server at one named version, its sample calls (as `gov policy check` requires), and a note of what it was checked against. A map says, for every tool, the operation, its kind, whether and how it can be put back, whether it reaches outside, and the resource it acts on | `gov policy check` passes on each; every tool of the server is mapped or listed as deliberately unmapped with a reason; the reviewer has read each map (the standing condition of GR-65). A map made from a server's published tool definitions, and not yet run against that server, says so, and is not called verified |
+| CM2 | **Drift**: a command, `gov map drift`, that takes a server's current tool listing and a map and reports tools added, removed and changed (by the digest of the definition) since the map was reviewed; and the gate's count of calls to tools the map does not know, by tool digest, on the operator's address | A changed description, a new tool and a removed tool are each reported; a tool whose definition is unchanged is not |
+| CP | **Proof about the record**, beyond what `gov verify` shows today. Its design is **not written in this repository**: the owner is deciding whether to file for a patent first, and what is written here is published. It is built after that decision | Not stated here, for the same reason |
+
+Where they sit: CM1 and CM2 need nothing that is not built, so they are built beside G4c
+to G4e, one system at a time, Jira first. CP waits for the owner. Custody (G6), undo (G9)
+and access reviews (the access governance spec) were in the conductor's answer too and
+are already slices.
 
 After the first release, in no fixed order: reconciliation (§7.5); GitHub with tokens minted
 per repository; a key-service driver; object-storage witness with lock; SCIM; passkey approval

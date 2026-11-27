@@ -116,6 +116,11 @@ pub enum Problem {
     /// Authority's chain (finding GR-84): the keys file says more than the Authority did.
     /// Reported only when the auditor names an Authority.
     KeyNotEnrolled,
+    /// A receipt marked proven names a mandate that no witnessed record of this
+    /// installation's Authority says was issued (spec §7.6.2, point 8): a forged mandate,
+    /// or one from an issuer that is not the Authority. Reported only when the auditor
+    /// names an Authority.
+    MandateNotIssued,
     /// A receipt is signed by a key and dated after the Authority's record that disabled its
     /// gate or revoked the key, by more than the clocks may differ.
     ReceiptAfterRetirement,
@@ -216,6 +221,10 @@ pub fn verify(check: &Check<'_>) -> Report {
     // (gate, time, number).
     let mut enrolments: BTreeMap<Id, Enrolment> = BTreeMap::new();
     let mut signed_last: BTreeMap<Id, (Id, i64, u64)> = BTreeMap::new();
+    // Mandates the Authorities recorded issuing (by id: the Authority and the record's
+    // number), and those that proven receipts name (by gate and id: the first receipt).
+    let mut issued: BTreeMap<Id, (Id, u64)> = BTreeMap::new();
+    let mut named: BTreeMap<(Id, Id), u64> = BTreeMap::new();
 
     if check.export.v != gov_core::VERSION {
         find(Problem::BadExport("unknown_version"), None, None);
@@ -344,9 +353,21 @@ pub fn verify(check: &Check<'_>) -> Report {
                                     (gate.gate.clone(), opened.doc.at, h.seq),
                                 );
                             }
+                            if opened.doc.agent.proof == gov_core::receipt::Proof::Proven {
+                                for mandate in &opened.doc.mandate {
+                                    named
+                                        .entry((gate.gate.clone(), mandate.clone()))
+                                        .or_insert(h.seq);
+                                }
+                            }
                         }
                         Link::Admin(opened) => {
                             let record = &opened.doc;
+                            if record.action == AdminAction::MandateIssued {
+                                issued
+                                    .entry(record.subject.id.clone())
+                                    .or_insert((gate.gate.clone(), h.seq));
+                            }
                             match (&record.action, &record.about, &record.value) {
                                 (AdminAction::KeyEnrolled, Some(about), Some(digest))
                                     if about.kind == SubjectKind::Gate =>
@@ -631,6 +652,14 @@ pub fn verify(check: &Check<'_>) -> Report {
                 if !borne_out {
                     find(Problem::KeyNotEnrolled, Some(gate), None);
                 }
+            }
+        }
+        for ((gate, mandate), seq) in &named {
+            let borne_out = issued.get(mandate).is_some_and(|(authority, record)| {
+                last_heads.get(authority).is_some_and(|w| record <= w)
+            });
+            if !borne_out {
+                find(Problem::MandateNotIssued, Some(gate), Some(*seq));
             }
         }
         for (kid, (gate, at, seq)) in &signed_last {

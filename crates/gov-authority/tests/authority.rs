@@ -37,6 +37,13 @@ fn root() -> PublicKey {
 
 fn authority<S: Store>(store: S) -> Authority<S> {
     Authority::new(store, scope(), id("authority"), admin_key(), root())
+        .with_online_keys(mandates_key(), leases_key())
+}
+fn mandates_key() -> SigningKey {
+    key("authority:mandates-1", 71)
+}
+fn leases_key() -> SigningKey {
+    key("authority:leases-1", 72)
 }
 
 /// A Postgres store in a fresh schema of Agent Governance's own test database. Needs
@@ -691,6 +698,23 @@ impl Store for Failing {
     async fn latest_bundle(&self, scope: &Scope) -> StoreResult<Option<gov_authority::Published>> {
         self.inner.latest_bundle(scope).await
     }
+    async fn mandate(
+        &self,
+        scope: &Scope,
+        id: &Id,
+    ) -> StoreResult<Option<gov_authority::IssuedMandate>> {
+        self.inner.mandate(scope, id).await
+    }
+    async fn mandates(&self, scope: &Scope) -> StoreResult<Vec<gov_authority::IssuedMandate>> {
+        self.inner.mandates(scope).await
+    }
+    async fn revocations_after(
+        &self,
+        scope: &Scope,
+        after: u64,
+    ) -> StoreResult<Vec<gov_core::revocation::RevocationEntry>> {
+        self.inner.revocations_after(scope, after).await
+    }
     async fn bundle(
         &self,
         scope: &Scope,
@@ -959,6 +983,7 @@ fn signed_bundle(number: u64, issuer: &str, rules: &[&str], signer: &SigningKey)
             })
             .collect(),
         connectors: Vec::new(),
+        templates: Vec::new(),
     };
     seal(&bundle, signer).unwrap()
 }
@@ -1064,3 +1089,739 @@ async fn names_apart<S: Store>(store: S) {
     assert_eq!(chain(&a).await.len(), before);
 }
 both_stores!(an_agent_and_a_gate_do_not_share_a_name, names_apart);
+
+// ----- G4c: mandates from the Authority (spec §7.6.2) --------------------------------------
+
+use gov_authority::MandateAsk;
+use gov_core::action::Grant;
+use gov_core::mandate::{
+    verify_chain, ChainCheck, DelegateRequest, IssuerKind, Limits, Mandate, Template,
+};
+use gov_core::revocation::{Revocable, RevocationFeed, RevocationSet};
+
+fn grant(ops: &[&str], resources: &[&str]) -> Grant {
+    Grant {
+        system: id("jira"),
+        operations: ops.iter().map(|o| id(o)).collect(),
+        resources: resources
+            .iter()
+            .map(|r| gov_core::ResourcePattern::new(r).unwrap())
+            .collect(),
+    }
+}
+
+fn template(name: &str, delegable: bool, people: &[&str], receivers: &[&str]) -> Template {
+    Template {
+        id: id(name),
+        grants: vec![grant(
+            &["issue.read", "issue.update"],
+            &["jira/project/pay/*"],
+        )],
+        max_life_secs: 3600,
+        limits: Limits {
+            max_actions: Some(100),
+            max_writes: Some(10),
+        },
+        delegable,
+        people: people.iter().map(|p| id(p)).collect(),
+        receivers: receivers.iter().map(|p| id(p)).collect(),
+    }
+}
+
+fn templates() -> Vec<Template> {
+    vec![
+        template("triage", true, &[], &[]),
+        template("solo", false, &[], &[]),
+        template("shared", true, &["cy"], &["cy"]),
+    ]
+}
+
+/// A signed bundle carrying the templates, with these keys for mandates.
+fn policy(number: u64, mandate_keys: Vec<PublicKey>) -> Envelope {
+    policy_with(number, mandate_keys, leases_key().public())
+}
+
+fn policy_with(number: u64, mandate_keys: Vec<PublicKey>, leases: PublicKey) -> Envelope {
+    use gov_core::policy::{OnlineKeys, PolicyBundle};
+    let bundle = PolicyBundle {
+        v: 1,
+        tenant: id("acme"),
+        env: id("prod"),
+        issuer: id("authority"),
+        version: id("v"),
+        number,
+        issued_at: NOW,
+        keys: OnlineKeys {
+            mandates: mandate_keys,
+            leases: vec![leases],
+        },
+        freshness: Default::default(),
+        rules: Vec::new(),
+        connectors: Vec::new(),
+        templates: templates(),
+    };
+    seal(&bundle, &root_key()).unwrap()
+}
+
+async fn enrol_agent<S: Store>(a: &Authority<S>, name: &str, k: &SigningKey) {
+    let code = a
+        .offer_enrolment(&id("ana"), EnrolKind::Agent, &id(name), NOW)
+        .await
+        .unwrap();
+    let asked = request(k, EnrolKind::Agent, name, k.public(), &code);
+    a.enrol(&code, &asked, NOW).await.unwrap();
+}
+
+fn ask(agent: &str, kid: &str, template: &str) -> MandateAsk {
+    MandateAsk {
+        agent: id(agent),
+        key: id(kid),
+        template: id(template),
+        grants: vec![grant(&["issue.update"], &["jira/project/pay/*"])],
+        life_secs: 1800,
+        limits: Limits::default(),
+    }
+}
+
+/// Check a mandate as a gate holding the templates would.
+fn as_a_gate(mandate: &Envelope, revoked: &RevocationSet) -> Result<Vec<Mandate>, gov_core::Error> {
+    let issuers = KeySet::new([mandates_key().public()]);
+    let held = templates();
+    verify_chain(
+        mandate,
+        &ChainCheck {
+            scope: &scope(),
+            authority: &issuers,
+            now: NOW,
+            revoked,
+            templates: Some(&held),
+        },
+    )
+    .map(|c| c.links().to_vec())
+}
+
+fn delegate_request(
+    signer: &SigningKey,
+    parent: &Id,
+    to: (&str, &str),
+    change: &dyn Fn(&mut DelegateRequest),
+) -> Envelope {
+    let mut r = DelegateRequest {
+        v: 1,
+        tenant: id("acme"),
+        env: id("prod"),
+        authority: id("authority"),
+        parent: parent.clone(),
+        agent: id(to.0),
+        key: id(to.1),
+        grants: vec![grant(&["issue.update"], &["jira/project/pay/issue/*"])],
+        expires_at: NOW + 600,
+        limits: Limits::default(),
+        nonce: id("n-1"),
+        at: NOW,
+    };
+    change(&mut r);
+    seal(&r, signer).unwrap()
+}
+
+/// An installation with a published bundle, three agents with enrolled keys (two of ben's,
+/// one of cy's), and nothing issued yet.
+async fn ready<S: Store>(store: S) -> (Authority<S>, SigningKey, SigningKey, SigningKey) {
+    let a = installed(store).await;
+    let ana = id("ana");
+    a.add_person(&ana, &id("cy"), Role::Owner, NOW)
+        .await
+        .unwrap();
+    a.add_person(&ana, &id("aud"), Role::Auditor, NOW)
+        .await
+        .unwrap();
+    for (agent, owner) in [("helper-bot", "ben"), ("cy-bot", "cy")] {
+        a.register_agent(&ana, &id(agent), &id(owner), BTreeSet::new(), NOW)
+            .await
+            .unwrap();
+    }
+    let (refund, helper, cys) = (
+        key("refund-bot:k1", 9),
+        key("helper-bot:k1", 12),
+        key("cy-bot:k1", 13),
+    );
+    enrol_agent(&a, "refund-bot", &refund).await;
+    enrol_agent(&a, "helper-bot", &helper).await;
+    enrol_agent(&a, "cy-bot", &cys).await;
+    (a, refund, helper, cys)
+}
+
+/// Issuing to a person's request: who may ask, what may be asked for, and what is written.
+async fn issuing<S: Store>(store: S) {
+    let (a, _refund, _, _) = ready(store).await;
+    let (ana, ben, cy) = (id("ana"), id("ben"), id("cy"));
+    let good = ask("refund-bot", "refund-bot:k1", "triage");
+
+    // No bundle published: there is no template to issue from.
+    assert!(a.issue_mandate(&ben, &good, NOW).await.is_err());
+    // A bundle that does not list this Authority's mandates key: it issues nothing.
+    let other = key("authority:mandates-9", 79).public();
+    a.publish_bundle(&ana, &policy(1, vec![other]), NOW)
+        .await
+        .unwrap();
+    assert!(matches!(
+        a.issue_mandate(&ben, &good, NOW).await,
+        Err(AuthorityError::Unknown("mandates key in the bundle"))
+    ));
+    a.publish_bundle(&ana, &policy(2, vec![mandates_key().public()]), NOW)
+        .await
+        .unwrap();
+    let before = chain(&a).await.len();
+    let refused = |r: Result<Envelope, AuthorityError>| assert!(r.is_err(), "issued");
+
+    // The owner asks, and gets a mandate a gate holding the same templates accepts.
+    let issued = a.issue_mandate(&ben, &good, NOW).await.unwrap();
+    let links = as_a_gate(&issued, &RevocationSet::default()).unwrap();
+    let m = &links[0];
+    assert_eq!(m.agent.id, id("refund-bot"));
+    assert_eq!(m.agent.key, key("refund-bot:k1", 9).public());
+    assert_eq!(m.template.as_str(), "triage@2");
+    assert_eq!((m.issued_at, m.expires_at), (NOW, NOW + 1800));
+    // A ceiling not asked for is the template's, never none.
+    assert_eq!(m.limits, template("triage", true, &[], &[]).limits);
+    // Nobody is signed in yet, and the mandate says so.
+    assert_eq!(
+        (m.issued_by.kind, &m.issued_by.id),
+        (IssuerKind::Person, &ben)
+    );
+    assert!(m.issued_by.session.is_none());
+    // Signed with the mandates key, and with no other key of the Authority's.
+    for wrong in [admin_key().public(), leases_key().public(), root()] {
+        assert!(open::<Mandate>(&issued, &KeySet::new([wrong]), &scope()).is_err());
+    }
+    // One record, in the same step: the mandate's id, the agent, the digest of the mandate.
+    let records = chain(&a).await;
+    assert_eq!(records.len(), before + 1);
+    let last = records.last().unwrap();
+    assert_eq!(
+        (
+            last.action,
+            &last.subject.id,
+            last.about.as_ref().map(|s| &s.id)
+        ),
+        (AdminAction::MandateIssued, &m.id, Some(&id("refund-bot")))
+    );
+    let digest = open::<Mandate>(&issued, &KeySet::new([mandates_key().public()]), &scope())
+        .unwrap()
+        .hash;
+    assert_eq!(last.value.as_ref(), Some(&digest));
+    let kept = a.store().mandate(&scope(), &m.id).await.unwrap().unwrap();
+    assert_eq!(
+        (&kept.envelope, kept.revoked, &kept.root_person),
+        (&issued, false, &ben)
+    );
+    // Two mandates never share an id.
+    let again = a.issue_mandate(&ben, &good, NOW).await.unwrap();
+    assert_ne!(
+        as_a_gate(&again, &RevocationSet::default()).unwrap()[0].id,
+        m.id
+    );
+    let before = chain(&a).await.len();
+
+    // An admin does not thereby hold an agent's authority; nor does another owner.
+    for other in [&ana, &cy] {
+        assert!(matches!(
+            a.issue_mandate(other, &good, NOW).await,
+            Err(AuthorityError::NotAllowed)
+        ));
+    }
+    // Unless the template names them.
+    a.issue_mandate(&cy, &ask("refund-bot", "refund-bot:k1", "shared"), NOW)
+        .await
+        .unwrap();
+    let before = before + 1;
+    // Nobody, and somebody offboarded.
+    assert!(a.issue_mandate(&id("nobody"), &good, NOW).await.is_err());
+
+    // More than the template allows: an operation, a resource, a life, a ceiling.
+    let with = |change: &dyn Fn(&mut MandateAsk)| {
+        let mut wider = good.clone();
+        change(&mut wider);
+        wider
+    };
+    for wider in [
+        with(&|m| m.grants = vec![grant(&["issue.delete"], &["jira/project/pay/*"])]),
+        with(&|m| m.grants = vec![grant(&["issue.update"], &["jira/project/ops/*"])]),
+        with(&|m| m.grants = Vec::new()),
+        with(&|m| m.life_secs = 3601),
+        with(&|m| m.life_secs = 0),
+        with(&|m| m.limits.max_writes = Some(11)),
+        // A template the bundle does not have.
+        with(&|m| m.template = id("admin")),
+        // A key that is not this agent's: another agent's, a gate's, nobody's.
+        with(&|m| m.key = id("helper-bot:k1")),
+        with(&|m| m.key = id("ghost:k1")),
+        // An agent nobody registered.
+        with(&|m| m.agent = id("ghost")),
+    ] {
+        refused(a.issue_mandate(&ben, &wider, NOW).await);
+    }
+    assert_eq!(chain(&a).await.len(), before);
+    // A narrower ceiling than the template's is kept as asked.
+    let narrow = with(&|m| m.limits.max_writes = Some(3));
+    let issued = a.issue_mandate(&ben, &narrow, NOW).await.unwrap();
+    let links = as_a_gate(&issued, &RevocationSet::default()).unwrap();
+    assert_eq!(links[0].limits.max_writes, Some(3));
+
+    // A person who has left asks for nothing, though the template still names them.
+    a.offboard_person(&ana, &cy, NOW).await.unwrap();
+    assert!(matches!(
+        a.issue_mandate(&cy, &ask("refund-bot", "refund-bot:k1", "shared"), NOW)
+            .await,
+        Err(AuthorityError::NotAllowed)
+    ));
+    // Nor do they see anything.
+    assert!(matches!(
+        a.list_mandates(&cy).await,
+        Err(AuthorityError::NotAllowed)
+    ));
+
+    // A suspended agent is issued nothing.
+    a.suspend_agent(&ana, &id("refund-bot"), NOW).await.unwrap();
+    refused(a.issue_mandate(&ben, &good, NOW).await);
+}
+both_stores!(
+    a_mandate_is_issued_to_its_agents_owner_inside_a_template,
+    issuing
+);
+
+/// Delegating: at the signed request of the agent holding the parent, narrower, to an
+/// agent whose owner agrees, once.
+async fn delegating<S: Store>(store: S) {
+    let (a, refund, helper, cys) = ready(store).await;
+    let (ana, ben) = (id("ana"), id("ben"));
+    a.publish_bundle(&ana, &policy(1, vec![mandates_key().public()]), NOW)
+        .await
+        .unwrap();
+    let parent_env = a
+        .issue_mandate(&ben, &ask("refund-bot", "refund-bot:k1", "triage"), NOW)
+        .await
+        .unwrap();
+    let parent = as_a_gate(&parent_env, &RevocationSet::default()).unwrap()[0].clone();
+    let to_helper = ("helper-bot", "helper-bot:k1");
+    let before = chain(&a).await.len();
+    let refused = |r: Result<Envelope, AuthorityError>| {
+        assert!(
+            matches!(r, Err(AuthorityError::Refused)),
+            "{:?}",
+            r.map(|_| ())
+        );
+    };
+
+    // What is not a request the Authority serves.
+    for bad in [
+        // Signed by another agent's key, or naming another Authority.
+        delegate_request(&helper, &parent.id, to_helper, &|_| {}),
+        delegate_request(&refund, &parent.id, to_helper, &|r| {
+            r.authority = id("another")
+        }),
+        // Too old, or dated ahead.
+        delegate_request(&refund, &parent.id, to_helper, &|r| r.at = NOW - 301),
+        delegate_request(&refund, &parent.id, to_helper, &|r| r.at = NOW + 301),
+        // A mandate that does not exist.
+        delegate_request(&refund, &id("m-none"), to_helper, &|_| {}),
+        // Wider than the parent: an operation it lacks, a resource outside, a later end.
+        delegate_request(&refund, &parent.id, to_helper, &|r| {
+            r.grants = vec![grant(&["issue.read"], &["jira/project/pay/*"])]
+        }),
+        delegate_request(&refund, &parent.id, to_helper, &|r| {
+            r.grants = vec![grant(&["issue.update"], &["jira/project/ops/*"])]
+        }),
+        delegate_request(&refund, &parent.id, to_helper, &|r| {
+            r.expires_at = NOW + 1801
+        }),
+        delegate_request(&refund, &parent.id, to_helper, &|r| {
+            r.limits.max_writes = Some(11)
+        }),
+        // To itself, to a key that is not the receiver's, to an agent nobody registered.
+        delegate_request(
+            &refund,
+            &parent.id,
+            ("refund-bot", "refund-bot:k1"),
+            &|_| {},
+        ),
+        delegate_request(&refund, &parent.id, ("helper-bot", "cy-bot:k1"), &|_| {}),
+        delegate_request(&refund, &parent.id, ("ghost", "ghost:k1"), &|_| {}),
+        // To an agent whose owner is not the person at the root: nobody asked cy (GR-139).
+        delegate_request(&refund, &parent.id, ("cy-bot", "cy-bot:k1"), &|_| {}),
+    ] {
+        refused(a.delegate(&bad, NOW).await);
+    }
+    assert_eq!(chain(&a).await.len(), before);
+
+    // Served: a child a gate accepts as a chain of two, under the parent's template.
+    let asked = delegate_request(&refund, &parent.id, to_helper, &|_| {});
+    let child_env = a.delegate(&asked, NOW).await.unwrap();
+    let links = as_a_gate(&child_env, &RevocationSet::default()).unwrap();
+    assert_eq!(links.len(), 2);
+    let child = &links[0];
+    assert_eq!(
+        (&child.agent.id, &child.agent.key),
+        (&id("helper-bot"), &helper.public())
+    );
+    assert_eq!(
+        (child.issued_by.kind, &child.issued_by.id),
+        (IssuerKind::Agent, &id("refund-bot"))
+    );
+    assert_eq!(
+        (&child.template, child.expires_at),
+        (&parent.template, NOW + 600)
+    );
+    assert_eq!(links[1].id, parent.id);
+    // The record is about the child agent, and the asking agent is its actor.
+    let records = chain(&a).await;
+    let last = records.last().unwrap();
+    assert_eq!(records.len(), before + 1);
+    assert_eq!(
+        (
+            last.action,
+            &last.subject.id,
+            last.about.as_ref().map(|s| &s.id)
+        ),
+        (
+            AdminAction::MandateIssued,
+            &child.id,
+            Some(&id("helper-bot"))
+        )
+    );
+    assert_eq!(
+        (&last.actor.id, last.actor.verified),
+        (&id("refund-bot"), false)
+    );
+    let kept = a
+        .store()
+        .mandate(&scope(), &child.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (&kept.root_person, &kept.parent),
+        (&ben, &Some(parent.id.clone()))
+    );
+
+    // The same request is never served twice.
+    refused(a.delegate(&asked, NOW).await);
+    assert_eq!(chain(&a).await.len(), before + 1);
+
+    // A template that names who may receive lets cy's agent take a delegation.
+    let shared = a
+        .issue_mandate(&ben, &ask("refund-bot", "refund-bot:k1", "shared"), NOW)
+        .await
+        .unwrap();
+    let shared = as_a_gate(&shared, &RevocationSet::default()).unwrap()[0].clone();
+    let to_cy = delegate_request(&refund, &shared.id, ("cy-bot", "cy-bot:k1"), &|_| {});
+    let cys_env = a.delegate(&to_cy, NOW).await.unwrap();
+    // And the holder of that child asks in its turn, with its own key, for a third link.
+    let cys_mandate = as_a_gate(&cys_env, &RevocationSet::default()).unwrap()[0].clone();
+    let third = delegate_request(&cys, &cys_mandate.id, to_helper, &|r| {
+        r.nonce = id("n-3");
+        r.expires_at = NOW + 300;
+    });
+    // helper-bot is ben's, and ben is the person at the root.
+    let third = a.delegate(&third, NOW).await.unwrap();
+    assert_eq!(
+        as_a_gate(&third, &RevocationSet::default()).unwrap().len(),
+        3
+    );
+
+    // A template that does not allow delegating.
+    let solo = a
+        .issue_mandate(&ben, &ask("refund-bot", "refund-bot:k1", "solo"), NOW)
+        .await
+        .unwrap();
+    let solo = as_a_gate(&solo, &RevocationSet::default()).unwrap()[0].clone();
+    refused(
+        a.delegate(
+            &delegate_request(&refund, &solo.id, to_helper, &|_| {}),
+            NOW,
+        )
+        .await,
+    );
+
+    // A revoked parent is delegated from no more, and its child no longer verifies at a
+    // gate that has read the feed: one entry covers the descendants.
+    a.revoke_mandate(&ben, &parent.id, NOW).await.unwrap();
+    let fresh = delegate_request(&refund, &parent.id, to_helper, &|r| r.nonce = id("n-9"));
+    refused(a.delegate(&fresh, NOW).await);
+    let mut revoked = RevocationSet::default();
+    revoked.revoke(Revocable::Mandate, parent.id.clone());
+    assert_eq!(
+        as_a_gate(&child_env, &revoked).unwrap_err(),
+        gov_core::Error::Revoked
+    );
+}
+both_stores!(
+    a_mandate_is_delegated_narrower_at_its_holders_signed_request,
+    delegating
+);
+
+/// Listing, revoking, and the feed a gate reads.
+async fn revoking<S: Store>(store: S) {
+    let (a, _refund, _, _) = ready(store).await;
+    let (ana, ben, cy, aud) = (id("ana"), id("ben"), id("cy"), id("aud"));
+    a.publish_bundle(&ana, &policy(1, vec![mandates_key().public()]), NOW)
+        .await
+        .unwrap();
+    let mut issued = Vec::new();
+    for (owner, agent) in [(&ben, "refund-bot"), (&ben, "helper-bot"), (&cy, "cy-bot")] {
+        let env = a
+            .issue_mandate(owner, &ask(agent, &format!("{agent}:k1"), "triage"), NOW)
+            .await
+            .unwrap();
+        issued.push(
+            as_a_gate(&env, &RevocationSet::default()).unwrap()[0]
+                .id
+                .clone(),
+        );
+    }
+    let (m_refund, m_helper, m_cy) = (&issued[0], &issued[1], &issued[2]);
+
+    // A person sees the mandates of agents they own; an admin and an auditor see all.
+    let seen = |who: Id| {
+        let a = &a;
+        async move {
+            let mut ids: Vec<Id> = a
+                .list_mandates(&who)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|m| m.id)
+                .collect();
+            ids.sort();
+            ids
+        }
+    };
+    let sorted = |mut v: Vec<Id>| {
+        v.sort();
+        v
+    };
+    assert_eq!(
+        seen(ben.clone()).await,
+        sorted(vec![m_refund.clone(), m_helper.clone()])
+    );
+    assert_eq!(seen(cy.clone()).await, vec![m_cy.clone()]);
+    assert_eq!(seen(ana.clone()).await, sorted(issued.clone()));
+    assert_eq!(seen(aud.clone()).await, sorted(issued.clone()));
+    assert!(a.list_mandates(&id("nobody")).await.is_err());
+
+    // Before anything is revoked the feed is empty, and is the leases key's to sign.
+    let leases = KeySet::new([leases_key().public()]);
+    let feed = |after: u64, now: i64| {
+        let (a, leases) = (&a, &leases);
+        async move {
+            let env = a.revocation_feed(after, now).await.unwrap();
+            for wrong in [admin_key().public(), mandates_key().public(), root()] {
+                assert!(open::<RevocationFeed>(&env, &KeySet::new([wrong]), &scope()).is_err());
+            }
+            let feed = open::<RevocationFeed>(&env, leases, &scope()).unwrap().doc;
+            feed.validate().unwrap();
+            feed
+        }
+    };
+    let empty = feed(0, NOW).await;
+    assert_eq!(
+        (empty.through, empty.dropped, empty.entries.len()),
+        (0, 0, 0)
+    );
+
+    // Another owner, and an auditor, revoke nothing of ben's. Ben does; so may an admin.
+    let before = chain(&a).await.len();
+    for other in [&cy, &aud, &id("nobody")] {
+        assert!(matches!(
+            a.revoke_mandate(other, m_refund, NOW).await,
+            Err(AuthorityError::NotAllowed)
+        ));
+    }
+    assert_eq!(a.revoke_mandate(&ben, m_refund, NOW).await.unwrap(), 1);
+    assert_eq!(a.revoke_mandate(&ana, m_cy, NOW).await.unwrap(), 2);
+    // Revoked once.
+    assert!(a.revoke_mandate(&ben, m_refund, NOW).await.is_err());
+    assert!(a.revoke_mandate(&ben, &id("m-none"), NOW).await.is_err());
+    let records = chain(&a).await;
+    assert_eq!(records.len(), before + 2);
+    let last = records.last().unwrap();
+    assert_eq!(
+        (last.action, &last.subject.id),
+        (AdminAction::Revoked, m_cy)
+    );
+    assert!(
+        a.store()
+            .mandate(&scope(), m_refund)
+            .await
+            .unwrap()
+            .unwrap()
+            .revoked
+    );
+    assert!(a
+        .list_mandates(&ben)
+        .await
+        .unwrap()
+        .iter()
+        .any(|m| &m.id == m_refund && m.revoked));
+
+    // The feed: numbered from 1 with no gaps, and what it names is what a gate refuses.
+    let all = feed(0, NOW).await;
+    assert_eq!((all.after, all.through, all.dropped), (0, 2, 0));
+    assert_eq!(
+        all.entries
+            .iter()
+            .map(|e| (e.seq, e.kind, &e.id))
+            .collect::<Vec<_>>(),
+        vec![
+            (1, Revocable::Mandate, m_refund),
+            (2, Revocable::Mandate, m_cy)
+        ]
+    );
+    assert_eq!(all.entries[0].until, NOW + 1800);
+    let mut set = RevocationSet::default();
+    all.apply(&mut set);
+    let kept = a
+        .store()
+        .mandate(&scope(), m_refund)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        as_a_gate(&kept.envelope, &set).unwrap_err(),
+        gov_core::Error::Revoked
+    );
+    // From a number already read, only what is later; from beyond the newest, nothing.
+    let later = feed(1, NOW).await;
+    assert_eq!((later.entries.len(), later.entries[0].seq), (1, 2));
+    assert!(matches!(
+        a.revocation_feed(3, NOW).await,
+        Err(AuthorityError::Refused)
+    ));
+
+    // Suspending an agent revokes its live mandates, each with its own record, and puts
+    // nothing in the feed that would have to be undone: no agent id (GR-140).
+    let before = chain(&a).await.len();
+    a.suspend_agent(&ana, &id("helper-bot"), NOW).await.unwrap();
+    let records = chain(&a).await;
+    assert_eq!(records.len(), before + 2);
+    assert_eq!(
+        (records[before].action, &records[before].subject.id),
+        (AdminAction::Revoked, m_helper)
+    );
+    assert_eq!(records[before + 1].action, AdminAction::AgentSuspended);
+    let after_suspend = feed(0, NOW).await;
+    assert_eq!(after_suspend.through, 3);
+    assert!(after_suspend
+        .entries
+        .iter()
+        .all(|e| e.kind == Revocable::Mandate));
+    // Resumed, the agent is issued a new mandate; the old one stays revoked.
+    a.resume_agent(&ana, &id("helper-bot"), NOW).await.unwrap();
+    a.issue_mandate(&ben, &ask("helper-bot", "helper-bot:k1", "triage"), NOW)
+        .await
+        .unwrap();
+    assert!(
+        a.store()
+            .mandate(&scope(), m_helper)
+            .await
+            .unwrap()
+            .unwrap()
+            .revoked
+    );
+
+    // Disabling is for good: the new mandate is revoked, and the agent's id joins the feed.
+    a.disable_agent(&ana, &id("helper-bot"), NOW).await.unwrap();
+    let after_disable = feed(0, NOW).await;
+    assert_eq!(after_disable.through, 5);
+    let last = after_disable.entries.last().unwrap();
+    assert_eq!(
+        (last.seq, last.kind, &last.id, last.until),
+        (5, Revocable::Agent, &id("helper-bot"), i64::MAX)
+    );
+
+    // Long after the mandates would have expired anyway, their entries are left out and
+    // counted, so the asker sees every number accounted for; the agent's stays.
+    let much_later = feed(0, NOW + 1800 + 301).await;
+    assert_eq!((much_later.through, much_later.dropped), (5, 4));
+    assert_eq!(much_later.entries.len(), 1);
+    assert_eq!(much_later.entries[0].kind, Revocable::Agent);
+    // Just inside the allowance they are all still there.
+    assert_eq!(feed(0, NOW + 1800 + 300).await.dropped, 0);
+
+    // Offboarding a person revokes their agents' mandates too.
+    let m_new = a
+        .issue_mandate(&cy, &ask("cy-bot", "cy-bot:k1", "triage"), NOW)
+        .await
+        .unwrap();
+    let m_new = as_a_gate(&m_new, &RevocationSet::default()).unwrap()[0]
+        .id
+        .clone();
+    a.offboard_person(&ana, &cy, NOW).await.unwrap();
+    assert!(
+        a.store()
+            .mandate(&scope(), &m_new)
+            .await
+            .unwrap()
+            .unwrap()
+            .revoked
+    );
+
+    // A bundle that does not list this Authority's leases key: it signs no feed.
+    let other = key("authority:leases-9", 78).public();
+    a.publish_bundle(
+        &ana,
+        &policy_with(2, vec![mandates_key().public()], other),
+        NOW,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        a.revocation_feed(0, NOW).await,
+        Err(AuthorityError::Unknown("leases key in the bundle"))
+    ));
+
+    // Last, since it writes a made-up record: the store takes a revocation only under the
+    // next number, and writes nothing of a commit that carries any other.
+    let held: Vec<u64> = a
+        .store()
+        .revocations_after(&scope(), 0)
+        .await
+        .unwrap()
+        .iter()
+        .map(|e| e.seq)
+        .collect();
+    let newest = *held.last().unwrap();
+    let records = a.store().records_after(&scope(), 0, 1000).await.unwrap();
+    let head = records.last().unwrap().clone();
+    for wrong in [newest, newest + 2, 1] {
+        let record = StoredRecord {
+            seq: head.seq + 1,
+            ..head.clone()
+        };
+        let entry = gov_core::revocation::RevocationEntry {
+            seq: wrong,
+            kind: Revocable::Mandate,
+            id: id("m-made-up"),
+            until: NOW,
+        };
+        let refused = a
+            .store()
+            .commit(&scope(), &record, &[Effect::AddRevocation(entry)])
+            .await;
+        assert!(matches!(refused, Err(StoreError::HeadMoved)), "{wrong}");
+    }
+    let after: Vec<u64> = a
+        .store()
+        .revocations_after(&scope(), 0)
+        .await
+        .unwrap()
+        .iter()
+        .map(|e| e.seq)
+        .collect();
+    assert_eq!(after, held);
+    assert_eq!(
+        a.store().records_after(&scope(), 0, 1000).await.unwrap(),
+        records
+    );
+}
+both_stores!(a_mandate_is_listed_revoked_and_named_in_the_feed, revoking);

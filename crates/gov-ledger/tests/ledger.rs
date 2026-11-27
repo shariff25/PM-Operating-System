@@ -1266,7 +1266,11 @@ async fn two_kinds<S: Store>(store: S) {
             .iter()
             .map(|f| (f.problem.clone(), f.gate.clone()))
             .collect::<Vec<_>>(),
-        vec![(Problem::KeyNotEnrolled, Some(id("gate-1")))]
+        vec![
+            (Problem::KeyNotEnrolled, Some(id("gate-1"))),
+            // And its receipts name a mandate, m-1, that this Authority never issued.
+            (Problem::MandateNotIssued, Some(id("gate-1"))),
+        ]
     );
     // The export and the keys survive a trip through JSON with their kinds.
     let export2: Export = serde_json::from_str(&serde_json::to_string(&export).unwrap()).unwrap();

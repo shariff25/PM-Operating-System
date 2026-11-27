@@ -154,6 +154,9 @@ fn describe(problem: &Problem) -> String {
         Problem::KeyNotEnrolled => {
             "a trusted key of this gate matches no witnessed record of its enrolment".into()
         }
+        Problem::MandateNotIssued => {
+            "a proven receipt names a mandate no witnessed record says was issued".into()
+        }
         Problem::ReceiptAfterRetirement => {
             "a receipt is dated after its gate was disabled or its key revoked".into()
         }
