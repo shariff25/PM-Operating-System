@@ -535,6 +535,6 @@ async fn a_lease_for_another_bundle_than_the_gate_decides_from_is_not_complete()
         let status = open_a_session(forwarder.clone()).await;
         assert_eq!(status == 200, opens, "{spool}: {status}");
         let refused = forwarder.sessions_refused().unwrap();
-        assert_eq!(refused.get(why::NO_LEASE).is_some(), !opens, "{spool}");
+        assert_eq!(refused.contains_key(why::NO_LEASE), !opens, "{spool}");
     }
 }
