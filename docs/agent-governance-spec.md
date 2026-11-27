@@ -951,6 +951,23 @@ reviewer ran the tests of `gov-core`, `gov-authority` and `gov-gate` without Pos
 | GR-168 | Low | An Authority whose clock or database goes back has its leases refused by every gate; right, but unsaid and unshown | §7.6.3, point 2: stated, with a reason of its own on the operator's address |
 | GR-169 | Low | The renewal listener needs the Ledger listener's hardening, and the text should say what is not on it | §7.6.3, point 11 |
 
+### Twenty-third read, 2026-11-27: the revised maps and CG0a at `cc6f5b5`
+
+**Verdict: no High or Critical; the gate still passes. GR-158, GR-159 and GR-160 are
+closed, so the three maps may back shadow mode as well as observe mode. Enforce mode
+still waits on GR-161.** CG0a passes, and the reviewer confirmed its three defaults and
+the rule that the stricter of two entries wins. It compared every tool with the maps it
+read before and checked each of the eighteen remaining undo claims against the listings;
+as before, against the listings and not live systems. GR-162 to GR-165 are closed or
+stated.
+
+| Id | Severity | What | Done |
+|---|---|---|---|
+| GR-170 | Low | A `restore` needs the earlier value, and the build checks only that a tool exists to write it back. GitHub's two subscription tools are marked `restore` and the listing has no tool that reads a subscription | To fix on `build/gov-review-23` |
+| GR-171 | Low | A receipt's cause may point at receipt number 0; receipts are numbered from 1 | To fix |
+| GR-172 | Low | A call whose proof failed is still forwarded in observe and shadow modes, so the agent may have read the data, yet its receipt raises no label: the shadow flow check under-counts such reads | To state in the access governance spec |
+| GR-173 | Info | The library's maps carry no labels, so every read raises a mandate to restricted and untrusted until a deployment labels its resources: the shadow flow check will flag nearly everything at first | Noted in the access governance spec |
+
 ## 1. What is being built
 
 Agent Governance is a second product, separate from PM OS. It has three parts.
