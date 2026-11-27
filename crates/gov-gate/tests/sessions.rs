@@ -8,7 +8,7 @@ use gov_core::request::{RequestProof, SessionOpen};
 use gov_core::{
     seal, Digest, Envelope, Id, KeySet, ResourcePath, ResourcePattern, Scope, SigningKey,
 };
-use gov_gate::sessions::{OpenRefused, Proved, Sessions, SessionsConfig};
+use gov_gate::sessions::{why, OpenRefused, Proved, Sessions, SessionsConfig};
 use serde_json::json;
 
 const NOW: i64 = 1_800_000_000;
@@ -172,12 +172,17 @@ fn only_the_keys_holder_opens_a_session() {
         Err(OpenRefused::Invalid)
     );
     assert!(s.is_empty());
+    // The asker is told nothing of why; the operator's count says (finding GR-155).
+    let count = |s: &Sessions, why: &str| s.refusals().get(why).copied().unwrap_or(0);
+    assert_eq!((count(&s, why::REQUEST), count(&s, why::MANDATE)), (4, 2));
 
     // The real one opens; the same signed request played again does not.
     let request = ask(&agent(), "gate-1", "n-7", NOW);
     s.open(&m, &request, NOW).unwrap();
     assert_eq!(s.open(&m, &request, NOW + 1), Err(OpenRefused::Invalid));
     assert_eq!(s.len(), 1);
+    assert_eq!(count(&s, why::REPLAY), 1);
+    assert_eq!(s.refusals().values().sum::<u64>(), 7);
 
     // A time at either end of the range is refused like any other; it does not stop the
     // gate (review finding GR-102).
@@ -401,6 +406,7 @@ fn unproven_sessions_never_push_out_a_proven_one() {
         }
     }
     assert_eq!(opened, 2);
+    assert_eq!(s.refusals().get(why::BUSY), Some(&8));
     let d = action(2, 2);
     assert!(matches!(
         s.prove(
@@ -468,4 +474,51 @@ fn unproven_sessions_never_push_out_a_proven_one() {
         ),
         Proved::Proven(_)
     ));
+}
+
+/// A mandate that a trusted key signed and that names no template of the bundle held, or
+/// goes wider than the one it names, is refused, and counted apart from every other
+/// refusal: signed with the real key, it is what a taken mandates key looks like (review
+/// findings GR-138 and GR-155).
+#[test]
+fn a_mandate_outside_its_template_is_counted_as_that() {
+    use gov_core::mandate::Template;
+    let template = |resource: &str| Template {
+        id: id("triage"),
+        grants: vec![Grant {
+            system: id("jira"),
+            operations: [id("issue.update")].into(),
+            resources: vec![ResourcePattern::new(resource).unwrap()],
+        }],
+        max_life_secs: 3600,
+        limits: Limits::default(),
+        delegable: false,
+        people: Default::default(),
+        receivers: Default::default(),
+    };
+    let with = |templates: Vec<Template>| {
+        let mut config =
+            SessionsConfig::new(scope(), id("gate-1"), KeySet::new([issuer().public()]));
+        config.templates = Some(templates);
+        Sessions::new(config)
+    };
+    let m = mandate(&agent(), NOW + 600);
+
+    // Within its template: opened, and nothing counted.
+    let mut s = with(vec![template("jira/project/pay/*")]);
+    s.open(&m, &ask(&agent(), "gate-1", "n-1", NOW), NOW)
+        .unwrap();
+    assert!(s.refusals().is_empty());
+
+    // Wider than its template, and a template the bundle does not hold.
+    for held in [vec![template("jira/project/pay/issue/pay-1")], Vec::new()] {
+        let mut s = with(held);
+        assert_eq!(
+            s.open(&m, &ask(&agent(), "gate-1", "n-2", NOW), NOW),
+            Err(OpenRefused::Invalid)
+        );
+        assert_eq!(s.refusals().get(why::TEMPLATE), Some(&1));
+        assert_eq!(s.refusals().len(), 1);
+        assert!(s.is_empty());
+    }
 }

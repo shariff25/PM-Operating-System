@@ -188,6 +188,38 @@ pub fn replies(event_stream: bool, body: &[u8]) -> Vec<Value> {
     }
 }
 
+/// The most separate things a [`Tally`] counts by name.
+pub const TALLY_KEYS: usize = 256;
+
+/// Counts under names an agent can choose (the tools it calls). It holds a fixed number of
+/// names; what comes after is counted together under `other`, so that calling ten thousand
+/// tools that do not exist costs the gate nothing (as review finding GR-74 asks of refusals).
+#[derive(Debug, Default)]
+pub struct Tally(Mutex<BTreeMap<String, u64>>);
+
+impl Tally {
+    pub fn add(&self, key: &str) {
+        let mut counts = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = if counts.contains_key(key) || counts.len() < TALLY_KEYS {
+            key
+        } else {
+            "other"
+        };
+        let n = counts.entry(key.to_string()).or_default();
+        *n = n.saturating_add(1);
+    }
+
+    pub fn counts(&self) -> BTreeMap<String, u64> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
 /// What an operator must be able to see (spec §3.4: observe mode protects nothing, and what
 /// it failed to record must not be silent). `not_recorded` is also kept in the spool's state,
 /// where it outlives a restart.
@@ -199,6 +231,9 @@ pub struct Counters {
     pub not_recorded: AtomicU64,
     /// Tool calls the connector map could not classify.
     pub unmapped: AtomicU64,
+    /// The same, by the operation each was recorded under (`unmapped-` and a digest of the
+    /// tool's name): which tools the map is missing, or no longer fits (slice CM2).
+    pub unmapped_by_tool: Tally,
     /// Rounds of shipping in which the Ledger took nothing.
     pub ship_no_progress: AtomicU64,
     /// Tool calls whose agent proved its key (through the shim).
@@ -255,6 +290,16 @@ struct Answer {
 }
 
 impl<S: Spool + 'static> Forwarder<S> {
+    /// Requests to open a session that were refused, by why; `None` where the gate opens no
+    /// sessions. For the operator alone (review finding GR-155).
+    pub fn sessions_refused(&self) -> Option<BTreeMap<&'static str, u64>> {
+        self.sessions.as_ref().map(|s| {
+            s.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .refusals()
+        })
+    }
+
     pub fn new(gate: Gate<S>, mut config: ForwarderConfig) -> Result<Arc<Self>, GateError> {
         config.map.validate()?;
         let sessions = config.sessions.take().map(|c| Mutex::new(Sessions::new(c)));
@@ -692,6 +737,9 @@ async fn call<S: Spool + 'static>(
                 let mapped = f.config.map.map(&tool, listed.as_ref(), &args, &salt);
                 if !mapped.known {
                     f.counters.unmapped.fetch_add(1, Ordering::Relaxed);
+                    f.counters
+                        .unmapped_by_tool
+                        .add(mapped.action.operation.as_str());
                 }
                 let now = (f.clock)();
                 // Who made the call. Proven is said by `Sessions::prove` alone, for the

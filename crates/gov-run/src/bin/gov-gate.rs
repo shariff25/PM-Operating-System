@@ -213,6 +213,9 @@ async fn serve(s: Serve) -> anyhow::Result<()> {
                 "recorded": c.counters.recorded.load(Ordering::Relaxed),
                 "not_recorded": c.counters.not_recorded.load(Ordering::Relaxed),
                 "unmapped": c.counters.unmapped.load(Ordering::Relaxed),
+                "unmapped_by_tool": c.counters.unmapped_by_tool.counts(),
+                // Requests to open a session that were refused, by why (GR-155).
+                "sessions_refused": c.sessions_refused(),
                 "ship_no_progress": c.counters.ship_no_progress.load(Ordering::Relaxed),
                 "proven": c.counters.proven.load(Ordering::Relaxed),
                 "proof_failed": c.counters.proof_failed.load(Ordering::Relaxed),

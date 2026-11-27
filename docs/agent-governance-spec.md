@@ -420,9 +420,11 @@ reviewer.
   - "The same request is never served twice" is kept by taking the child mandate's id from
     the request's own hash, not by remembering nonces: a second copy asks for an id that
     exists.
-  - Stopping an agent revokes its mandates **before** the record that stops it, as
-    separate records, not in one step: a stop between the two leaves an agent with less
-    authority than it should have, never more.
+  - Stopping an agent revokes its mandates as separate records, not in one step with
+    the record that stops it: once **before** that record, so a stop halfway leaves an
+    agent with less authority than it should have, and once **after** it, for a mandate
+    issued while the first round ran (GR-152, fixed after the twentieth read). Asking
+    again for a stop that was interrupted finishes it.
   - The Authority is still a library. The gate does not read the revocation feed, so a
     revoked mandate still opens a session until G4d; nothing is served until G4e.
   - A call under a mandate the gate will not open a session for is forwarded, as
@@ -465,7 +467,11 @@ reviewer.
     and the server's own read-only hint agree on all 91 tools, and a test holds them to it.
   - Slack choices: every tool that posts reaches people; a channel is its id, and a
     channel given by name is recorded as unknown.
-  - Still to build: the gate's count of calls to unmapped tools by digest (CM2).
+  - **CM2's count:** the gate's operator address shows `unmapped_by_tool`: calls the map
+    could not read, by the operation each was recorded under (`unmapped-` and a digest of
+    the tool's name). `gov map drift` prints the same name beside each tool it reports,
+    so an operator can tell which tool a count is for. The count holds 256 names and
+    adds the rest together; it is lost at a restart (the receipts are not).
 
 ## Security review of 2026-11-26 (first read; the gate did not pass)
 
@@ -863,11 +869,11 @@ were not re-run. **GR-152 and GR-153 are to be fixed before G4d.**
 
 | Id | Severity | What | Done |
 |---|---|---|---|
-| GR-152 | Medium, before G4d | An agent's mandates were revoked before the agent was marked stopped, so a mandate issued in between stayed live under a suspended agent | Open: to fix on `build/gov-review-20` |
-| GR-153 | Medium, before G4d | A leaver's mandates for agents owned by others stayed live | Open: to fix on `build/gov-review-20` |
-| GR-154 | Low | A delegation's record names an agent in the field that elsewhere holds a person: the two cannot be told apart | Open |
-| GR-155 | Low | A refused attempt to open a session leaves no trace | Open |
-| GR-156 | Low | A template's grants for a system that folds case are not required to be lower case | Open |
+| GR-152 | Medium, before G4d | An agent's mandates were revoked before the agent was marked stopped, so a mandate issued in between stayed live under a suspended agent | Fixed on `build/gov-review-20`: revoke, mark, revoke again. Once the agent is marked nothing is issued to it, so the second round leaves none. Stopping an agent already stopped makes the round again and still answers that it is in that state, which finishes a stop that was interrupted |
+| GR-153 | Medium, before G4d | A leaver's mandates for agents owned by others stayed live | Fixed: offboarding revokes every live mandate the leaver is at the root of, and suspends their agents, before the person is marked and again after. The other owner's agent and its other mandates are left alone |
+| GR-154 | Low | A delegation's record names an agent in the field that elsewhere holds a person: the two cannot be told apart | Fixed: the actor has a kind, `agent` for a delegation. It is left out for a person, so earlier records read as they did. `verified` stays false for both until G4e |
+| GR-155 | Low | A refused attempt to open a session leaves no trace | Fixed: the gate counts refusals by why (`mandate`, `template`, `request`, `replay`, `busy`) and shows them on the operator's address as `sessions_refused`. The asker is still told nothing more. A count only: it is lost at a restart, and the record of such attempts is G4d's |
+| GR-156 | Low | A template's grants for a system that folds case are not required to be lower case | Fixed: the bundle's lint refuses it, as it does a rule |
 | GR-157 | Info | CP's design is not in the repository, so nothing of CP can count as through the gate until the reviewer is given it some other way | Noted; CP is not built |
 
 What the reviewer asked to be settled in the text before G4d is built: what a gate does

@@ -277,7 +277,10 @@ fn map(command: MapCommand) -> anyhow::Result<bool> {
                 ("changed", &drift.changed),
             ] {
                 for tool in tools {
-                    println!("{what}: {tool}");
+                    // What a gate records a call to it as, and counts it under for its
+                    // operator, until the map is reviewed again.
+                    let recorded = gov_core::connector::unmapped_operation(tool);
+                    println!("{what}: {tool} (a call is recorded as {recorded})");
                 }
             }
             if drift.none() {

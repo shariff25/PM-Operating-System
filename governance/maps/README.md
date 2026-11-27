@@ -27,6 +27,10 @@ reason, and refuses a review of a tool the server does not list. `drift` exits n
 names the tools a later listing has added, removed or changed in any field (a rewritten
 description is a change: that is where an instruction to the agent would be put).
 
+A gate's operator address (`/healthz`) shows `unmapped_by_tool`: how many calls the map
+could not read, by the operation each was recorded under. `drift` prints that operation
+beside each tool it names, which is how a count is matched to a tool.
+
 To use a map, copy `<server>.json` and `<server>.samples.json` into a policy directory's
 `connectors/`; `gov policy check` runs the samples again before anything is signed.
 
