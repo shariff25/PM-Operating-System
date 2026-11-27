@@ -304,10 +304,17 @@ impl<S: Store> Authority<S> {
         })
     }
 
-    /// A person leaves. Each of their agents is suspended first, with a record each, and
-    /// the person is marked last: stopped halfway, what remains is a person still listed
-    /// whose agents are already stopped, never the other way round. (An agent is in any
-    /// case usable only while its owner is active: see [`Authority::agent_usable`].)
+    /// A person leaves. Their agents are suspended and every live mandate they stand at the
+    /// root of is revoked, each with its own record, and the person is marked after that:
+    /// stopped halfway, what remains is a person still listed whose agents and mandates
+    /// are already stopped, never the other way round. (An agent is in any case usable only
+    /// while its owner is active: see [`Authority::agent_usable`].)
+    ///
+    /// Then the same round is made again, for an agent registered or a mandate issued
+    /// while the first ran: once the person is marked, they can issue nothing and nothing
+    /// can be issued to their agents, so the second round leaves none (review findings
+    /// GR-152 and GR-153). Offboarding someone who has already left makes the rounds again,
+    /// which finishes an offboarding that was interrupted.
     pub async fn offboard_person(&self, actor: &Id, person: &Id, now: i64) -> Result<u64> {
         if actor == person {
             // The last admin cannot remove themselves and leave nobody able to act.
@@ -317,14 +324,8 @@ impl<S: Store> Authority<S> {
         if self.store.person(&self.scope, person).await?.is_none() {
             return Err(AuthorityError::Unknown("person"));
         }
-        for agent in self.store.agents_of(&self.scope, person).await? {
-            match self.suspend_agent(actor, &agent.id, now).await {
-                // Suspended or disabled already.
-                Ok(_) | Err(AuthorityError::Unknown(_)) => {}
-                Err(e) => return Err(e),
-            }
-        }
-        on_head!(self, head, {
+        self.stop_what_a_leaver_holds(actor, person, now).await?;
+        let seq = on_head!(self, head, {
             self.admin(actor).await?;
             let Some(mut leaving) = self.store.person(&self.scope, person).await? else {
                 return Err(AuthorityError::Unknown("person"));
@@ -333,7 +334,31 @@ impl<S: Store> Authority<S> {
             let did = Did::to(AdminAction::PersonOffboarded, SubjectKind::Person, person);
             self.commit(head, actor, did, &[Effect::PutPerson(leaving)], now)
                 .await
-        })
+        })?;
+        self.stop_what_a_leaver_holds(actor, person, now).await?;
+        Ok(seq)
+    }
+
+    /// Suspend a person's agents, and revoke every live mandate the person is at the root
+    /// of: also those for agents other people own, which a template may let them issue
+    /// (review finding GR-153). Revoking the root covers what was delegated from it.
+    async fn stop_what_a_leaver_holds(&self, actor: &Id, person: &Id, now: i64) -> Result<()> {
+        for agent in self.store.agents_of(&self.scope, person).await? {
+            match self.suspend_agent(actor, &agent.id, now).await {
+                // Suspended or disabled already.
+                Ok(_) | Err(AuthorityError::Unknown(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        for m in self.store.mandates(&self.scope).await? {
+            if &m.root_person == person && !m.revoked && m.expires_at > now {
+                match self.revoke(actor, &m.id, true, now).await {
+                    Ok(_) | Err(AuthorityError::Unknown(_)) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Name an agent and the person who answers for it. It has no key until it enrols.
@@ -402,18 +427,27 @@ impl<S: Store> Authority<S> {
         to: Status,
         now: i64,
     ) -> Result<u64> {
-        // Stopping an agent revokes its live mandates first, each with its own record
-        // (spec §7.6.2, point 6).
-        if to != Status::Active {
+        // Stopping an agent revokes its live mandates, each with its own record (spec
+        // §7.6.2, point 6): once before the agent is marked, so that a stop halfway leaves
+        // it with less authority and never more, and once after, for any mandate issued
+        // while the first round ran. After the mark none can be issued, so the second round
+        // leaves none (review finding GR-152).
+        let stopping = to != Status::Active;
+        if stopping {
             self.admin(actor).await?;
             match self.store.agent(&self.scope, agent).await? {
                 Some(a) if from.contains(&a.status) => {}
+                // Stopped already, perhaps by a stop that did not finish: finish it.
+                Some(a) if a.status == to => {
+                    self.revoke_agents_mandates(actor, agent, now).await?;
+                    return Err(AuthorityError::Unknown("agent in that state"));
+                }
                 Some(_) => return Err(AuthorityError::Unknown("agent in that state")),
                 None => return Err(AuthorityError::Unknown("agent")),
             }
             self.revoke_agents_mandates(actor, agent, now).await?;
         }
-        on_head!(self, head, {
+        let seq = on_head!(self, head, {
             self.admin(actor).await?;
             let Some(mut found) = self.store.agent(&self.scope, agent).await? else {
                 return Err(AuthorityError::Unknown("agent"));
@@ -447,7 +481,11 @@ impl<S: Store> Authority<S> {
             }
             let did = Did::to(action, SubjectKind::Agent, agent);
             self.commit(head, actor, did, &effects, now).await
-        })
+        })?;
+        if stopping {
+            self.revoke_agents_mandates(actor, agent, now).await?;
+        }
+        Ok(seq)
     }
 
     pub async fn suspend_agent(&self, actor: &Id, agent: &Id, now: i64) -> Result<u64> {
@@ -876,9 +914,8 @@ impl<S: Store> Authority<S> {
         self.revoke(actor, mandate, false, now).await
     }
 
-    /// Revoke every live mandate of an agent, each with its own record. Done **before** the
-    /// change that stops the agent, so that a stop between the two leaves an agent with
-    /// less authority than it should have, never more.
+    /// Revoke every live mandate of an agent, each with its own record. Done before the
+    /// change that stops the agent and again after it: see [`Authority::set_agent`].
     async fn revoke_agents_mandates(&self, actor: &Id, agent: &Id, now: i64) -> Result<()> {
         for m in self.store.mandates(&self.scope).await? {
             if &m.agent == agent && !m.revoked && m.expires_at > now {
