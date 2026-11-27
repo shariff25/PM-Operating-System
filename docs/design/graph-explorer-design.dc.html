@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Session investigation</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+body{margin:0;background:#F7F7F8}
+a{color:#4F46E5}a:hover{color:#3730A3}
+button{font:inherit}
+</style>
+</helmet>
+<div style="font-family: Inter, system-ui, sans-serif; color: #18181B; background: #F7F7F8; min-height: 100vh;">
+<div style="background: #FFFFFF; border-bottom: 1px solid #E4E4E7;">
+<div style="max-width: 1440px; margin: 0 auto; padding: 10px 24px; box-sizing: border-box; display: flex; flex-wrap: wrap; align-items: center; gap: 20px;">
+<div style="display: flex; align-items: center; gap: 10px; font-weight: 600; font-size: 15px;"><span aria-hidden="true" style="width: 26px; height: 26px; border-radius: 7px; background: #4F46E5; color: #FFFFFF; display: inline-flex; align-items: center; justify-content: center; font-size: 12px;">AG</span>Agent Governance</div>
+<nav aria-label="Main" style="display: flex; flex-wrap: wrap; gap: 4px; font-size: 13.5px;">
+<a href="#" style="padding: 7px 11px; border-radius: 8px; background: #EEF2FF; color: #3730A3; text-decoration: none; font-weight: 500;">Investigations</a>
+<a href="#" style="padding: 7px 11px; border-radius: 8px; color: #52525B; text-decoration: none;">Review queue</a>
+<a href="#" style="padding: 7px 11px; border-radius: 8px; color: #52525B; text-decoration: none;">Agents</a>
+<a href="#" style="padding: 7px 11px; border-radius: 8px; color: #52525B; text-decoration: none;">Mandates</a>
+<a href="#" style="padding: 7px 11px; border-radius: 8px; color: #52525B; text-decoration: none;">Policy</a>
+<a href="#" style="padding: 7px 11px; border-radius: 8px; color: #52525B; text-decoration: none;">Ledger</a>
+</nav>
+<span style="margin-left: auto; font-size: 12px; padding: 5px 10px; border-radius: 999px; background: #FEF3C7; color: #92400E; font-weight: 500;">Test stack · fake data</span>
+</div>
+</div>
+<main style="max-width: 1440px; margin: 0 auto; padding: 24px; box-sizing: border-box; display: flex; flex-direction: column; gap: 20px;">
+<div style="display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 16px;">
+<div style="display: flex; flex-direction: column; gap: 6px; min-width: 0;">
+<div style="font-size: 12.5px; color: #71717A;">Investigations / Session s-0412</div>
+<h1 style="margin: 0; font-size: 24px; font-weight: 600; letter-spacing: -0.01em;">Echo acting for Priya Raman</h1>
+<div style="font-size: 13px; color: #52525B;">Nov 26, 09:02 to 09:14 · 4 gates · Enforce mode · Policy v14</div>
+</div>
+<div style="display: flex; flex-wrap: wrap; gap: 8px;">
+<button onClick="{{toggleTrace}}" aria-pressed="{{traceStr}}" style="{{traceBtnStyle}}">{{traceLabel}}</button>
+<button style="height: 36px; padding: 0 14px; border-radius: 9px; font-size: 13.5px; font-weight: 500; background: #FFFFFF; color: #18181B; border: 1px solid #D4D4D8; cursor: pointer;">Replay under policy v15</button>
+<button style="height: 36px; padding: 0 14px; border-radius: 9px; font-size: 13.5px; font-weight: 500; background: #FFFFFF; color: #18181B; border: 1px solid #D4D4D8; cursor: pointer;">Export evidence</button>
+</div>
+</div>
+<div style="display: flex; flex-wrap: wrap; gap: 12px;">
+<div style="flex: 1 1 200px; background: #FFFFFF; border: 1px solid #E4E4E7; border-radius: 12px; padding: 14px 16px; display: flex; flex-direction: column; gap: 4px;"><span style="font-size: 12px; color: #71717A;">Actions recorded</span><span style="font-size: 22px; font-weight: 600;">7</span><span style="font-size: 12px; color: #52525B;">6 by Echo, 1 by Researcher</span></div>
+<div style="flex: 1 1 200px; background: #FFFFFF; border: 1px solid #E4E4E7; border-radius: 12px; padding: 14px 16px; display: flex; flex-direction: column; gap: 4px;"><span style="font-size: 12px; color: #71717A;">Refused</span><span style="font-size: 22px; font-weight: 600; color: #B91C1C;">1</span><span style="font-size: 12px; color: #52525B;">label_exceeds_clearance</span></div>
+<div style="flex: 1 1 200px; background: #FFFFFF; border: 1px solid #E4E4E7; border-radius: 12px; padding: 14px 16px; display: flex; flex-direction: column; gap: 4px;"><span style="font-size: 12px; color: #71717A;">Approvals</span><span style="font-size: 22px; font-weight: 600;">2</span><span style="font-size: 12px; color: #52525B;">1 by reviewer agent, 1 by a person</span></div>
+<div style="flex: 1 1 200px; background: #FFFFFF; border: 1px solid #E4E4E7; border-radius: 12px; padding: 14px 16px; display: flex; flex-direction: column; gap: 4px;"><span style="font-size: 12px; color: #71717A;">Session label</span><span style="font-size: 17px; font-weight: 600; color: #C2410C; line-height: 30px;">Confidential · untrusted</span><span style="font-size: 12px; color: #52525B;">Since 09:05 (web fetch)</span></div>
+<div style="flex: 1 1 200px; background: #FFFFFF; border: 1px solid #E4E4E7; border-radius: 12px; padding: 14px 16px; display: flex; flex-direction: column; gap: 4px;"><span style="font-size: 12px; color: #71717A;">Evidence</span><span style="font-size: 17px; font-weight: 600; color: #15803D; line-height: 30px;">Chain verified</span><span style="font-size: 12px; color: #52525B;">Checkpoint #2207 witnessed</span></div>
+</div>
+<div style="display: flex; flex-wrap: wrap; gap: 20px; align-items: flex-start;">
+<section aria-label="Activity graph" style="flex: 999 1 640px; min-width: 0; background: #FFFFFF; border: 1px solid #E4E4E7; border-radius: 14px; padding: 16px; box-sizing: border-box; display: flex; flex-direction: column; gap: 12px;">
+<div style="display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px;">
+<div style="display: flex; flex-direction: column; gap: 2px;"><h2 style="margin: 0; font-size: 16px; font-weight: 600;">Activity graph</h2><span style="font-size: 12.5px; color: #71717A;">Tap any node to inspect it. Trace why lights up everything that led to it.</span></div>
+<div style="display: flex; flex-wrap: wrap; gap: 6px;">
+<button onClick="{{tAuth}}" aria-pressed="{{authStr}}" style="{{authStyle}}">Authority</button>
+<button onClick="{{tFlow}}" aria-pressed="{{flowStr}}" style="{{flowStyle}}">Data flow</button>
+<button onClick="{{tAppr}}" aria-pressed="{{apprStr}}" style="{{apprStyle}}">Approvals</button>
+</div>
+</div>
+<div style="overflow-x: auto; border-radius: 10px; background: #FAFAFA; border: 1px solid #F4F4F5;">
+<div style="position: relative; width: 900px; height: 604px; margin: 0 auto;">
+<span style="position: absolute; left: 16px; top: 10px; font-size: 11px; font-weight: 500; color: #71717A;">Who</span>
+<span style="position: absolute; left: 170px; top: 10px; font-size: 11px; font-weight: 500; color: #71717A;">Agents</span>
+<span style="position: absolute; left: 330px; top: 10px; font-size: 11px; font-weight: 500; color: #71717A;">Mandates and approvals</span>
+<span style="position: absolute; left: 480px; top: 10px; font-size: 11px; font-weight: 500; color: #71717A;">Actions, in order</span>
+<span style="position: absolute; left: 710px; top: 10px; font-size: 11px; font-weight: 500; color: #71717A;">Resources</span>
+<sc-for list="{{edges}}" as="e" hint-placeholder-count="23"><svg width="900" height="604" aria-hidden="true" style="position: absolute; left: 0; top: 0; overflow: visible; pointer-events: none;"><defs><marker id="mk-{{e.id}}" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" style="{{e.mstyle}}"></path></marker></defs><path d="{{e.d}}" style="{{e.style}}"></path></svg></sc-for>
+<sc-for list="{{nodes}}" as="n" hint-placeholder-count="24"><button onClick="{{n.pick}}" aria-label="{{n.aria}}" style="{{n.style}}"><span aria-hidden="true" style="{{n.iconStyle}}">{{n.g}}</span><span style="display: flex; flex-direction: column; min-width: 0; line-height: 1.25;"><span style="font-size: 12.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">{{n.title}}</span><span style="font-size: 11px; color: #71717A; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">{{n.sub}}</span></span></button></sc-for>
+</div>
+</div>
+<div style="display: flex; flex-wrap: wrap; gap: 14px; font-size: 12px; color: #52525B;">
+<span style="display: inline-flex; align-items: center; gap: 6px;"><svg width="22" height="8" aria-hidden="true"><line x1="0" y1="4" x2="22" y2="4" style="stroke: #A1A1AA; stroke-width: 1.5;"></line></svg>Authority</span>
+<span style="display: inline-flex; align-items: center; gap: 6px;"><svg width="22" height="8" aria-hidden="true"><line x1="0" y1="4" x2="22" y2="4" style="stroke: #EA580C; stroke-width: 2;"></line></svg>Read, confidential</span>
+<span style="display: inline-flex; align-items: center; gap: 6px;"><svg width="22" height="8" aria-hidden="true"><line x1="0" y1="4" x2="22" y2="4" style="stroke: #CA8A04; stroke-width: 2; stroke-dasharray: 2 3;"></line></svg>Read, untrusted</span>
+<span style="display: inline-flex; align-items: center; gap: 6px;"><svg width="22" height="8" aria-hidden="true"><line x1="0" y1="4" x2="22" y2="4" style="stroke: #2563EB; stroke-width: 2;"></line></svg>Write</span>
+<span style="display: inline-flex; align-items: center; gap: 6px;"><svg width="22" height="8" aria-hidden="true"><line x1="0" y1="4" x2="22" y2="4" style="stroke: #DC2626; stroke-width: 2; stroke-dasharray: 6 4;"></line></svg>Blocked write</span>
+<span style="display: inline-flex; align-items: center; gap: 6px;"><svg width="22" height="8" aria-hidden="true"><line x1="0" y1="4" x2="22" y2="4" style="stroke: #7C3AED; stroke-width: 2; stroke-dasharray: 4 3;"></line></svg>Approval</span>
+</div>
+</section>
+<aside aria-label="Details" style="flex: 1 1 400px; min-width: 0; background: #FFFFFF; border: 1px solid #E4E4E7; border-radius: 14px; padding: 18px; box-sizing: border-box; display: flex; flex-direction: column; gap: 14px;">
+<div style="display: flex; flex-direction: column; gap: 6px;">
+<span style="font-size: 12px; color: #71717A;">{{det.kind}}</span>
+<h2 style="margin: 0; font-size: 18px; font-weight: 600; font-family: 'JetBrains Mono', ui-monospace, monospace; overflow-wrap: anywhere;">{{det.title}}</h2>
+<sc-if value="{{det.hasDecision}}" hint-placeholder-val="{{ true }}"><span style="{{det.decStyle}}">{{det.decision}}</span></sc-if>
+</div>
+<dl style="margin: 0;">
+<sc-for list="{{det.rows}}" as="r" hint-placeholder-count="6"><div style="display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: 10px; font-size: 13px; padding: 8px 0; border-top: 1px solid #F4F4F5;"><dt style="margin: 0; color: #71717A;">{{r.k}}</dt><dd style="margin: 0; color: #18181B; overflow-wrap: anywhere;">{{r.v}}</dd></div></sc-for>
+</dl>
+<sc-if value="{{det.hasWhy}}" hint-placeholder-val="{{ true }}">
+<div style="display: flex; flex-direction: column; gap: 8px;">
+<div style="display: flex; flex-direction: column; gap: 2px;"><h3 style="margin: 0; font-size: 14px; font-weight: 600;">Why this decision</h3><span style="font-size: 12px; color: #71717A;">What the gate observed, never the model's own account</span></div>
+<ul style="margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 6px; font-size: 13px; line-height: 1.45; color: #27272A;">
+<sc-for list="{{det.why}}" as="w" hint-placeholder-count="3"><li>{{w.t}}</li></sc-for>
+</ul>
+</div>
+</sc-if>
+<sc-if value="{{det.hasClaim}}" hint-placeholder-val="{{ false }}">
+<div style="border: 1px dashed #D4A017; background: #FEFCE8; border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 4px;"><span style="font-size: 11.5px; font-weight: 600; color: #854D0E;">Model's own explanation · untrusted claim, not evidence</span><span style="font-size: 13px; color: #3F3F46;">{{det.claim}}</span></div>
+</sc-if>
+<sc-if value="{{det.hasEvidence}}" hint-placeholder-val="{{ true }}">
+<div style="display: flex; flex-direction: column; gap: 6px;">
+<h3 style="margin: 0; font-size: 14px; font-weight: 600;">Evidence</h3>
+<sc-for list="{{det.ev}}" as="v" hint-placeholder-count="3"><div style="display: flex; justify-content: space-between; gap: 12px; font-size: 12.5px; padding: 6px 10px; background: #FAFAFA; border-radius: 8px;"><span style="color: #71717A;">{{v.k}}</span><span style="font-family: 'JetBrains Mono', ui-monospace, monospace; color: #18181B; text-align: right;">{{v.v}}</span></div></sc-for>
+</div>
+</sc-if>
+<div style="display: flex; flex-direction: column; gap: 8px; padding-top: 12px; border-top: 1px solid #F4F4F5;">
+<span style="font-size: 12.5px; font-weight: 600;">{{meterTitle}}</span>
+<div style="display: flex; gap: 4px;"><sc-for list="{{confSteps}}" as="c" hint-placeholder-count="4"><span style="{{c.style}}">{{c.c}}</span></sc-for></div>
+<div style="display: flex; gap: 4px;"><sc-for list="{{integSteps}}" as="c" hint-placeholder-count="2"><span style="{{c.style}}">{{c.c}}</span></sc-for></div>
+</div>
+</aside>
+</div>
+<section aria-label="Timeline" style="background: #FFFFFF; border: 1px solid #E4E4E7; border-radius: 14px; padding: 16px 18px; box-sizing: border-box; display: flex; flex-direction: column; gap: 12px;">
+<div style="display: flex; flex-direction: column; gap: 2px;"><h2 style="margin: 0; font-size: 16px; font-weight: 600;">Timeline</h2><span style="font-size: 12.5px; color: #71717A;">Every action in session s-0412, as the gate signed it</span></div>
+<div style="display: flex; flex-wrap: wrap; gap: 10px;">
+<sc-for list="{{timeline}}" as="t" hint-placeholder-count="7"><button onClick="{{t.pick}}" aria-label="{{t.aria}}" style="{{t.style}}"><span style="font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 12px; color: #71717A;">{{t.time}} · {{t.num}}</span><span style="font-size: 13px; font-weight: 600; font-family: 'JetBrains Mono', ui-monospace, monospace;">{{t.op}}</span><span style="{{t.decStyle}}">{{t.dec}}</span></button></sc-for>
+</div>
+</section>
+</main>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1440,"height":1520}}'>
+class Component extends DCLogic {
+  constructor(props) {
+    super(props);
+    this.state = { sel: 'a5', trace: true, auth: true, flow: true, appr: true };
+  }
+  renderVals() {
+    const s = this.state;
+    const OY = 34;
+    const N = [
+      { id: 'priya', t: 'person', x: 16, y: 150, w: 120, g: 'PR', title: 'Priya Raman', sub: 'PM, owner' },
+      { id: 'alex', t: 'person', x: 16, y: 520, w: 120, g: 'AC', title: 'Alex Chen', sub: 'Approver' },
+      { id: 'echo', t: 'agent', x: 170, y: 150, w: 128, g: 'EC', title: 'Echo', sub: 'Outbound PM bot' },
+      { id: 'researcher', t: 'agent', x: 170, y: 246, w: 128, g: 'RS', title: 'Researcher', sub: 'Sub-agent' },
+      { id: 'warden', t: 'reviewer', x: 170, y: 420, w: 128, g: 'WD', title: 'Warden', sub: 'Reviewer agent' },
+      { id: 'm7f3', t: 'mandate', x: 330, y: 150, w: 124, g: 'M', title: 'm-7f3', sub: 'pmos-bot-session' },
+      { id: 'm7f31', t: 'mandate', x: 330, y: 246, w: 124, g: 'M', title: 'm-7f3.1', sub: 'web.fetch only' },
+      { id: 'c901', t: 'approval', x: 330, y: 344, w: 124, g: 'C', title: 'c-901', sub: 'Agent approved' },
+      { id: 'c902', t: 'approval', x: 330, y: 430, w: 124, g: 'C', title: 'c-902', sub: 'Person denied' },
+      { id: 'a1', t: 'action', d: 'ok', x: 480, y: 40, w: 190, g: 'R', title: 'jira.issue.read', sub: '09:02 · allowed', time: '09:02', num: 'A1' },
+      { id: 'a2', t: 'action', d: 'ok', x: 480, y: 116, w: 190, g: 'R', title: 'confluence.page.read', sub: '09:03 · allowed', time: '09:03', num: 'A2' },
+      { id: 'a3', t: 'action', d: 'ok', x: 480, y: 192, w: 190, g: 'R', title: 'web.fetch', sub: '09:05 · allowed', time: '09:05', num: 'A3' },
+      { id: 'a4', t: 'action', d: 'agent', x: 480, y: 268, w: 190, g: 'W', title: 'jira.comment.add', sub: '09:07 · agent-approved', time: '09:07', num: 'A4' },
+      { id: 'a5', t: 'action', d: 'refused', x: 480, y: 344, w: 190, g: 'W', title: 'slack.message.post', sub: '09:09 · refused', time: '09:09', num: 'A5' },
+      { id: 'a6', t: 'action', d: 'ok', x: 480, y: 420, w: 190, g: 'W', title: 'slack.message.post', sub: '09:11 · allowed', time: '09:11', num: 'A6' },
+      { id: 'a7', t: 'action', d: 'ok', x: 480, y: 496, w: 190, g: 'W', title: 'jira.issue.create', sub: '09:14 · allowed', time: '09:14', num: 'A7' },
+      { id: 'r1', t: 'resource', lab: 'conf', x: 710, y: 40, w: 180, g: 'JI', title: 'PAY-12', sub: 'jira · confidential' },
+      { id: 'r2', t: 'resource', lab: 'conf', x: 710, y: 116, w: 180, g: 'CF', title: 'Pricing 2027', sub: 'confluence · confidential' },
+      { id: 'r3', t: 'resource', lab: 'untrusted', x: 710, y: 192, w: 180, g: 'WB', title: 'Competitor blog', sub: 'web · untrusted' },
+      { id: 'r4', t: 'resource', lab: 'external', x: 710, y: 344, w: 180, g: 'SL', title: '#partner-acme', sub: 'slack · external' },
+      { id: 'r5', t: 'resource', lab: 'internal', x: 710, y: 420, w: 180, g: 'SL', title: '#pay-team', sub: 'slack · internal' },
+      { id: 'r6', t: 'resource', lab: 'conf', x: 710, y: 496, w: 180, g: 'JI', title: 'PAY-31', sub: 'jira · confidential' }
+    ];
+    const E = [
+      ['priya', 'echo', 'auth'], ['echo', 'm7f3', 'auth'], ['echo', 'researcher', 'auth'], ['researcher', 'm7f31', 'auth'],
+      ['m7f3', 'a1', 'auth'], ['m7f3', 'a2', 'auth'], ['m7f3', 'a4', 'auth'], ['m7f3', 'a5', 'auth'], ['m7f3', 'a6', 'auth'], ['m7f3', 'a7', 'auth'], ['m7f31', 'a3', 'auth'],
+      ['warden', 'c901', 'appr'], ['c901', 'a4', 'appr'], ['warden', 'c902', 'appr'], ['alex', 'c902', 'appr'], ['c902', 'a5', 'appr'],
+      ['r1', 'a1', 'read'], ['r2', 'a2', 'read'], ['r3', 'a3', 'readu'],
+      ['a4', 'r1', 'write'], ['a5', 'r4', 'blocked'], ['a6', 'r5', 'write'], ['a7', 'r6', 'write']
+    ];
+    const by = {};
+    N.forEach((n) => { by[n.id] = n; });
+    const CAUSE = { a4: ['a1'], a5: ['a1', 'a2', 'a3'], a6: ['a1', 'a2', 'a3'], a7: ['a1', 'a2', 'a3'] };
+    const sel = s.sel;
+    const set = new Set([sel]);
+    const up = (id) => {
+      E.forEach((e) => {
+        if (e[1] === id && (e[2] === 'auth' || e[2] === 'appr') && !set.has(e[0])) { set.add(e[0]); up(e[0]); }
+      });
+    };
+    const near = (id) => {
+      E.forEach((e) => {
+        if (e[0] === id) set.add(e[1]);
+        if (e[1] === id) set.add(e[0]);
+      });
+    };
+    if (by[sel].t === 'action') {
+      const acts = [sel].concat(CAUSE[sel] || []);
+      acts.forEach((a) => { set.add(a); near(a); });
+      Array.from(set).forEach((id) => up(id));
+    } else {
+      near(sel);
+      up(sel);
+    }
+    const ICON = {
+      person: ['#F4F4F5', '#3F3F46'], agent: ['#EEF2FF', '#4338CA'], reviewer: ['#F5F3FF', '#6D28D9'],
+      mandate: ['#F0FDFA', '#0F766E'], approval: ['#F5F3FF', '#6D28D9'], action: ['#EFF6FF', '#1D4ED8'],
+      refused: ['#FEE2E2', '#B91C1C'], conf: ['#FFF7ED', '#C2410C'], untrusted: ['#FEFCE8', '#A16207'],
+      external: ['#FEE2E2', '#B91C1C'], internal: ['#F4F4F5', '#3F3F46']
+    };
+    const nodes = N.map((n) => {
+      const key = n.t === 'resource' ? n.lab : (n.d === 'refused' ? 'refused' : n.t);
+      const ic = ICON[key];
+      const dim = s.trace && !set.has(n.id);
+      const isSel = n.id === sel;
+      return {
+        id: n.id, g: n.g, title: n.title, sub: n.sub, aria: n.title + ', ' + n.sub,
+        pick: () => this.setState({ sel: n.id }),
+        style: {
+          position: 'absolute', left: n.x + 'px', top: (n.y + OY) + 'px', width: n.w + 'px', height: '40px',
+          boxSizing: 'border-box', display: 'flex', alignItems: 'center', gap: '8px', padding: '0 8px',
+          background: n.d === 'refused' ? '#FEF2F2' : '#FFFFFF',
+          border: '1px solid ' + (n.d === 'refused' ? '#FCA5A5' : (n.d === 'agent' ? '#C4B5FD' : '#E4E4E7')),
+          borderRadius: '10px', cursor: 'pointer', textAlign: 'left', color: '#18181B',
+          opacity: dim ? 0.28 : 1, outline: isSel ? '2px solid #4F46E5' : 'none', outlineOffset: '2px',
+          transition: 'opacity 0.15s'
+        },
+        iconStyle: {
+          width: '24px', height: '24px', flex: '0 0 24px', borderRadius: n.t === 'person' ? '50%' : '6px',
+          background: ic[0], color: ic[1], fontSize: '10px', fontWeight: 600,
+          display: 'flex', alignItems: 'center', justifyContent: 'center'
+        }
+      };
+    });
+    const EC = {
+      auth: ['#A1A1AA', 1.25, 'none'], appr: ['#7C3AED', 1.5, '4 3'], read: ['#EA580C', 1.75, 'none'],
+      readu: ['#CA8A04', 1.75, '2 3'], write: ['#2563EB', 1.75, 'none'], blocked: ['#DC2626', 1.75, '6 4']
+    };
+    const showKind = (k) => (k === 'auth' ? s.auth : (k === 'appr' ? s.appr : s.flow));
+    const geom = (a, b) => {
+      const ay = a.y + OY;
+      const by2 = b.y + OY;
+      if (Math.abs(a.x - b.x) < 4) {
+        const x = a.x + a.w / 2;
+        return 'M' + x + ' ' + (ay + 40) + ' L' + x + ' ' + (by2 - 3);
+      }
+      let x1;
+      let x2;
+      if (a.x < b.x) { x1 = a.x + a.w; x2 = b.x - 3; } else { x1 = a.x; x2 = b.x + b.w + 3; }
+      const y1 = ay + 20;
+      const y2 = by2 + 20;
+      const dx = (x2 - x1) / 2;
+      return 'M' + x1 + ' ' + y1 + ' C' + (x1 + dx) + ' ' + y1 + ' ' + (x2 - dx) + ' ' + y2 + ' ' + x2 + ' ' + y2;
+    };
+    const edges = E.filter((e) => showKind(e[2])).map((e, i) => {
+      const c = EC[e[2]];
+      const on = set.has(e[0]) && set.has(e[1]);
+      const id = e[0] + '-' + e[1];
+      return {
+        id: id, d: geom(by[e[0]], by[e[1]]), mstyle: { fill: c[0] },
+        style: {
+          fill: 'none', stroke: c[0], strokeWidth: s.trace && on ? c[1] + 0.75 : c[1], strokeDasharray: c[2],
+          opacity: s.trace ? (on ? 1 : 0.13) : 0.85, markerEnd: 'url(#mk-' + id + ')'
+        }
+      };
+    });
+    const D = {
+      a5: { kind: 'Action · receipt 4471', title: 'slack.message.post', dec: 'refused', decision: 'Refused · label_exceeds_clearance',
+        rows: [['Who', 'Echo · proof: proven'], ['For', 'Priya Raman, through mandate m-7f3'], ['What', 'Post to slack/channel/partner-acme (write, outward)'], ['Where', 'gate-slack · enforce · custody'], ['When', 'Nov 26, 09:09:41'], ['Caused by', 'A1 read PAY-12, A2 read Pricing 2027, A3 fetched a competitor blog']],
+        why: ['Rule r-31, policy v14: an outward write needs audience clearance at or above the session label.', 'The session label was confidential and untrusted, set by A1, A2 and A3.', '#partner-acme is shared with an outside company, so its clearance is public.', 'Approval c-902: Warden advised deny, and Alex Chen denied (attested).'],
+        claim: '“Sharing the pricing summary the partner asked for.”',
+        ev: [['Receipt', 'gate-slack #4471'], ['Previous', '9f2c…e81a'], ['Args digest', 'salted, salt deleted'], ['Checkpoint', '#2207 witnessed']] },
+      a1: { kind: 'Action · receipt 1180', title: 'jira.issue.read', dec: 'ok', decision: 'Allowed · rule r-12',
+        rows: [['Who', 'Echo · proof: proven'], ['For', 'Priya Raman, through mandate m-7f3'], ['What', 'Read jira/project/PAY/issue/PAY-12'], ['Where', 'gate-jira · enforce · custody'], ['When', 'Nov 26, 09:02:10'], ['Effect', 'Session label rose to confidential']],
+        why: ['Rule r-12, policy v14: reads inside the mandate are allowed.', 'The connector map labels PAY-12 confidential.'],
+        ev: [['Receipt', 'gate-jira #1180'], ['Checkpoint', '#2206 witnessed']] },
+      a2: { kind: 'Action · receipt 322', title: 'confluence.page.read', dec: 'ok', decision: 'Allowed · rule r-12',
+        rows: [['Who', 'Echo · proof: proven'], ['For', 'Priya Raman, through mandate m-7f3'], ['What', 'Read confluence/space/PRICING/page/2027'], ['Where', 'gate-confluence · enforce · custody'], ['When', 'Nov 26, 09:03:27'], ['Effect', 'Session label stays confidential']],
+        why: ['Rule r-12, policy v14: reads inside the mandate are allowed.', 'The connector map labels the Pricing space confidential.'],
+        ev: [['Receipt', 'gate-confluence #322'], ['Checkpoint', '#2206 witnessed']] },
+      a3: { kind: 'Action · receipt 77', title: 'web.fetch', dec: 'ok', decision: 'Allowed · rule r-18',
+        rows: [['Who', 'Researcher · proof: proven'], ['For', 'Priya Raman, through m-7f3 then m-7f3.1'], ['What', 'Fetch a competitor blog post (read)'], ['Where', 'gate-web · enforce · in line'], ['When', 'Nov 26, 09:05:12'], ['Effect', 'Session integrity dropped to untrusted']],
+        why: ['Rule r-18, policy v14: fetches are allowed under m-7f3.1.', 'Web content is labelled untrusted because it can carry injected instructions.'],
+        ev: [['Receipt', 'gate-web #77'], ['Checkpoint', '#2206 witnessed']] },
+      a4: { kind: 'Action · receipt 1181', title: 'jira.comment.add', dec: 'agent', decision: 'Allowed · agent-approved (c-901)',
+        rows: [['Who', 'Echo · proof: proven'], ['For', 'Priya Raman, through mandate m-7f3'], ['What', 'Comment on PAY-12 (write, internal)'], ['Where', 'gate-jira · enforce · custody'], ['When', 'Nov 26, 09:07:02'], ['Undo', 'Inverse: the comment can be deleted']],
+        why: ['Rule r-22, policy v14: a comment on an issue of the same label accepts an agent countersignature.', 'Warden approved: reversible, internal audience, no label change.', 'Caused by A1.'],
+        ev: [['Receipt', 'gate-jira #1181'], ['Outcome', 'ok · comment 10233'], ['Countersign', 'c-901 · agent · spent']] },
+      a6: { kind: 'Action · receipt 4472', title: 'slack.message.post', dec: 'ok', decision: 'Allowed · rule r-31',
+        rows: [['Who', 'Echo · proof: proven'], ['For', 'Priya Raman, through mandate m-7f3'], ['What', 'Post to slack/channel/pay-team (write, internal)'], ['Where', 'gate-slack · enforce · custody'], ['When', 'Nov 26, 09:11:30'], ['Caused by', 'A1, A2, A3']],
+        why: ['Rule r-31, policy v14: every member of #pay-team is cleared for confidential.', 'The channel is internal, so the untrusted session asks for no approval here.'],
+        ev: [['Receipt', 'gate-slack #4472'], ['Outcome', 'ok · message ts 1764…']] },
+      a7: { kind: 'Action · receipt 1182', title: 'jira.issue.create', dec: 'ok', decision: 'Allowed · rule r-20',
+        rows: [['Who', 'Echo · proof: proven'], ['For', 'Priya Raman, through mandate m-7f3'], ['What', 'Create jira/project/PAY/issue/PAY-31'], ['Where', 'gate-jira · enforce · custody'], ['When', 'Nov 26, 09:14:05'], ['Undo', 'Inverse: the issue can be archived']],
+        why: ['Rule r-20, policy v14: creating issues in PAY is inside the mandate.', 'The new issue takes the session label, confidential.'],
+        ev: [['Receipt', 'gate-jira #1182'], ['Outcome', 'ok · PAY-31']] },
+      priya: { kind: 'Person', title: 'Priya Raman', rows: [['Role', 'Product manager, owner of Echo'], ['Signed in', 'Entra ID'], ['Issued', 'm-7f3 at 08:58 from pmos-bot-session@v14'], ['Acted for', '7 actions in this session']] },
+      alex: { kind: 'Person', title: 'Alex Chen', rows: [['Role', 'Approver, group security-approvers'], ['Decided', 'c-902: deny, at 09:10:15'], ['Class', 'Attested: the Authority vouched for the sign-in']] },
+      echo: { kind: 'Agent', title: 'Echo', rows: [['Owner', 'Priya Raman'], ['Key', 'k-echo-3, enrolled Nov 20'], ['Mandate', 'm-7f3, expires 17:00'], ['This session', '6 actions, 1 refused'], ['Proof', 'Proven on every call']] },
+      researcher: { kind: 'Agent · delegated', title: 'Researcher', rows: [['Parent', 'Echo'], ['Mandate', 'm-7f3.1, a child of m-7f3'], ['Grants', 'web.fetch on web/*'], ['Depth', '2 of at most 4'], ['This session', '1 action']] },
+      warden: { kind: 'Reviewer agent', title: 'Warden', rows: [['Class', 'Agent countersignature'], ['May approve', 'Reversible, internal writes inside the mandate'], ['Never', 'Its own chain, outward or irreversible actions, declassification'], ['Here', 'Approved c-901, advised deny on c-902'], ['Agreement', 'Shown after 50 reviewed decisions']] },
+      m7f3: { kind: 'Mandate', title: 'm-7f3', rows: [['Agent', 'Echo'], ['Issued by', 'Priya Raman, 08:58, live session'], ['Template', 'pmos-bot-session@v14'], ['Grants', 'jira issue and comment on PAY/*; confluence page.read on PRICING/*; slack message.post'], ['Limits', '20 writes, 4 used'], ['Expires', 'Nov 26, 17:00']] },
+      m7f31: { kind: 'Mandate · delegated', title: 'm-7f3.1', rows: [['Agent', 'Researcher'], ['Parent', 'm-7f3, checked inside its parent'], ['Grants', 'web.fetch on web/*'], ['Expires', 'Nov 26, 17:00, no later than its parent']] },
+      c901: { kind: 'Countersignature · agent class', title: 'c-901', rows: [['Approver', 'Warden'], ['Action', 'A4, digest 3a1f…c09d'], ['Reason', 'Reversible, internal audience, no label change'], ['Use', 'Single use, spent at 09:07']] },
+      c902: { kind: 'Approval request · denied', title: 'c-902', rows: [['Action', 'A5, digest 7be0…41aa'], ['Warden', 'Advised deny: confidential data would reach an outside audience, with untrusted web content in the session'], ['Alex Chen', 'Denied, attested, 09:10'], ['Readable form', 'Deleted one hour after the decision']] },
+      r1: { kind: 'Resource', title: 'PAY-12', rows: [['Path', 'jira/project/PAY/issue/PAY-12'], ['Label', 'Confidential, from the connector map'], ['Touched by', 'A1 read, A4 comment']] },
+      r2: { kind: 'Resource', title: 'Pricing 2027', rows: [['Path', 'confluence/space/PRICING/page/2027'], ['Label', 'Confidential'], ['Touched by', 'A2 read']] },
+      r3: { kind: 'Resource', title: 'Competitor blog', rows: [['Path', 'web/blog.competitor.example/post-118'], ['Label', 'Untrusted integrity'], ['Touched by', 'A3 fetch, by Researcher']] },
+      r4: { kind: 'Resource', title: '#partner-acme', rows: [['Path', 'slack/channel/partner-acme'], ['Audience', 'External, shared with Acme'], ['Clearance', 'Public'], ['Touched by', 'A5, refused']] },
+      r5: { kind: 'Resource', title: '#pay-team', rows: [['Path', 'slack/channel/pay-team'], ['Audience', 'Internal'], ['Clearance', 'Confidential'], ['Touched by', 'A6 post']] },
+      r6: { kind: 'Resource', title: 'PAY-31', rows: [['Path', 'jira/project/PAY/issue/PAY-31'], ['Label', 'Confidential, taken from the session'], ['Touched by', 'A7 create']] }
+    };
+    const DEC = {
+      ok: ['#EFF6FF', '#1D4ED8', 'Allowed'], agent: ['#F5F3FF', '#6D28D9', 'Agent-approved'], refused: ['#FEE2E2', '#B91C1C', 'Refused']
+    };
+    const pill = (k) => ({ alignSelf: 'flex-start', fontSize: '12.5px', fontWeight: 600, padding: '5px 10px', borderRadius: '999px', background: DEC[k][0], color: DEC[k][1] });
+    const raw = D[sel];
+    const det = {
+      kind: raw.kind, title: raw.title,
+      hasDecision: !!raw.dec, decision: raw.decision || '', decStyle: raw.dec ? pill(raw.dec) : {},
+      rows: raw.rows.map((r) => ({ k: r[0], v: r[1] })),
+      hasWhy: !!raw.why, why: (raw.why || []).map((t) => ({ t: t })),
+      hasClaim: !!raw.claim, claim: raw.claim || '',
+      hasEvidence: !!raw.ev, ev: (raw.ev || []).map((r) => ({ k: r[0], v: r[1] }))
+    };
+    const LAB = { a1: [2, 0], a2: [2, 0], a3: [2, 1], a4: [2, 1], a5: [2, 1], a6: [2, 1], a7: [2, 1] };
+    const lab = LAB[sel] || [2, 1];
+    const step = (on, warm) => ({
+      flex: '1 1 0', minWidth: 0, textAlign: 'center', fontSize: '11.5px', fontWeight: 500, padding: '6px 4px', borderRadius: '6px',
+      background: on ? (warm ? '#FFEDD5' : '#E0E7FF') : '#F4F4F5', color: on ? (warm ? '#9A3412' : '#3730A3') : '#71717A'
+    });
+    const confSteps = ['Public', 'Internal', 'Confidential', 'Restricted'].map((c, i) => ({ c: c, style: step(i <= lab[0], i === lab[0]) }));
+    const integSteps = ['Trusted', 'Untrusted'].map((c, i) => ({ c: c, style: step(i === lab[1], i === 1) }));
+    const timeline = N.filter((n) => n.t === 'action').map((n) => {
+      const k = n.d;
+      return {
+        time: n.time, num: n.num, op: n.title, dec: DEC[k][2], aria: n.num + ', ' + n.title + ', ' + DEC[k][2],
+        pick: () => this.setState({ sel: n.id }),
+        decStyle: { alignSelf: 'flex-start', fontSize: '11.5px', fontWeight: 600, padding: '3px 8px', borderRadius: '999px', background: DEC[k][0], color: DEC[k][1] },
+        style: {
+          flex: '1 1 160px', display: 'flex', flexDirection: 'column', gap: '6px', alignItems: 'flex-start', textAlign: 'left',
+          padding: '10px 12px', borderRadius: '10px', cursor: 'pointer', color: '#18181B',
+          background: n.id === sel ? '#EEF2FF' : '#FFFFFF', border: n.id === sel ? '1.5px solid #4F46E5' : '1px solid #E4E4E7'
+        }
+      };
+    });
+    const tog = (on) => ({ height: '32px', padding: '0 12px', borderRadius: '8px', fontSize: '12.5px', fontWeight: 500, cursor: 'pointer', background: on ? '#18181B' : '#FFFFFF', color: on ? '#FFFFFF' : '#52525B', border: on ? '1px solid #18181B' : '1px solid #D4D4D8' });
+    return {
+      nodes: nodes, edges: edges, det: det, timeline: timeline, confSteps: confSteps, integSteps: integSteps,
+      meterTitle: by[sel].t === 'action' ? 'Session label after ' + by[sel].num : 'Session label now',
+      toggleTrace: () => this.setState({ trace: !s.trace }),
+      traceStr: s.trace ? 'true' : 'false',
+      traceLabel: s.trace ? 'Tracing why: on' : 'Trace why',
+      traceBtnStyle: { height: '36px', padding: '0 14px', borderRadius: '9px', fontSize: '13.5px', fontWeight: 500, cursor: 'pointer', background: s.trace ? '#4F46E5' : '#FFFFFF', color: s.trace ? '#FFFFFF' : '#18181B', border: s.trace ? '1px solid #4F46E5' : '1px solid #D4D4D8' },
+      tAuth: () => this.setState({ auth: !s.auth }), tFlow: () => this.setState({ flow: !s.flow }), tAppr: () => this.setState({ appr: !s.appr }),
+      authStr: s.auth ? 'true' : 'false', flowStr: s.flow ? 'true' : 'false', apprStr: s.appr ? 'true' : 'false',
+      authStyle: tog(s.auth), flowStyle: tog(s.flow), apprStyle: tog(s.appr)
+    };
+  }
+}
+</script>
+</body>
+</html>

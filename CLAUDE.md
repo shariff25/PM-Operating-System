@@ -404,8 +404,11 @@ follow-up tracking.
   owner: "You assess where it make sense". The assessment is `docs/access-governance-spec.md`:
   the PRD's requirements, eight departures, four added threats, and the order (the
   Authority first; the receipt fields right after G4c; everything that blocks or approves
-  after G6). Not yet read by the reviewer; nothing built. The PRD and its design file are
-  not in the repository.
+  after G6). Not yet read by the reviewer; nothing built. Then: "Push the prd specs to
+  github and design": the PRD (`docs/prd-access-governance.md`) and the graph explorer's
+  design source (`docs/design/graph-explorer-design.dc.html`) are committed as the owner
+  pasted them. The PRD's architecture image was never given and is not in the repository.
+  Where the PRD and the spec differ, the spec is what is built from.
 
 ## Where the build stands (2026-11-23)
 
