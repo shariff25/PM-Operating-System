@@ -393,6 +393,20 @@ follow-up tracking.
   Authority (spec §4.4; not built, slice G6). Whether another product already offers undo has
   not been checked.
 
+## Owner's decisions of 2026-11-27
+
+- **Agent access governance (owner's PRD of 2026-11-26, pasted on 2026-11-27 with "Check
+  this prd"):** a context graph with labels that rise with what a session reads, a reviewer
+  agent that may approve a narrow class of actions, access reviews, and three console
+  screens. The conductor found four requirements that do not work as written (the label
+  cannot see across gates; it resets with a new session or a restart; a sub-agent's reads
+  do not reach its parent; suspension through the revocation feed contradicts GR-140). The
+  owner: "You assess where it make sense". The assessment is `docs/access-governance-spec.md`:
+  the PRD's requirements, eight departures, four added threats, and the order (the
+  Authority first; the receipt fields right after G4c; everything that blocks or approves
+  after G6). Not yet read by the reviewer; nothing built. The PRD and its design file are
+  not in the repository.
+
 ## Where the build stands (2026-11-23)
 
 - Pushed and checked: `claude/web-app` (draft pull request #10).
