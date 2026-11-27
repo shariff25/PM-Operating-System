@@ -33,6 +33,9 @@ pub struct Reviewed {
     pub reversal: Reversal,
     pub outward: bool,
     pub resource: ResourceTemplate,
+    /// Whether what the tool returns can be trusted to steer an agent. Left out, it cannot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub results: Option<gov_core::label::Integrity>,
     /// Why, where the choice is not the obvious one. For the reader; it is not in the map.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -49,6 +52,14 @@ pub struct Review {
     /// What was reviewed: the server's package and version, and how its listing was got.
     pub source: String,
     pub tools: BTreeMap<String, Reviewed>,
+    /// How confidential the system's resources are, and what may be sent where (access
+    /// governance spec, CG-4). Which project is confidential is the deployment's to say,
+    /// so a map in the library carries none; a resource nobody labelled is taken for the
+    /// most closely held.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<gov_core::connector::ResourceLabel>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clearances: Vec<gov_core::connector::ResourceClearance>,
     /// Tools left out of the map on purpose, each with the reason. A call to one is
     /// recorded as unknown and can never be allowed where anything is enforced.
     #[serde(default)]
@@ -142,6 +153,7 @@ pub fn build(listing: &[Value], review: &Review) -> anyhow::Result<ServerMap> {
             continue;
         };
         tools.push(ToolMap {
+            results: reviewed.results,
             tool: Id::new(name).map_err(|_| anyhow::anyhow!("{name} is not an identifier"))?,
             digest: tool_digest(definition)
                 .map_err(|_| anyhow::anyhow!("the definition of {name} has no canonical form"))?,
@@ -159,6 +171,8 @@ pub fn build(listing: &[Value], review: &Review) -> anyhow::Result<ServerMap> {
         );
     }
     let map = ServerMap {
+        labels: review.labels.clone(),
+        clearances: review.clearances.clone(),
         server: review.server.clone(),
         system: review.system.clone(),
         fold_case: review.fold_case,

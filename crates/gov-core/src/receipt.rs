@@ -268,6 +268,21 @@ pub struct Receipt {
     /// identical actions in flight are told apart by it (review finding GR-40).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intent: Option<u64>,
+    /// The session the call presented (access governance spec, CG-1). A bare claim has
+    /// none. Written by no gate before slice CG1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<Id>,
+    /// What came before this receipt under the same root mandate. Computed by the gate from
+    /// its own record, never taken from the caller (CG-2). Only on a proven agent's receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<crate::label::Cause>,
+    /// The policy rule that decided; absent when none matched, or nothing decided.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<Id>,
+    /// The label of what the call touched and the mandate's label after it. Only on a
+    /// proven agent's receipt: a stock client has no mandate, so no label (GR-151).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<crate::label::ReceiptLabels>,
 }
 
 document!(Receipt, "gov.receipt.v1");
@@ -311,6 +326,36 @@ impl Receipt {
         }
         if self.mode == Mode::Enforce && self.agent.proof != Proof::Proven {
             return Err(Error::Malformed("enforce mode needs a proven agent"));
+        }
+        // A session is something a caller presented: a bare claim presented none.
+        if self.session.is_some() && self.agent.proof == Proof::Claimed {
+            return Err(Error::Malformed("a bare claim has no session"));
+        }
+        // Labels and cause are about a mandate, and count only what its agent provably
+        // did: a failed proof is nobody's act, and a bare claim has no mandate (GR-151).
+        if (self.labels.is_some() || self.cause.is_some()) && self.agent.proof != Proof::Proven {
+            return Err(Error::Malformed(
+                "labels and cause belong to a proven agent's receipt",
+            ));
+        }
+        if let Some(labels) = &self.labels {
+            labels.validate()?;
+        }
+        if let Some(cause) = &self.cause {
+            // A cause that says nothing is left out, so one receipt has one form.
+            if cause.prev.is_none() && cause.token.is_none() {
+                return Err(Error::Malformed("an empty cause is left out"));
+            }
+            // The receipt before is an earlier one of this gate's own chain.
+            if cause
+                .prev
+                .as_ref()
+                .is_some_and(|p| p.gate != self.gate || p.seq >= self.seq)
+            {
+                return Err(Error::Malformed(
+                    "a cause is an earlier receipt of the same gate",
+                ));
+            }
         }
         if self.before_digest.is_some()
             && (self.phase != Phase::Intent

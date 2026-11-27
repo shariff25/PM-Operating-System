@@ -51,6 +51,11 @@ To use a map, copy `<server>.json` and `<server>.samples.json` into a policy dir
   `unknown`, not guessed at.
 - **A tool with several methods is one tool to a map**, mapped as the widest thing any of
   its methods does.
+- **No map here says how confidential anything is.** A review may carry `labels`,
+  `clearances` and, on a tool, `results` (see `docs/access-governance-spec.md`, CG-4), and
+  `build` passes them into the map; which project is confidential is each deployment's to
+  say. Until it does, every resource is taken for restricted, cleared for public only, and
+  every tool's results for untrusted. Nothing acts on labels yet.
 - Each map is read by the security reviewer before it backs anything but observe mode.
 
 ## Maps

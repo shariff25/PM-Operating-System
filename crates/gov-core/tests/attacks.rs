@@ -854,6 +854,10 @@ fn args_only_digest() -> Digest {
 
 fn receipt(seq: u64, prev: Option<Digest>, phase: Phase) -> Receipt {
     Receipt {
+        session: None,
+        cause: None,
+        rule: None,
+        labels: None,
         v: 1,
         tenant: id("acme"),
         env: id("prod"),
@@ -1844,10 +1848,13 @@ fn listed(description: &str) -> Value {
 fn jira_map() -> gov_core::connector::ServerMap {
     use gov_core::connector::{tool_digest, ResourceTemplate, ServerMap, ToolMap};
     ServerMap {
+        labels: Vec::new(),
+        clearances: Vec::new(),
         server: id("jira-mcp"),
         system: id("jira"),
         fold_case: true,
         tools: vec![ToolMap {
+            results: None,
             tool: id("jira_update_issue"),
             digest: tool_digest(&listed("Update an issue")).unwrap(),
             operation: id("issue.update"),
@@ -2777,4 +2784,351 @@ fn templates_are_policy() {
     let shown = changes(Some(&before), &with(Vec::new()));
     assert_eq!(shown.templates_removed, vec![id("triage")]);
     assert!(!shown.other && !shown.is_empty());
+}
+
+// ----- labels: the words and where they are written (access governance spec, CG0a) -------
+
+mod labels {
+    use super::*;
+    use gov_core::connector::{ResourceClearance, ResourceLabel};
+    use gov_core::label::{Cause, Confidentiality, Integrity, Label, ReceiptLabels};
+    use gov_core::receipt::ReceiptRef;
+
+    const C: [Confidentiality; 4] = [
+        Confidentiality::Public,
+        Confidentiality::Internal,
+        Confidentiality::Confidential,
+        Confidentiality::Restricted,
+    ];
+    const I: [Integrity; 2] = [Integrity::Trusted, Integrity::Untrusted];
+
+    fn all() -> Vec<Label> {
+        C.iter()
+            .flat_map(|c| {
+                I.iter().map(|i| Label {
+                    confidentiality: *c,
+                    integrity: *i,
+                })
+            })
+            .collect()
+    }
+
+    fn label(c: Confidentiality, i: Integrity) -> Label {
+        Label {
+            confidentiality: c,
+            integrity: i,
+        }
+    }
+
+    /// Gates learn of the same reads in different orders, and more than once. A label that
+    /// depended on either would differ from gate to gate (review finding GR-145). Checked
+    /// for every label there is.
+    #[test]
+    fn a_label_only_rises_and_the_order_of_reads_does_not_matter() {
+        for a in all() {
+            assert_eq!(a.join(a), a);
+            assert_eq!(a.join(Label::CLEAN), a);
+            assert_eq!(a.join(Label::WORST), Label::WORST);
+            assert!(Label::WORST.covers(&a) && a.covers(&Label::CLEAN));
+            for b in all() {
+                let joined = a.join(b);
+                assert_eq!(joined, b.join(a));
+                // Never below either: nothing read lowers a label.
+                assert!(joined.covers(&a) && joined.covers(&b));
+                // And no higher than it must be.
+                assert!(joined.confidentiality == a.confidentiality.max(b.confidentiality));
+                assert_eq!(a.covers(&b), a.join(b) == a);
+                for c in all() {
+                    assert_eq!(a.join(b).join(c), a.join(b.join(c)));
+                }
+            }
+        }
+        // One part higher and one lower: neither covers the other.
+        let secret = label(Confidentiality::Restricted, Integrity::Trusted);
+        let dirty = label(Confidentiality::Public, Integrity::Untrusted);
+        assert!(!secret.covers(&dirty) && !dirty.covers(&secret));
+        assert_eq!(secret.join(dirty), Label::WORST);
+    }
+
+    fn labelled() -> Receipt {
+        let mut r = receipt(5, Some(Digest::of(&[b"prev"])), Phase::Intent);
+        r.session = Some(id("sess-1"));
+        r.rule = Some(id("allow-triage"));
+        r.cause = Some(Cause {
+            prev: Some(ReceiptRef {
+                gate: id("gate-1"),
+                seq: 3,
+                hash: Digest::of(&[b"earlier"]),
+            }),
+            token: Some(Digest::of(&[b"token"])),
+        });
+        r.labels = Some(ReceiptLabels {
+            data: label(Confidentiality::Confidential, Integrity::Trusted),
+            after: label(Confidentiality::Confidential, Integrity::Untrusted),
+        });
+        r
+    }
+
+    fn text(e: &Envelope) -> String {
+        String::from_utf8(URL_SAFE_NO_PAD.decode(&e.payload).unwrap()).unwrap()
+    }
+
+    /// The new fields are signed like the rest, and a receipt without them is byte for byte
+    /// what it was before they existed: every receipt already written still verifies.
+    #[test]
+    fn a_receipt_carries_its_session_cause_rule_and_labels_or_none_of_them() {
+        let gate = key("gate-1-key", 20);
+        let keys = KeySet::new([gate.public()]);
+        let r = labelled();
+        r.validate().unwrap();
+        let sealed = seal(&r, &gate).unwrap();
+        assert_eq!(open::<Receipt>(&sealed, &keys, &scope()).unwrap().doc, r);
+        let signed = text(&sealed);
+        for part in [
+            r#""session":"sess-1""#,
+            r#""rule":"allow-triage""#,
+            r#""data":{"confidentiality":"confidential","integrity":"trusted"}"#,
+            r#""after":{"confidentiality":"confidential","integrity":"untrusted"}"#,
+            r#""cause":{"prev":{"gate":"gate-1""#,
+        ] {
+            assert!(signed.contains(part), "{part} is not in {signed}");
+        }
+
+        let plain = receipt(5, Some(Digest::of(&[b"prev"])), Phase::Intent);
+        let signed = text(&seal(&plain, &gate).unwrap());
+        for word in ["session", "cause", "rule", "labels"] {
+            assert!(!signed.contains(&format!("\"{word}\"")), "{word}");
+        }
+
+        // A word outside the closed lists, or a field nobody defined, is refused.
+        let tampered = |from: &str, to: &str| {
+            let mut value: Value = serde_json::to_value(labelled()).unwrap();
+            let s = serde_json::to_string(&value).unwrap().replace(from, to);
+            value = serde_json::from_str(&s).unwrap();
+            serde_json::from_value::<Receipt>(value)
+        };
+        tampered("sess-1", "sess-2").unwrap();
+        assert!(tampered(r#""confidential""#, r#""secret""#).is_err());
+        assert!(tampered(r#""untrusted""#, r#""tainted""#).is_err());
+        assert!(tampered(
+            r#""integrity":"trusted""#,
+            r#""integrity":"trusted","note":"x""#
+        )
+        .is_err());
+        assert!(tampered(r#""token":"#, r#""tokens":"#).is_err());
+    }
+
+    /// What a receipt may not say about labels, whoever signs it.
+    #[test]
+    fn a_receipt_that_misstates_its_labels_or_cause_is_refused() {
+        let bad = |change: &dyn Fn(&mut Receipt)| {
+            let mut r = labelled();
+            change(&mut r);
+            r.validate()
+        };
+        bad(&|_| {}).unwrap();
+        // The mandate's label after a call is never below what the call touched.
+        assert!(bad(&|r| {
+            r.labels.as_mut().unwrap().after =
+                label(Confidentiality::Internal, Integrity::Untrusted)
+        })
+        .is_err());
+        assert!(bad(&|r| {
+            r.labels.as_mut().unwrap().data = label(Confidentiality::Public, Integrity::Untrusted);
+            r.labels.as_mut().unwrap().after =
+                label(Confidentiality::Restricted, Integrity::Trusted);
+        })
+        .is_err());
+        // A cause is an earlier receipt of this gate's chain, and says something.
+        assert!(bad(&|r| r.cause.as_mut().unwrap().prev.as_mut().unwrap().seq = 5).is_err());
+        assert!(bad(&|r| r.cause.as_mut().unwrap().prev.as_mut().unwrap().seq = 6).is_err());
+        assert!(
+            bad(&|r| r.cause.as_mut().unwrap().prev.as_mut().unwrap().gate = id("gate-2")).is_err()
+        );
+        assert!(bad(&|r| {
+            r.cause = Some(Cause {
+                prev: None,
+                token: None,
+            })
+        })
+        .is_err());
+        bad(&|r| r.cause.as_mut().unwrap().prev = None).unwrap();
+        bad(&|r| r.cause.as_mut().unwrap().token = None).unwrap();
+
+        // A stock client's call has no mandate: no session, no label, no cause (GR-151).
+        let claimed = |change: &dyn Fn(&mut Receipt)| {
+            let mut r = receipt(5, Some(Digest::of(&[b"prev"])), Phase::Intent);
+            r.mode = Mode::Observe;
+            r.coverage = Coverage::InLine;
+            r.agent.proof = Proof::Claimed;
+            r.mandate = Vec::new();
+            change(&mut r);
+            r.validate()
+        };
+        claimed(&|_| {}).unwrap();
+        claimed(&|r| r.rule = Some(id("allow-triage"))).unwrap();
+        assert!(claimed(&|r| r.session = labelled().session).is_err());
+        assert!(claimed(&|r| r.labels = labelled().labels).is_err());
+        assert!(claimed(&|r| r.cause = labelled().cause).is_err());
+        // A failed proof presented a session, and is nobody's act: it moves no label.
+        let failed = |change: &dyn Fn(&mut Receipt)| {
+            claimed(&|r| {
+                r.agent.proof = Proof::Failed;
+                r.agent.failure = Some(gov_core::receipt::ProofFailure::BadSignature);
+                r.mandate = vec![id("m-root")];
+                change(r);
+            })
+        };
+        failed(&|r| r.session = labelled().session).unwrap();
+        assert!(failed(&|r| r.labels = labelled().labels).is_err());
+        assert!(failed(&|r| r.cause = labelled().cause).is_err());
+    }
+
+    fn pattern(p: &str) -> ResourcePattern {
+        ResourcePattern::new(p).unwrap()
+    }
+    fn path(p: &str) -> ResourcePath {
+        ResourcePath::new(p).unwrap()
+    }
+    fn labelled_map() -> gov_core::connector::ServerMap {
+        let mut map = jira_map();
+        map.labels = vec![
+            ResourceLabel {
+                resources: pattern("jira/*"),
+                confidentiality: Confidentiality::Internal,
+            },
+            ResourceLabel {
+                resources: pattern("jira/project/pay/*"),
+                confidentiality: Confidentiality::Restricted,
+            },
+            ResourceLabel {
+                resources: pattern("jira/project/docs/*"),
+                confidentiality: Confidentiality::Public,
+            },
+        ];
+        map.clearances = vec![
+            ResourceClearance {
+                resources: pattern("jira/project/*"),
+                clearance: Confidentiality::Confidential,
+            },
+            ResourceClearance {
+                resources: pattern("jira/project/docs/*"),
+                clearance: Confidentiality::Public,
+            },
+        ];
+        map
+    }
+
+    /// What nobody labelled is taken for the worst, and where two entries cover one
+    /// resource the stricter wins: a mistake in a map can only make it stricter.
+    #[test]
+    fn an_unlabelled_resource_is_the_most_closely_held_and_cleared_for_nothing() {
+        let bare = jira_map();
+        bare.validate().unwrap();
+        let anywhere = path("jira/project/pay/issue/pay-1");
+        assert_eq!(
+            bare.confidentiality_of(&anywhere),
+            Confidentiality::Restricted
+        );
+        assert_eq!(bare.clearance_of(&anywhere), Confidentiality::Public);
+        assert!(bare
+            .tools
+            .iter()
+            .all(|t| t.results() == Integrity::Untrusted));
+
+        let map = labelled_map();
+        map.validate().unwrap();
+        for (resource, held, cleared) in [
+            // Two labels cover it: the more closely held.
+            (
+                "jira/project/pay/issue/pay-1",
+                Confidentiality::Restricted,
+                Confidentiality::Confidential,
+            ),
+            // A wider entry says internal, a narrower says public: still internal.
+            (
+                "jira/project/docs/issue/docs-1",
+                Confidentiality::Internal,
+                Confidentiality::Public,
+            ),
+            (
+                "jira/project/ops/issue/ops-1",
+                Confidentiality::Internal,
+                Confidentiality::Confidential,
+            ),
+            // Labelled, and no clearance covers it: cleared for nothing above public.
+            (
+                "jira/search",
+                Confidentiality::Internal,
+                Confidentiality::Public,
+            ),
+        ] {
+            let r = path(resource);
+            assert_eq!(map.confidentiality_of(&r), held, "{resource}");
+            assert_eq!(map.clearance_of(&r), cleared, "{resource}");
+        }
+        let mut trusted = map.clone();
+        trusted.tools[0].results = Some(Integrity::Trusted);
+        assert_eq!(trusted.tools[0].results(), Integrity::Trusted);
+    }
+
+    /// Labels in a map are held to what a rule's patterns are, and are part of what the
+    /// root key signs: a change to one shows to the signer as a changed map.
+    #[test]
+    fn a_maps_labels_are_linted_and_signed_with_it() {
+        let bad = |change: &dyn Fn(&mut gov_core::connector::ServerMap)| {
+            let mut map = labelled_map();
+            change(&mut map);
+            map.validate()
+        };
+        // Another system's resource.
+        assert!(bad(&|m| m.labels[0].resources = pattern("github/*")).is_err());
+        assert!(bad(&|m| m.clearances[0].resources = pattern("github/*")).is_err());
+        // Upper case in a system that folds: it would cover nothing, and so label nothing.
+        assert!(bad(&|m| m.labels[1].resources = pattern("jira/project/PAY/*")).is_err());
+        assert!(bad(&|m| m.clearances[1].resources = pattern("jira/project/DOCS/*")).is_err());
+        bad(&|m| {
+            m.fold_case = false;
+            m.labels[1].resources = pattern("jira/project/PAY/*");
+        })
+        .unwrap();
+        // The same pattern twice in one list, which could say two things.
+        assert!(bad(&|m| m.labels[2].resources = pattern("jira/*")).is_err());
+        assert!(bad(&|m| m.clearances[1].resources = pattern("jira/project/*")).is_err());
+        // The same pattern in both lists says one thing each.
+        bad(&|m| m.clearances[1].resources = pattern("jira/*")).unwrap();
+
+        // A map without labels is written exactly as it was before there were any.
+        let bare = serde_json::to_string(&jira_map()).unwrap();
+        for word in ["labels", "clearances", "results"] {
+            assert!(!bare.contains(word), "{word}");
+        }
+        // Loosening one label is a changed map to whoever signs the next bundle.
+        let with = |map| PolicyBundle {
+            connectors: vec![map],
+            ..bundle(Vec::new())
+        };
+        let before = with(labelled_map());
+        let mut loosened = labelled_map();
+        loosened.labels[1].confidentiality = Confidentiality::Public;
+        let after = PolicyBundle {
+            number: 2,
+            ..with(loosened)
+        };
+        after.validate().unwrap();
+        assert_eq!(
+            changes(Some(&before), &after).maps_changed,
+            [id("jira-mcp")]
+        );
+        let mut trusting = labelled_map();
+        trusting.tools[0].results = Some(Integrity::Trusted);
+        let after = PolicyBundle {
+            number: 2,
+            ..with(trusting)
+        };
+        assert_eq!(
+            changes(Some(&before), &after).maps_changed,
+            [id("jira-mcp")]
+        );
+    }
 }

@@ -13,7 +13,36 @@ data only, and a control is not built until removing it fails a test.
   requirements, the departures from it (§2), and where the work sits among the slices
   still open (§8).
 - **Read by the reviewer on 2026-11-27 (its nineteenth read): the spec passes the gate as a
-  design**, with conditions answered in §11. **Nothing is built.**
+  design**, with conditions answered in §11.
+- **CG0a built (2026-11-27), on `build/gov-cg0a`; not yet read by the reviewer. Nothing
+  else is built, and CG0a changes no behaviour:** no gate writes or reads the new fields.
+  - *The words* (`gov-core/src/label.rs`): confidentiality (public, internal,
+    confidential, restricted), integrity (trusted, untrusted), and a label's join, checked
+    for every pair and triple of labels: the order of reads does not matter and a label
+    never goes down.
+  - *On a receipt:* `session`, `cause` (the previous receipt of the same root mandate at
+    this gate, and the digest of a label token), `rule` and `labels` (what the call
+    touched, and the mandate's label after it). Each is left out when absent, so **a
+    receipt without them is byte for byte what it was, and every export made before still
+    verifies**: the break GR-150 accepted did not have to happen. A receipt is refused if
+    a bare claim carries a session, if labels or cause sit on anything but a proven
+    agent's receipt (GR-151), if the label after a call is below what the call touched,
+    or if a cause is empty, of another gate, or not earlier.
+  - *In a connector map:* `labels` (confidentiality by resource pattern), `clearances`
+    (the most confidential thing that may be sent to a pattern, for every kind of call:
+    GR-144), and `results` on a tool (the integrity of what it returns). They are in what
+    the root key signs, and a changed label shows to the signer as a changed map. The
+    lint holds their patterns to the map's system, to lower case where the system folds,
+    and to one entry a pattern.
+  - **Three choices the PRD and this spec had not made, for the reviewer:** a resource no
+    entry labels is taken for **restricted**; a resource no entry clears is cleared for
+    **public** only; a tool whose results nobody marked returns **untrusted** text. Where
+    two entries cover one resource the stricter wins (the higher label, the lower
+    clearance), so a narrower entry can tighten a wider one and never loosen it. A
+    mistake in a map can then only make it stricter.
+  - The three maps in the library carry no labels: which project is confidential is each
+    deployment's to say. `gov map build` passes a review's labels through to the map.
+  - 22 checks removed one at a time; each removal fails a test.
 - The PRD is `docs/prd-access-governance.md` and the graph explorer's design source is
   `docs/design/graph-explorer-design.dc.html`, both committed on 2026-11-27 at the owner's
   word, as the owner pasted them. The design file is a component source that does not run

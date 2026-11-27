@@ -510,3 +510,65 @@ fn a_change_in_a_tools_arguments_is_drift() {
     assert_eq!(d.changed, ["delete_issue"]);
     assert_eq!(d.unchanged, 1);
 }
+
+// ----- labels in a review (access governance spec, CG-4; slice CG0a) --------------------
+
+/// A review may say how confidential the system's resources are, what may be sent where,
+/// and whether a tool's results can be trusted. The map carries exactly that, the lint a
+/// gate holds a map to still applies, and a review that says none of it builds the map it
+/// always did.
+#[test]
+fn what_a_review_says_about_labels_is_in_the_map_and_nothing_else() {
+    use gov_core::label::{Confidentiality, Integrity};
+    let plain = build(&listing(), &review()).unwrap();
+    assert!(plain.labels.is_empty() && plain.clearances.is_empty());
+    assert!(plain.tools.iter().all(|t| t.results.is_none()));
+
+    let mut value = serde_json::to_value(review()).unwrap();
+    value["labels"] = json!([
+        {"resources": "tracker/*", "confidentiality": "internal"},
+        {"resources": "tracker/issue/pay-1", "confidentiality": "restricted"},
+    ]);
+    value["clearances"] = json!([{"resources": "tracker/*", "clearance": "internal"}]);
+    value["tools"]["get_issue"]["results"] = json!("trusted");
+    let labelled: Review = serde_json::from_value(value.clone()).unwrap();
+    let map = build(&listing(), &labelled).unwrap();
+    assert_eq!(map.labels.len(), 2);
+    assert_eq!(map.clearances.len(), 1);
+    let tool = |name: &str| map.tools.iter().find(|t| t.tool.as_str() == name).unwrap();
+    assert_eq!(tool("get_issue").results, Some(Integrity::Trusted));
+    // Nothing was said of the other tool: its results are not trusted.
+    assert_eq!(tool("delete_issue").results, None);
+    assert_eq!(tool("delete_issue").results(), Integrity::Untrusted);
+    let pay = gov_core::ResourcePath::new("tracker/issue/pay-1").unwrap();
+    assert_eq!(map.confidentiality_of(&pay), Confidentiality::Restricted);
+    // Everything else about the map is as it was.
+    let mut stripped = map.clone();
+    stripped.labels.clear();
+    stripped.clearances.clear();
+    stripped.tools.iter_mut().for_each(|t| t.results = None);
+    assert_eq!(stripped, plain);
+
+    // A label for another system's resources stops the build, as the gate's lint would.
+    value["labels"][0]["resources"] = json!("other/*");
+    let wrong: Review = serde_json::from_value(value.clone()).unwrap();
+    assert!(build(&listing(), &wrong).is_err());
+    // And a word that is not one of the four is not a review at all.
+    value["labels"][0] = json!({"resources": "tracker/*", "confidentiality": "secret"});
+    assert!(serde_json::from_value::<Review>(value).is_err());
+}
+
+/// No map in the library says how confidential anything is: that is each deployment's to
+/// say. Until it does, every resource is taken for the most closely held.
+#[test]
+fn the_library_maps_carry_no_labels_of_their_own() {
+    for shelf in shelves() {
+        let review = read_review(&shelf.join("review.json")).unwrap();
+        let map = read_map(&shelf.join(format!("{}.json", review.server))).unwrap();
+        assert!(
+            map.labels.is_empty() && map.clearances.is_empty(),
+            "{}",
+            shelf.display()
+        );
+    }
+}

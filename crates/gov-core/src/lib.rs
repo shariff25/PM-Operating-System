@@ -17,6 +17,7 @@ pub mod error;
 pub mod ids;
 pub mod jcs;
 pub mod keys;
+pub mod label;
 pub mod lease;
 pub mod mandate;
 pub mod policy;
