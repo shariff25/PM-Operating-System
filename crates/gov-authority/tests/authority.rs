@@ -1519,6 +1519,23 @@ async fn delegating<S: Store>(store: S) {
         (&last.actor.id, last.actor.verified),
         (&id("refund-bot"), false)
     );
+    // An agent, and the record says so: a person may be called refund-bot too (GR-154).
+    assert_eq!(last.actor.kind, gov_core::admin::ActorKind::Agent);
+    // Every other record so far is a person's, and its signed text does not carry the
+    // field at all, as records written before the field existed do not.
+    for record in &records[..records.len() - 1] {
+        assert_eq!(record.actor.kind, gov_core::admin::ActorKind::Person);
+    }
+    let stored = a.store().records_after(&scope(), 0, 10_000).await.unwrap();
+    let text = |e: &Envelope| {
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&e.payload)
+            .unwrap();
+        String::from_utf8(bytes).unwrap()
+    };
+    assert!(text(&stored.last().unwrap().envelope).contains(r#""kind":"agent""#));
+    assert!(text(&stored[0].envelope).contains(r#""actor":{"id":"ana","verified":false}"#));
     let kept = a
         .store()
         .mandate(&scope(), &child.id)

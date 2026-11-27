@@ -649,6 +649,7 @@ async fn a_record_about_a_gate_never_retires_the_authoritys_own_key() {
         at: NOW,
         actor: Actor {
             id: id("ana"),
+            kind: Default::default(),
             verified: false,
         },
         action: AdminAction::GateDisabled,

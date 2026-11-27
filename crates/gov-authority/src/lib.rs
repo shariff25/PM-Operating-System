@@ -219,6 +219,19 @@ impl<S: Store> Authority<S> {
         effects: &[Effect],
         now: i64,
     ) -> Result<u64> {
+        let by = (actor, gov_core::admin::ActorKind::Person);
+        self.commit_as(head, by, did, effects, now).await
+    }
+
+    /// As [`Authority::commit`], for an actor that may be an agent.
+    async fn commit_as(
+        &self,
+        head: Option<ChainHead>,
+        (actor, kind): (&Id, gov_core::admin::ActorKind),
+        did: Did,
+        effects: &[Effect],
+        now: i64,
+    ) -> Result<u64> {
         // A record's time never goes back along the chain, whatever the clock does.
         let at = match &head {
             Some(h) => self
@@ -239,6 +252,7 @@ impl<S: Store> Authority<S> {
             at,
             actor: Actor {
                 id: actor.clone(),
+                kind,
                 // Nobody is signed in before G4e.
                 verified: false,
             },
@@ -652,7 +666,14 @@ impl<S: Store> Authority<S> {
                 &mandate.id,
             )
         };
-        self.commit(head, actor, did, &[Effect::PutMandate(kept)], now)
+        // A delegation is asked for by an agent, a first mandate by a person: the record
+        // says which, since the two can share an id (review finding GR-154).
+        let kind = if kept.parent.is_some() {
+            gov_core::admin::ActorKind::Agent
+        } else {
+            gov_core::admin::ActorKind::Person
+        };
+        self.commit_as(head, (actor, kind), did, &[Effect::PutMandate(kept)], now)
             .await?;
         Ok(envelope)
     }

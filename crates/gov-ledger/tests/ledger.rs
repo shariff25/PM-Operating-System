@@ -1152,6 +1152,7 @@ fn admin_record(seq: u64, prev: Option<gov_core::Digest>, at: i64) -> gov_core::
         at,
         actor: Actor {
             id: id("ana"),
+            kind: Default::default(),
             verified: false,
         },
         action: AdminAction::GateRegistered,

@@ -68,11 +68,32 @@ pub struct Subject {
     pub id: Id,
 }
 
+/// What kind of thing acted. People and agents are named from separate lists, so the same
+/// id can be one of each: a record says which it means (review finding GR-154).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActorKind {
+    #[default]
+    Person,
+    /// An agent, acting through a request signed with its enrolled key: a delegation.
+    Agent,
+}
+
+impl ActorKind {
+    fn is_person(&self) -> bool {
+        *self == ActorKind::Person
+    }
+}
+
 /// Who did it, and whether the Authority knew that or was told it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Actor {
     pub id: Id,
+    /// A person unless it says otherwise: left out for a person, so that a record written
+    /// before this field existed reads as what it was.
+    #[serde(default, skip_serializing_if = "ActorKind::is_person")]
+    pub kind: ActorKind,
     /// True only when the person was signed in when they acted. Before sign-in exists (G4e)
     /// every record says false, as `claimed` does for an agent, so that none reads as a
     /// person's proven act (review finding GR-111).
