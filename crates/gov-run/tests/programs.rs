@@ -436,6 +436,7 @@ async fn a_gate_and_a_ledger_run_as_programs_leave_a_record_an_auditor_can_check
             freshness: Default::default(),
             rules: Vec::new(),
             connectors: vec![map.clone()],
+            templates: Vec::new(),
         };
         serde_json::to_vec(&gov_core::seal(&bundle, &root).unwrap()).unwrap()
     };

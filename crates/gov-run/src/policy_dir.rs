@@ -45,6 +45,8 @@ struct Source {
     freshness: FreshnessLimits,
     keys: OnlineKeys,
     rules: Vec<Rule>,
+    #[serde(default)]
+    templates: Vec<gov_core::mandate::Template>,
 }
 
 /// One sample call for a connector map.
@@ -156,6 +158,7 @@ pub fn check(dir: &Path, number: u64, now: i64) -> anyhow::Result<Checked> {
         freshness: source.freshness,
         rules: source.rules,
         connectors,
+        templates: source.templates,
     };
     bundle
         .validate()
@@ -291,6 +294,9 @@ pub fn describe(changes: &Changes) -> Vec<String> {
         ("connector map added", &changes.maps_added),
         ("connector map removed", &changes.maps_removed),
         ("connector map changed", &changes.maps_changed),
+        ("template added", &changes.templates_added),
+        ("template removed", &changes.templates_removed),
+        ("template changed", &changes.templates_changed),
     ] {
         for id in ids {
             out.push(format!("{what}: {id}"));

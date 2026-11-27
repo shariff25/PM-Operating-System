@@ -142,6 +142,7 @@ fn check<'a>(scope: &'a Scope, keys: &'a KeySet, revoked: &'a RevocationSet) -> 
         authority: keys,
         now: NOW,
         revoked,
+        templates: None,
     }
 }
 
@@ -1270,6 +1271,7 @@ fn bundle(rules: Vec<Rule>) -> PolicyBundle {
         freshness: FreshnessLimits::default(),
         rules,
         connectors: Vec::new(),
+        templates: Vec::new(),
     }
 }
 
@@ -2581,4 +2583,177 @@ fn the_signer_is_shown_what_changed() {
         vec![before.connectors[0].server.clone()]
     );
     assert_eq!((shown.keys_added.len(), shown.keys_removed.len()), (2, 2));
+}
+
+// ----- G4c: the gate holds a mandate to its template (spec §7.6.2, point 10) --------------
+
+fn triage_template() -> gov_core::mandate::Template {
+    gov_core::mandate::Template {
+        id: id("triage"),
+        grants: vec![grant(
+            &["issue.read", "issue.update"],
+            &["jira/project/PAY/*"],
+        )],
+        max_life_secs: 2 * 3600,
+        limits: Limits {
+            max_actions: Some(100),
+            max_writes: Some(10),
+        },
+        delegable: true,
+        people: BTreeSet::new(),
+        receivers: BTreeSet::new(),
+    }
+}
+
+/// Check `env` as a gate holding `templates` would.
+fn verify_under(
+    env: &Envelope,
+    templates: &[gov_core::mandate::Template],
+) -> Result<gov_core::mandate::VerifiedChain, Error> {
+    verify_chain(
+        env,
+        &ChainCheck {
+            templates: Some(templates),
+            ..check(&scope(), &authority_keys(), &RevocationSet::default())
+        },
+    )
+}
+
+/// GR-138: the key mandates are signed with is online, so its signature alone is worth no
+/// more than the templates the root signed. A mandate wider than its template in any way,
+/// or naming a template the gate does not hold, is refused though validly signed.
+#[test]
+fn a_validly_signed_mandate_wider_than_its_template_is_refused() {
+    let agent = key("agent-0-key", 10);
+    let good = root(&agent, "agent-0");
+    let signed = |m: &Mandate| seal(m, &authority()).unwrap();
+    let held = [triage_template()];
+    verify_under(&signed(&good), &held).unwrap();
+    // With no bundle loaded nothing is held to a template: tests and the unsigned path only.
+    verify(&signed(&good)).unwrap();
+
+    // What someone holding the mandates key could sign, and a gate refuses.
+    let wider = |change: &dyn Fn(&mut Mandate)| {
+        let mut m = good.clone();
+        change(&mut m);
+        verify_under(&signed(&m), &held).unwrap_err()
+    };
+    assert_eq!(
+        wider(&|m| m.grants = vec![grant(&["issue.delete"], &["jira/project/PAY/*"])]),
+        Error::WiderThanTemplate("grants")
+    );
+    assert_eq!(
+        wider(&|m| m.grants = vec![grant(&["issue.read"], &["jira/project/OPS/*"])]),
+        Error::WiderThanTemplate("grants")
+    );
+    assert_eq!(
+        wider(&|m| m.expires_at = m.issued_at + 2 * 3600 + 1),
+        Error::WiderThanTemplate("time")
+    );
+    assert_eq!(
+        wider(&|m| m.limits.max_writes = Some(11)),
+        Error::WiderThanTemplate("limits")
+    );
+    assert_eq!(
+        wider(&|m| m.limits.max_actions = None),
+        Error::WiderThanTemplate("limits")
+    );
+    // A template the gate does not hold, whatever number follows the name.
+    assert_eq!(
+        wider(&|m| m.template = id("admin@7")),
+        Error::UnknownTemplate
+    );
+    assert_eq!(
+        verify_under(&signed(&good), &[]).unwrap_err(),
+        Error::UnknownTemplate
+    );
+
+    // The number after the @ does not choose the template: the one held governs. A mandate
+    // issued from bundle 7 is held to the template as it stands now, so narrowing a
+    // template tightens the mandates already out, and removing it ends them.
+    let mut narrowed = triage_template();
+    narrowed.grants = vec![grant(&["issue.read"], &["jira/project/PAY/*"])];
+    assert_eq!(
+        verify_under(&signed(&good), &[narrowed]).unwrap_err(),
+        Error::WiderThanTemplate("grants")
+    );
+    let mut later = good.clone();
+    later.template = id("triage@99");
+    verify_under(&signed(&later), &held).unwrap();
+}
+
+/// A chain is delegated only where its template allows it, and a child cannot name a
+/// template of its own choosing.
+#[test]
+fn delegation_is_the_templates_to_allow() {
+    let (leaf, _, _) = chain();
+    let held = [triage_template()];
+    verify_under(&leaf, &held).unwrap();
+    let mut alone = triage_template();
+    alone.delegable = false;
+    assert_eq!(
+        verify_under(&leaf, &[alone.clone()]).unwrap_err(),
+        Error::WiderThanTemplate("delegation")
+    );
+    // The same template still serves a mandate that is not delegated.
+    let agent = key("agent-0-key", 10);
+    verify_under(
+        &seal(&root(&agent, "agent-0"), &authority()).unwrap(),
+        &[alone],
+    )
+    .unwrap();
+
+    // A child that names another template, one that would allow more, is not believed.
+    let a0 = key("agent-0-key", 10);
+    let a1 = key("agent-1-key", 11);
+    let r = root(&a0, "agent-0");
+    let r_env = seal(&r, &authority()).unwrap();
+    let mut c = child(&r, &r_env, &a1, 1);
+    c.template = id("wide@7");
+    let mut wide = triage_template();
+    wide.id = id("wide");
+    assert_eq!(
+        verify_under(&seal(&c, &authority()).unwrap(), &[triage_template(), wide]).unwrap_err(),
+        Error::WiderThanParent("template")
+    );
+}
+
+/// What a template must be before a bundle carrying it is a bundle, and the signer is shown
+/// a template that was added, removed or changed.
+#[test]
+fn templates_are_policy() {
+    let with = |templates: Vec<gov_core::mandate::Template>| PolicyBundle {
+        templates,
+        ..bundle(Vec::new())
+    };
+    with(vec![triage_template()]).validate().unwrap();
+    let bad = |change: &dyn Fn(&mut gov_core::mandate::Template)| {
+        let mut t = triage_template();
+        change(&mut t);
+        with(vec![t]).validate()
+    };
+    assert!(bad(&|t| t.grants.clear()).is_err());
+    assert!(bad(&|t| t.max_life_secs = 0).is_err());
+    assert!(bad(&|t| t.max_life_secs = 8 * 3600 + 1).is_err());
+    bad(&|t| t.max_life_secs = 8 * 3600).unwrap();
+    assert!(bad(&|t| t.id = id("triage@7")).is_err());
+    assert!(with(vec![triage_template(), triage_template()])
+        .validate()
+        .is_err());
+
+    let before = with(vec![triage_template()]);
+    let mut loosened = triage_template();
+    loosened.grants = vec![grant(
+        &["issue.read", "issue.update", "issue.delete"],
+        &["jira/*"],
+    )];
+    let mut extra = triage_template();
+    extra.id = id("admin");
+    let shown = changes(Some(&before), &with(vec![loosened, extra]));
+    assert_eq!(shown.templates_changed, vec![id("triage")]);
+    assert_eq!(shown.templates_added, vec![id("admin")]);
+    assert!(!shown.other);
+    let shown = changes(Some(&before), &with(Vec::new()));
+    assert_eq!(shown.templates_removed, vec![id("triage")]);
+    assert!(!shown.other && !shown.is_empty());
 }

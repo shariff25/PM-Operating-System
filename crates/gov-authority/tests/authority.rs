@@ -959,6 +959,7 @@ fn signed_bundle(number: u64, issuer: &str, rules: &[&str], signer: &SigningKey)
             })
             .collect(),
         connectors: Vec::new(),
+        templates: Vec::new(),
     };
     seal(&bundle, signer).unwrap()
 }

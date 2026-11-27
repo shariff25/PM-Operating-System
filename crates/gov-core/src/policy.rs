@@ -16,6 +16,7 @@ use crate::error::{Error, Result};
 use crate::ids::{Digest, Id, ResourcePattern, Scope};
 use crate::keys::{KeySet, PublicKey};
 use crate::lease::{Freshness, FreshnessLimits};
+use crate::mandate::Template;
 
 /// What a rule applies to. An absent field matches anything.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +112,9 @@ pub struct PolicyBundle {
     /// The connector map: what each upstream tool is and does.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub connectors: Vec<ServerMap>,
+    /// What a mandate may carry at most, by name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub templates: Vec<Template>,
 }
 
 document!(PolicyBundle, "gov.policy.v1");
@@ -209,6 +213,13 @@ impl PolicyBundle {
                 return Err(Error::Malformed("a server is mapped twice"));
             }
             server.validate()?;
+        }
+        let mut names = BTreeSet::new();
+        for template in &self.templates {
+            if !names.insert(&template.id) {
+                return Err(Error::Malformed("two templates share an id"));
+            }
+            template.validate()?;
         }
         let mut ids = BTreeSet::new();
         for rule in &self.rules {
@@ -433,6 +444,9 @@ pub struct Changes {
     pub maps_added: Vec<Id>,
     pub maps_removed: Vec<Id>,
     pub maps_changed: Vec<Id>,
+    pub templates_added: Vec<Id>,
+    pub templates_removed: Vec<Id>,
+    pub templates_changed: Vec<Id>,
     /// The freshness limits differ.
     pub freshness_changed: bool,
     /// The two bundles differ in something this list does not name (review finding GR-135):
@@ -491,6 +505,19 @@ pub fn changes(previous: Option<&PolicyBundle>, next: &PolicyBundle) -> Changes 
             out.maps_removed.push(map.server.clone());
         }
     }
+    let before_templates: &[Template] = previous.map_or(&[], |p| &p.templates);
+    for template in &next.templates {
+        match before_templates.iter().find(|t| t.id == template.id) {
+            None => out.templates_added.push(template.id.clone()),
+            Some(old) if old != template => out.templates_changed.push(template.id.clone()),
+            Some(_) => {}
+        }
+    }
+    for template in before_templates {
+        if !next.templates.iter().any(|t| t.id == template.id) {
+            out.templates_removed.push(template.id.clone());
+        }
+    }
     out.freshness_changed = previous.is_some_and(|p| p.freshness != next.freshness);
     // Whatever is left once everything named above, and what differs by design (the
     // number, the time, the label people read), is set equal.
@@ -502,6 +529,7 @@ pub fn changes(previous: Option<&PolicyBundle>, next: &PolicyBundle) -> Changes 
             keys: next.keys.clone(),
             rules: next.rules.clone(),
             connectors: next.connectors.clone(),
+            templates: next.templates.clone(),
             freshness: next.freshness,
             ..p.clone()
         };
