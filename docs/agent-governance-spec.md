@@ -850,6 +850,33 @@ Postgres was read, not run, by the reviewer.
 | GR-142 | Medium, before the scene is shown | Turning the seam off is PM OS's own setting, so it is not always a recorded act | §8.4 reworded: with the library seam the cover is in line, not custody, and PM OS's operator can go round it |
 | GR-143 | Low | "Names both" does not fit a record with one `about` field | §7.6.2, point 4: the record is about the child agent; the parent is in the mandate, which the record's digest covers |
 
+### Twentieth read, 2026-11-27: G4c at `d376e20`
+
+**Verdict: no High or Critical; the gate passes for the main spec, G1, G2, G3a, G3b, G4a,
+G4b and G4c.** The template check at the gate (GR-138), issuing, delegation, the feed and
+the auditor's check were read and found sound. Of the three departures, the child's id
+from the request's hash stands, recording a refused mandate's call as claimed is
+acceptable until G4d, and the order of stopping an agent does not stand (GR-152). The
+reviewer ran the tests of `gov-core`, `gov-authority` and `gov-ledger` without Postgres;
+the Authority's Postgres store was read, not run, and `gov-gate`, `gov-run` and `gov-cli`
+were not re-run. **GR-152 and GR-153 are to be fixed before G4d.**
+
+| Id | Severity | What | Done |
+|---|---|---|---|
+| GR-152 | Medium, before G4d | An agent's mandates were revoked before the agent was marked stopped, so a mandate issued in between stayed live under a suspended agent | Open: to fix on `build/gov-review-20` |
+| GR-153 | Medium, before G4d | A leaver's mandates for agents owned by others stayed live | Open: to fix on `build/gov-review-20` |
+| GR-154 | Low | A delegation's record names an agent in the field that elsewhere holds a person: the two cannot be told apart | Open |
+| GR-155 | Low | A refused attempt to open a session leaves no trace | Open |
+| GR-156 | Low | A template's grants for a system that folds case are not required to be lower case | Open |
+| GR-157 | Info | CP's design is not in the repository, so nothing of CP can count as through the gate until the reviewer is given it some other way | Noted; CP is not built |
+
+What the reviewer asked to be settled in the text before G4d is built: what a gate does
+before its first lease (GR-72); how the lease and the feed are checked together; that the
+lease names the bundle (closing GR-132 and GR-133) and how a gate changes bundle without a
+restart; separate reasons for closing a session (GR-110); key rotation (GR-59, GR-126); and
+that `gov verify` orders receipts after a retirement by the witness, not by the gate's own
+time (GR-130). CM1 and CM2 were called sound as slices; each map is read when it is sent.
+
 ## 1. What is being built
 
 Agent Governance is a second product, separate from PM OS. It has three parts.
