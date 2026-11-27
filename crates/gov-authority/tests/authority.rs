@@ -1138,6 +1138,10 @@ fn templates() -> Vec<Template> {
 
 /// A signed bundle carrying the templates, with these keys for mandates.
 fn policy(number: u64, mandate_keys: Vec<PublicKey>) -> Envelope {
+    policy_with(number, mandate_keys, leases_key().public())
+}
+
+fn policy_with(number: u64, mandate_keys: Vec<PublicKey>, leases: PublicKey) -> Envelope {
     use gov_core::policy::{OnlineKeys, PolicyBundle};
     let bundle = PolicyBundle {
         v: 1,
@@ -1149,7 +1153,7 @@ fn policy(number: u64, mandate_keys: Vec<PublicKey>) -> Envelope {
         issued_at: NOW,
         keys: OnlineKeys {
             mandates: mandate_keys,
-            leases: vec![leases_key().public()],
+            leases: vec![leases],
         },
         freshness: Default::default(),
         rules: Vec::new(),
@@ -1363,6 +1367,19 @@ async fn issuing<S: Store>(store: S) {
     let issued = a.issue_mandate(&ben, &narrow, NOW).await.unwrap();
     let links = as_a_gate(&issued, &RevocationSet::default()).unwrap();
     assert_eq!(links[0].limits.max_writes, Some(3));
+
+    // A person who has left asks for nothing, though the template still names them.
+    a.offboard_person(&ana, &cy, NOW).await.unwrap();
+    assert!(matches!(
+        a.issue_mandate(&cy, &ask("refund-bot", "refund-bot:k1", "shared"), NOW)
+            .await,
+        Err(AuthorityError::NotAllowed)
+    ));
+    // Nor do they see anything.
+    assert!(matches!(
+        a.list_mandates(&cy).await,
+        Err(AuthorityError::NotAllowed)
+    ));
 
     // A suspended agent is issued nothing.
     a.suspend_agent(&ana, &id("refund-bot"), NOW).await.unwrap();
@@ -1676,7 +1693,10 @@ async fn revoking<S: Store>(store: S) {
     // From a number already read, only what is later; from beyond the newest, nothing.
     let later = feed(1, NOW).await;
     assert_eq!((later.entries.len(), later.entries[0].seq), (1, 2));
-    assert!(a.revocation_feed(3, NOW).await.is_err());
+    assert!(matches!(
+        a.revocation_feed(3, NOW).await,
+        Err(AuthorityError::Refused)
+    ));
 
     // Suspending an agent revokes its live mandates, each with its own record, and puts
     // nothing in the feed that would have to be undone: no agent id (GR-140).
@@ -1744,6 +1764,64 @@ async fn revoking<S: Store>(store: S) {
             .unwrap()
             .unwrap()
             .revoked
+    );
+
+    // A bundle that does not list this Authority's leases key: it signs no feed.
+    let other = key("authority:leases-9", 78).public();
+    a.publish_bundle(
+        &ana,
+        &policy_with(2, vec![mandates_key().public()], other),
+        NOW,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        a.revocation_feed(0, NOW).await,
+        Err(AuthorityError::Unknown("leases key in the bundle"))
+    ));
+
+    // Last, since it writes a made-up record: the store takes a revocation only under the
+    // next number, and writes nothing of a commit that carries any other.
+    let held: Vec<u64> = a
+        .store()
+        .revocations_after(&scope(), 0)
+        .await
+        .unwrap()
+        .iter()
+        .map(|e| e.seq)
+        .collect();
+    let newest = *held.last().unwrap();
+    let records = a.store().records_after(&scope(), 0, 1000).await.unwrap();
+    let head = records.last().unwrap().clone();
+    for wrong in [newest, newest + 2, 1] {
+        let record = StoredRecord {
+            seq: head.seq + 1,
+            ..head.clone()
+        };
+        let entry = gov_core::revocation::RevocationEntry {
+            seq: wrong,
+            kind: Revocable::Mandate,
+            id: id("m-made-up"),
+            until: NOW,
+        };
+        let refused = a
+            .store()
+            .commit(&scope(), &record, &[Effect::AddRevocation(entry)])
+            .await;
+        assert!(matches!(refused, Err(StoreError::HeadMoved)), "{wrong}");
+    }
+    let after: Vec<u64> = a
+        .store()
+        .revocations_after(&scope(), 0)
+        .await
+        .unwrap()
+        .iter()
+        .map(|e| e.seq)
+        .collect();
+    assert_eq!(after, held);
+    assert_eq!(
+        a.store().records_after(&scope(), 0, 1000).await.unwrap(),
+        records
     );
 }
 both_stores!(a_mandate_is_listed_revoked_and_named_in_the_feed, revoking);

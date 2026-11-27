@@ -646,10 +646,8 @@ impl<S: Store> Authority<S> {
             if &agent.owner != person && !template.people.contains(person) {
                 return Err(AuthorityError::NotAllowed);
             }
+            // A life of nothing is refused by the gate's check below, as an empty window.
             let life = i64::try_from(ask.life_secs).map_err(|_| AuthorityError::Refused)?;
-            if life == 0 {
-                return Err(AuthorityError::Refused);
-            }
             let mandate = Mandate {
                 v: VERSION,
                 tenant: self.scope.tenant.clone(),
@@ -711,9 +709,10 @@ impl<S: Store> Authority<S> {
             if self.store.mandate(&self.scope, &id).await?.is_some() {
                 return Err(AuthorityError::Refused);
             }
-            let parent = match self.store.mandate(&self.scope, &ask.parent).await? {
-                Some(p) if !p.revoked => p,
-                _ => return Err(AuthorityError::Refused),
+            // A revoked parent is refused by the chain check below, from the same
+            // revocations a gate reads.
+            let Some(parent) = self.store.mandate(&self.scope, &ask.parent).await? else {
+                return Err(AuthorityError::Refused);
             };
             // The parent verifies now, as a gate would check it, and the request is signed
             // with the very key the parent mandate is bound to.
