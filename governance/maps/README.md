@@ -51,9 +51,11 @@ write that takes free text to rule 1.
 
 **Put back.** A tool is marked `inverse` or `restore` only when the same server lists the
 tool that takes the call back, and the review names it in `undo_with`: the opposite tool
-for `inverse`, the tool that writes the old value again for `restore`. `build` refuses a
-review that marks one and names none, or names a tool that is not in the map or only
-reads. A server with no such tool gets `none`, however easy the undo is in the system's own
+for `inverse`, the tool that writes the old value again for `restore`. A `restore` also
+names, in `read_with`, the tool that reads the value as it was before: without one there
+is nothing to write back. `build` refuses a review that marks one and names none, names a
+tool that is not in the map, names a read to undo with, or names anything but a read to
+read with. A server with no such tool gets `none`, however easy the undo is in the system's own
 screens: a reversal class is a promise that a gate can undo the action through this
 connector. Slack's server has none at all.
 

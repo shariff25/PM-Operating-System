@@ -41,6 +41,11 @@ pub struct Reviewed {
     /// For the reader and the build; it is not in the map.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub undo_with: Option<String>,
+    /// For a `restore`: the tool of this same server that reads the value as it was
+    /// before, without which there is nothing to write back (review finding GR-170). It
+    /// must be in the map and be a read. Not for an `inverse`, which needs no old value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_with: Option<String>,
     /// Whether what the tool returns can be trusted to steer an agent. Left out, it cannot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub results: Option<gov_core::label::Integrity>,
@@ -172,6 +177,26 @@ pub fn build(listing: &[Value], review: &Review) -> anyhow::Result<ServerMap> {
                     "{name} is to be put back with {undo}, which only reads"
                 );
             }
+        }
+    }
+    for (name, reviewed) in &review.tools {
+        match (&reviewed.read_with, reviewed.reversal) {
+            (None, Reversal::Restore) => {
+                bail!("{name} is put back from its old value, and names no tool that reads it")
+            }
+            (Some(read), Reversal::Restore) => {
+                let Some(with) = review.tools.get(read) else {
+                    bail!("{name} reads its old value with {read}, which is not in the map");
+                };
+                ensure!(
+                    with.kind == Kind::Read,
+                    "{name} reads its old value with {read}, which is not a read"
+                );
+            }
+            (Some(_), _) => {
+                bail!("{name} names a tool that reads its old value, and is not put back from one")
+            }
+            (None, _) => {}
         }
     }
     let mut tools = Vec::new();

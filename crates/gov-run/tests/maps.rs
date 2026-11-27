@@ -497,11 +497,34 @@ fn every_tool_that_can_be_put_back_names_the_tool_that_does_it() {
                     // An opposite is another tool; writing the old value again may be the same.
                     if tool.reversal == Reversal::Inverse {
                         assert_ne!(with, name, "{name} is its own opposite");
+                        assert!(tool.read_with.is_none(), "{name}");
+                    } else {
+                        // What is put back from its old value names the tool that reads
+                        // it, and that tool only reads (review finding GR-170).
+                        let read = tool.read_with.as_ref().unwrap_or_else(|| {
+                            panic!("{}: {name} names no tool that reads it", shelf.display())
+                        });
+                        assert_eq!(review.tools[read].kind, Kind::Read, "{name}");
                     }
                 }
                 other => panic!("{}: {name}: {other:?}", shelf.display()),
             }
         }
+    }
+    // GitHub's server reads no subscription and no comment by its id, so neither is put
+    // back from an old value (GR-170).
+    let github = shelf("github", "github-mcp");
+    for name in [
+        "manage_notification_subscription",
+        "manage_repository_notification_subscription",
+        "update_issue_comment",
+    ] {
+        let tool = github
+            .tools
+            .iter()
+            .find(|t| t.tool.as_str() == name)
+            .unwrap();
+        assert_eq!(tool.reversal, Reversal::None, "{name}");
     }
     // Slack's server has no tool that takes anything back.
     let slack = shelf("slack", "slack-mcp");
@@ -793,6 +816,41 @@ fn a_review_that_promises_an_undo_the_server_cannot_do_stops_the_build() {
     })
     .unwrap_err();
     assert!(e.contains("only reads"), "{e}");
+    // Put back from its old value: it names the tool that reads that value, which is in
+    // the map and only reads (review finding GR-170).
+    let restore = |v: &mut serde_json::Value| {
+        v["tools"]["delete_issue"]["reversal"] = json!("restore");
+        v["tools"]["delete_issue"]["undo_with"] = json!("debug_dump");
+    };
+    with(&|v| {
+        restore(v);
+        v["tools"]["delete_issue"]["read_with"] = json!("get_issue");
+    })
+    .unwrap();
+    let e = with(&|v| restore(v)).unwrap_err();
+    assert!(e.contains("names no tool that reads"), "{e}");
+    let e = with(&|v| {
+        restore(v);
+        v["tools"]["delete_issue"]["read_with"] = json!("get_history");
+    })
+    .unwrap_err();
+    assert!(e.contains("not in the map"), "{e}");
+    let e = with(&|v| {
+        restore(v);
+        v["tools"]["delete_issue"]["read_with"] = json!("debug_dump");
+    })
+    .unwrap_err();
+    assert!(e.contains("not a read"), "{e}");
+    // An opposite needs no old value, and neither does what is not put back at all.
+    let e = with(&|v| {
+        v["tools"]["delete_issue"]["reversal"] = json!("inverse");
+        v["tools"]["delete_issue"]["undo_with"] = json!("debug_dump");
+        v["tools"]["delete_issue"]["read_with"] = json!("get_issue");
+    })
+    .unwrap_err();
+    assert!(e.contains("is not put back from one"), "{e}");
+    let e = with(&|v| v["tools"]["delete_issue"]["read_with"] = json!("get_issue")).unwrap_err();
+    assert!(e.contains("is not put back from one"), "{e}");
     // Names a tool, and is not marked as one that can be put back: which is it?
     let e = with(&|v| v["tools"]["delete_issue"]["undo_with"] = json!("debug_dump")).unwrap_err();
     assert!(e.contains("is not marked"), "{e}");

@@ -2940,6 +2940,9 @@ mod labels {
         })
         .is_err());
         // A cause is an earlier receipt of this gate's chain, and says something.
+        // Receipts are numbered from 1: there is no receipt 0 to point at (GR-171).
+        assert!(bad(&|r| r.cause.as_mut().unwrap().prev.as_mut().unwrap().seq = 0).is_err());
+        bad(&|r| r.cause.as_mut().unwrap().prev.as_mut().unwrap().seq = 1).unwrap();
         assert!(bad(&|r| r.cause.as_mut().unwrap().prev.as_mut().unwrap().seq = 5).is_err());
         assert!(bad(&|r| r.cause.as_mut().unwrap().prev.as_mut().unwrap().seq = 6).is_err());
         assert!(

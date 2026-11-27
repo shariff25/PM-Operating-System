@@ -476,7 +476,7 @@
       "digest": "afa22b796bf0db511f28ea09d9160782715b1f900111bbecb4396203d9ae0f08",
       "operation": "issuelink.remove",
       "kind": "write",
-      "reversal": "restore",
+      "reversal": "none",
       "outward": false,
       "resource": "jira/issuelink/{link_id}"
     },

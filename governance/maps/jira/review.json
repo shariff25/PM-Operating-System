@@ -44,7 +44,8 @@
    "outward": true,
    "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}",
    "note": "Jira may email the new assignee, by its own notification scheme, which a map cannot see. Put back by assigning the earlier person again, or nobody: the tool takes an empty assignee.",
-   "undo_with": "jira_assign_issue"
+   "undo_with": "jira_assign_issue",
+   "read_with": "jira_get_issue"
   },
   "jira_batch_create_issues": {
    "operation": "issue.batch-create",
@@ -141,7 +142,8 @@
    "outward": true,
    "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}",
    "note": "Jira keeps no earlier version of a comment: putting it back relies on the value sealed before the edit.",
-   "undo_with": "jira_edit_comment"
+   "undo_with": "jira_edit_comment",
+   "read_with": "jira_get_issue"
   },
   "jira_get_agile_boards": {
    "operation": "board.list",
@@ -398,11 +400,10 @@
   "jira_remove_issue_link": {
    "operation": "issuelink.remove",
    "kind": "write",
-   "reversal": "restore",
+   "reversal": "none",
    "outward": false,
    "resource": "jira/issuelink/{link_id}",
-   "undo_with": "jira_create_issue_link",
-   "note": "Put back by creating the link again from what it was before: the call itself names only the link's id."
+   "note": "Put back by creating the link again from what it was before: the call itself names only the link's id. The call names only the link's id, and no tool reads a link by its id, so what the link was cannot be read before it goes: not marked as one that can be put back (GR-170)."
   },
   "jira_remove_watcher": {
    "operation": "issue.watcher.remove",
@@ -464,7 +465,8 @@
    "outward": true,
    "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}",
    "undo_with": "jira_update_proforma_form_answers",
-   "note": "Answers are text people see on the issue."
+   "note": "Answers are text people see on the issue.",
+   "read_with": "jira_get_proforma_form_details"
   },
   "jira_update_sprint": {
    "operation": "sprint.update",
