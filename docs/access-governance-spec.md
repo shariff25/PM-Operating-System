@@ -13,9 +13,14 @@ data only, and a control is not built until removing it fails a test.
   requirements, the departures from it (§2), and where the work sits among the slices
   still open (§8).
 - **Not yet read by the reviewer. Nothing is built.**
-- The PRD's text, its architecture image and the design's source file are **not in the
-  repository**: they exist in the owner's session only. Requirement numbers (CG, RV, AR,
-  UI) are the PRD's, so the two can be laid side by side when the owner commits it.
+- The PRD is `docs/prd-access-governance.md` and the graph explorer's design source is
+  `docs/design/graph-explorer-design.dc.html`, both committed on 2026-11-27 at the owner's
+  word, as the owner pasted them. The design file is a component source that does not run
+  on its own, and it shows the PRD's behaviour, not this spec's: see §6 for what differs.
+  The PRD's architecture image (`design/access-governance-architecture.png`) was never
+  given to the conductor and is **not in the repository**. Requirement numbers (CG, RV,
+  AR, UI) are the PRD's, so the two can be laid side by side. Where they differ, this spec
+  is what is built from (§2).
 - The PRD's table of what is built was out of date. As of this writing: G1 to G4b are
   built and have passed the reviewer's gate (G3 in observe mode); the design of G4c is
   cleared; G4c to G9 are not built. The gate blocks nothing.
@@ -232,5 +237,5 @@ the reviewer (no default; needed before RV3), whether the reviewer may suspend w
 person (yes, three codes, capped, one-step restore), the reviewer's model, who the
 security certifiers are, how long the reviewer's free text is kept (7 days), the label
 names, and what happens to undecided items (suspended). Added here: the window over which
-a standing label is kept (CG-11), and whether the PRD and its design source are to be
-committed beside this spec.
+a standing label is kept (CG-11), and the architecture image the PRD refers to, which the
+conductor does not have.
