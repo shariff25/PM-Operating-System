@@ -826,4 +826,94 @@ mod with_an_authority {
             );
         }
     }
+
+    /// The gate takes another bundle: a session whose chain still holds under it goes on,
+    /// one that no longer does is dropped, and a marker stays whatever the bundle says.
+    #[test]
+    fn a_new_bundle_drops_the_sessions_it_no_longer_covers_and_keeps_markers() {
+        use gov_core::mandate::Template;
+        let none = RevocationSet::default();
+        let template = |name: &str, resource: &str| Template {
+            id: id(name),
+            grants: vec![Grant {
+                system: id("jira"),
+                operations: [id("issue.update")].into(),
+                resources: vec![ResourcePattern::new(resource).unwrap()],
+            }],
+            max_life_secs: 8 * 3600,
+            limits: Limits::default(),
+            delegable: false,
+            people: Default::default(),
+            receivers: Default::default(),
+        };
+        let issuers = || KeySet::new([issuer().public()]);
+        let m = mandate(&agent(), NOW + 3600);
+        let opened = |s: &mut Sessions, n: &str| {
+            let (sid, chal) = s.open(&m, &ask(&agent(), "gate-1", n, NOW), NOW).unwrap();
+            assert!(matches!(
+                call(s, &sid, &chal, 1, true, &none),
+                Proved::Proven(_)
+            ));
+            (sid, chal)
+        };
+
+        // The same issuers and a template that still covers the mandate: nothing changes.
+        let mut s = sessions();
+        let (sid, chal) = opened(&mut s, "n-1");
+        let same = Some(vec![template("triage", "jira/project/pay/*")]);
+        assert_eq!(s.rebundle(issuers(), same, &none, NOW), 0);
+        assert!(matches!(
+            call(&mut s, &sid, &chal, 2, true, &none),
+            Proved::Proven(_)
+        ));
+
+        // The template is gone, is narrower, or the issuer's key is no longer listed: the
+        // session is dropped, and its next call is an unknown session.
+        for (what, keys, templates) in [
+            ("no template", issuers(), Some(Vec::new())),
+            (
+                "a narrower template",
+                issuers(),
+                Some(vec![template("triage", "jira/project/pay/issue/pay-1")]),
+            ),
+            (
+                "another issuer",
+                KeySet::new([key("issuer-2", 2).public()]),
+                Some(vec![template("triage", "jira/project/pay/*")]),
+            ),
+        ] {
+            let mut s = sessions();
+            let (sid, chal) = opened(&mut s, "n-1");
+            assert_eq!(s.rebundle(keys, templates, &none, NOW), 1, "{what}");
+            assert!(!s.holds(&sid) && s.is_empty(), "{what}");
+            let after = call(&mut s, &sid, &chal, 2, true, &none);
+            assert_eq!(who(&after), None, "{what}");
+            assert_eq!(why(after), ProofFailure::UnknownSession, "{what}");
+            // And a new one is held to the new bundle.
+            let again = ask(&agent(), "gate-1", "n-2", NOW);
+            assert_eq!(s.open(&m, &again, NOW), Err(OpenRefused::Invalid), "{what}");
+        }
+
+        // A marker is kept: it still says whose call it was and what was revoked, even
+        // under a bundle that would no longer open a session for its mandate.
+        let mut s = sessions();
+        let (sid, chal) = opened(&mut s, "n-1");
+        let set = revoked(&[(Revocable::Mandate, "m-1")]);
+        assert_eq!(s.revoke(&set, NOW), 1);
+        assert_eq!(s.rebundle(issuers(), Some(Vec::new()), &set, NOW), 0);
+        assert!(s.holds(&sid));
+        assert_eq!(
+            why(call(&mut s, &sid, &chal, 2, true, &set)),
+            ProofFailure::MandateRevoked
+        );
+        // What a new bundle's arrival also revokes is marked in the same step.
+        let mut s = sessions();
+        let (sid, chal) = opened(&mut s, "n-1");
+        let same = Some(vec![template("triage", "jira/project/pay/*")]);
+        assert_eq!(s.rebundle(issuers(), same, &set, NOW), 0);
+        assert_eq!(
+            why(call(&mut s, &sid, &chal, 2, true, &set)),
+            ProofFailure::MandateRevoked
+        );
+    }
 }

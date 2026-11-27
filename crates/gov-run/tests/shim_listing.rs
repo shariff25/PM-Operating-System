@@ -152,6 +152,7 @@ async fn the_shim_keeps_its_listing_when_only_the_session_ran_out() {
     let shim_addr = socket.local_addr().unwrap();
     let shim = Shim::new(
         ShimConfig {
+            follow: None,
             scope: scope(),
             gate: id("gate-1"),
             gate_url: format!("http://{gate_addr}"),

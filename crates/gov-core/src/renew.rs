@@ -106,6 +106,8 @@ pub struct Standing {
     authority: Id,
     root: PublicKey,
     bundle: Option<OpenedBundle>,
+    /// The bundle as it was signed, to hand on to a shim that follows this gate.
+    signed: Option<Envelope>,
     lease: Option<HeldLease>,
     revoked: RevocationSet,
     through: u64,
@@ -113,25 +115,42 @@ pub struct Standing {
 
 impl Standing {
     /// A gate that has heard nothing from its Authority yet. `bundle` is one it was started
-    /// with, already opened under `root`: it gives the gate a map at once, and no lease is
-    /// complete until a lease names that very bundle (GR-132).
+    /// with, as signed: it is opened here under `root`, must be this Authority's, and gives
+    /// the gate a map at once. No lease is complete until a lease names that very bundle
+    /// (GR-132).
     pub fn new(
         scope: Scope,
         gate: Id,
         authority: Id,
         root: PublicKey,
-        bundle: Option<OpenedBundle>,
-    ) -> Self {
-        Standing {
+        bundle: Option<Envelope>,
+    ) -> Result<Self> {
+        let opened = match &bundle {
+            None => None,
+            Some(envelope) => {
+                let opened = open_bundle(envelope, &root, &scope)?;
+                if opened.bundle.issuer != authority {
+                    return Err(Error::Malformed("a bundle of another Authority"));
+                }
+                Some(opened)
+            }
+        };
+        Ok(Standing {
             scope,
             gate,
             authority,
             root,
-            bundle,
+            bundle: opened,
+            signed: bundle,
             lease: None,
             revoked: RevocationSet::default(),
             through: 0,
-        }
+        })
+    }
+
+    /// The bundle held, as it was signed by the root key.
+    pub fn signed_bundle(&self) -> Option<&Envelope> {
+        self.signed.as_ref()
     }
 
     pub fn bundle(&self) -> Option<&OpenedBundle> {
@@ -268,6 +287,7 @@ impl Standing {
         };
         if let Some(bundle) = offered {
             self.bundle = Some(bundle);
+            self.signed.clone_from(&answer.bundle);
         }
         self.lease = Some(held);
         Ok(Taken {

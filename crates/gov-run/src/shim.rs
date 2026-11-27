@@ -7,6 +7,8 @@
 //! runtime that started the shim can read it.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -20,8 +22,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use gov_core::connector::ServerMap;
 use gov_core::mandate::Mandate;
+use gov_core::policy::{may_replace, open_bundle, HeldBundle};
 use gov_core::request::{RequestProof, SessionOpen};
-use gov_core::{random_id, random_salt, seal, Envelope, Id, Scope, SigningKey, VERSION};
+use gov_core::{random_id, random_salt, seal, Envelope, Id, PublicKey, Scope, SigningKey, VERSION};
 use gov_gate::forward::{is_event_stream, Listings};
 use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
@@ -45,6 +48,36 @@ pub struct ShimConfig {
     /// Required on every request, in `x-gov-shim-key`.
     pub secret: String,
     pub call_timeout: Duration,
+    /// How this shim follows its gate to another policy bundle while it runs. Without it
+    /// the shim keeps the map it started with.
+    pub follow: Option<Follow>,
+}
+
+/// What a shim needs to take the bundle its gate has moved to (spec §7.6.3, point 7; review
+/// finding GR-133). The gate only hands the bundle over: it is believed as far as the root
+/// key signed it, and never if it would take the shim back.
+pub struct Follow {
+    /// The root key this shim pinned itself.
+    pub root: PublicKey,
+    /// The bundle the shim's map came from.
+    pub held: HeldBundle,
+    /// Where the newest bundle accepted is noted, before it is used.
+    pub state: Option<PathBuf>,
+    /// The server whose map this shim uses, as bundles name it.
+    pub server: Id,
+}
+
+/// What a receipt carries for a bundle: its number and the start of its digest.
+fn version_of(held: &HeldBundle) -> Id {
+    Id::new(&format!("{}-{}", held.number, &held.digest.as_str()[..16]))
+        .expect("digits and hex make an id")
+}
+
+/// The shim's map, and the bundle it came from.
+struct Using {
+    map: Arc<ServerMap>,
+    held: Option<HeldBundle>,
+    version: Option<Id>,
 }
 
 /// A session open at the gate.
@@ -52,6 +85,8 @@ struct Open {
     id: Id,
     challenge: Id,
     counter: u64,
+    /// The bundle the gate said it decides from, when the session was opened.
+    policy: Option<String>,
 }
 
 pub struct Shim {
@@ -64,6 +99,10 @@ pub struct Shim {
     /// counter rises in the order the gate sees (review finding GR-92).
     session: AsyncMutex<Option<Open>>,
     listed: Mutex<Listings>,
+    using: Mutex<Using>,
+    /// Bundles taken from the gate, and bundles the gate offered that were not taken.
+    pub followed: AtomicU64,
+    pub not_followed: AtomicU64,
 }
 
 impl Shim {
@@ -91,6 +130,13 @@ impl Shim {
             host: addr.to_string(),
             session: AsyncMutex::new(None),
             listed: Mutex::new(Listings::default()),
+            using: Mutex::new(Using {
+                map: Arc::new(config.map.clone()),
+                held: config.follow.as_ref().map(|f| f.held.clone()),
+                version: config.follow.as_ref().map(|f| version_of(&f.held)),
+            }),
+            followed: AtomicU64::new(0),
+            not_followed: AtomicU64::new(0),
             config,
         }))
     }
@@ -136,7 +182,91 @@ impl Shim {
             id: Id::new(body.get("session")?.as_str()?).ok()?,
             challenge: Id::new(body.get("challenge")?.as_str()?).ok()?,
             counter: 0,
+            policy: body
+                .get("policy")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         })
+    }
+
+    /// The map in use.
+    fn map(&self) -> Arc<ServerMap> {
+        self.using.lock().expect("the map's lock").map.clone()
+    }
+
+    /// The gate says it decides from the bundle `said`. If that is not the one this shim's
+    /// map came from, ask the gate for it and take it, by the rules a program starts by:
+    /// it opens under the root key this shim pinned, it is the one the gate named, and it
+    /// does not take the shim back to an older bundle or to another under the same number.
+    /// Anything else is not taken, and the shim keeps its map: its proofs then fail at
+    /// the gate, which is recorded there, and nothing is read by a map nobody signed.
+    async fn follow(&self, session: &Id, said: &str) {
+        let Some(follow) = &self.config.follow else {
+            return;
+        };
+        let held = {
+            let using = self.using.lock().expect("the map's lock");
+            if using.version.as_ref().is_some_and(|v| v.as_str() == said) {
+                return;
+            }
+            using.held.clone()
+        };
+        let taken = async {
+            let url = format!("{}/v1/bundle", self.config.gate_url.trim_end_matches('/'));
+            let mut answer = self
+                .http
+                .post(url)
+                .timeout(self.config.call_timeout)
+                .json(&json!({"session": session}))
+                .send()
+                .await
+                .ok()
+                .filter(|r| r.status().is_success())?;
+            let mut body = Vec::new();
+            while let Some(chunk) = answer.chunk().await.ok()? {
+                if body.len() + chunk.len() > MAX_BODY {
+                    return None;
+                }
+                body.extend_from_slice(&chunk);
+            }
+            let value = gov_core::strict::parse(&body).ok()?;
+            let envelope: Envelope = serde_json::from_value(value.get("bundle")?.clone()).ok()?;
+            let opened = open_bundle(&envelope, &follow.root, &self.config.scope).ok()?;
+            if opened.policy_version().as_str() != said {
+                return None;
+            }
+            may_replace(held.as_ref(), &opened.held()).ok()?;
+            if let Some(state) = &follow.state {
+                crate::policy_source::note(state, &opened.held()).ok()?;
+            }
+            Some(opened)
+        }
+        .await;
+        let Some(opened) = taken else {
+            self.not_followed.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        let current = self.map();
+        let map = opened
+            .bundle
+            .connectors
+            .iter()
+            .find(|m| m.server == follow.server)
+            .cloned()
+            // The new bundle maps nothing for this server: every tool is then unknown, on
+            // both sides alike.
+            .unwrap_or(ServerMap {
+                tools: Vec::new(),
+                labels: Vec::new(),
+                clearances: Vec::new(),
+                ..(*current).clone()
+            });
+        *self.using.lock().expect("the map's lock") = Using {
+            map: Arc::new(map),
+            version: Some(opened.policy_version()),
+            held: Some(opened.held()),
+        };
+        self.followed.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Send a request on to the gate and read the whole answer, up to the cap.
@@ -189,7 +319,16 @@ impl Shim {
         let mut session = self.session.lock().await;
         if session.is_none() {
             *session = self.open().await;
+            // The gate says which bundle it decides from: be on the same one before the
+            // first proof is made.
+            if let Some((id, said)) = session
+                .as_ref()
+                .and_then(|o| Some((o.id.clone(), o.policy.clone()?)))
+            {
+                self.follow(&id, &said).await;
+            }
         }
+        let map = self.map();
         let signed = session.as_mut().and_then(|open| {
             let c = &self.config;
             let params = message.get("params");
@@ -207,7 +346,7 @@ impl Shim {
                 .lock()
                 .expect("the tool list's lock")
                 .digest(mcp_session, tool);
-            let action = c.map.map(tool, listed.as_ref(), &args, &salt).action;
+            let action = map.map(tool, listed.as_ref(), &args, &salt).action;
             let proof = seal(
                 &RequestProof {
                     v: VERSION,
@@ -237,6 +376,15 @@ impl Shim {
         // goes: the gate records it as a client that offered no proof.
         let sent = self.send(headers, body, &signed.unwrap_or_default()).await;
         if let Ok((_, head, _)) = &sent {
+            // The gate has moved to another bundle: follow it before the next call. This
+            // call was read by the gate under its new map and proven under the old one, so
+            // it may be recorded as a failed proof, once (a stated limit).
+            if let (Some(open), Some(said)) = (
+                session.as_ref(),
+                head.get("x-gov-policy").and_then(|v| v.to_str().ok()),
+            ) {
+                self.follow(&open.id.clone(), said).await;
+            }
             if let Some(reopen) = head.get("x-gov-reopen") {
                 *session = None;
                 // The gate says whether it still holds a listing for this MCP session. If it

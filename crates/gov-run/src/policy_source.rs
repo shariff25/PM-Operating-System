@@ -36,6 +36,23 @@ pub struct Policy {
     /// What every receipt carries: the bundle's number and the start of its digest, or
     /// `unsigned`.
     pub version: Id,
+    /// On the signed path: what a program needs to take a later bundle by the same rules
+    /// while it runs (spec §7.6.3, point 7).
+    pub signed: Option<Signed>,
+}
+
+/// The signed bundle a program started with, and how it would check the next.
+#[derive(Debug, Clone)]
+pub struct Signed {
+    /// The bundle as the root key signed it.
+    pub envelope: Envelope,
+    /// The one key a bundle is opened under.
+    pub root: PublicKey,
+    pub held: HeldBundle,
+    /// Where the newest bundle accepted is noted, before it is used.
+    pub state: PathBuf,
+    /// The server whose map this program uses.
+    pub server: Id,
 }
 
 /// The options both programs take.
@@ -80,7 +97,7 @@ fn read<T: serde::de::DeserializeOwned>(path: &Path, what: &str) -> anyhow::Resu
 }
 
 /// Note `held` in `path`, whole or not at all, before the bundle is used.
-fn note(path: &Path, held: &HeldBundle) -> anyhow::Result<()> {
+pub fn note(path: &Path, held: &HeldBundle) -> anyhow::Result<()> {
     let tmp = path.with_extension("tmp");
     let mut file = std::fs::File::create(&tmp)
         .with_context(|| format!("{} cannot be written", tmp.display()))?;
@@ -150,6 +167,14 @@ impl PolicyArgs {
             mandate_issuers: opened.bundle.keys.mandates.clone(),
             templates: Some(opened.bundle.templates.clone()),
             version: opened.policy_version(),
+            signed: Some(Signed {
+                envelope,
+                root,
+                held: opened.held(),
+                state: state.clone(),
+                server: Id::new(server)
+                    .map_err(|_| anyhow::anyhow!("the server's name is not an identifier"))?,
+            }),
         })
     }
 
@@ -176,6 +201,7 @@ impl PolicyArgs {
             mandate_issuers,
             templates: None,
             version: Id::new(UNSIGNED).expect("a word is an identifier"),
+            signed: None,
         })
     }
 }
