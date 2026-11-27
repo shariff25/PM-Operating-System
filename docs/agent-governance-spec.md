@@ -771,7 +771,7 @@ Postgres was read, not run, by the reviewer.
 
 | Id | Severity | What | Done |
 |---|---|---|---|
-| GR-135 | Low | The signer's list of changes is written field by field, so a field added later would show nothing | Fixed on `build/gov-review-16`: anything that differs and is not named is shown as "other changes" |
+| GR-135 | Low | The signer's list of changes is written field by field, so a field added later would show nothing | Fixed on `build/gov-review-17`: anything that differs and is not named is shown as "other changes" |
 | GR-136 | Low | The bundle's time was the signer's clock, so nobody else could rebuild the same digest from the repository | Fixed: `sign` takes the time from `--issued-at`, which a second person repeats |
 | GR-137 | Low | `--yes` skips the question | Kept; it still prints the changes, and its help says they must have been shown to a person elsewhere |
 | GR-138 | Medium, before G4c | The template was checked only by the Authority at issue, so whoever takes the online mandates key could sign any grants | §7.6.2, point 10: the gate holds every chain's root mandate to the template in the bundle it holds |
