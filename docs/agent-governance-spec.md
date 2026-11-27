@@ -432,6 +432,40 @@ reviewer.
     yet checked against a call (G5).
 - One more test on both of the Ledger's stores (a chain holds one kind of document), and
   two with an Authority and a Ledger together.
+- **CM1, first map, and CM2's command built (2026-11-27), on `build/gov-cm1`; not yet read
+  by the reviewer.** The library is `governance/maps/` (its `README.md` says what a map
+  claims). A map is built, never written by hand: `gov map build` joins the server's own
+  `tools/list` answer with a review file, and refuses unless every listed tool is reviewed
+  or set aside by name with a reason. `gov map drift` names tools a later listing added,
+  removed or changed in any field, and exits non-zero.
+  - **Jira:** `mcp-atlassian` 0.24.8, 63 Jira tools, all mapped. The listing was got by
+    starting the server with made-up settings; **no Jira was contacted and no tool has
+    been run against one, so the map is not verified**, only reviewed against the listing.
+  - Choices a reader should know: an issue is placed in the project its own key names;
+    `jira_update_issue` is mapped as not undoable and reaching outside, because one call
+    can also comment, move the issue through its workflow and attach files;
+    `jira_move_issue` and `jira_delete_issue` are destructive; a search, and every tool
+    that takes a list of issues, has a resource of its own outside any project, so a grant
+    on one project never reaches it.
+  - **Limits:** `jira_move_issue` names its target project in an argument the resource
+    does not carry, and `jira_create_issue_link` and `jira_add_issues_to_sprint` can name
+    issues of other projects: a grant on the source is enough for each. A resource holds
+    one place; a rule on a second argument waits for G5.
+  - Eleven controls of the builder and the drift check removed one at a time; each
+    removal fails a test.
+  - **GitHub:** `github-mcp-server` v1.14.0 with every toolset, 91 tools, all mapped.
+    **Slack:** `@modelcontextprotocol/server-slack` 2025.4.25, 8 tools, all mapped. Both
+    listings were got with a made-up token and no network: **neither map is verified.**
+  - GitHub choices: a call is held to the repository its `owner` and `repo` name, and no
+    finer, because an issue's or a pull request's number is not a string a resource can
+    be built from; a tool with several methods is mapped as the widest (so
+    `pull_request_review_write`, which can approve, and `actions_run_trigger`, which runs
+    whatever a workflow holds, are destructive and reach outside); searches, projects,
+    rulesets, gists and notifications have resources outside any repository. The review
+    and the server's own read-only hint agree on all 91 tools, and a test holds them to it.
+  - Slack choices: every tool that posts reaches people; a channel is its id, and a
+    channel given by name is recorded as unknown.
+  - Still to build: the gate's count of calls to unmapped tools by digest (CM2).
 
 ## Security review of 2026-11-26 (first read; the gate did not pass)
 
@@ -815,6 +849,33 @@ Postgres was read, not run, by the reviewer.
 | GR-141 | Medium, before the scene is shown | "Verifies the refusal" claimed more than an export shows, and with the library seam PM OS is the gate's operator | §1.2 reworded; the scene runs with a separate gate holding the credential, or says whose word the refusal is |
 | GR-142 | Medium, before the scene is shown | Turning the seam off is PM OS's own setting, so it is not always a recorded act | §8.4 reworded: with the library seam the cover is in line, not custody, and PM OS's operator can go round it |
 | GR-143 | Low | "Names both" does not fit a record with one `about` field | §7.6.2, point 4: the record is about the child agent; the parent is in the mandate, which the record's digest covers |
+
+### Twentieth read, 2026-11-27: G4c at `d376e20`
+
+**Verdict: no High or Critical; the gate passes for the main spec, G1, G2, G3a, G3b, G4a,
+G4b and G4c.** The template check at the gate (GR-138), issuing, delegation, the feed and
+the auditor's check were read and found sound. Of the three departures, the child's id
+from the request's hash stands, recording a refused mandate's call as claimed is
+acceptable until G4d, and the order of stopping an agent does not stand (GR-152). The
+reviewer ran the tests of `gov-core`, `gov-authority` and `gov-ledger` without Postgres;
+the Authority's Postgres store was read, not run, and `gov-gate`, `gov-run` and `gov-cli`
+were not re-run. **GR-152 and GR-153 are to be fixed before G4d.**
+
+| Id | Severity | What | Done |
+|---|---|---|---|
+| GR-152 | Medium, before G4d | An agent's mandates were revoked before the agent was marked stopped, so a mandate issued in between stayed live under a suspended agent | Open: to fix on `build/gov-review-20` |
+| GR-153 | Medium, before G4d | A leaver's mandates for agents owned by others stayed live | Open: to fix on `build/gov-review-20` |
+| GR-154 | Low | A delegation's record names an agent in the field that elsewhere holds a person: the two cannot be told apart | Open |
+| GR-155 | Low | A refused attempt to open a session leaves no trace | Open |
+| GR-156 | Low | A template's grants for a system that folds case are not required to be lower case | Open |
+| GR-157 | Info | CP's design is not in the repository, so nothing of CP can count as through the gate until the reviewer is given it some other way | Noted; CP is not built |
+
+What the reviewer asked to be settled in the text before G4d is built: what a gate does
+before its first lease (GR-72); how the lease and the feed are checked together; that the
+lease names the bundle (closing GR-132 and GR-133) and how a gate changes bundle without a
+restart; separate reasons for closing a session (GR-110); key rotation (GR-59, GR-126); and
+that `gov verify` orders receipts after a retirement by the witness, not by the gate's own
+time (GR-130). CM1 and CM2 were called sound as slices; each map is read when it is sent.
 
 ## 1. What is being built
 

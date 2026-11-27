@@ -1,0 +1,79 @@
+{
+  "server": "slack-mcp",
+  "system": "slack",
+  "fold_case": true,
+  "tools": [
+    {
+      "tool": "slack_add_reaction",
+      "digest": "43c9d517db7c7a29f8851010646bc211273a2e2ee487c4d360bbf4ac015e549b",
+      "operation": "reaction.add",
+      "kind": "write",
+      "reversal": "inverse",
+      "outward": true,
+      "resource": "slack/channel/{channel_id}"
+    },
+    {
+      "tool": "slack_get_channel_history",
+      "digest": "979c7a0298cbd7e5ed080d6814baae5cbb124c158824ac3ba348b7e4b69d7cf3",
+      "operation": "channel.history.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "slack/channel/{channel_id}"
+    },
+    {
+      "tool": "slack_get_thread_replies",
+      "digest": "b3b4f264357519b9bf3bd4aedd927d7fe73a69265b7f12cef2a18f40e4350ff5",
+      "operation": "thread.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "slack/channel/{channel_id}"
+    },
+    {
+      "tool": "slack_get_user_profile",
+      "digest": "d3c41d40b4c7a0c355df5b8cc547f4442c2289c2eeacdaf407b2c3472d8f1b91",
+      "operation": "user.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "slack/user/{user_id}"
+    },
+    {
+      "tool": "slack_get_users",
+      "digest": "9700918c481cd6a086f34498ac853f1e19d87dfd05781b1c76a68bfb2b3bd312",
+      "operation": "user.list",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "slack/user"
+    },
+    {
+      "tool": "slack_list_channels",
+      "digest": "c078094c1b3715472e24cdbc7cdc95031a4e3cc216c5fcb75408cb524c456fcc",
+      "operation": "channel.list",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "slack/channel"
+    },
+    {
+      "tool": "slack_post_message",
+      "digest": "4a7f7f27218331ac27522af5877ed0c6bf16b97c15d0e8af6daf6b6c104ab83a",
+      "operation": "message.post",
+      "kind": "write",
+      "reversal": "inverse",
+      "outward": true,
+      "resource": "slack/channel/{channel_id}"
+    },
+    {
+      "tool": "slack_reply_to_thread",
+      "digest": "cda4f62a6fa1f7b6e0e508ff9ee2802037562e18da729d209ee082488a3996e0",
+      "operation": "thread.reply",
+      "kind": "write",
+      "reversal": "inverse",
+      "outward": true,
+      "resource": "slack/channel/{channel_id}"
+    }
+  ]
+}

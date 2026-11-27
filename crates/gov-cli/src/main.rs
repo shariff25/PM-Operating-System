@@ -61,6 +61,41 @@ enum Command {
         #[command(subcommand)]
         command: PolicyCommand,
     },
+    /// Build a connector map from a server's tool listing and its review, and see what a
+    /// server has changed since.
+    Map {
+        #[command(subcommand)]
+        command: MapCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum MapCommand {
+    /// Join a server's tool listing and the review of it into a connector map. Refuses
+    /// unless every listed tool is reviewed or set aside by name with a reason.
+    Build {
+        /// The server's answer to `tools/list`, as it gave it.
+        #[arg(long)]
+        listing: PathBuf,
+        /// The review: what each tool is, and which are left out and why.
+        #[arg(long)]
+        review: PathBuf,
+        /// Where the map is written.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Report tools a server has added, removed or changed since a map was reviewed. Exits
+    /// with failure when anything has.
+    Drift {
+        /// The server's answer to `tools/list` now.
+        #[arg(long)]
+        listing: PathBuf,
+        #[arg(long)]
+        map: PathBuf,
+        /// The review the map was built from, so tools it set aside are not reported as new.
+        #[arg(long)]
+        review: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -202,6 +237,65 @@ fn print(report: &Report) {
     }
 }
 
+fn map(command: MapCommand) -> anyhow::Result<bool> {
+    use gov_run::maps;
+    match command {
+        MapCommand::Build {
+            listing,
+            review,
+            out,
+        } => {
+            let listing = maps::read_listing(&listing)?;
+            let review = maps::read_review(&review)?;
+            let built = maps::build(&listing, &review)?;
+            std::fs::write(&out, serde_json::to_vec_pretty(&built)?)
+                .with_context(|| format!("{} cannot be written", out.display()))?;
+            println!(
+                "{}: {} tools mapped, {} set aside, of {} the server lists.",
+                built.server,
+                built.tools.len(),
+                review.unmapped.len(),
+                listing.len()
+            );
+            Ok(true)
+        }
+        MapCommand::Drift {
+            listing,
+            map,
+            review,
+        } => {
+            let listing = maps::read_listing(&listing)?;
+            let map = maps::read_map(&map)?;
+            let set_aside = match review {
+                Some(path) => maps::read_review(&path)?.unmapped.into_keys().collect(),
+                None => Default::default(),
+            };
+            let drift = maps::drift(&listing, &map, &set_aside)?;
+            for (what, tools) in [
+                ("added", &drift.added),
+                ("removed", &drift.removed),
+                ("changed", &drift.changed),
+            ] {
+                for tool in tools {
+                    println!("{what}: {tool}");
+                }
+            }
+            if drift.none() {
+                println!("No drift: {} tools as reviewed.", drift.unchanged);
+            } else {
+                println!(
+                    "Drift: {} added, {} removed, {} changed, {} as reviewed. A changed or new tool is recorded as unknown until the map is reviewed again.",
+                    drift.added.len(),
+                    drift.removed.len(),
+                    drift.changed.len(),
+                    drift.unchanged
+                );
+            }
+            Ok(drift.none())
+        }
+    }
+}
+
 fn policy(command: PolicyCommand) -> anyhow::Result<bool> {
     use gov_run::policy_dir;
     match command {
@@ -286,10 +380,11 @@ fn run(cli: Cli) -> anyhow::Result<bool> {
         gate_quiet,
     } = cli.command
     else {
-        let Command::Policy { command } = cli.command else {
-            unreachable!("a command is one or the other")
+        return match cli.command {
+            Command::Policy { command } => policy(command),
+            Command::Map { command } => map(command),
+            Command::Verify { .. } => unreachable!("matched above"),
         };
-        return policy(command);
     };
     let now = now.or_else(|| {
         let since = std::time::SystemTime::now()

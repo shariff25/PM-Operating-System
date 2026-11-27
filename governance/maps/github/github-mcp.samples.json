@@ -1,0 +1,1141 @@
+[
+ {
+  "tool": "actions_get",
+  "arguments": {
+   "method": "get_workflow",
+   "owner": "Acme",
+   "repo": "Payments",
+   "resource_id": "x"
+  },
+  "expect": {
+   "operation": "actions.read",
+   "kind": "read",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "actions_list",
+  "arguments": {
+   "method": "list_workflows",
+   "owner": "Acme",
+   "repo": "Payments"
+  },
+  "expect": {
+   "operation": "actions.list",
+   "kind": "read",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "actions_run_trigger",
+  "arguments": {
+   "method": "run_workflow",
+   "owner": "Acme",
+   "repo": "Payments"
+  },
+  "expect": {
+   "operation": "actions.run",
+   "kind": "destructive",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "add_comment_to_pending_review",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments",
+   "pullNumber": 1,
+   "path": "x",
+   "body": "x",
+   "subjectType": "FILE"
+  },
+  "expect": {
+   "operation": "pull.review.comment.add",
+   "kind": "write",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "add_issue_comment",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments",
+   "issue_number": 1
+  },
+  "expect": {
+   "operation": "issue.comment.add",
+   "kind": "write",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "add_reply_to_pull_request_comment",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments",
+   "commentId": 1
+  },
+  "expect": {
+   "operation": "pull.comment.reply",
+   "kind": "write",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "assign_copilot_to_issue",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments",
+   "issue_number": 1
+  },
+  "expect": {
+   "operation": "issue.assign-agent",
+   "kind": "write",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "assign_copilot_to_issue_with_intent",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments",
+   "issue_number": 1,
+   "rationale": "x",
+   "confidence": "LOW",
+   "is_suggestion": false
+  },
+  "expect": {
+   "operation": "issue.assign-agent.with-intent",
+   "kind": "write",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "create_branch",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments",
+   "branch": "x"
+  },
+  "expect": {
+   "operation": "branch.create",
+   "kind": "write",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "create_gist",
+  "arguments": {
+   "filename": "x",
+   "content": "x"
+  },
+  "expect": {
+   "operation": "gist.create",
+   "kind": "write",
+   "resource": "github/gist"
+  }
+ },
+ {
+  "tool": "create_or_update_file",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments",
+   "path": "x",
+   "content": "x",
+   "message": "x",
+   "branch": "x"
+  },
+  "expect": {
+   "operation": "file.write",
+   "kind": "write",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "create_pull_request",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments",
+   "title": "x",
+   "head": "x",
+   "base": "x"
+  },
+  "expect": {
+   "operation": "pull.create",
+   "kind": "write",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "create_repository",
+  "arguments": {
+   "name": "x"
+  },
+  "expect": {
+   "operation": "repo.create",
+   "kind": "write",
+   "resource": "github/account"
+  }
+ },
+ {
+  "tool": "create_repository_ruleset",
+  "arguments": {
+   "level": "repository",
+   "name": "x",
+   "enforcement": "disabled",
+   "rules": []
+  },
+  "expect": {
+   "operation": "ruleset.create",
+   "kind": "write",
+   "resource": "github/admin"
+  }
+ },
+ {
+  "tool": "custom_properties_read",
+  "arguments": {
+   "level": "repository"
+  },
+  "expect": {
+   "operation": "custom-properties.read",
+   "kind": "read",
+   "resource": "github/admin"
+  }
+ },
+ {
+  "tool": "custom_properties_write",
+  "arguments": {
+   "level": "repository",
+   "properties": []
+  },
+  "expect": {
+   "operation": "custom-properties.write",
+   "kind": "write",
+   "resource": "github/admin"
+  }
+ },
+ {
+  "tool": "delete_file",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments",
+   "path": "x",
+   "message": "x",
+   "branch": "x"
+  },
+  "expect": {
+   "operation": "file.delete",
+   "kind": "write",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "discussion_comment_write",
+  "arguments": {
+   "method": "add"
+  },
+  "expect": {
+   "operation": "discussion.comment.write",
+   "kind": "destructive",
+   "resource": "github/discussion"
+  }
+ },
+ {
+  "tool": "dismiss_notification",
+  "arguments": {
+   "threadID": "x",
+   "state": "read"
+  },
+  "expect": {
+   "operation": "notification.dismiss",
+   "kind": "write",
+   "resource": "github/notification"
+  }
+ },
+ {
+  "tool": "fork_repository",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments"
+  },
+  "expect": {
+   "operation": "repo.fork",
+   "kind": "write",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "get_code_quality_finding",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments",
+   "findingNumber": 1
+  },
+  "expect": {
+   "operation": "code-quality.finding.read",
+   "kind": "read",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "get_code_scanning_alert",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments",
+   "alertNumber": 1
+  },
+  "expect": {
+   "operation": "code-scanning.alert.read",
+   "kind": "read",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "get_commit",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments",
+   "sha": "x"
+  },
+  "expect": {
+   "operation": "commit.read",
+   "kind": "read",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "get_dependabot_alert",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments",
+   "alertNumber": 1
+  },
+  "expect": {
+   "operation": "dependabot.alert.read",
+   "kind": "read",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "get_discussion",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments",
+   "discussionNumber": 1
+  },
+  "expect": {
+   "operation": "discussion.read",
+   "kind": "read",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "get_discussion_comments",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments",
+   "discussionNumber": 1
+  },
+  "expect": {
+   "operation": "discussion.comments.read",
+   "kind": "read",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "get_file_contents",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments"
+  },
+  "expect": {
+   "operation": "file.read",
+   "kind": "read",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "get_gist",
+  "arguments": {
+   "gist_id": "aa5a315d61ae9438b18d"
+  },
+  "expect": {
+   "operation": "gist.read",
+   "kind": "read",
+   "resource": "github/gist/aa5a315d61ae9438b18d"
+  }
+ },
+ {
+  "tool": "get_global_security_advisory",
+  "arguments": {
+   "ghsaId": "x"
+  },
+  "expect": {
+   "operation": "advisory.global.read",
+   "kind": "read",
+   "resource": "github/advisory"
+  }
+ },
+ {
+  "tool": "get_job_logs",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments"
+  },
+  "expect": {
+   "operation": "actions.job.logs.read",
+   "kind": "read",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "get_label",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments",
+   "name": "x"
+  },
+  "expect": {
+   "operation": "label.read",
+   "kind": "read",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "get_latest_release",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments"
+  },
+  "expect": {
+   "operation": "release.latest.read",
+   "kind": "read",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "get_me",
+  "arguments": {},
+  "expect": {
+   "operation": "user.self.read",
+   "kind": "read",
+   "resource": "github/user"
+  }
+ },
+ {
+  "tool": "get_notification_details",
+  "arguments": {
+   "notificationID": "x"
+  },
+  "expect": {
+   "operation": "notification.read",
+   "kind": "read",
+   "resource": "github/notification"
+  }
+ },
+ {
+  "tool": "get_release_by_tag",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments",
+   "tag": "x"
+  },
+  "expect": {
+   "operation": "release.read",
+   "kind": "read",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "get_repository_tree",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments"
+  },
+  "expect": {
+   "operation": "tree.read",
+   "kind": "read",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "get_secret_scanning_alert",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments",
+   "alertNumber": 1
+  },
+  "expect": {
+   "operation": "secret-scanning.alert.read",
+   "kind": "read",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "get_tag",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments",
+   "tag": "x"
+  },
+  "expect": {
+   "operation": "tag.read",
+   "kind": "read",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "get_team_members",
+  "arguments": {
+   "org": "Acme",
+   "team_slug": "x"
+  },
+  "expect": {
+   "operation": "team.members.read",
+   "kind": "read",
+   "resource": "github/org/acme"
+  }
+ },
+ {
+  "tool": "get_teams",
+  "arguments": {},
+  "expect": {
+   "operation": "team.list",
+   "kind": "read",
+   "resource": "github/user"
+  }
+ },
+ {
+  "tool": "issue_read",
+  "arguments": {
+   "method": "get",
+   "owner": "Acme",
+   "repo": "Payments",
+   "issue_number": 1
+  },
+  "expect": {
+   "operation": "issue.read",
+   "kind": "read",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "issue_write",
+  "arguments": {
+   "method": "create",
+   "owner": "Acme",
+   "repo": "Payments"
+  },
+  "expect": {
+   "operation": "issue.write",
+   "kind": "write",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "label_write",
+  "arguments": {
+   "method": "create",
+   "owner": "Acme",
+   "repo": "Payments",
+   "name": "x"
+  },
+  "expect": {
+   "operation": "label.write",
+   "kind": "destructive",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "list_branches",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments"
+  },
+  "expect": {
+   "operation": "branch.list",
+   "kind": "read",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "list_code_scanning_alerts",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments"
+  },
+  "expect": {
+   "operation": "code-scanning.alert.list",
+   "kind": "read",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "list_commits",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments"
+  },
+  "expect": {
+   "operation": "commit.list",
+   "kind": "read",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "list_dependabot_alerts",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments"
+  },
+  "expect": {
+   "operation": "dependabot.alert.list",
+   "kind": "read",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "list_discussion_categories",
+  "arguments": {
+   "owner": "Acme"
+  },
+  "expect": {
+   "operation": "discussion.category.list",
+   "kind": "read",
+   "resource": "github/owner/acme"
+  }
+ },
+ {
+  "tool": "list_discussions",
+  "arguments": {
+   "owner": "Acme"
+  },
+  "expect": {
+   "operation": "discussion.list",
+   "kind": "read",
+   "resource": "github/owner/acme"
+  }
+ },
+ {
+  "tool": "list_gists",
+  "arguments": {},
+  "expect": {
+   "operation": "gist.list",
+   "kind": "read",
+   "resource": "github/gist"
+  }
+ },
+ {
+  "tool": "list_global_security_advisories",
+  "arguments": {},
+  "expect": {
+   "operation": "advisory.global.list",
+   "kind": "read",
+   "resource": "github/advisory"
+  }
+ },
+ {
+  "tool": "list_issue_fields",
+  "arguments": {
+   "owner": "Acme"
+  },
+  "expect": {
+   "operation": "issue.field.list",
+   "kind": "read",
+   "resource": "github/owner/acme"
+  }
+ },
+ {
+  "tool": "list_issue_types",
+  "arguments": {
+   "owner": "Acme"
+  },
+  "expect": {
+   "operation": "issue.type.list",
+   "kind": "read",
+   "resource": "github/owner/acme"
+  }
+ },
+ {
+  "tool": "list_issues",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments"
+  },
+  "expect": {
+   "operation": "issue.list",
+   "kind": "read",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "list_label",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments"
+  },
+  "expect": {
+   "operation": "label.list",
+   "kind": "read",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "list_notifications",
+  "arguments": {},
+  "expect": {
+   "operation": "notification.list",
+   "kind": "read",
+   "resource": "github/notification"
+  }
+ },
+ {
+  "tool": "list_org_repository_security_advisories",
+  "arguments": {
+   "org": "Acme"
+  },
+  "expect": {
+   "operation": "advisory.org.list",
+   "kind": "read",
+   "resource": "github/org/acme"
+  }
+ },
+ {
+  "tool": "list_pull_requests",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments"
+  },
+  "expect": {
+   "operation": "pull.list",
+   "kind": "read",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "list_releases",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments"
+  },
+  "expect": {
+   "operation": "release.list",
+   "kind": "read",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "list_repository_collaborators",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments"
+  },
+  "expect": {
+   "operation": "collaborator.list",
+   "kind": "read",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "list_repository_security_advisories",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments"
+  },
+  "expect": {
+   "operation": "advisory.repo.list",
+   "kind": "read",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "list_secret_scanning_alerts",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments"
+  },
+  "expect": {
+   "operation": "secret-scanning.alert.list",
+   "kind": "read",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "list_starred_repositories",
+  "arguments": {},
+  "expect": {
+   "operation": "star.list",
+   "kind": "read",
+   "resource": "github/user"
+  }
+ },
+ {
+  "tool": "list_tags",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments"
+  },
+  "expect": {
+   "operation": "tag.list",
+   "kind": "read",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "manage_notification_subscription",
+  "arguments": {
+   "notificationID": "x",
+   "action": "ignore"
+  },
+  "expect": {
+   "operation": "notification.subscription.write",
+   "kind": "write",
+   "resource": "github/notification"
+  }
+ },
+ {
+  "tool": "manage_repository_notification_subscription",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments",
+   "action": "ignore"
+  },
+  "expect": {
+   "operation": "repo.subscription.write",
+   "kind": "write",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "mark_all_notifications_read",
+  "arguments": {},
+  "expect": {
+   "operation": "notification.mark-all-read",
+   "kind": "write",
+   "resource": "github/notification"
+  }
+ },
+ {
+  "tool": "merge_pull_request",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments",
+   "pullNumber": 1
+  },
+  "expect": {
+   "operation": "pull.merge",
+   "kind": "write",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "projects_get",
+  "arguments": {
+   "method": "get_project"
+  },
+  "expect": {
+   "operation": "project.read",
+   "kind": "read",
+   "resource": "github/project"
+  }
+ },
+ {
+  "tool": "projects_list",
+  "arguments": {
+   "method": "list_projects",
+   "owner": "Acme"
+  },
+  "expect": {
+   "operation": "project.list",
+   "kind": "read",
+   "resource": "github/owner/acme"
+  }
+ },
+ {
+  "tool": "projects_write",
+  "arguments": {
+   "method": "add_project_item",
+   "owner": "Acme"
+  },
+  "expect": {
+   "operation": "project.write",
+   "kind": "destructive",
+   "resource": "github/owner/acme"
+  }
+ },
+ {
+  "tool": "pull_request_read",
+  "arguments": {
+   "method": "get",
+   "owner": "Acme",
+   "repo": "Payments",
+   "pullNumber": 1
+  },
+  "expect": {
+   "operation": "pull.read",
+   "kind": "read",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "pull_request_review_write",
+  "arguments": {
+   "method": "create",
+   "owner": "Acme",
+   "repo": "Payments",
+   "pullNumber": 1
+  },
+  "expect": {
+   "operation": "pull.review.write",
+   "kind": "destructive",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "push_files",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments",
+   "branch": "x",
+   "files": [],
+   "message": "x"
+  },
+  "expect": {
+   "operation": "file.push",
+   "kind": "write",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "repository_ruleset_read",
+  "arguments": {
+   "level": "repository",
+   "method": "get"
+  },
+  "expect": {
+   "operation": "ruleset.read",
+   "kind": "read",
+   "resource": "github/admin"
+  }
+ },
+ {
+  "tool": "request_copilot_review",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments",
+   "pullNumber": 1
+  },
+  "expect": {
+   "operation": "pull.review.request-automated",
+   "kind": "write",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "search_code",
+  "arguments": {
+   "query": "x"
+  },
+  "expect": {
+   "operation": "search.code",
+   "kind": "read",
+   "resource": "github/search"
+  }
+ },
+ {
+  "tool": "search_commits",
+  "arguments": {
+   "query": "x"
+  },
+  "expect": {
+   "operation": "search.commits",
+   "kind": "read",
+   "resource": "github/search"
+  }
+ },
+ {
+  "tool": "search_issues",
+  "arguments": {
+   "query": "x"
+  },
+  "expect": {
+   "operation": "search.issues",
+   "kind": "read",
+   "resource": "github/search"
+  }
+ },
+ {
+  "tool": "search_orgs",
+  "arguments": {
+   "query": "x"
+  },
+  "expect": {
+   "operation": "search.orgs",
+   "kind": "read",
+   "resource": "github/search"
+  }
+ },
+ {
+  "tool": "search_pull_requests",
+  "arguments": {
+   "query": "x"
+  },
+  "expect": {
+   "operation": "search.pulls",
+   "kind": "read",
+   "resource": "github/search"
+  }
+ },
+ {
+  "tool": "search_repositories",
+  "arguments": {
+   "query": "x"
+  },
+  "expect": {
+   "operation": "search.repositories",
+   "kind": "read",
+   "resource": "github/search"
+  }
+ },
+ {
+  "tool": "search_users",
+  "arguments": {
+   "query": "x"
+  },
+  "expect": {
+   "operation": "search.users",
+   "kind": "read",
+   "resource": "github/search"
+  }
+ },
+ {
+  "tool": "star_repository",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments"
+  },
+  "expect": {
+   "operation": "star.add",
+   "kind": "write",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "sub_issue_write",
+  "arguments": {
+   "method": "x",
+   "owner": "Acme",
+   "repo": "Payments",
+   "issue_number": 1,
+   "sub_issue_id": 1
+  },
+  "expect": {
+   "operation": "issue.sub-issue.write",
+   "kind": "write",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "ui_get",
+  "arguments": {
+   "method": "labels",
+   "owner": "Acme"
+  },
+  "expect": {
+   "operation": "ui.read",
+   "kind": "read",
+   "resource": "github/owner/acme"
+  }
+ },
+ {
+  "tool": "unstar_repository",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments"
+  },
+  "expect": {
+   "operation": "star.remove",
+   "kind": "write",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "update_gist",
+  "arguments": {
+   "gist_id": "aa5a315d61ae9438b18d",
+   "filename": "x",
+   "content": "x"
+  },
+  "expect": {
+   "operation": "gist.update",
+   "kind": "write",
+   "resource": "github/gist/aa5a315d61ae9438b18d"
+  }
+ },
+ {
+  "tool": "update_issue_comment",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments",
+   "comment_id": 1,
+   "body": "x"
+  },
+  "expect": {
+   "operation": "issue.comment.update",
+   "kind": "write",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "update_pull_request",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments",
+   "pullNumber": 1
+  },
+  "expect": {
+   "operation": "pull.update",
+   "kind": "write",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "update_pull_request_branch",
+  "arguments": {
+   "owner": "Acme",
+   "repo": "Payments",
+   "pullNumber": 1
+  },
+  "expect": {
+   "operation": "pull.branch.update",
+   "kind": "write",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "merge_pull_request",
+  "arguments": {
+   "owner": "acme",
+   "repo": "payments",
+   "pullNumber": 7
+  },
+  "expect": {
+   "operation": "pull.merge",
+   "kind": "write",
+   "resource": "github/repo/acme/payments"
+  }
+ },
+ {
+  "tool": "get_file_contents",
+  "arguments": {
+   "owner": "ACME",
+   "repo": "Payments",
+   "path": "../other/secret"
+  },
+  "expect": {
+   "operation": "file.read",
+   "kind": "read",
+   "resource": "github/repo/acme/payments"
+  }
+ }
+]

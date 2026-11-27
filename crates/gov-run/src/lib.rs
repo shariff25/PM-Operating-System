@@ -5,6 +5,7 @@
 //! must not cross a network in the clear because of a default. An operator who puts a TLS
 //! terminator in front says so with `--plain-http-on-network`.
 
+pub mod maps;
 pub mod policy_dir;
 pub mod policy_source;
 pub mod shim;

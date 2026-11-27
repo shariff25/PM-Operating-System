@@ -442,6 +442,18 @@ follow-up tracking.
   signed with a stolen mandates key but wider than its template is not recorded as proven.
   Not yet read by the reviewer. The gate does not read the feed yet (G4d), and nothing is
   served (G4e).
+- **Twentieth read (2026-11-27), G4c at `d376e20`:** no High or Critical; the gate passes
+  through G4c. Two Medium findings to fix before G4d (GR-152: a mandate could be issued to
+  an agent while it was being stopped; GR-153: a leaver's mandates for agents owned by
+  others stayed live) and three Low. The reviewer also listed what G4d's design must settle
+  in the text first, and noted that CP cannot pass the gate while its design is kept from
+  the reviewer.
+- **CM1 and CM2's command built (2026-11-27), on `build/gov-cm1`:** the map library
+  (`governance/maps/`) with maps for Jira (63 tools), GitHub (91) and Slack (8), each built
+  by `gov map build` from the server's own tool listing and a review file, and `gov map
+  drift`. The three servers are open-source ones run locally with made-up tokens and no
+  network: **no map has been run against the real system, and none is called verified.**
+  Not yet read by the reviewer. Not built: the gate's count of calls to unmapped tools.
 
 ## Where the build stands (2026-11-23)
 
