@@ -1959,6 +1959,152 @@ limit on how many mandates may be issued in a time, which belongs with the liste
 screens (G8). A mandate's grants are still not checked against an action until G5, so a
 proven receipt is still not an authorised one.
 
+#### 7.6.3 G4d, the lease at the gate (design of 2026-11-27; not built; for the reviewer)
+
+Makes revocation take effect and ends the gate's own clock. It settles what the reviewer's
+twentieth read asked to be in the text first. The lease, the held lease and the freshness
+check exist in `gov-core` since G1 (§4.6); nothing has used them yet.
+
+1. **One request, one answer.** A gate renews with one signed document, `gov.renew.v1`:
+   its name, the Authority's name, a fresh random nonce, the bundle it holds (number and
+   digest, or none) and the revocation number it has read through. It is signed with a key
+   enrolled for that gate. It carries no time: a gate may not have one yet.
+   The Authority answers a gate that is not disabled, for a key that is its own and not
+   revoked, with three things made from one reading of its store:
+   - a **lease** (§4.6), signed with a leases key of the latest published bundle, carrying
+     the request's nonce, the Authority's time, that bundle's version (number and digest)
+     and the newest revocation number;
+   - the **revocation feed** after the number the gate named, always, even when empty;
+   - the **bundle**, when the gate does not hold the one the lease names.
+   A renewal changes nothing at the Authority and writes no record. A copy of a request
+   played by someone else gets an answer bound to that nonce, which no gate is waiting for.
+   The Authority answers one gate at most once a second.
+2. **The gate takes the whole answer or none of it**, checking in this order:
+   - the bundle, if one came: it opens under the pinned root key and may replace the one
+     held (§7.6.1, point 3): never a lower number, never another bundle under the same
+     number;
+   - the lease: it opens under a leases key **of the bundle it names**, which must now be
+     the bundle in hand; it is for this gate and carries the nonce of the request the gate
+     sent and has not yet used; its time and its revocation number are not lower than the
+     held lease's (GR-1, as built);
+   - the feed: it opens under a leases key of the same bundle; its issuer is the lease's;
+     its `after` is the number the gate asked for; its `through` is not lower than the
+     lease's revocation number; its entries are numbered in order, and entries and the
+     count of those left out account for every number between `after` and `through`.
+   Then the bundle is put in use (point 6), the entries are added to the gate's revoked
+   set, and the lease is held. If any check fails nothing is changed, the gate keeps what
+   it had, and the operator's address says which check failed.
+3. **Entries left out.** The Authority leaves out an entry once what it names expired more
+   than five minutes ago by its own clock. The gate's clock is the Authority's (point 4),
+   so the gate already refuses that mandate as expired: nothing is missing. Entries for an
+   agent and for a key name things that do not expire, and are never left out. A gate does
+   not keep its revoked set across a restart: it has no lease then either, and asks from
+   number 0.
+4. **The gate's time** (GR-72). "Now" is the held lease's Authority time plus the gate's
+   own count of time since that lease's request left (as built in `HeldLease`).
+   - The count must go on while the machine is suspended. On Linux that is the
+     `CLOCK_BOOTTIME` clock, read through a library with a safe interface; the standard
+     library's `Instant` does not count suspension there. On any other system the gate
+     program refuses to start with an Authority configured, except with fake data.
+   - A receipt stamped this way says so: a new field, `at_from_lease`, true. It is left
+     out when false, so every receipt written before G4d reads as what it was: stamped
+     from the gate's own clock. A receipt's time still never goes back along the chain
+     (`at_clamped`, as built).
+   - **Before its first lease**, and with no Authority configured (tests, fake data), a
+     gate in observe mode forwards and records as now, stamps from its own clock, and the
+     receipt does not carry `at_from_lease`. In enforce mode (G6) it refuses everything.
+   - Once a gate has held a lease in this run it keeps stamping from it, however old the
+     lease is: an old lease still gives a better clock than the machine's.
+5. **Proof needs a complete, fresh lease.** A lease is *complete* when the gate holds the
+   bundle it names and has read the feed through its revocation number (`permits`, as
+   built), and *fresh* while it is no older than its `valid_for_secs`. With an Authority
+   configured:
+   - a session is opened only under a complete, fresh lease, and only for a chain that
+     holds against the revoked set. A refusal is counted by why, as since GR-155, with two
+     more reasons: `no_lease` and `revoked`;
+   - a call under an open session, with a proof that holds, is recorded as **proven** only
+     under a complete, fresh lease. Otherwise it is forwarded, as everything is in observe
+     mode, and recorded as a failed proof with a new reason, `no_lease`: the gate could not
+     say whether the agent was revoked, and does not guess;
+   - enforce mode (G6) refuses an action whose freshness class the lease's age exceeds
+     (§4.6); nothing in G4d blocks.
+6. **A revoked agent, mandate or key** (GR-110; §7.6, choice 5). When an accepted feed
+   revokes any link of a session's chain, the agent a link names, or the session's key,
+   the session is **closed to proof and kept as a marker**. A later call that presents
+   it, with a proof that holds, is recorded as that agent's with a failed proof and one of
+   three new reasons: `key_revoked`, `agent_revoked`, `mandate_revoked`. The caller did
+   hold the key, and the reason says so; the receipt is not `claimed` and not an
+   unknown session. A proof that does not hold keeps its own reason.
+   - A marker lives as long as the session would have (its mandate's expiry, the idle
+     limit), under the same limits for each key, and pushes out nothing proven.
+   - No new session is opened for a revoked mandate, agent or key. The shim, refused, goes
+     on presenting the session it has, so its calls stay named. Once the marker is gone
+     they are recorded as an unknown session, with the agent as claimed: a stated limit.
+   - Enforce mode (G6) refuses these calls.
+7. **Changing bundle without a restart** (GR-132, GR-133). The connector map, the
+   issuers' keys, the templates and the version are swapped together between calls. A
+   call whose intent is already written finishes under the bundle its intent names.
+   - Each open session's chain is checked again against the new issuers and templates;
+     one that no longer holds is dropped, and its next call is an unknown session.
+   - **A gate with no saved state** (GR-132) may be started with a bundle file, to have a
+     map at once, but its lease is not complete until a lease names that very bundle. If
+     the lease names a newer one, the answer carries it. If the lease names an older one
+     than the gate holds, the gate keeps its own, has no complete lease, and says so on
+     the operator's address: something handed it a newer bundle than its Authority
+     publishes, or the Authority was put back.
+   - **The shim follows the gate** (GR-133). The gate's answer to opening a session, and
+     to every call the shim sends, names the version the gate holds, in a header the shim
+     removes before the agent sees it. A shim holding another version asks the gate for
+     the bundle, checks it under the root key it pinned itself, by the same rule against
+     going back, and uses it from its next call. The call that crossed the change may be
+     recorded as a failed proof (`wrong_digest`), once for each shim at each change: a
+     stated limit, counted on the operator's address.
+8. **Rotating a gate's key** (GR-59). A gate enrols a further key as it enrolled its first:
+   a one-time code from an admin, a key id under its own name that was never used, a
+   record. Both keys then open its receipts at the Ledger.
+   - The chain goes on across the change: receipt *n* is signed with the old key, *n+1*
+     with the new, linked as any two are.
+   - The gate keeps the public half of every key it has signed with, a file each beside
+     the spool, and opens its spool under that set. A receipt in its spool under any
+     other key still stops it from starting. The old private half is deleted once the
+     Ledger has acknowledged the last receipt signed with it.
+   - An admin then revokes the old key (`Revoked`, of a key): the Ledger retires it, and
+     the feed carries it, so no gate opens a session for an agent key revoked the same
+     way.
+9. **Replacing the Authority's admin-record key** (GR-126). A planned change is a record
+   in the Authority's own chain, signed with the old key, that names the new one; records
+   after it are signed with the new key, and the Ledger and `gov verify` follow the chain
+   across it. A **taken** admin-record key cannot be repaired this way, since whoever
+   holds it can write the same record: that is repaired by the operator at the Ledger and
+   by giving auditors the new key out of band, like the first installation, and is stated
+   as a limit beside the loss of the root key (owner's decision 9).
+   The Authority also checks, when it ships, that a witnessed checkpoint covers its own
+   chain's head within a set time, and counts it for its operator when none does.
+10. **After a retirement, the witness's order decides** (GR-130). `gov verify` no longer
+    compares the gate's date on a receipt with the Authority's date on the record. A
+    receipt under a retired key, or of a disabled gate, counts as written before the
+    retirement only if a witnessed checkpoint earlier than the first one covering the
+    retirement record already covered that receipt. Any other is reported. A receipt
+    written honestly before and shipped late is reported too; the report says "not shown
+    to be earlier", not "written after".
+11. **What is served** (a departure from §7.6's table, for the reviewer to confirm or
+    refuse). The table put the `gov-authority` program in G4e. G4d cannot be run as
+    programs without one, so its last step adds the program with **one listener, for
+    gates only**: the renewal of point 1 and nothing else. Every request on it is a
+    document signed with an enrolled gate key; it takes no admin action and no sign-in,
+    which stay with G4e (choice 8). It follows the programs' connection rule (HTTPS, or a
+    literal loopback address) and their key-file rule (fake data only).
+
+**Steps.** G4d-1: the renewal document, the Authority's answer and the gate's check of it
+(points 1 to 3), as libraries. G4d-2: the gate's time, proof under a lease, and revoked
+sessions (points 4 to 6). G4d-3: the bundle changed in place and the shim following
+(point 7). G4d-4: key rotation and the auditor's order (points 8 to 10). G4d-5: the
+program and the gate's renewal loop (point 11), run as four programs with fake data.
+
+**Not in G4d:** people and sign-in (G4e); anything blocked (G6); whether a gate may ask
+the Authority at the moment of an outward call (access governance spec §11; the owner's
+decision).
+
 ## 8. The seam in PM OS
 
 ### 8.1 Where
