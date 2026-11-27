@@ -124,13 +124,16 @@ async fn serve(s: Serve) -> anyhow::Result<()> {
         .context("the Ledger's public keys cannot be read")?;
     anyhow::ensure!(!ledger_keys.is_empty(), "no public key for the Ledger");
     // With issuers' keys the gate opens sessions for the shim and records a proven agent
-    // as proven. Until the Authority issues mandates (G4c) these are a test issuer's keys.
+    // as proven. A mandate is held to the template it names in the bundle this gate holds,
+    // so the key mandates are signed with is worth no more than the templates allow.
     let sessions = (!policy.mandate_issuers.is_empty()).then(|| {
-        SessionsConfig::new(
+        let mut config = SessionsConfig::new(
             scope.clone(),
             gate.clone(),
             KeySet::new(policy.mandate_issuers.clone()),
-        )
+        );
+        config.templates = policy.templates.clone();
+        config
     });
     let operator_secret = new_secret(&s.operator_secret_file)?;
     let config = GateConfig {

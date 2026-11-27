@@ -96,6 +96,10 @@ async fn installed() -> (TheAuthority, TheLedger) {
         id("authority"),
         admin_key(),
         key("authority-root-1", 61).public(),
+    )
+    .with_online_keys(
+        key("authority:mandates-1", 71),
+        key("authority:leases-1", 72),
     );
     let ana = id("ana");
     a.bootstrap(&ana, NOW).await.unwrap();
@@ -264,7 +268,17 @@ async fn the_authoritys_chain_is_witnessed_and_a_gates_key_follows_from_it() {
         clock_skew_secs: 60,
         retention_secs: None,
     });
-    assert!(report.ok(), "{:?}", report.findings);
+    // Every signature, chain and key verifies. The one finding is that gate-1's receipts,
+    // made by the test helper, name a mandate (m-1) this Authority never issued; the test
+    // below, of a mandate it did issue, has none.
+    assert_eq!(
+        report
+            .findings
+            .iter()
+            .map(|f| (f.problem.clone(), f.gate.clone(), f.seq))
+            .collect::<Vec<_>>(),
+        vec![(Problem::MandateNotIssued, Some(id("gate-1")), Some(1))]
+    );
     assert_eq!(report.receipts_verified, 14 + 2);
 
     // The auditor's check believes a gate's key only as far as a witnessed record of its
@@ -284,6 +298,8 @@ async fn the_authoritys_chain_is_witnessed_and_a_gates_key_follows_from_it() {
         })
         .findings
         .into_iter()
+        // The finding about the helper's mandate, checked above, is in every answer.
+        .filter(|f| f.problem != Problem::MandateNotIssued)
         .map(|f| (f.problem, f.gate))
         .collect::<Vec<_>>()
     };
@@ -650,4 +666,212 @@ async fn a_record_about_a_gate_never_retires_the_authoritys_own_key() {
         .key_retired(&scope(), &a.admin_public().kid)
         .await
         .unwrap());
+}
+
+/// The auditor's check holds a proven receipt to a mandate the Authority recorded issuing
+/// (spec §7.6.2, point 8): one it did issue passes, one it never issued is reported, and so
+/// is one whose record no checkpoint covers yet.
+#[tokio::test]
+async fn a_proven_receipt_names_a_mandate_the_authority_issued() {
+    use gov_core::action::Grant;
+    use gov_core::mandate::{Limits, Mandate, Template};
+    use gov_core::policy::{OnlineKeys, PolicyBundle};
+    let (a, ledger) = installed().await;
+    let (ana, ben) = (id("ana"), id("ben"));
+    let g1 = key("gate-1:k1", 20);
+    enrol_gate(&a, "gate-1", &g1).await;
+
+    // A bundle with one template, published; the agent's key enrolled; a mandate issued.
+    let grants = vec![Grant {
+        system: id("jira"),
+        operations: [id("issue.update")].into(),
+        resources: vec![gov_core::ResourcePattern::new("jira/project/pay/*").unwrap()],
+    }];
+    let bundle = PolicyBundle {
+        v: 1,
+        tenant: id("acme"),
+        env: id("prod"),
+        issuer: id("authority"),
+        version: id("v"),
+        number: 1,
+        issued_at: NOW,
+        keys: OnlineKeys {
+            mandates: vec![key("authority:mandates-1", 71).public()],
+            leases: vec![key("authority:leases-1", 72).public()],
+        },
+        freshness: Default::default(),
+        rules: Vec::new(),
+        connectors: Vec::new(),
+        templates: vec![Template {
+            id: id("triage"),
+            grants: grants.clone(),
+            max_life_secs: 3600,
+            limits: Limits::default(),
+            delegable: false,
+            people: BTreeSet::new(),
+            receivers: BTreeSet::new(),
+        }],
+    };
+    let signed = seal(&bundle, &key("authority-root-1", 61)).unwrap();
+    a.publish_bundle(&ana, &signed, NOW).await.unwrap();
+    let bot = key("refund-bot:k1", 9);
+    let code = a
+        .offer_enrolment(&ana, EnrolKind::Agent, &id("refund-bot"), NOW)
+        .await
+        .unwrap();
+    let asked = seal(
+        &EnrolRequest {
+            v: 1,
+            tenant: id("acme"),
+            env: id("prod"),
+            authority: id("authority"),
+            kind: EnrolKind::Agent,
+            name: id("refund-bot"),
+            key: bot.public(),
+            code: code_digest(&code),
+        },
+        &bot,
+    )
+    .unwrap();
+    a.enrol(&code, &asked, NOW).await.unwrap();
+    let ask = gov_authority::MandateAsk {
+        agent: id("refund-bot"),
+        key: id("refund-bot:k1"),
+        template: id("triage"),
+        grants,
+        life_secs: 1800,
+        limits: Limits::default(),
+    };
+    let issued = a.issue_mandate(&ben, &ask, NOW).await.unwrap();
+    let issuers = KeySet::new([key("authority:mandates-1", 71).public()]);
+    let mandate = gov_core::open::<Mandate>(&issued, &issuers, &scope())
+        .unwrap()
+        .doc
+        .id;
+
+    let acked = ship(&a, &ledger, 0).await;
+    ledger.supply_key(&g1.public()).await.unwrap();
+    // Two receipts that name the issued mandate, and then two that name another.
+    let receipts = |mandates: [&Id; 2]| {
+        let mut out: Vec<Envelope> = Vec::new();
+        let mut prev = None;
+        for seq in 1..=4u64 {
+            let mut r = common::receipt("gate-1", seq, prev.clone(), NOW + seq as i64);
+            r.mandate = vec![mandates[((seq - 1) / 2) as usize].clone()];
+            let env = seal(&r, &g1).unwrap();
+            prev = Some(common::hash_of(&env, &g1));
+            out.push(env);
+        }
+        out
+    };
+    // Not a made-up name: one the Authority's chain does hold a record about, as an agent
+    // it registered. Only a record of a mandate's issue bears a mandate out.
+    let forged = id("refund-bot");
+    let chain = receipts([&mandate, &forged]);
+    for env in &chain[..2] {
+        ledger.ingest(env, NOW).await.unwrap();
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let witness = DirWitness::new(dir.path());
+    ledger
+        .checkpoint(&ledger_key(), &id("ledger"), NOW + 60, &witness)
+        .await
+        .unwrap();
+    // The mandate was issued, and the record of it is witnessed: nothing to report.
+    assert_eq!(findings_of(&ledger, &witness, NOW + 61).await, vec![]);
+
+    // A mandate the Authority never issued, in a receipt marked proven: reported, at the
+    // first receipt that names it.
+    for env in &chain[2..] {
+        ledger.ingest(env, NOW).await.unwrap();
+    }
+    ledger
+        .checkpoint(&ledger_key(), &id("ledger"), NOW + 120, &witness)
+        .await
+        .unwrap();
+    assert_eq!(
+        findings_of(&ledger, &witness, NOW + 121).await,
+        vec![(Problem::MandateNotIssued, Some(id("gate-1")), Some(3))]
+    );
+
+    // A record of issue that no checkpoint covers is the Ledger's word alone: with only the
+    // checkpoints from before it, the mandate it issued is not yet borne out.
+    let early = tempfile::tempdir().unwrap();
+    let early_witness = DirWitness::new(early.path());
+    let (b, ledger_b) = installed().await;
+    enrol_gate(&b, "gate-1", &g1).await;
+    let _ = ship(&b, &ledger_b, 0).await;
+    ledger_b.supply_key(&g1.public()).await.unwrap();
+    ledger_b
+        .checkpoint(&ledger_key(), &id("ledger"), NOW + 60, &early_witness)
+        .await
+        .unwrap();
+    b.publish_bundle(&ana, &signed, NOW).await.unwrap();
+    let code = b
+        .offer_enrolment(&ana, EnrolKind::Agent, &id("refund-bot"), NOW)
+        .await
+        .unwrap();
+    let asked = seal(
+        &EnrolRequest {
+            v: 1,
+            tenant: id("acme"),
+            env: id("prod"),
+            authority: id("authority"),
+            kind: EnrolKind::Agent,
+            name: id("refund-bot"),
+            key: bot.public(),
+            code: code_digest(&code),
+        },
+        &bot,
+    )
+    .unwrap();
+    b.enrol(&code, &asked, NOW).await.unwrap();
+    let issued_b = b.issue_mandate(&ben, &ask, NOW).await.unwrap();
+    let mandate_b = gov_core::open::<Mandate>(&issued_b, &issuers, &scope())
+        .unwrap()
+        .doc
+        .id;
+    let head = ledger_b
+        .store()
+        .head(&scope(), &id("authority"))
+        .await
+        .unwrap()
+        .unwrap()
+        .seq;
+    let _ = ship(&b, &ledger_b, head).await;
+    let chain_b = receipts([&mandate_b, &mandate_b]);
+    for env in &chain_b[..2] {
+        ledger_b.ingest(env, NOW).await.unwrap();
+    }
+    let unwitnessed = findings_of(&ledger_b, &early_witness, NOW + 61).await;
+    assert!(
+        unwitnessed.contains(&(Problem::MandateNotIssued, Some(id("gate-1")), Some(1))),
+        "{unwitnessed:?}"
+    );
+    let _ = acked;
+}
+
+/// What the auditor's check finds in this Ledger's export against this witness.
+async fn findings_of(
+    ledger: &TheLedger,
+    witness: &DirWitness,
+    now: i64,
+) -> Vec<(Problem, Option<Id>, Option<u64>)> {
+    let export = ledger.export().await.unwrap();
+    let keys = ledger.keys(&ledger_key()).await.unwrap();
+    verify(&Check {
+        scope: &scope(),
+        keys: &keys,
+        export: &export,
+        checkpoints: &witness.all().unwrap(),
+        interval_secs: 60,
+        now: Some(now),
+        gate_quiet_secs: None,
+        clock_skew_secs: 60,
+        retention_secs: None,
+    })
+    .findings
+    .into_iter()
+    .map(|f| (f.problem, f.gate, f.seq))
+    .collect()
 }
