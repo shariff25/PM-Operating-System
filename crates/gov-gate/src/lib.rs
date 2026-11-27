@@ -325,6 +325,20 @@ impl<S: Spool> Gate<S> {
     /// Record that a call is about to pass through, before it does. Returns the intent's
     /// number, to give to [`Gate::finish`].
     pub fn begin(&mut self, call: &Observed<'_>, now: i64) -> Result<u64, GateError> {
+        let policy = self.config.policy_version.clone();
+        self.begin_under(call, now, policy)
+    }
+
+    /// As [`Gate::begin`], for a gate whose policy bundle can change while it runs: the
+    /// receipt carries the version of the bundle the call was read under, which the caller
+    /// took together with the map it read the call with. The outcome carries its intent's
+    /// (spec §7.6.3, point 7).
+    pub fn begin_under(
+        &mut self,
+        call: &Observed<'_>,
+        now: i64,
+        policy_version: Option<Id>,
+    ) -> Result<u64, GateError> {
         let (at, at_clamped) = self.stamp(now);
         let receipt = Receipt {
             session: None,
@@ -349,7 +363,7 @@ impl<S: Spool> Gate<S> {
                 failure: call.who.failure,
             },
             mandate: call.who.mandates.clone(),
-            policy_version: self.config.policy_version.clone(),
+            policy_version,
             action: ReceiptAction::from(call.action),
             reversal: call.reversal,
             before_digest: None,

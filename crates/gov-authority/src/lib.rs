@@ -93,6 +93,11 @@ pub struct Authority<S> {
     leases_key: Option<SigningKey>,
     /// When each gate was last answered a renewal, by this Authority's clock.
     renewed: std::sync::Mutex<std::collections::BTreeMap<Id, i64>>,
+    /// The latest bundle as last opened, by its digest, and how many times one was opened.
+    /// Opening checks the root's signature and every online key; with gates renewing every
+    /// few seconds that would be this Authority's main cost (review finding GR-175).
+    opened: std::sync::Mutex<Option<gov_core::policy::OpenedBundle>>,
+    opens: std::sync::atomic::AtomicU64,
 }
 
 /// Where a mandate being issued comes from: the person at the root of its chain, and the
@@ -195,6 +200,8 @@ impl<S: Store> Authority<S> {
             mandates_key: None,
             leases_key: None,
             renewed: std::sync::Mutex::default(),
+            opened: std::sync::Mutex::default(),
+            opens: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -579,6 +586,34 @@ impl<S: Store> Authority<S> {
         })
     }
 
+    /// `latest`, opened under the root key. The one opened last is kept and used again for
+    /// as long as the store's latest bundle is that very one, by its digest: the digest is
+    /// of the signed bytes, and the store is read every time, so a newly published bundle
+    /// is opened afresh on its first use and never served from what was kept.
+    fn open_latest(&self, latest: &Published) -> Result<gov_core::policy::OpenedBundle> {
+        let mut kept = self
+            .opened
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(opened) = kept.as_ref().filter(|o| o.digest == latest.digest) {
+            return Ok(opened.clone());
+        }
+        let opened = gov_core::policy::open_bundle(&latest.envelope, &self.root, &self.scope)?;
+        // What the store says the bundle's digest is, and what it is.
+        if opened.digest != latest.digest {
+            return Err(AuthorityError::Unknown("bundle as it was published"));
+        }
+        self.opens
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *kept = Some(opened.clone());
+        Ok(opened)
+    }
+
+    /// How many times a bundle has been opened by this Authority, for its operator.
+    pub fn bundles_opened(&self) -> u64 {
+        self.opens.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// The latest published bundle, opened, and the key mandates are signed with, only if
     /// that bundle lists it under `mandates`: an Authority whose mandates key the root has
     /// not named issues nothing.
@@ -588,7 +623,7 @@ impl<S: Store> Authority<S> {
             .latest_bundle(&self.scope)
             .await?
             .ok_or(AuthorityError::Unknown("published bundle"))?;
-        let opened = gov_core::policy::open_bundle(&latest.envelope, &self.root, &self.scope)?;
+        let opened = self.open_latest(&latest)?;
         let key = self
             .mandates_key
             .as_ref()
@@ -975,7 +1010,7 @@ impl<S: Store> Authority<S> {
             .latest_bundle(&self.scope)
             .await?
             .ok_or(AuthorityError::Unknown("published bundle"))?;
-        let opened = gov_core::policy::open_bundle(&latest.envelope, &self.root, &self.scope)?;
+        let opened = self.open_latest(&latest)?;
         let key = self
             .leases_key
             .as_ref()

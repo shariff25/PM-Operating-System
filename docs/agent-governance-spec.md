@@ -544,6 +544,45 @@ reviewer.
     and its calls are then recorded as a client's bare claim, not as `no_lease`. (4) The
     new reasons are new words in the receipt's closed list: a `gov verify` built before
     this slice refuses a receipt that carries one.
+- **G4d-3 built (2026-11-27), from §7.6.3 point 7; not yet read by the reviewer.** On
+  `build/gov-g4d3`. Libraries and tests; the gate program is wired to an Authority in
+  G4d-5.
+  - *The gate changes bundle in place.* When an answer brings another bundle, the
+    forwarder swaps its connector map and the version its receipts carry together, and
+    the sessions take the new issuers' keys and templates. A call takes the map and the
+    version as one thing when it starts, so no receipt names one bundle for a call read
+    by another's map, and an outcome carries its intent's. A bundle with no map for the
+    gate's server leaves every tool unknown.
+  - *Sessions under the new bundle.* Each open session's chain is checked again as a new
+    one would be. One that no longer holds (its template gone or narrower, its issuer's
+    key no longer listed) is dropped, and its next call is an unknown session. A marker
+    for something revoked is kept whatever the new bundle says.
+  - *The shim follows* (GR-133). The gate names the bundle it decides from when a
+    session opens and with every answer to the shim. A shim on another asks the gate for
+    it (`POST /v1/bundle`, given only to a caller that names a session open at that
+    gate), opens it under the root key the shim pinned itself, takes it only if it is the
+    one the gate named and would not take the shim back or sideways, notes it in its
+    state file, and uses it from its next call.
+  - *A gate's standing keeps the bundle as signed* (to hand on), and starts only on a
+    bundle the root signed for its own Authority.
+  - *GR-175:* the Authority keeps the bundle it last opened and opens another only when
+    the store's latest has another digest.
+  - Run with a gate and a shim in one process: proven under the first bundle; the second
+    arrives, the next call is read by the new map and its proof fails (`wrong_digest`)
+    once; the shim follows and the call after is proven under the same session; a third
+    bundle without the mandate's template drops the session. A shim that pinned another
+    root, holds a later bundle, or holds another under the same number takes nothing. A
+    stand-in for the gate that names one bundle and hands over another moves the shim
+    nowhere. 18 controls removed one at a time; each removal fails a test.
+  - **Departures and limits.** (1) The call that crosses a change is recorded as a failed
+    proof with `wrong_digest`, as §7.6.3 says, but it is **not counted apart** on the
+    operator's address: it is in the count of failed proofs, and the receipt has the
+    reason. (2) A shim with no session is handed no bundle, so it cannot follow; its
+    calls are bare claims then, and no map of its own matters to them. (3) The gate
+    library does not write the bundle it took to its state file; the program does that
+    in G4d-5, and until then a gate started again begins from the bundle file it is given
+    and is brought forward by its first renewal. (4) The bundle is policy, and any agent
+    with a mandate that opens a session can read it.
 
 ## Security review of 2026-11-26 (first read; the gate did not pass)
 
@@ -1020,7 +1059,7 @@ GR-171 are closed. It ran the Authority's tests without Postgres.
 | Id | Severity | What | Done |
 |---|---|---|---|
 | GR-174 | Low, with G4d-5 | The limit for each gate is applied after the key is looked up and the signature checked, so a caller with no valid key still costs a database read each time | Open: the listener limits by source before any of that work (G4d-5, with GR-169) |
-| GR-175 | Low | Every renewal opens the latest bundle again and checks each online key again: the Authority's main cost once several gates renew every few seconds | Open: to keep the opened bundle until another is published |
+| GR-175 | Low | Every renewal opens the latest bundle again and checks each online key again: the Authority's main cost once several gates renew every few seconds | Fixed on `build/gov-g4d3`: the bundle last opened is kept and used again while the store's latest has the same digest |
 | GR-176 | Low | A lease is good for the bundle's `standard` limit, two minutes by default, so a revoked agent's calls can be recorded as proven for up to that long after the revocation, plus the time between renewals | Stated in G4d-1's status note |
 
 ## 1. What is being built

@@ -2067,7 +2067,7 @@ mod renewal {
     }
 
     fn standing(gate: &str) -> Standing {
-        Standing::new(scope(), id(gate), id("authority"), root(), None)
+        Standing::new(scope(), id(gate), id("authority"), root(), None).unwrap()
     }
 
     /// An Authority with people, agents, an enrolled gate and its first bundle.
@@ -2184,6 +2184,10 @@ mod renewal {
             .revoked()
             .is_revoked(Revocable::Agent, &id("helper-bot")));
 
+        // Two bundles were published and used, and each was opened once: not once for
+        // every renewal and every mandate (review finding GR-175).
+        assert_eq!(a.bundles_opened(), 2);
+
         // A renewal writes nothing: every record since the start is one of the acts above.
         let acts = chain(&a).await.len() - records;
         assert_eq!(acts, 4, "issued, revoked, agent disabled, published");
@@ -2223,7 +2227,8 @@ mod renewal {
         let (other, _) = standing("gate-2").ask(&gate, 0).unwrap();
         refused(a.renew(&other, NOW).await);
         // A request meant for another Authority.
-        let elsewhere = Standing::new(scope(), id("gate-1"), id("authority-2"), root(), None);
+        let elsewhere =
+            Standing::new(scope(), id("gate-1"), id("authority-2"), root(), None).unwrap();
         let (misdirected, _) = elsewhere.ask(&gate, 0).unwrap();
         refused(a.renew(&misdirected, NOW).await);
         // Something signed by the gate that is not a renewal at all.
@@ -2522,7 +2527,14 @@ mod renewal {
 
         // A gate started with a bundle file that is older than what the Authority
         // publishes is brought forward by its first renewal (GR-132)...
-        let mut stale = Standing::new(scope(), id("gate-1"), id("authority"), root(), Some(old));
+        let mut stale = Standing::new(
+            scope(),
+            id("gate-1"),
+            id("authority"),
+            root(),
+            Some(first.clone()),
+        )
+        .unwrap();
         assert!(!stale.fresh(0));
         let taken = round(&a, &mut stale, &gate, 20, NOW + 6).await;
         assert!(taken.bundle_changed && stale.fresh(20));
@@ -2530,9 +2542,18 @@ mod renewal {
         // ...and one started with a newer bundle than its Authority publishes keeps its
         // own, and has no lease: something handed it that bundle, or the Authority was
         // put back.
-        let third =
-            open_bundle(&policy(3, vec![mandates_key().public()]), &root(), &scope()).unwrap();
-        let mut ahead = Standing::new(scope(), id("gate-1"), id("authority"), root(), Some(third));
+        let third = policy(3, vec![mandates_key().public()]);
+        let mut ahead =
+            Standing::new(scope(), id("gate-1"), id("authority"), root(), Some(third)).unwrap();
+        // A bundle not signed by the root, or another Authority's, starts no gate at all.
+        let theirs = signed_bundle(1, "authority-2", &[], &root_key());
+        assert!(
+            Standing::new(scope(), id("gate-1"), id("authority"), root(), Some(theirs)).is_err()
+        );
+        let forged = signed_bundle(1, "authority", &[], &key("authority-root-1", 99));
+        assert!(
+            Standing::new(scope(), id("gate-1"), id("authority"), root(), Some(forged)).is_err()
+        );
         let (request, asked) = ahead.ask(&gate, 30).unwrap();
         let answer = a.renew(&request, NOW + 7).await.unwrap();
         assert_eq!(ahead.take(&answer, asked), Err(RenewRefused::BundleOlder));

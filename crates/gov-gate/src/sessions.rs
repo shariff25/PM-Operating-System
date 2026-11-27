@@ -384,6 +384,48 @@ impl Sessions {
         closed
     }
 
+    /// Is this session open here? A marker counts: it is still this gate's session.
+    pub fn holds(&self, session: &Id) -> bool {
+        self.open.contains_key(session)
+    }
+
+    /// The gate has taken another policy bundle (spec §7.6.3, point 7): from now on chains
+    /// are held to its issuers' keys and its templates. Every open session's chain is
+    /// checked again as a new one would be. One that is revoked is kept as a marker, as in
+    /// [`Sessions::revoke`]; one that no longer holds for any other reason (its issuer's
+    /// key is gone from the bundle, its template is gone or narrower) is dropped, and its
+    /// next call is an unknown session. Returns how many were dropped.
+    pub fn rebundle(
+        &mut self,
+        issuers: KeySet,
+        templates: Option<Vec<gov_core::mandate::Template>>,
+        revoked: &RevocationSet,
+        now: i64,
+    ) -> usize {
+        self.config.issuers = issuers;
+        self.config.templates = templates;
+        self.revoke(revoked, now);
+        let c = &self.config;
+        let none = RevocationSet::default();
+        let before = self.open.len();
+        self.open.retain(|_, entry| {
+            // A marker stays whatever the new bundle says: it records what was revoked.
+            entry.revoked.is_some()
+                || verify_chain(
+                    &entry.presented,
+                    &ChainCheck {
+                        scope: &c.scope,
+                        authority: &c.issuers,
+                        now,
+                        revoked: &none,
+                        templates: c.templates.as_deref(),
+                    },
+                )
+                .is_ok()
+        });
+        before - self.open.len()
+    }
+
     /// Decide whether a call is proven. `digest` is of the action the gate itself computed
     /// from its own map, its own record of the listing, the arguments it parsed and the
     /// salt it was sent; `canonical` is false when those arguments have no canonical form.

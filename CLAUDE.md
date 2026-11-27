@@ -506,6 +506,19 @@ follow-up tracking.
   is refused a renewal must come back in G4d-4 with its test. Three Low notes: limit by
   source before any work (G4d-5), keep the opened bundle between renewals, and say that
   "proven" can lag a revocation by up to the lease's life (two minutes by default; said).
+- **A lint failure was merged and pushed once (2026-11-27), and fixed within the hour.**
+  The whole-workspace lint failed on one line of a new test (G4d-2), and the conductor's
+  check command hid it: clippy's output was piped through `tail`, which threw its exit
+  status away, so the run read as clean. The merge `dcb71c1` was pushed with it; the fix is
+  `e64062b`. No behaviour changed and the tests had passed. The six runs before it that
+  day were read again and were clean. The checks are now run by a script in which each
+  step's own exit status decides. The reviewer and the owner were told.
+- **G4d-3 built (2026-11-27), on `build/gov-g4d3`:** a gate takes another policy bundle
+  without a restart (map, version, issuers and templates together), checks its open
+  sessions against it, and names its bundle to the shim, which fetches it from the gate
+  and takes it only under its own pinned root key, only if it is the one named, and never
+  backwards. Libraries and tests. Not yet read by the reviewer. Next: G4d-4 (key rotation,
+  the witness's order in `gov verify`), then G4d-5 (the programs).
 
 ## Where the build stands (2026-11-23)
 

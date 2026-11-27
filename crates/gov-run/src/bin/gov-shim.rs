@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::Parser;
 use gov_core::{Envelope, Id, Scope};
-use gov_run::shim::{Shim, ShimConfig};
+use gov_run::shim::{Follow, Shim, ShimConfig};
 use gov_run::{bind, listen_address, new_secret, outbound_address, read_key};
 
 #[derive(Parser)]
@@ -67,13 +67,23 @@ async fn main() -> anyhow::Result<()> {
     let key = read_key(&cli.key_file)?;
     let mandate: Envelope = serde_json::from_slice(&std::fs::read(&cli.mandate)?)
         .context("the mandate cannot be read")?;
-    let map = cli.policy.load(&scope)?.map;
+    let policy = cli.policy.load(&scope)?;
+    let map = policy.map;
+    // On the signed path the shim follows its gate to a later bundle, by the same rules
+    // it started by.
+    let follow = policy.signed.map(|signed| Follow {
+        root: signed.root,
+        held: signed.held,
+        state: Some(signed.state),
+        server: signed.server,
+    });
     // The secret is in its file before the shim says it is listening: whoever reads that
     // line can read the secret at once.
     let secret = new_secret(&cli.secret_file)?;
     let socket = bind(addr).await?;
     let shim = Shim::new(
         ShimConfig {
+            follow,
             scope,
             gate,
             gate_url: cli.gate_url,

@@ -29,7 +29,7 @@ use gov_core::action::Salt;
 use gov_core::connector::{tool_digest, ServerMap};
 use gov_core::receipt::{Coverage, OutcomeStatus, ProofFailure};
 use gov_core::renew::{RenewRefused, Renewed, Standing, Taken};
-use gov_core::{Digest, Envelope, Id};
+use gov_core::{Digest, Envelope, Id, KeySet};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
@@ -270,9 +270,15 @@ pub struct FromAuthority {
     /// The gate's own count of time, in milliseconds, which must go on while the machine is
     /// suspended. The lease's time is counted on with it.
     pub mono: fn() -> u64,
-    /// The version of the bundle this forwarder's map and templates were loaded from. A
-    /// lease is complete only while it names that one.
-    pub policy_in_use: Id,
+}
+
+/// The policy a call is read under: the connector map, and the version of the bundle it
+/// came from. Taken together, so that a receipt never names one bundle for a call read
+/// with another's map.
+pub struct InUse {
+    pub map: ServerMap,
+    /// What a receipt carries; `None` only where the gate was given no version at all.
+    pub version: Option<Id>,
 }
 
 pub struct Forwarder<S> {
@@ -290,6 +296,9 @@ pub struct Forwarder<S> {
     in_flight: Arc<Semaphore>,
     clock: fn() -> i64,
     authority: Option<Held>,
+    /// The map and bundle version in use. Swapped whole when the gate takes another bundle;
+    /// a call keeps the one it started with.
+    policy: std::sync::RwLock<Arc<InUse>>,
     pub counters: Counters,
 }
 
@@ -297,7 +306,6 @@ pub struct Forwarder<S> {
 struct Held {
     standing: Mutex<Standing>,
     mono: fn() -> u64,
-    policy_in_use: Id,
 }
 
 fn wall_clock() -> i64 {
@@ -332,8 +340,11 @@ impl<S: Spool + 'static> Forwarder<S> {
         let authority = config.authority.take().map(|a| Held {
             standing: Mutex::new(a.standing),
             mono: a.mono,
-            policy_in_use: a.policy_in_use,
         });
+        let policy = std::sync::RwLock::new(Arc::new(InUse {
+            map: config.map.clone(),
+            version: gate.config.policy_version.clone(),
+        }));
         let in_flight = Arc::new(Semaphore::new(config.max_in_flight));
         Ok(Arc::new(Forwarder {
             gate: Arc::new(AsyncMutex::new(gate)),
@@ -349,6 +360,7 @@ impl<S: Spool + 'static> Forwarder<S> {
             in_flight,
             clock: wall_clock,
             authority,
+            policy,
             counters: Counters::default(),
         }))
     }
@@ -368,6 +380,14 @@ impl<S: Spool + 'static> Forwarder<S> {
             .unwrap_or_else(self.clock)
     }
 
+    /// The map and bundle version in use now.
+    pub fn policy(&self) -> Arc<InUse> {
+        self.policy
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     /// Do something with what the gate holds from its Authority, as sessions need it: is
     /// the lease complete and fresh, and what is revoked. `None` is passed where the gate
     /// has no Authority.
@@ -381,10 +401,11 @@ impl<S: Spool + 'static> Forwarder<S> {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Complete also means that what this forwarder decides from is the bundle the
         // lease names.
+        let in_use = self.policy();
         let fresh = standing.fresh((a.mono)())
             && standing
                 .bundle()
-                .is_some_and(|b| b.policy_version() == a.policy_in_use);
+                .is_some_and(|b| Some(b.policy_version()) == in_use.version);
         work(Some(&Trust {
             fresh,
             revoked: standing.revoked(),
@@ -420,18 +441,58 @@ impl<S: Spool + 'static> Forwarder<S> {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let taken = standing.take(answer, request);
-            match &taken {
-                Ok(t) if !t.revoked.is_empty() => {
-                    if let (Some(sessions), Some(now)) = (&self.sessions, standing.now((a.mono)()))
-                    {
-                        sessions
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .revoke(standing.revoked(), now);
+            let now = standing.now((a.mono)());
+            match (&taken, now) {
+                (Ok(t), Some(now)) => {
+                    // Another bundle: the map, the version, the issuers' keys and the
+                    // templates change together, between calls. A call already begun
+                    // keeps the map and the version it started with (point 7).
+                    if let (true, Some(bundle)) = (t.bundle_changed, standing.bundle()) {
+                        let server = self.policy().map.clone();
+                        let map = bundle
+                            .bundle
+                            .connectors
+                            .iter()
+                            .find(|m| m.server == server.server)
+                            .cloned()
+                            // The new bundle maps nothing for this server: every tool is
+                            // then unknown, and nothing is read by the old map.
+                            .unwrap_or(ServerMap {
+                                tools: Vec::new(),
+                                labels: Vec::new(),
+                                clearances: Vec::new(),
+                                ..server
+                            });
+                        *self
+                            .policy
+                            .write()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(InUse {
+                            map,
+                            version: Some(bundle.policy_version()),
+                        });
+                        if let Some(sessions) = &self.sessions {
+                            let issuers = KeySet::new(bundle.bundle.keys.mandates.iter().cloned());
+                            sessions
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .rebundle(
+                                    issuers,
+                                    Some(bundle.bundle.templates.clone()),
+                                    standing.revoked(),
+                                    now,
+                                );
+                        }
+                    } else if !t.revoked.is_empty() {
+                        if let Some(sessions) = &self.sessions {
+                            sessions
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .revoke(standing.revoked(), now);
+                        }
                     }
                 }
-                Ok(_) => {}
-                Err(why) => self.counters.renew_refused.add(why.code()),
+                (Ok(_), None) => {}
+                (Err(why), _) => self.counters.renew_refused.add(why.code()),
             }
             taken
         };
@@ -511,6 +572,7 @@ impl<S: Spool + 'static> Forwarder<S> {
         Router::new()
             .route("/mcp", any(handle::<S>))
             .route("/v1/sessions", post(open_session::<S>))
+            .route("/v1/bundle", post(hand_bundle::<S>))
             .with_state(self)
     }
 
@@ -632,10 +694,57 @@ async fn open_session<S: Spool + 'static>(
     });
     match opened {
         Ok((session, challenge)) => {
-            axum::Json(json!({"session": session, "challenge": challenge})).into_response()
+            let mut body = json!({"session": session, "challenge": challenge});
+            // With an Authority, the shim is told which bundle the gate decides from.
+            if let (Some(_), Some(version)) = (&f.authority, &f.policy().version) {
+                body["policy"] = json!(version);
+            }
+            axum::Json(body).into_response()
         }
         Err(OpenRefused::Busy) => StatusCode::TOO_MANY_REQUESTS.into_response(),
         Err(OpenRefused::Invalid) => StatusCode::FORBIDDEN.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BundleRequest {
+    session: Id,
+}
+
+/// Hand the shim the bundle this gate decides from, as the root key signed it (spec
+/// §7.6.3, point 7; review finding GR-133). Only to a caller that names a session open
+/// here: the bundle is policy, and is given to agents that have a mandate, not to anyone
+/// who can reach the address. The shim opens it under the root key it pinned itself, so
+/// what a gate hands over is believed only as far as the root signed it.
+async fn hand_bundle<S: Spool + 'static>(
+    State(f): State<Arc<Forwarder<S>>>,
+    body: Bytes,
+) -> Response {
+    let (Some(sessions), Some(a)) = (&f.sessions, &f.authority) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Ok(asked) = gov_core::strict::parse(&body).and_then(|v| {
+        serde_json::from_value::<BundleRequest>(v).map_err(|_| gov_core::Error::Malformed("bundle"))
+    }) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let known = sessions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .holds(&asked.session);
+    if !known {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let signed = a
+        .standing
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .signed_bundle()
+        .cloned();
+    match signed {
+        Some(bundle) => axum::Json(json!({"bundle": bundle})).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
@@ -848,6 +957,14 @@ async fn call<S: Spool + 'static>(
         .lock()
         .expect("the tool list's lock")
         .holds(&session);
+    // The policy this call is read under, map and version together, whatever the gate
+    // takes from its Authority while the call runs.
+    let in_use = f.policy();
+    // What the shim is told, so that it can follow the gate to another bundle (GR-133).
+    let told = shim
+        .as_ref()
+        .and(f.authority.as_ref())
+        .and(in_use.version.clone());
     let task = tokio::spawn(async move {
         let _permit = permit;
         let mut reopen = false;
@@ -857,7 +974,7 @@ async fn call<S: Spool + 'static>(
         let sent_salt = shim.as_ref().and_then(|s| s.salt);
         let begun = match sent_salt.map_or_else(gov_core::random_salt, Ok) {
             Ok(salt) => {
-                let mapped = f.config.map.map(&tool, listed.as_ref(), &args, &salt);
+                let mapped = in_use.map.map(&tool, listed.as_ref(), &args, &salt);
                 if !mapped.known {
                     f.counters.unmapped.fetch_add(1, Ordering::Relaxed);
                     f.counters
@@ -914,7 +1031,7 @@ async fn call<S: Spool + 'static>(
                         // The agent holds its own credential; the gate is only in the path.
                         coverage: Coverage::InLine,
                     };
-                    gate.begin(&observed, now)
+                    gate.begin_under(&observed, now, in_use.version.clone())
                 })
                 .await
             }
@@ -979,6 +1096,9 @@ async fn call<S: Spool + 'static>(
                 response
                     .headers_mut()
                     .insert("x-gov-reopen", HeaderValue::from_static(listing));
+            }
+            if let Some(version) = told.and_then(|v| HeaderValue::from_str(v.as_str()).ok()) {
+                response.headers_mut().insert("x-gov-policy", version);
             }
             response
         }
