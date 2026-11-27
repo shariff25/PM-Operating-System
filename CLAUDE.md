@@ -434,11 +434,14 @@ follow-up tracking.
   every committed file until the owner decides about filing; the repository answered a
   request with no login on 2026-11-27, so it is taken to be public until the owner says
   otherwise. Not buildable by the conductor: design partners and a real deployment.
-- **G4c so far (2026-11-27), on `build/gov-g4c`, not merged:** templates in the bundle and
-  held at the gate (16 controls, all caught); issuing, delegating, listing, revoking and the
-  revocation feed in the Authority (31 controls, 8 not yet caught by a test). Still to do:
-  those eight, the gate's sessions using the bundle's templates, `gov verify` reporting a
-  mandate nobody issued, an end-to-end run, the full checks and the reviewer's read.
+- **G4c built (2026-11-27), on `build/gov-g4c`:** mandates from the Authority. Templates
+  are in the signed bundle and a gate holds every mandate to its template; the Authority
+  issues to an agent's owner, delegates narrower at the holder's signed request, lists,
+  revokes, and signs a numbered revocation feed; `gov verify` reports a mandate nobody
+  issued. Run as three programs with fake data on a mandate the Authority issued; a mandate
+  signed with a stolen mandates key but wider than its template is not recorded as proven.
+  Not yet read by the reviewer. The gate does not read the feed yet (G4d), and nothing is
+  served (G4e).
 
 ## Where the build stands (2026-11-23)
 

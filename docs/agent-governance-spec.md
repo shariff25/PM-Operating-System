@@ -395,6 +395,41 @@ reviewer.
   gate ran on was published by the Authority (`gov verify` reporting a policy version with
   no `PolicyPublished` record is not written); the `gov` command now links the programs'
   library to read a key file, though no command of it opens a network connection.
+- **G4c built (2026-11-27), from §7.6.2 after the eighteenth read; not yet read by the
+  reviewer.** Mandates from the Authority, on `build/gov-g4c`:
+  - *templates* are in the root-signed bundle, shown to the signer like rules, and a gate
+    holds every chain's root mandate to the template of that name in the bundle it holds
+    (GR-138); a child stays under its parent's template;
+  - *issuing*: to the agent's owner or a person the template names, from the latest
+    published bundle, signed with a key that bundle lists for mandates, checked as a gate
+    would check it, and written with its `MandateIssued` record in one step. The mandate
+    carries no session, since nobody is signed in before G4e;
+  - *delegating*: at the signed request (`gov.delegate.v1`) of the agent holding the
+    parent, narrower, to an agent whose owner is the person at the root or one the template
+    names, once;
+  - *listing* by ownership, *revoking* by the issuer, the owner or an admin, and the
+    numbered *revocation feed* (`gov.revocations.v1`) signed with the leases key;
+  - `gov verify`, with an Authority named, reports a proven receipt whose mandate no
+    witnessed record says was issued.
+  Run as three programs with fake data, the agent's mandate is now the Authority's and not
+  a test issuer's: its call is recorded as proven, and a mandate signed with the same
+  mandates key but wider than its template is not. About fifty controls removed one at a
+  time; each removal fails a test, after two that only repeated the chain check were taken
+  out.
+  **Departures from §7.6.2, and limits:**
+  - "The same request is never served twice" is kept by taking the child mandate's id from
+    the request's own hash, not by remembering nonces: a second copy asks for an id that
+    exists.
+  - Stopping an agent revokes its mandates **before** the record that stops it, as
+    separate records, not in one step: a stop between the two leaves an agent with less
+    authority than it should have, never more.
+  - The Authority is still a library. The gate does not read the revocation feed, so a
+    revoked mandate still opens a session until G4d; nothing is served until G4e.
+  - A call under a mandate the gate will not open a session for is forwarded, as
+    everything is in observe mode, and recorded as a client's bare claim, not as a failed
+    proof. The marker for such calls is G4d's (§7.6, choice 5).
+  - Limits are carried and compared, not yet charged (G6). A mandate's grants are not
+    yet checked against a call (G5).
 - One more test on both of the Ledger's stores (a chain holds one kind of document), and
   two with an Authority and a Ledger together.
 
