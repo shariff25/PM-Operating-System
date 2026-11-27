@@ -214,12 +214,34 @@ impl PolicyBundle {
             }
             server.validate()?;
         }
+        // A system that does not tell upper case from lower has its resources written in
+        // lower case. A rule written otherwise for it would match nothing, and a refusal
+        // that matches nothing lets through what it meant to stop (finding GR-66).
+        let folded = |system: &Id| {
+            self.connectors
+                .iter()
+                .any(|c| c.fold_case && &c.system == system)
+        };
         let mut names = BTreeSet::new();
         for template in &self.templates {
             if !names.insert(&template.id) {
                 return Err(Error::Malformed("two templates share an id"));
             }
             template.validate()?;
+            // A grant written otherwise matches nothing either. That fails safe, but whoever
+            // wrote it would not know why the agent is refused (finding GR-156).
+            let upper = template.grants.iter().any(|g| {
+                folded(&g.system)
+                    && g.resources.iter().any(|r| {
+                        let text = String::from(r.clone());
+                        text != text.to_ascii_lowercase()
+                    })
+            });
+            if upper {
+                return Err(Error::Malformed(
+                    "a folded system's patterns are lower case",
+                ));
+            }
         }
         let mut ids = BTreeSet::new();
         for rule in &self.rules {
@@ -235,14 +257,6 @@ impl PolicyBundle {
             {
                 return Err(Error::Malformed("a rule names the unknown kind"));
             }
-            // A system that does not tell upper case from lower has its resources written in
-            // lower case. A rule written otherwise for it would match nothing, and a refusal
-            // that matches nothing lets through what it meant to stop (finding GR-66).
-            let folded = |system: &Id| {
-                self.connectors
-                    .iter()
-                    .any(|c| c.fold_case && &c.system == system)
-            };
             if let Some(resources) = &rule.matches.resources {
                 let upper = resources.iter().any(|r| {
                     let text = String::from(r.clone());

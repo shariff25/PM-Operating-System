@@ -184,6 +184,14 @@ pub struct Mapped {
     pub known: bool,
 }
 
+/// The operation a call is recorded under when the map cannot read it: a digest of the
+/// tool's name, never the name. Whoever holds a server's listing can work out which tool
+/// a recorded operation stands for; nobody else can read a name out of a receipt.
+pub fn unmapped_operation(tool: &str) -> Id {
+    let name = Digest::of(&[b"gov.toolname.v1\0", tool.as_bytes()]);
+    Id::new(&format!("unmapped-{}", &name.as_str()[..16])).expect("hex digits are an identifier")
+}
+
 impl ServerMap {
     /// The lint for one server's map.
     pub fn validate(&self) -> Result<()> {
@@ -258,9 +266,7 @@ impl ServerMap {
         // the caller or the server, and a receipt holds no text either could choose (T17,
         // review finding GR-71). The resource says only that it was not mapped. The worst is
         // assumed of it.
-        let name = Digest::of(&[b"gov.toolname.v1\0", tool.as_bytes()]);
-        let operation = Id::new(&format!("unmapped-{}", &name.as_str()[..16]))
-            .expect("hex digits are an identifier");
+        let operation = unmapped_operation(tool);
         let resource = ResourcePath::new(&format!("{}/unmapped", self.system))
             .expect("a system and a word are a resource");
         Mapped {

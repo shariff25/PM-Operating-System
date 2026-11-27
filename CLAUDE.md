@@ -453,7 +453,12 @@ follow-up tracking.
   by `gov map build` from the server's own tool listing and a review file, and `gov map
   drift`. The three servers are open-source ones run locally with made-up tokens and no
   network: **no map has been run against the real system, and none is called verified.**
-  Not yet read by the reviewer. Not built: the gate's count of calls to unmapped tools.
+  Not yet read by the reviewer.
+- **Twentieth-read fixes built (2026-11-27), on `build/gov-review-20`:** GR-152 (a stop
+  revokes, marks, and revokes again), GR-153 (offboarding revokes every mandate the leaver
+  is at the root of), GR-154 to GR-156, and CM2's count of unmapped calls by tool on the
+  gate's operator address. Not yet read by the reviewer. Next: G4d's design in the spec
+  (the reviewer listed what it must settle), then G4d.
 
 ## Where the build stands (2026-11-23)
 

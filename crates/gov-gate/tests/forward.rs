@@ -476,6 +476,10 @@ async fn every_tool_call_through_the_gate_leaves_receipts_and_is_changed_by_noth
         ),
         (4, 0, 1)
     );
+    // The operator sees which tool it was, under the name the receipt carries (CM2).
+    let by_tool = c.unmapped_by_tool.counts();
+    assert_eq!(by_tool.len(), 1);
+    assert_eq!(by_tool.get(r[6].action.operation.as_str()), Some(&1));
 
     // Nothing the agent sent or the server answered is on the gate's disk: not the
     // credential, not an argument value, not the reply.
@@ -1184,4 +1188,25 @@ async fn a_session_the_server_answers_under_is_one_it_issued() {
         .await;
     }
     assert!(!s.forwarder.holds_listing("made-up-1"));
+}
+
+/// The count of unmapped calls by tool holds a fixed number of names: an agent calling
+/// tools that do not exist, each by a new name, fills it and then adds to one number.
+#[test]
+fn the_count_by_tool_does_not_grow_without_end() {
+    use gov_gate::forward::{Tally, TALLY_KEYS};
+    let tally = Tally::default();
+    for n in 0..TALLY_KEYS + 500 {
+        tally.add(&format!("unmapped-{n}"));
+    }
+    // One already counted is still counted under its own name.
+    tally.add("unmapped-3");
+    let counts = tally.counts();
+    assert_eq!(counts.len(), TALLY_KEYS + 1);
+    assert_eq!(counts.get("other"), Some(&500));
+    assert_eq!(counts.get("unmapped-3"), Some(&2));
+    assert_eq!(
+        counts.values().sum::<u64>(),
+        u64::try_from(TALLY_KEYS + 501).unwrap()
+    );
 }

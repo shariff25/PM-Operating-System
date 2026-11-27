@@ -75,6 +75,14 @@ fn drift_passes_on_the_listing_reviewed_and_fails_naming_what_changed() {
     assert!(text.contains("changed: jira_get_issue"), "{text}");
     assert!(text.contains("removed: jira_delete_issue"), "{text}");
     assert!(text.contains("added: jira_purge_project"), "{text}");
+    // Each is named with what a gate's operator sees it counted under.
+    let recorded = gov_core::connector::unmapped_operation("jira_purge_project");
+    assert!(
+        text.contains(&format!(
+            "added: jira_purge_project (a call is recorded as {recorded})"
+        )),
+        "{text}"
+    );
     assert!(
         text.contains("1 added, 1 removed, 1 changed, 61 as reviewed"),
         "{text}"

@@ -649,7 +649,16 @@ both_stores!(two_admins_at_once_keep_one_chain, two_writers);
 struct Failing {
     inner: MemoryStore,
     fail: std::sync::atomic::AtomicBool,
+    /// Mandates this store does not show yet, as if they were issued a moment later than
+    /// they were: see [`UNTIL_AGENT_STOPPED`] and the others.
+    late: std::sync::atomic::AtomicU8,
 }
+/// Mandates are not listed until the record that stops an agent is written.
+const UNTIL_AGENT_STOPPED: u8 = 1;
+/// Mandates are not listed until the record that marks a person as gone is written.
+const UNTIL_PERSON_GONE: u8 = 2;
+/// Mandates are not listed, until the test says otherwise.
+const UNTIL_TOLD: u8 = 3;
 #[async_trait]
 impl Store for Failing {
     async fn head(&self, scope: &Scope) -> StoreResult<Option<ChainHead>> {
@@ -661,10 +670,24 @@ impl Store for Failing {
         record: &StoredRecord,
         effects: &[Effect],
     ) -> StoreResult<()> {
-        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.fail.load(SeqCst) {
             return Err(StoreError::Other("the disk is full".into()));
         }
-        self.inner.commit(scope, record, effects).await
+        self.inner.commit(scope, record, effects).await?;
+        let agent_stopped = effects
+            .iter()
+            .any(|e| matches!(e, Effect::PutAgent(a) if a.status != Status::Active));
+        let person_gone = effects
+            .iter()
+            .any(|e| matches!(e, Effect::PutPerson(p) if !p.active));
+        let late = self.late.load(SeqCst);
+        if (late == UNTIL_AGENT_STOPPED && agent_stopped)
+            || (late == UNTIL_PERSON_GONE && person_gone)
+        {
+            self.late.store(0, SeqCst);
+        }
+        Ok(())
     }
     async fn records_after(
         &self,
@@ -706,6 +729,9 @@ impl Store for Failing {
         self.inner.mandate(scope, id).await
     }
     async fn mandates(&self, scope: &Scope) -> StoreResult<Vec<gov_authority::IssuedMandate>> {
+        if self.late.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            return Ok(Vec::new());
+        }
         self.inner.mandates(scope).await
     }
     async fn revocations_after(
@@ -1493,6 +1519,23 @@ async fn delegating<S: Store>(store: S) {
         (&last.actor.id, last.actor.verified),
         (&id("refund-bot"), false)
     );
+    // An agent, and the record says so: a person may be called refund-bot too (GR-154).
+    assert_eq!(last.actor.kind, gov_core::admin::ActorKind::Agent);
+    // Every other record so far is a person's, and its signed text does not carry the
+    // field at all, as records written before the field existed do not.
+    for record in &records[..records.len() - 1] {
+        assert_eq!(record.actor.kind, gov_core::admin::ActorKind::Person);
+    }
+    let stored = a.store().records_after(&scope(), 0, 10_000).await.unwrap();
+    let text = |e: &Envelope| {
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&e.payload)
+            .unwrap();
+        String::from_utf8(bytes).unwrap()
+    };
+    assert!(text(&stored.last().unwrap().envelope).contains(r#""kind":"agent""#));
+    assert!(text(&stored[0].envelope).contains(r#""actor":{"id":"ana","verified":false}"#));
     let kept = a
         .store()
         .mandate(&scope(), &child.id)
@@ -1825,3 +1868,174 @@ async fn revoking<S: Store>(store: S) {
     );
 }
 both_stores!(a_mandate_is_listed_revoked_and_named_in_the_feed, revoking);
+
+// ----- stopping an agent, and a person leaving (review findings GR-152 and GR-153) -------
+
+async fn mandate_id(issued: &Envelope) -> Id {
+    as_a_gate(issued, &RevocationSet::default()).unwrap()[0]
+        .id
+        .clone()
+}
+
+async fn is_revoked<S: Store>(a: &Authority<S>, mandate: &Id) -> bool {
+    let kept = a.store().mandate(&scope(), mandate).await.unwrap().unwrap();
+    let in_feed = a
+        .store()
+        .revocations_after(&scope(), 0)
+        .await
+        .unwrap()
+        .iter()
+        .any(|e| e.kind == Revocable::Mandate && &e.id == mandate);
+    // The two are written together or not at all.
+    assert_eq!(kept.revoked, in_feed);
+    kept.revoked
+}
+
+async fn published(store: Failing) -> Authority<Failing> {
+    let (a, _, _, _) = ready(store).await;
+    a.publish_bundle(&id("ana"), &policy(1, vec![mandates_key().public()]), NOW)
+        .await
+        .unwrap();
+    a
+}
+
+/// A mandate issued after the stop has looked for mandates and before the agent is marked
+/// is revoked all the same: the stop looks again once nothing more can be issued.
+#[tokio::test]
+async fn a_mandate_issued_while_its_agent_is_being_stopped_is_revoked() {
+    use std::sync::atomic::Ordering::SeqCst;
+    for disable in [false, true] {
+        let a = published(Failing::default()).await;
+        let (ana, ben) = (id("ana"), id("ben"));
+        let good = ask("refund-bot", "refund-bot:k1", "triage");
+        let m = mandate_id(&a.issue_mandate(&ben, &good, NOW).await.unwrap()).await;
+        // The stop's first look does not see it: it was issued a moment too late for that.
+        a.store().late.store(UNTIL_AGENT_STOPPED, SeqCst);
+        if disable {
+            a.disable_agent(&ana, &id("refund-bot"), NOW).await.unwrap();
+        } else {
+            a.suspend_agent(&ana, &id("refund-bot"), NOW).await.unwrap();
+        }
+        assert!(is_revoked(&a, &m).await, "disable: {disable}");
+        // And once the agent is marked, nothing more is issued to it.
+        assert!(a.issue_mandate(&ben, &good, NOW).await.is_err());
+        // The records, in order: the agent stopped, then the mandate revoked.
+        let records = chain(&a).await;
+        let last: Vec<AdminAction> = records.iter().rev().take(2).map(|r| r.action).collect();
+        let stopped = if disable {
+            AdminAction::AgentDisabled
+        } else {
+            AdminAction::AgentSuspended
+        };
+        assert_eq!(last, [AdminAction::Revoked, stopped]);
+    }
+}
+
+/// A stop that was interrupted after the agent was marked is finished by asking again:
+/// the answer is still that the agent is in that state, and its mandates are revoked.
+#[tokio::test]
+async fn a_stop_that_did_not_finish_is_finished_by_asking_again() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let a = published(Failing::default()).await;
+    let (ana, ben) = (id("ana"), id("ben"));
+    let good = ask("refund-bot", "refund-bot:k1", "triage");
+    let m = mandate_id(&a.issue_mandate(&ben, &good, NOW).await.unwrap()).await;
+    // Neither look sees the mandate: as if the Authority stopped right after the mark.
+    a.store().late.store(UNTIL_TOLD, SeqCst);
+    a.suspend_agent(&ana, &id("refund-bot"), NOW).await.unwrap();
+    a.store().late.store(0, SeqCst);
+    assert!(!is_revoked(&a, &m).await);
+
+    assert!(matches!(
+        a.suspend_agent(&ana, &id("refund-bot"), NOW).await,
+        Err(AuthorityError::Unknown("agent in that state"))
+    ));
+    assert!(is_revoked(&a, &m).await);
+    // Asking a third time writes nothing more.
+    let before = chain(&a).await.len();
+    assert!(a.suspend_agent(&ana, &id("refund-bot"), NOW).await.is_err());
+    assert_eq!(chain(&a).await.len(), before);
+    // Only an admin can make the Authority do that work.
+    assert!(matches!(
+        a.suspend_agent(&ben, &id("refund-bot"), NOW).await,
+        Err(AuthorityError::NotAllowed)
+    ));
+}
+
+/// A person a template names can issue to an agent someone else owns. When that person
+/// leaves, those mandates are revoked too; the agent, and what its own owner issued to it,
+/// are left alone.
+async fn leaving<S: Store>(store: S) {
+    let (a, _, _, _) = ready(store).await;
+    let (ana, ben, cy) = (id("ana"), id("ben"), id("cy"));
+    a.publish_bundle(&ana, &policy(1, vec![mandates_key().public()]), NOW)
+        .await
+        .unwrap();
+    let by_cy = a
+        .issue_mandate(&cy, &ask("refund-bot", "refund-bot:k1", "shared"), NOW)
+        .await
+        .unwrap();
+    let by_cy = mandate_id(&by_cy).await;
+    let by_ben = a
+        .issue_mandate(&ben, &ask("refund-bot", "refund-bot:k1", "triage"), NOW)
+        .await
+        .unwrap();
+    let by_ben = mandate_id(&by_ben).await;
+    let cys_own = a
+        .issue_mandate(&cy, &ask("cy-bot", "cy-bot:k1", "triage"), NOW)
+        .await
+        .unwrap();
+    let cys_own = mandate_id(&cys_own).await;
+    let before = chain(&a).await.len();
+
+    a.offboard_person(&ana, &cy, NOW).await.unwrap();
+    assert!(is_revoked(&a, &by_cy).await);
+    assert!(is_revoked(&a, &cys_own).await);
+    assert!(!is_revoked(&a, &by_ben).await);
+    let refund = a
+        .store()
+        .agent(&scope(), &id("refund-bot"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(refund.status, Status::Active);
+    // Two mandates revoked, one agent suspended, one person marked: four records, the
+    // person's last.
+    let records = chain(&a).await;
+    assert_eq!(records.len(), before + 4);
+    assert_eq!(
+        records.last().unwrap().action,
+        AdminAction::PersonOffboarded
+    );
+    // Gone, cy issues nothing, and nothing is issued to cy's agent.
+    assert!(a
+        .issue_mandate(&cy, &ask("refund-bot", "refund-bot:k1", "shared"), NOW)
+        .await
+        .is_err());
+    // Asking again finds nothing left to do but say so once more.
+    a.offboard_person(&ana, &cy, NOW).await.unwrap();
+    assert_eq!(chain(&a).await.len(), before + 5);
+}
+both_stores!(
+    a_leavers_mandates_for_other_peoples_agents_are_revoked,
+    leaving
+);
+
+/// A mandate the leaver issued while the offboarding was looking is revoked all the same.
+#[tokio::test]
+async fn a_mandate_issued_while_its_issuer_is_leaving_is_revoked() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let a = published(Failing::default()).await;
+    let (ana, cy) = (id("ana"), id("cy"));
+    let by_cy = a
+        .issue_mandate(&cy, &ask("refund-bot", "refund-bot:k1", "shared"), NOW)
+        .await
+        .unwrap();
+    let by_cy = mandate_id(&by_cy).await;
+    a.store().late.store(UNTIL_PERSON_GONE, SeqCst);
+    a.offboard_person(&ana, &cy, NOW).await.unwrap();
+    assert!(is_revoked(&a, &by_cy).await);
+    let records = chain(&a).await;
+    let last: Vec<AdminAction> = records.iter().rev().take(2).map(|r| r.action).collect();
+    assert_eq!(last, [AdminAction::Revoked, AdminAction::PersonOffboarded]);
+}

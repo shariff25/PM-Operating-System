@@ -117,6 +117,25 @@ pub struct Sessions {
     open: BTreeMap<Id, Entry>,
     /// Nonces of requests to open, with when they were seen, kept for twice the skew.
     nonces: BTreeMap<Id, i64>,
+    /// Requests to open that were refused, by why. The asker is told none of this; the
+    /// operator is (review finding GR-155).
+    refused: BTreeMap<&'static str, u64>,
+}
+
+/// Why a request to open was refused, for the operator's count.
+pub mod why {
+    /// The mandate chain does not hold: a signature, a time, a link.
+    pub const MANDATE: &str = "mandate";
+    /// The chain holds, and names a template the bundle lacks or goes wider than it. Signed
+    /// with a real mandates key, this is what a taken key looks like (GR-138).
+    pub const TEMPLATE: &str = "template";
+    /// The request is not signed by the mandate's agent, or is for another gate, mandate
+    /// or time.
+    pub const REQUEST: &str = "request";
+    /// The request has been seen before.
+    pub const REPLAY: &str = "replay";
+    /// The agent key has as many unproven sessions as it may.
+    pub const BUSY: &str = "busy";
 }
 
 impl Sessions {
@@ -125,6 +144,22 @@ impl Sessions {
             config,
             open: BTreeMap::new(),
             nonces: BTreeMap::new(),
+            refused: BTreeMap::new(),
+        }
+    }
+
+    /// How many requests to open were refused, by why (see [`why`]).
+    pub fn refusals(&self) -> BTreeMap<&'static str, u64> {
+        self.refused.clone()
+    }
+
+    fn refuse(&mut self, why: &'static str) -> OpenRefused {
+        let n = self.refused.entry(why).or_default();
+        *n = n.saturating_add(1);
+        if why == why::BUSY {
+            OpenRefused::Busy
+        } else {
+            OpenRefused::Invalid
         }
     }
 
@@ -161,33 +196,45 @@ impl Sessions {
         now: i64,
     ) -> Result<(Id, Id), OpenRefused> {
         self.sweep(now);
-        let c = &self.config;
         // Revocation is not checked before there is an Authority to say what is revoked.
         let none_revoked = RevocationSet::default();
-        let chain = verify_chain(
-            mandate,
-            &ChainCheck {
-                scope: &c.scope,
-                authority: &c.issuers,
-                now,
-                revoked: &none_revoked,
-                templates: c.templates.as_deref(),
-            },
-        )
-        .map_err(|_| OpenRefused::Invalid)?;
+        let checked = {
+            let c = &self.config;
+            verify_chain(
+                mandate,
+                &ChainCheck {
+                    scope: &c.scope,
+                    authority: &c.issuers,
+                    now,
+                    revoked: &none_revoked,
+                    templates: c.templates.as_deref(),
+                },
+            )
+        };
+        let chain = match checked {
+            Ok(chain) => chain,
+            Err(gov_core::Error::UnknownTemplate | gov_core::Error::WiderThanTemplate(_)) => {
+                return Err(self.refuse(why::TEMPLATE))
+            }
+            Err(_) => return Err(self.refuse(why::MANDATE)),
+        };
         let leaf = chain.leaf();
         let agent_key = KeySet::new([leaf.agent.key.clone()]);
-        let asked = open::<SessionOpen>(request, &agent_key, &c.scope)
-            .map_err(|_| OpenRefused::Invalid)?
-            .doc;
+        let Ok(asked) = open::<SessionOpen>(request, &agent_key, &self.config.scope) else {
+            return Err(self.refuse(why::REQUEST));
+        };
+        let asked = asked.doc;
+        let c = &self.config;
         if asked.gate != c.gate
             || asked.mandate != leaf.id
             // Compared without arithmetic that can overflow: a time at the far end of the
             // range is refused like any other, and never panics (review finding GR-102).
             || asked.at.abs_diff(now) > c.open_skew_secs.unsigned_abs()
-            || self.nonces.contains_key(&asked.nonce)
         {
-            return Err(OpenRefused::Invalid);
+            return Err(self.refuse(why::REQUEST));
+        }
+        if self.nonces.contains_key(&asked.nonce) {
+            return Err(self.refuse(why::REPLAY));
         }
         let key = leaf.agent.key.clone();
         let unproven = self
@@ -196,8 +243,9 @@ impl Sessions {
             .filter(|e| e.key == key && !e.proven)
             .count();
         if unproven >= c.max_unproven {
-            return Err(OpenRefused::Busy);
+            return Err(self.refuse(why::BUSY));
         }
+        let c = &self.config;
         let id = random_id("sess").map_err(|_| OpenRefused::Invalid)?;
         let challenge = random_id("chal").map_err(|_| OpenRefused::Invalid)?;
         self.nonces.insert(asked.nonce, now);

@@ -818,6 +818,15 @@ async fn a_gate_and_a_ledger_run_as_programs_leave_a_record_an_auditor_can_check
         after["recorded"].as_u64().unwrap(),
         before["recorded"].as_u64().unwrap() + 1
     );
+    // Until refused attempts are recorded (G4d), the operator's count is where a mandate
+    // signed with the real key and wider than its template shows (review finding GR-155).
+    let refused =
+        |health: &serde_json::Value| health["sessions_refused"]["template"].as_u64().unwrap_or(0);
+    assert!(
+        refused(&after) > refused(&before),
+        "the refused mandate left no trace: {}",
+        after["sessions_refused"]
+    );
     drop(second);
 
     drop(shim);

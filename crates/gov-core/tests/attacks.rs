@@ -2043,6 +2043,26 @@ fn a_rule_that_could_never_match_a_folded_system_is_refused() {
     bundle(vec![refuse("jira/project/PAY/*")])
         .validate()
         .unwrap();
+    // A mandate template's grants are held to it too (review finding GR-156): one written
+    // otherwise would grant nothing, and its author would not know why.
+    let with_template = |pattern: &str, connectors| {
+        let mut t = triage_template();
+        t.grants = vec![grant(&["issue.read"], &[pattern])];
+        PolicyBundle {
+            connectors,
+            templates: vec![t],
+            ..bundle(Vec::new())
+        }
+    };
+    with_template("jira/project/pay/*", vec![jira_map()])
+        .validate()
+        .unwrap();
+    assert!(with_template("jira/project/PAY/*", vec![jira_map()])
+        .validate()
+        .is_err());
+    with_template("jira/project/PAY/*", Vec::new())
+        .validate()
+        .unwrap();
     // And the map's own template is held to it.
     let mut map = jira_map();
     map.tools[0].resource = ResourceTemplate::new("jira/Project/{key}").unwrap();
@@ -2211,6 +2231,7 @@ fn admin(
         at: NOW,
         actor: Actor {
             id: id("ana"),
+            kind: Default::default(),
             verified: false,
         },
         action,
