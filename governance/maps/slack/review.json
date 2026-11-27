@@ -2,15 +2,15 @@
  "server": "slack-mcp",
  "system": "slack",
  "fold_case": true,
- "source": "@modelcontextprotocol/server-slack 2025.4.25 from npm (server name \"Slack MCP Server\", version 1.0.0). Listing taken on 2026-11-27 over stdio with a made-up token and no network; Slack was not contacted, so no tool here has been run against Slack.",
+ "source": "@modelcontextprotocol/server-slack 2025.4.25 from npm (server name \"Slack MCP Server\", version 1.0.0). Listing taken on 2026-11-27 over stdio with a made-up token and no network; Slack was not contacted, so no tool here has been run against Slack. Settings the listing was taken under: the defaults. Run `gov map drift` against the real server before this map is relied on (GR-165).",
  "tools": {
   "slack_add_reaction": {
    "operation": "reaction.add",
    "kind": "write",
-   "reversal": "inverse",
+   "reversal": "none",
    "outward": true,
    "resource": "slack/channel/{channel_id}",
-   "note": "Seen by everyone in the channel. The server offers no tool to remove one."
+   "note": "Seen by everyone in the channel. The server offers no tool to remove one. So it is not marked as one that can be put back (GR-158)."
   },
   "slack_get_channel_history": {
    "operation": "channel.history.read",
@@ -51,18 +51,18 @@
   "slack_post_message": {
    "operation": "message.post",
    "kind": "write",
-   "reversal": "inverse",
+   "reversal": "none",
    "outward": true,
    "resource": "slack/channel/{channel_id}",
-   "note": "People are notified and may have read it before it is deleted; deleting takes the message away, not the reading of it. The server offers no delete tool."
+   "note": "People are notified and may have read it before it is deleted; deleting takes the message away, not the reading of it. The server offers no delete tool. So it is not marked as one that can be put back (GR-158)."
   },
   "slack_reply_to_thread": {
    "operation": "thread.reply",
    "kind": "write",
-   "reversal": "inverse",
+   "reversal": "none",
    "outward": true,
    "resource": "slack/channel/{channel_id}",
-   "note": "As for a message."
+   "note": "As for a message. The server lists no tool that takes this back, so it is not marked as one that can be put back (GR-158)."
   }
  },
  "unmapped": {}

@@ -2,23 +2,23 @@
  "server": "jira-mcp",
  "system": "jira",
  "fold_case": true,
- "source": "mcp-atlassian 0.24.8 from PyPI (server name \"Atlassian MCP\", version 3.4.11), Jira tools only. Listing taken on 2026-11-27 by starting the server over stdio with made-up settings and asking tools/list; no Jira was contacted, so no tool here has been run against a real Jira.",
+ "source": "mcp-atlassian 0.24.8 from PyPI (server name \"Atlassian MCP\", version 3.4.11), Jira tools only. Listing taken on 2026-11-27 by starting the server over stdio with made-up settings and asking tools/list; no Jira was contacted, so no tool here has been run against a real Jira. Settings the listing was taken under: a cloud-form address, READ_ONLY_MODE=false, no tool filter. A server set otherwise may list other tools or other definitions, and every tool whose definition differs is recorded as unknown: run `gov map drift` against the real server before this map is relied on (GR-165).",
  "tools": {
   "jira_add_comment": {
    "operation": "comment.add",
    "kind": "write",
-   "reversal": "inverse",
+   "reversal": "none",
    "outward": true,
    "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}",
-   "note": "A comment notifies watchers and anyone it mentions; on a service desk it can reach a customer."
+   "note": "A comment notifies watchers and anyone it mentions; on a service desk it can reach a customer. The server lists no tool that takes this back, so it is not marked as one that can be put back (GR-158)."
   },
   "jira_add_issues_to_sprint": {
    "operation": "sprint.issues.add",
    "kind": "write",
-   "reversal": "inverse",
+   "reversal": "none",
    "outward": false,
    "resource": "jira/sprint/{sprint_id}",
-   "note": "The issues named may be of any project."
+   "note": "The issues named may be of any project. Moving the issues to the backlog afterwards does not put back an issue that was in another sprint before, so it is not marked as one that can be put back."
   },
   "jira_add_watcher": {
    "operation": "issue.watcher.add",
@@ -26,37 +26,42 @@
    "reversal": "inverse",
    "outward": true,
    "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}",
-   "note": "Widens who is told about the issue."
+   "note": "Widens who is told about the issue.",
+   "undo_with": "jira_remove_watcher"
   },
   "jira_add_worklog": {
    "operation": "worklog.add",
    "kind": "write",
-   "reversal": "inverse",
-   "outward": false,
-   "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}"
+   "reversal": "none",
+   "outward": true,
+   "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}",
+   "note": "The server lists no tool that takes this back, so it is not marked as one that can be put back (GR-158). Its comment is text people see on the issue."
   },
   "jira_assign_issue": {
    "operation": "issue.assign",
    "kind": "write",
    "reversal": "restore",
-   "outward": false,
+   "outward": true,
    "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}",
-   "note": "Jira may email the new assignee, by its own notification scheme, which a map cannot see."
+   "note": "Jira may email the new assignee, by its own notification scheme, which a map cannot see. Put back by assigning the earlier person again, or nobody: the tool takes an empty assignee.",
+   "undo_with": "jira_assign_issue"
   },
   "jira_batch_create_issues": {
    "operation": "issue.batch-create",
    "kind": "write",
    "reversal": "inverse",
-   "outward": false,
+   "outward": true,
    "resource": "jira/batch",
-   "note": "Each issue names its own project inside a list: no single resource. Treat a grant for it as system-wide."
+   "note": "Each issue names its own project inside a list: no single resource. Treat a grant for it as system-wide. As for one issue.",
+   "undo_with": "jira_delete_issue"
   },
   "jira_batch_create_versions": {
    "operation": "version.batch-create",
    "kind": "write",
-   "reversal": "inverse",
-   "outward": false,
-   "resource": "jira/project/{project_key}"
+   "reversal": "none",
+   "outward": true,
+   "resource": "jira/project/{project_key}",
+   "note": "The server lists no tool that takes this back, so it is not marked as one that can be put back (GR-158). As for one version."
   },
   "jira_batch_get_changelogs": {
    "operation": "issue.changelog.batch-read",
@@ -78,39 +83,42 @@
    "operation": "issue.create",
    "kind": "write",
    "reversal": "inverse",
-   "outward": false,
+   "outward": true,
    "resource": "jira/project/{project_key}",
-   "note": "Put back by deleting or archiving the issue created."
+   "note": "Put back by deleting or archiving the issue created. Puts text the agent chose in front of the assignee and whoever watches the project.",
+   "undo_with": "jira_delete_issue"
   },
   "jira_create_issue_link": {
    "operation": "issuelink.create",
    "kind": "write",
-   "reversal": "inverse",
-   "outward": false,
+   "reversal": "none",
+   "outward": true,
    "resource": "jira/project/{inward_issue_key:before(-)}/issue/{inward_issue_key}",
-   "note": "Links two issues; the resource is the inward one. The other may be in a project the mandate does not cover."
+   "note": "Links two issues; the resource is the inward one. The other may be in a project the mandate does not cover. Its comment argument posts a comment on the issue (GR-159). Removing the link afterwards leaves the comment, so it is not marked as one that can be put back."
   },
   "jira_create_remote_issue_link": {
    "operation": "remotelink.create",
    "kind": "write",
-   "reversal": "inverse",
-   "outward": false,
+   "reversal": "none",
+   "outward": true,
    "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}",
-   "note": "Stores an address outside Jira on the issue; nothing is sent to it."
+   "note": "Stores an address outside Jira on the issue; nothing is sent to it. The server lists no tool that takes this back, so it is not marked as one that can be put back (GR-158). Its title and address are shown on the issue."
   },
   "jira_create_sprint": {
    "operation": "sprint.create",
    "kind": "write",
-   "reversal": "inverse",
-   "outward": false,
-   "resource": "jira/board/{board_id}"
+   "reversal": "none",
+   "outward": true,
+   "resource": "jira/board/{board_id}",
+   "note": "The server lists no tool that takes this back, so it is not marked as one that can be put back (GR-158). Its name and goal are text the team sees."
   },
   "jira_create_version": {
    "operation": "version.create",
    "kind": "write",
-   "reversal": "inverse",
-   "outward": false,
-   "resource": "jira/project/{project_key}"
+   "reversal": "none",
+   "outward": true,
+   "resource": "jira/project/{project_key}",
+   "note": "The server lists no tool that takes this back, so it is not marked as one that can be put back (GR-158). Its name and description are text people see."
   },
   "jira_delete_issue": {
    "operation": "issue.delete",
@@ -132,7 +140,8 @@
    "reversal": "restore",
    "outward": true,
    "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}",
-   "note": "Jira keeps no earlier version of a comment: putting it back relies on the value sealed before the edit."
+   "note": "Jira keeps no earlier version of a comment: putting it back relies on the value sealed before the edit.",
+   "undo_with": "jira_edit_comment"
   },
   "jira_get_agile_boards": {
    "operation": "board.list",
@@ -168,8 +177,8 @@
    "kind": "read",
    "reversal": "none",
    "outward": false,
-   "resource": "jira/project/{project_key}",
-   "note": "Named for one project, but its answer describes issues of others."
+   "resource": "jira/dependencies",
+   "note": "Named for one project, but its answer describes issues of others. So it has a resource of its own, as the searches have, and a grant on one project does not reach it (GR-162)."
   },
   "jira_get_field_options": {
    "operation": "field.options.read",
@@ -183,7 +192,8 @@
    "kind": "read",
    "reversal": "none",
    "outward": false,
-   "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}"
+   "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}",
+   "note": "Asked for an epic's children or linked issues, the answer can describe issues of other projects."
   },
   "jira_get_issue_dates": {
    "operation": "issue.dates.read",
@@ -364,9 +374,10 @@
   "jira_link_to_epic": {
    "operation": "issue.epic.link",
    "kind": "write",
-   "reversal": "restore",
+   "reversal": "none",
    "outward": false,
-   "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}"
+   "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}",
+   "note": "The tool links to an epic and cannot unlink, so an issue that had no epic before cannot be put back: not marked as one that can be."
   },
   "jira_move_issue": {
    "operation": "issue.move",
@@ -379,24 +390,27 @@
   "jira_move_issues_to_backlog": {
    "operation": "backlog.issues.move",
    "kind": "write",
-   "reversal": "inverse",
+   "reversal": "none",
    "outward": false,
    "resource": "jira/batch",
-   "note": "Takes a list of issues: no single resource."
+   "note": "Takes a list of issues: no single resource. Which sprint each issue was in is not in the call, so it is not marked as one that can be put back."
   },
   "jira_remove_issue_link": {
    "operation": "issuelink.remove",
    "kind": "write",
-   "reversal": "inverse",
+   "reversal": "restore",
    "outward": false,
-   "resource": "jira/issuelink/{link_id}"
+   "resource": "jira/issuelink/{link_id}",
+   "undo_with": "jira_create_issue_link",
+   "note": "Put back by creating the link again from what it was before: the call itself names only the link's id."
   },
   "jira_remove_watcher": {
    "operation": "issue.watcher.remove",
    "kind": "write",
    "reversal": "inverse",
    "outward": false,
-   "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}"
+   "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}",
+   "undo_with": "jira_add_watcher"
   },
   "jira_search": {
    "operation": "issue.search",
@@ -431,9 +445,9 @@
    "operation": "issue.transition",
    "kind": "write",
    "reversal": "none",
-   "outward": false,
+   "outward": true,
    "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}",
-   "note": "A workflow step can run rules the map cannot see (notify, close, deploy), and may have no way back."
+   "note": "A workflow step can run rules the map cannot see (notify, close, deploy), and may have no way back. Its fields and comment arguments set fields and post a comment in the same call, as an update can (GR-159)."
   },
   "jira_update_issue": {
    "operation": "issue.update",
@@ -447,24 +461,26 @@
    "operation": "issue.form.update",
    "kind": "write",
    "reversal": "restore",
-   "outward": false,
-   "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}"
+   "outward": true,
+   "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}",
+   "undo_with": "jira_update_proforma_form_answers",
+   "note": "Answers are text people see on the issue."
   },
   "jira_update_sprint": {
    "operation": "sprint.update",
    "kind": "write",
-   "reversal": "restore",
-   "outward": false,
+   "reversal": "none",
+   "outward": true,
    "resource": "jira/sprint/{sprint_id}",
-   "note": "Can start or close a sprint, which moves its issues."
+   "note": "Can start or close a sprint, which moves its issues. A closed sprint is not opened again by this tool, so it is not marked as one that can be put back. Its name and goal are text the team sees, and starting a sprint tells the team."
   },
   "jira_update_version": {
    "operation": "version.update",
    "kind": "write",
-   "reversal": "restore",
-   "outward": false,
+   "reversal": "none",
+   "outward": true,
    "resource": "jira/version/{version_id}",
-   "note": "Can release or archive a version."
+   "note": "Can release or archive a version. Whether a released or archived version can be taken back through this tool has not been tried, so it is not marked as one that can be put back. Its name and description are text people see."
   }
  },
  "unmapped": {}

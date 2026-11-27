@@ -219,13 +219,37 @@ fn the_jira_tools_that_cannot_be_put_back_say_so() {
     ] {
         assert_eq!(tool(name).reversal, Reversal::None, "{name}");
     }
-    // These tell people outside the agent's own work.
+    // The server lists no tool that takes these back (review finding GR-158), or the tool
+    // that seems to would leave something behind.
+    for name in [
+        "jira_add_comment",
+        "jira_add_worklog",
+        "jira_create_version",
+        "jira_batch_create_versions",
+        "jira_create_remote_issue_link",
+        "jira_create_sprint",
+        "jira_create_issue_link",
+        "jira_link_to_epic",
+        "jira_add_issues_to_sprint",
+        "jira_move_issues_to_backlog",
+        "jira_update_sprint",
+        "jira_update_version",
+    ] {
+        assert_eq!(tool(name).reversal, Reversal::None, "{name}");
+    }
+    // These put text the agent chose in front of people, or tell a person something.
     for name in [
         "jira_update_issue",
         "jira_add_comment",
         "jira_edit_comment",
         "jira_add_watcher",
         "jira_create_customer_request",
+        // Both can post a comment in the same call (review finding GR-159).
+        "jira_transition_issue",
+        "jira_create_issue_link",
+        // Both notify people (review finding GR-160).
+        "jira_create_issue",
+        "jira_assign_issue",
     ] {
         assert!(tool(name).outward, "{name}");
     }
@@ -236,6 +260,11 @@ fn a_jira_call_that_names_no_single_project_is_not_placed_in_one() {
     // A grant on one project's resources must not reach a call that can touch any project.
     for (tool, arguments) in [
         ("jira_search", json!({"jql": "project = PAY"})),
+        // Named for one project, and answers with other projects' issues (GR-162).
+        (
+            "jira_get_cross_project_dependencies",
+            json!({"project_key": "PAY"}),
+        ),
         (
             "jira_batch_create_issues",
             json!({"issues": "[{\"project_key\": \"PAY\"}]"}),
@@ -266,7 +295,10 @@ fn a_github_call_is_held_to_the_repository_its_arguments_name() {
         json!({"owner": "Acme", "repo": "Payments", "pullNumber": 7}),
     );
     assert!(mapped.known);
-    assert_eq!(mapped.action.resource.as_str(), "github/repo/acme/payments");
+    assert_eq!(
+        mapped.action.resource.as_str(),
+        "github/repo/acme/payments/pulls"
+    );
     // A name that is not a plain identifier is not guessed at, and neither is a missing one.
     for arguments in [
         json!({"owner": "acme", "repo": "payments/../other", "pullNumber": 7}),
@@ -367,6 +399,8 @@ fn every_slack_tool_that_posts_reaches_people_and_is_held_to_its_channel() {
         let tool = map.tools.iter().find(|t| t.tool.as_str() == name).unwrap();
         assert!(tool.outward, "{name}");
         assert_eq!(tool.kind, Kind::Write, "{name}");
+        // A sent message is not taken back: people have read it (GR-158).
+        assert_eq!(tool.reversal, Reversal::None, "{name}");
         let mapped = read_with(
             &map,
             name,
@@ -377,6 +411,142 @@ fn every_slack_tool_that_posts_reaches_people_and_is_held_to_its_channel() {
         // A channel given by name, as a person would, is not an id: not guessed at.
         let mapped = read_with(&map, name, json!({"channel_id": "#general", "text": "x"}));
         assert!(!mapped.known, "{name}");
+    }
+}
+
+/// A repository's resource ends in an area, so that a grant to read its code does not
+/// reach its leaked secrets or its workflow logs (review finding GR-163).
+#[test]
+fn a_grant_on_one_area_of_a_repository_does_not_reach_another() {
+    use gov_core::ResourcePattern;
+    let map = shelf("github", "github-mcp");
+    let at = |tool: &str| {
+        let mapped = read_with(
+            &map,
+            tool,
+            json!({"owner": "acme", "repo": "payments", "method": "get"}),
+        );
+        assert!(mapped.known, "{tool}");
+        mapped.action.resource
+    };
+    let code = ResourcePattern::new("github/repo/acme/payments/code").unwrap();
+    let whole = ResourcePattern::new("github/repo/acme/payments/*").unwrap();
+    for tool in ["get_file_contents", "list_commits", "push_files"] {
+        assert!(code.covers(&at(tool)), "{tool}");
+    }
+    for tool in [
+        "get_secret_scanning_alert",
+        "list_secret_scanning_alerts",
+        "get_job_logs",
+        "actions_run_trigger",
+        "merge_pull_request",
+        "issue_write",
+        "list_repository_collaborators",
+    ] {
+        assert!(
+            !code.covers(&at(tool)),
+            "{tool} is reached by a grant on code"
+        );
+        assert!(whole.covers(&at(tool)), "{tool}");
+    }
+    assert_eq!(
+        at("get_secret_scanning_alert").as_str(),
+        "github/repo/acme/payments/security"
+    );
+    assert_eq!(
+        at("get_job_logs").as_str(),
+        "github/repo/acme/payments/actions"
+    );
+    // No tool is left on the bare repository, where a grant on any area would miss it and
+    // only a grant on everything would reach it.
+    for tool in &map.tools {
+        let mapped = read_with(
+            &map,
+            tool.tool.as_str(),
+            json!({"owner": "acme", "repo": "payments"}),
+        );
+        assert_ne!(
+            mapped.action.resource.as_str(),
+            "github/repo/acme/payments",
+            "{}",
+            tool.tool
+        );
+    }
+}
+
+// ----- what every map in the library is held to ----------------------------------------
+
+/// A tool marked as one that can be put back names the tool of the same server that does
+/// it, and that tool is in the map and changes something (review finding GR-158). `build`
+/// refuses a review that does not; this reads the committed reviews to show what they say.
+#[test]
+fn every_tool_that_can_be_put_back_names_the_tool_that_does_it() {
+    for shelf in shelves() {
+        let review = read_review(&shelf.join("review.json")).unwrap();
+        for (name, tool) in &review.tools {
+            match (&tool.undo_with, tool.reversal) {
+                (None, Reversal::None) => {}
+                (Some(with), Reversal::Inverse | Reversal::Restore) => {
+                    let undo = review.tools.get(with).unwrap_or_else(|| {
+                        panic!(
+                            "{}: {name} is put back with {with}, not in the map",
+                            shelf.display()
+                        )
+                    });
+                    assert_ne!(undo.kind, Kind::Read, "{name}");
+                    // An opposite is another tool; writing the old value again may be the same.
+                    if tool.reversal == Reversal::Inverse {
+                        assert_ne!(with, name, "{name} is its own opposite");
+                    }
+                }
+                other => panic!("{}: {name}: {other:?}", shelf.display()),
+            }
+        }
+    }
+    // Slack's server has no tool that takes anything back.
+    let slack = shelf("slack", "slack-mcp");
+    assert!(slack.tools.iter().all(|t| t.reversal == Reversal::None));
+}
+
+/// A write that takes free text people will see is outward (the rule is in the library's
+/// README; review finding GR-160). The one exception is named with its reason.
+#[test]
+fn a_write_that_carries_text_people_see_is_outward() {
+    const TEXT: &[&str] = &[
+        "comment",
+        "body",
+        "text",
+        "description",
+        "summary",
+        "message",
+        "title",
+        "content",
+        "goal",
+    ];
+    // A comment on a pending review is shown to nobody until the review is submitted,
+    // which is another tool, and that one is outward.
+    const UNSEEN: &[&str] = &["add_comment_to_pending_review"];
+    for shelf in shelves() {
+        let review = read_review(&shelf.join("review.json")).unwrap();
+        let listing = read_listing(&shelf.join("listing.json")).unwrap();
+        for listed in &listing {
+            let name = listed["name"].as_str().unwrap();
+            let Some(tool) = review.tools.get(name) else {
+                continue;
+            };
+            let takes_text = listed["inputSchema"]["properties"]
+                .as_object()
+                .is_some_and(|p| p.keys().any(|k| TEXT.contains(&k.as_str())));
+            if tool.kind != Kind::Read && takes_text && !UNSEEN.contains(&name) {
+                assert!(
+                    tool.outward,
+                    "{}: {name} takes text and is not outward",
+                    shelf.display()
+                );
+            }
+        }
+        let pending = review.tools.get("pull_request_review_write");
+        assert!(pending.is_none_or(|t| t.outward));
     }
 }
 
@@ -458,6 +628,8 @@ fn a_built_map_passes_the_lint_a_gate_would_hold_it_to() {
     // A read that claims to be undoable is refused by the map's own lint.
     let mut r = review();
     r.tools.get_mut("get_issue").unwrap().reversal = Reversal::Inverse;
+    // It names a tool to be put back with, so it is the lint that refuses it.
+    r.tools.get_mut("get_issue").unwrap().undo_with = Some("delete_issue".into());
     let e = build(&listing(), &r).unwrap_err().to_string();
     assert!(e.contains("lint"), "{e}");
     // So is a resource in another system.
@@ -571,4 +743,57 @@ fn the_library_maps_carry_no_labels_of_their_own() {
             shelf.display()
         );
     }
+}
+
+// ----- a tool that can be put back names the tool that does it (GR-158) -----------------
+
+#[test]
+fn a_review_that_promises_an_undo_the_server_cannot_do_stops_the_build() {
+    let with = |change: &dyn Fn(&mut serde_json::Value)| {
+        let mut value = serde_json::to_value(review()).unwrap();
+        // A third tool, so that there is something to undo with.
+        value["tools"]["debug_dump"] = json!({"operation": "issue.restore", "kind": "write",
+            "reversal": "none", "outward": false, "resource": "tracker/issue/{key}"});
+        value["unmapped"] = json!({});
+        change(&mut value);
+        let review: Review = serde_json::from_value(value).unwrap();
+        build(&listing(), &review).map_err(|e| e.to_string())
+    };
+    with(&|_| {}).unwrap();
+    // Put back with a tool the map holds, which changes something.
+    with(&|v| {
+        v["tools"]["delete_issue"]["reversal"] = json!("inverse");
+        v["tools"]["delete_issue"]["undo_with"] = json!("debug_dump");
+    })
+    .unwrap();
+    // Marked as one that can be put back, and names nothing.
+    let e = with(&|v| v["tools"]["delete_issue"]["reversal"] = json!("inverse")).unwrap_err();
+    assert!(e.contains("names no tool"), "{e}");
+    let e = with(&|v| v["tools"]["delete_issue"]["reversal"] = json!("restore")).unwrap_err();
+    assert!(e.contains("names no tool"), "{e}");
+    // Names a tool the server does not have, or one that was set aside.
+    let e = with(&|v| {
+        v["tools"]["delete_issue"]["reversal"] = json!("inverse");
+        v["tools"]["delete_issue"]["undo_with"] = json!("undelete_issue");
+    })
+    .unwrap_err();
+    assert!(e.contains("not in the map"), "{e}");
+    let e = with(&|v| {
+        v["tools"]["delete_issue"]["reversal"] = json!("inverse");
+        v["tools"]["delete_issue"]["undo_with"] = json!("debug_dump");
+        v["tools"].as_object_mut().unwrap().remove("debug_dump");
+        v["unmapped"] = json!({"debug_dump": "Left out."});
+    })
+    .unwrap_err();
+    assert!(e.contains("not in the map"), "{e}");
+    // Names a tool that only reads.
+    let e = with(&|v| {
+        v["tools"]["delete_issue"]["reversal"] = json!("inverse");
+        v["tools"]["delete_issue"]["undo_with"] = json!("get_issue");
+    })
+    .unwrap_err();
+    assert!(e.contains("only reads"), "{e}");
+    // Names a tool, and is not marked as one that can be put back: which is it?
+    let e = with(&|v| v["tools"]["delete_issue"]["undo_with"] = json!("debug_dump")).unwrap_err();
+    assert!(e.contains("is not marked"), "{e}");
 }

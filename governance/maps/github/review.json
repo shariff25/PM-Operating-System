@@ -2,14 +2,14 @@
  "server": "github-mcp",
  "system": "github",
  "fold_case": true,
- "source": "github.com/github/github-mcp-server v1.14.0, built from its Go module, started as `github-mcp-server stdio --toolsets all` (every toolset). Listing taken on 2026-11-27 over stdio with a made-up token and no network; GitHub was not contacted, so no tool here has been run against GitHub. A server started with fewer toolsets, in read-only mode, or as the hosted service may list other tools or other definitions: run `gov map drift` against it.",
+ "source": "github.com/github/github-mcp-server v1.14.0, built from its Go module, started as `github-mcp-server stdio --toolsets all` (every toolset). Listing taken on 2026-11-27 over stdio with a made-up token and no network; GitHub was not contacted, so no tool here has been run against GitHub. A server started with fewer toolsets, in read-only mode, or as the hosted service may list other tools or other definitions: run `gov map drift` against it. Settings the listing was taken under: the local server over stdio, `--toolsets all`, not read-only. The hosted service, a read-only server or one with fewer toolsets may list other tools or other definitions, and every tool whose definition differs is recorded as unknown: run `gov map drift` against the real server before this map is relied on (GR-165). A repository's resource ends in an area (code, issues, pulls, actions, security, discussions, settings), so a grant can be for one area of a repository (GR-163).",
  "tools": {
   "actions_get": {
    "operation": "actions.read",
    "kind": "read",
    "reversal": "none",
    "outward": false,
-   "resource": "github/repo/{owner}/{repo}",
+   "resource": "github/repo/{owner}/{repo}/actions",
    "note": "Includes a link to a run's logs and its artifacts, which can hold whatever the workflow printed or built."
   },
   "actions_list": {
@@ -17,45 +17,46 @@
    "kind": "read",
    "reversal": "none",
    "outward": false,
-   "resource": "github/repo/{owner}/{repo}"
+   "resource": "github/repo/{owner}/{repo}/actions"
   },
   "actions_run_trigger": {
    "operation": "actions.run",
    "kind": "destructive",
    "reversal": "none",
    "outward": true,
-   "resource": "github/repo/{owner}/{repo}",
+   "resource": "github/repo/{owner}/{repo}/actions",
    "note": "Runs, re-runs or cancels a workflow, or deletes a run's logs. A workflow does whatever it was written to do, with the repository's own secrets: a grant for this is a grant for that."
   },
   "add_comment_to_pending_review": {
    "operation": "pull.review.comment.add",
    "kind": "write",
-   "reversal": "inverse",
+   "reversal": "none",
    "outward": false,
-   "resource": "github/repo/{owner}/{repo}",
-   "note": "A pending review is seen by nobody else until it is submitted."
+   "resource": "github/repo/{owner}/{repo}/pulls",
+   "note": "A pending review is seen by nobody else until it is submitted. The server lists no tool that takes this back, so it is not marked as one that can be put back (GR-158). Deleting the whole pending review is another tool's method, and takes every comment with it."
   },
   "add_issue_comment": {
    "operation": "issue.comment.add",
    "kind": "write",
-   "reversal": "inverse",
+   "reversal": "none",
    "outward": true,
-   "resource": "github/repo/{owner}/{repo}",
-   "note": "Also comments on a pull request, and can add a reaction. On a public repository anyone can read it."
+   "resource": "github/repo/{owner}/{repo}/issues",
+   "note": "Also comments on a pull request, and can add a reaction. On a public repository anyone can read it. The server lists no tool that takes this back, so it is not marked as one that can be put back (GR-158)."
   },
   "add_reply_to_pull_request_comment": {
    "operation": "pull.comment.reply",
    "kind": "write",
-   "reversal": "inverse",
+   "reversal": "none",
    "outward": true,
-   "resource": "github/repo/{owner}/{repo}"
+   "resource": "github/repo/{owner}/{repo}/pulls",
+   "note": "The server lists no tool that takes this back, so it is not marked as one that can be put back (GR-158)."
   },
   "assign_copilot_to_issue": {
    "operation": "issue.assign-agent",
    "kind": "write",
    "reversal": "none",
    "outward": true,
-   "resource": "github/repo/{owner}/{repo}",
+   "resource": "github/repo/{owner}/{repo}/issues",
    "note": "Starts another agent, which writes code and opens a pull request under its own instructions."
   },
   "assign_copilot_to_issue_with_intent": {
@@ -63,15 +64,16 @@
    "kind": "write",
    "reversal": "none",
    "outward": true,
-   "resource": "github/repo/{owner}/{repo}",
+   "resource": "github/repo/{owner}/{repo}/issues",
    "note": "As above."
   },
   "create_branch": {
    "operation": "branch.create",
    "kind": "write",
-   "reversal": "inverse",
+   "reversal": "none",
    "outward": false,
-   "resource": "github/repo/{owner}/{repo}"
+   "resource": "github/repo/{owner}/{repo}/code",
+   "note": "The server lists no tool that takes this back, so it is not marked as one that can be put back (GR-158). A branch is a name, and holds nothing people are shown."
   },
   "create_gist": {
    "operation": "gist.create",
@@ -86,16 +88,18 @@
    "kind": "write",
    "reversal": "restore",
    "outward": true,
-   "resource": "github/repo/{owner}/{repo}",
-   "note": "A commit on any branch, the default branch included. Put back by another commit; the first stays in history, and a push can start workflows (a deploy) and notify people."
+   "resource": "github/repo/{owner}/{repo}/code",
+   "note": "A commit on any branch, the default branch included. Put back by another commit; the first stays in history, and a push can start workflows (a deploy) and notify people.",
+   "undo_with": "create_or_update_file"
   },
   "create_pull_request": {
    "operation": "pull.create",
    "kind": "write",
    "reversal": "inverse",
    "outward": true,
-   "resource": "github/repo/{owner}/{repo}",
-   "note": "Notifies watchers and can ask people for review. Put back by closing it."
+   "resource": "github/repo/{owner}/{repo}/pulls",
+   "note": "Notifies watchers and can ask people for review. Put back by closing it.",
+   "undo_with": "update_pull_request"
   },
   "create_repository": {
    "operation": "repo.create",
@@ -109,9 +113,9 @@
    "operation": "ruleset.create",
    "kind": "write",
    "reversal": "none",
-   "outward": false,
+   "outward": true,
    "resource": "github/admin",
-   "note": "Acts on a repository, an organization or an enterprise, chosen by an argument: no single resource. Treat a grant for it as system-wide. A ruleset can stop everyone's pushes or merges."
+   "note": "Acts on a repository, an organization or an enterprise, chosen by an argument: no single resource. Treat a grant for it as system-wide. A ruleset can stop everyone's pushes or merges. A ruleset can name who may bypass it and changes what everyone may push or merge."
   },
   "custom_properties_read": {
    "operation": "custom-properties.read",
@@ -125,17 +129,18 @@
    "operation": "custom-properties.write",
    "kind": "write",
    "reversal": "none",
-   "outward": false,
+   "outward": true,
    "resource": "github/admin",
-   "note": "Acts on a repository, an organization or an enterprise, chosen by an argument: no single resource. Treat a grant for it as system-wide."
+   "note": "Acts on a repository, an organization or an enterprise, chosen by an argument: no single resource. Treat a grant for it as system-wide. Property values are shown on repositories and can decide which rulesets apply to them."
   },
   "delete_file": {
    "operation": "file.delete",
    "kind": "write",
    "reversal": "restore",
    "outward": true,
-   "resource": "github/repo/{owner}/{repo}",
-   "note": "A commit that removes a file. Mapped as a write, not as destructive: the file stays in the repository's history and another commit puts it back."
+   "resource": "github/repo/{owner}/{repo}/code",
+   "note": "A commit that removes a file. Mapped as a write, not as destructive: the file stays in the repository's history and another commit puts it back.",
+   "undo_with": "create_or_update_file"
   },
   "discussion_comment_write": {
    "operation": "discussion.comment.write",
@@ -157,57 +162,57 @@
    "kind": "write",
    "reversal": "none",
    "outward": true,
-   "resource": "github/repo/{owner}/{repo}",
-   "note": "Copies the repository into the user's account or an organization named in an argument: whoever can read that place can then read the copy. The server offers no way to delete a fork."
+   "resource": "github/repo/{owner}/{repo}/code",
+   "note": "Copies the repository into the user's account or an organization named in an argument: whoever can read that place can then read the copy. The server offers no way to delete a fork. The place it writes to is named in a second argument, which the resource does not carry: a grant on the source repository is enough (GR-164)."
   },
   "get_code_quality_finding": {
    "operation": "code-quality.finding.read",
    "kind": "read",
    "reversal": "none",
    "outward": false,
-   "resource": "github/repo/{owner}/{repo}"
+   "resource": "github/repo/{owner}/{repo}/security"
   },
   "get_code_scanning_alert": {
    "operation": "code-scanning.alert.read",
    "kind": "read",
    "reversal": "none",
    "outward": false,
-   "resource": "github/repo/{owner}/{repo}"
+   "resource": "github/repo/{owner}/{repo}/security"
   },
   "get_commit": {
    "operation": "commit.read",
    "kind": "read",
    "reversal": "none",
    "outward": false,
-   "resource": "github/repo/{owner}/{repo}"
+   "resource": "github/repo/{owner}/{repo}/code"
   },
   "get_dependabot_alert": {
    "operation": "dependabot.alert.read",
    "kind": "read",
    "reversal": "none",
    "outward": false,
-   "resource": "github/repo/{owner}/{repo}"
+   "resource": "github/repo/{owner}/{repo}/security"
   },
   "get_discussion": {
    "operation": "discussion.read",
    "kind": "read",
    "reversal": "none",
    "outward": false,
-   "resource": "github/repo/{owner}/{repo}"
+   "resource": "github/repo/{owner}/{repo}/discussions"
   },
   "get_discussion_comments": {
    "operation": "discussion.comments.read",
    "kind": "read",
    "reversal": "none",
    "outward": false,
-   "resource": "github/repo/{owner}/{repo}"
+   "resource": "github/repo/{owner}/{repo}/discussions"
   },
   "get_file_contents": {
    "operation": "file.read",
    "kind": "read",
    "reversal": "none",
    "outward": false,
-   "resource": "github/repo/{owner}/{repo}",
+   "resource": "github/repo/{owner}/{repo}/code",
    "note": "Any file at any branch or commit of the repository."
   },
   "get_gist": {
@@ -229,7 +234,7 @@
    "kind": "read",
    "reversal": "none",
    "outward": false,
-   "resource": "github/repo/{owner}/{repo}",
+   "resource": "github/repo/{owner}/{repo}/actions",
    "note": "Logs hold whatever the workflow printed."
   },
   "get_label": {
@@ -237,14 +242,14 @@
    "kind": "read",
    "reversal": "none",
    "outward": false,
-   "resource": "github/repo/{owner}/{repo}"
+   "resource": "github/repo/{owner}/{repo}/issues"
   },
   "get_latest_release": {
    "operation": "release.latest.read",
    "kind": "read",
    "reversal": "none",
    "outward": false,
-   "resource": "github/repo/{owner}/{repo}"
+   "resource": "github/repo/{owner}/{repo}/code"
   },
   "get_me": {
    "operation": "user.self.read",
@@ -265,21 +270,21 @@
    "kind": "read",
    "reversal": "none",
    "outward": false,
-   "resource": "github/repo/{owner}/{repo}"
+   "resource": "github/repo/{owner}/{repo}/code"
   },
   "get_repository_tree": {
    "operation": "tree.read",
    "kind": "read",
    "reversal": "none",
    "outward": false,
-   "resource": "github/repo/{owner}/{repo}"
+   "resource": "github/repo/{owner}/{repo}/code"
   },
   "get_secret_scanning_alert": {
    "operation": "secret-scanning.alert.read",
    "kind": "read",
    "reversal": "none",
    "outward": false,
-   "resource": "github/repo/{owner}/{repo}",
+   "resource": "github/repo/{owner}/{repo}/security",
    "note": "Says where a leaked secret is."
   },
   "get_tag": {
@@ -287,7 +292,7 @@
    "kind": "read",
    "reversal": "none",
    "outward": false,
-   "resource": "github/repo/{owner}/{repo}"
+   "resource": "github/repo/{owner}/{repo}/code"
   },
   "get_team_members": {
    "operation": "team.members.read",
@@ -308,51 +313,51 @@
    "kind": "read",
    "reversal": "none",
    "outward": false,
-   "resource": "github/repo/{owner}/{repo}"
+   "resource": "github/repo/{owner}/{repo}/issues"
   },
   "issue_write": {
    "operation": "issue.write",
    "kind": "write",
    "reversal": "none",
    "outward": true,
-   "resource": "github/repo/{owner}/{repo}",
+   "resource": "github/repo/{owner}/{repo}/issues",
    "note": "Creates an issue or updates one: an update can close it, reassign it or mark it a duplicate, and both notify people."
   },
   "label_write": {
    "operation": "label.write",
    "kind": "destructive",
    "reversal": "none",
-   "outward": false,
-   "resource": "github/repo/{owner}/{repo}",
-   "note": "Creates, renames or deletes a label; deleting one takes it off every issue that had it."
+   "outward": true,
+   "resource": "github/repo/{owner}/{repo}/issues",
+   "note": "Creates, renames or deletes a label; deleting one takes it off every issue that had it. A label's name and description are text people see on every issue that carries it."
   },
   "list_branches": {
    "operation": "branch.list",
    "kind": "read",
    "reversal": "none",
    "outward": false,
-   "resource": "github/repo/{owner}/{repo}"
+   "resource": "github/repo/{owner}/{repo}/code"
   },
   "list_code_scanning_alerts": {
    "operation": "code-scanning.alert.list",
    "kind": "read",
    "reversal": "none",
    "outward": false,
-   "resource": "github/repo/{owner}/{repo}"
+   "resource": "github/repo/{owner}/{repo}/security"
   },
   "list_commits": {
    "operation": "commit.list",
    "kind": "read",
    "reversal": "none",
    "outward": false,
-   "resource": "github/repo/{owner}/{repo}"
+   "resource": "github/repo/{owner}/{repo}/code"
   },
   "list_dependabot_alerts": {
    "operation": "dependabot.alert.list",
    "kind": "read",
    "reversal": "none",
    "outward": false,
-   "resource": "github/repo/{owner}/{repo}"
+   "resource": "github/repo/{owner}/{repo}/security"
   },
   "list_discussion_categories": {
    "operation": "discussion.category.list",
@@ -405,14 +410,14 @@
    "kind": "read",
    "reversal": "none",
    "outward": false,
-   "resource": "github/repo/{owner}/{repo}"
+   "resource": "github/repo/{owner}/{repo}/issues"
   },
   "list_label": {
    "operation": "label.list",
    "kind": "read",
    "reversal": "none",
    "outward": false,
-   "resource": "github/repo/{owner}/{repo}"
+   "resource": "github/repo/{owner}/{repo}/issues"
   },
   "list_notifications": {
    "operation": "notification.list",
@@ -434,35 +439,35 @@
    "kind": "read",
    "reversal": "none",
    "outward": false,
-   "resource": "github/repo/{owner}/{repo}"
+   "resource": "github/repo/{owner}/{repo}/pulls"
   },
   "list_releases": {
    "operation": "release.list",
    "kind": "read",
    "reversal": "none",
    "outward": false,
-   "resource": "github/repo/{owner}/{repo}"
+   "resource": "github/repo/{owner}/{repo}/code"
   },
   "list_repository_collaborators": {
    "operation": "collaborator.list",
    "kind": "read",
    "reversal": "none",
    "outward": false,
-   "resource": "github/repo/{owner}/{repo}"
+   "resource": "github/repo/{owner}/{repo}/settings"
   },
   "list_repository_security_advisories": {
    "operation": "advisory.repo.list",
    "kind": "read",
    "reversal": "none",
    "outward": false,
-   "resource": "github/repo/{owner}/{repo}"
+   "resource": "github/repo/{owner}/{repo}/security"
   },
   "list_secret_scanning_alerts": {
    "operation": "secret-scanning.alert.list",
    "kind": "read",
    "reversal": "none",
    "outward": false,
-   "resource": "github/repo/{owner}/{repo}",
+   "resource": "github/repo/{owner}/{repo}/security",
    "note": "Says where leaked secrets are."
   },
   "list_starred_repositories": {
@@ -477,21 +482,25 @@
    "kind": "read",
    "reversal": "none",
    "outward": false,
-   "resource": "github/repo/{owner}/{repo}"
+   "resource": "github/repo/{owner}/{repo}/code"
   },
   "manage_notification_subscription": {
    "operation": "notification.subscription.write",
    "kind": "write",
-   "reversal": "inverse",
+   "reversal": "restore",
    "outward": false,
-   "resource": "github/notification"
+   "resource": "github/notification",
+   "undo_with": "manage_notification_subscription",
+   "note": "Put back by setting the subscription to what it was before, with the same tool."
   },
   "manage_repository_notification_subscription": {
    "operation": "repo.subscription.write",
    "kind": "write",
-   "reversal": "inverse",
+   "reversal": "restore",
    "outward": false,
-   "resource": "github/repo/{owner}/{repo}"
+   "resource": "github/repo/{owner}/{repo}/settings",
+   "undo_with": "manage_repository_notification_subscription",
+   "note": "Put back by setting the subscription to what it was before, with the same tool."
   },
   "mark_all_notifications_read": {
    "operation": "notification.mark-all-read",
@@ -506,7 +515,7 @@
    "kind": "write",
    "reversal": "none",
    "outward": true,
-   "resource": "github/repo/{owner}/{repo}",
+   "resource": "github/repo/{owner}/{repo}/pulls",
    "note": "Changes the base branch for everyone; a merge is not taken back, only followed by another change. Can start a deploy."
   },
   "projects_get": {
@@ -538,14 +547,14 @@
    "kind": "read",
    "reversal": "none",
    "outward": false,
-   "resource": "github/repo/{owner}/{repo}"
+   "resource": "github/repo/{owner}/{repo}/pulls"
   },
   "pull_request_review_write": {
    "operation": "pull.review.write",
    "kind": "destructive",
    "reversal": "none",
    "outward": true,
-   "resource": "github/repo/{owner}/{repo}",
+   "resource": "github/repo/{owner}/{repo}/pulls",
    "note": "One tool for several things, mapped as the widest: submitting a review can approve a pull request, which may be the last thing a merge waits for; it can also delete a pending review."
   },
   "push_files": {
@@ -553,8 +562,9 @@
    "kind": "write",
    "reversal": "restore",
    "outward": true,
-   "resource": "github/repo/{owner}/{repo}",
-   "note": "Several files in one commit on any branch; as for a single file."
+   "resource": "github/repo/{owner}/{repo}/code",
+   "note": "Several files in one commit on any branch; as for a single file.",
+   "undo_with": "push_files"
   },
   "repository_ruleset_read": {
    "operation": "ruleset.read",
@@ -569,7 +579,7 @@
    "kind": "write",
    "reversal": "none",
    "outward": true,
-   "resource": "github/repo/{owner}/{repo}",
+   "resource": "github/repo/{owner}/{repo}/pulls",
    "note": "Starts another automated reviewer, which comments on the pull request."
   },
   "search_code": {
@@ -633,15 +643,16 @@
    "kind": "write",
    "reversal": "inverse",
    "outward": true,
-   "resource": "github/repo/{owner}/{repo}",
-   "note": "A star is public."
+   "resource": "github/repo/{owner}/{repo}/settings",
+   "note": "A star is public.",
+   "undo_with": "unstar_repository"
   },
   "sub_issue_write": {
    "operation": "issue.sub-issue.write",
    "kind": "write",
    "reversal": "none",
    "outward": false,
-   "resource": "github/repo/{owner}/{repo}",
+   "resource": "github/repo/{owner}/{repo}/issues",
    "note": "Adds, removes or reorders a sub-issue; the sub-issue may be of another repository."
   },
   "ui_get": {
@@ -657,28 +668,31 @@
    "kind": "write",
    "reversal": "inverse",
    "outward": false,
-   "resource": "github/repo/{owner}/{repo}"
+   "resource": "github/repo/{owner}/{repo}/settings",
+   "undo_with": "star_repository"
   },
   "update_gist": {
    "operation": "gist.update",
    "kind": "write",
    "reversal": "restore",
    "outward": true,
-   "resource": "github/gist/{gist_id}"
+   "resource": "github/gist/{gist_id}",
+   "undo_with": "update_gist"
   },
   "update_issue_comment": {
    "operation": "issue.comment.update",
    "kind": "write",
    "reversal": "restore",
    "outward": true,
-   "resource": "github/repo/{owner}/{repo}"
+   "resource": "github/repo/{owner}/{repo}/issues",
+   "undo_with": "update_issue_comment"
   },
   "update_pull_request": {
    "operation": "pull.update",
    "kind": "write",
    "reversal": "none",
    "outward": true,
-   "resource": "github/repo/{owner}/{repo}",
+   "resource": "github/repo/{owner}/{repo}/pulls",
    "note": "Can close or reopen, change the base branch and ask people for review, in one call."
   },
   "update_pull_request_branch": {
@@ -686,7 +700,7 @@
    "kind": "write",
    "reversal": "none",
    "outward": true,
-   "resource": "github/repo/{owner}/{repo}",
+   "resource": "github/repo/{owner}/{repo}/pulls",
    "note": "Merges the base branch into the pull request's branch, which starts its workflows again."
   }
  },

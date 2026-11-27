@@ -10,7 +10,7 @@
   "expect": {
    "operation": "actions.read",
    "kind": "read",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/actions"
   }
  },
  {
@@ -23,7 +23,7 @@
   "expect": {
    "operation": "actions.list",
    "kind": "read",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/actions"
   }
  },
  {
@@ -36,7 +36,7 @@
   "expect": {
    "operation": "actions.run",
    "kind": "destructive",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/actions"
   }
  },
  {
@@ -52,7 +52,7 @@
   "expect": {
    "operation": "pull.review.comment.add",
    "kind": "write",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/pulls"
   }
  },
  {
@@ -65,7 +65,7 @@
   "expect": {
    "operation": "issue.comment.add",
    "kind": "write",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/issues"
   }
  },
  {
@@ -78,7 +78,7 @@
   "expect": {
    "operation": "pull.comment.reply",
    "kind": "write",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/pulls"
   }
  },
  {
@@ -91,7 +91,7 @@
   "expect": {
    "operation": "issue.assign-agent",
    "kind": "write",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/issues"
   }
  },
  {
@@ -107,7 +107,7 @@
   "expect": {
    "operation": "issue.assign-agent.with-intent",
    "kind": "write",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/issues"
   }
  },
  {
@@ -120,7 +120,7 @@
   "expect": {
    "operation": "branch.create",
    "kind": "write",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/code"
   }
  },
  {
@@ -148,7 +148,7 @@
   "expect": {
    "operation": "file.write",
    "kind": "write",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/code"
   }
  },
  {
@@ -163,7 +163,7 @@
   "expect": {
    "operation": "pull.create",
    "kind": "write",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/pulls"
   }
  },
  {
@@ -226,7 +226,7 @@
   "expect": {
    "operation": "file.delete",
    "kind": "write",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/code"
   }
  },
  {
@@ -261,7 +261,7 @@
   "expect": {
    "operation": "repo.fork",
    "kind": "write",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/code"
   }
  },
  {
@@ -274,7 +274,7 @@
   "expect": {
    "operation": "code-quality.finding.read",
    "kind": "read",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/security"
   }
  },
  {
@@ -287,7 +287,7 @@
   "expect": {
    "operation": "code-scanning.alert.read",
    "kind": "read",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/security"
   }
  },
  {
@@ -300,7 +300,7 @@
   "expect": {
    "operation": "commit.read",
    "kind": "read",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/code"
   }
  },
  {
@@ -313,7 +313,7 @@
   "expect": {
    "operation": "dependabot.alert.read",
    "kind": "read",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/security"
   }
  },
  {
@@ -326,7 +326,7 @@
   "expect": {
    "operation": "discussion.read",
    "kind": "read",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/discussions"
   }
  },
  {
@@ -339,7 +339,7 @@
   "expect": {
    "operation": "discussion.comments.read",
    "kind": "read",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/discussions"
   }
  },
  {
@@ -351,7 +351,7 @@
   "expect": {
    "operation": "file.read",
    "kind": "read",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/code"
   }
  },
  {
@@ -385,7 +385,7 @@
   "expect": {
    "operation": "actions.job.logs.read",
    "kind": "read",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/actions"
   }
  },
  {
@@ -398,7 +398,7 @@
   "expect": {
    "operation": "label.read",
    "kind": "read",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/issues"
   }
  },
  {
@@ -410,7 +410,7 @@
   "expect": {
    "operation": "release.latest.read",
    "kind": "read",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/code"
   }
  },
  {
@@ -443,7 +443,7 @@
   "expect": {
    "operation": "release.read",
    "kind": "read",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/code"
   }
  },
  {
@@ -455,7 +455,7 @@
   "expect": {
    "operation": "tree.read",
    "kind": "read",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/code"
   }
  },
  {
@@ -468,7 +468,7 @@
   "expect": {
    "operation": "secret-scanning.alert.read",
    "kind": "read",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/security"
   }
  },
  {
@@ -481,7 +481,7 @@
   "expect": {
    "operation": "tag.read",
    "kind": "read",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/code"
   }
  },
  {
@@ -516,7 +516,7 @@
   "expect": {
    "operation": "issue.read",
    "kind": "read",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/issues"
   }
  },
  {
@@ -529,7 +529,7 @@
   "expect": {
    "operation": "issue.write",
    "kind": "write",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/issues"
   }
  },
  {
@@ -543,7 +543,7 @@
   "expect": {
    "operation": "label.write",
    "kind": "destructive",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/issues"
   }
  },
  {
@@ -555,7 +555,7 @@
   "expect": {
    "operation": "branch.list",
    "kind": "read",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/code"
   }
  },
  {
@@ -567,7 +567,7 @@
   "expect": {
    "operation": "code-scanning.alert.list",
    "kind": "read",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/security"
   }
  },
  {
@@ -579,7 +579,7 @@
   "expect": {
    "operation": "commit.list",
    "kind": "read",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/code"
   }
  },
  {
@@ -591,7 +591,7 @@
   "expect": {
    "operation": "dependabot.alert.list",
    "kind": "read",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/security"
   }
  },
  {
@@ -665,7 +665,7 @@
   "expect": {
    "operation": "issue.list",
    "kind": "read",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/issues"
   }
  },
  {
@@ -677,7 +677,7 @@
   "expect": {
    "operation": "label.list",
    "kind": "read",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/issues"
   }
  },
  {
@@ -709,7 +709,7 @@
   "expect": {
    "operation": "pull.list",
    "kind": "read",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/pulls"
   }
  },
  {
@@ -721,7 +721,7 @@
   "expect": {
    "operation": "release.list",
    "kind": "read",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/code"
   }
  },
  {
@@ -733,7 +733,7 @@
   "expect": {
    "operation": "collaborator.list",
    "kind": "read",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/settings"
   }
  },
  {
@@ -745,7 +745,7 @@
   "expect": {
    "operation": "advisory.repo.list",
    "kind": "read",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/security"
   }
  },
  {
@@ -757,7 +757,7 @@
   "expect": {
    "operation": "secret-scanning.alert.list",
    "kind": "read",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/security"
   }
  },
  {
@@ -778,7 +778,7 @@
   "expect": {
    "operation": "tag.list",
    "kind": "read",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/code"
   }
  },
  {
@@ -803,7 +803,7 @@
   "expect": {
    "operation": "repo.subscription.write",
    "kind": "write",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/settings"
   }
  },
  {
@@ -825,7 +825,7 @@
   "expect": {
    "operation": "pull.merge",
    "kind": "write",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/pulls"
   }
  },
  {
@@ -874,7 +874,7 @@
   "expect": {
    "operation": "pull.read",
    "kind": "read",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/pulls"
   }
  },
  {
@@ -888,7 +888,7 @@
   "expect": {
    "operation": "pull.review.write",
    "kind": "destructive",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/pulls"
   }
  },
  {
@@ -903,7 +903,7 @@
   "expect": {
    "operation": "file.push",
    "kind": "write",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/code"
   }
  },
  {
@@ -928,7 +928,7 @@
   "expect": {
    "operation": "pull.review.request-automated",
    "kind": "write",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/pulls"
   }
  },
  {
@@ -1017,7 +1017,7 @@
   "expect": {
    "operation": "star.add",
    "kind": "write",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/settings"
   }
  },
  {
@@ -1032,7 +1032,7 @@
   "expect": {
    "operation": "issue.sub-issue.write",
    "kind": "write",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/issues"
   }
  },
  {
@@ -1056,7 +1056,7 @@
   "expect": {
    "operation": "star.remove",
    "kind": "write",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/settings"
   }
  },
  {
@@ -1083,7 +1083,7 @@
   "expect": {
    "operation": "issue.comment.update",
    "kind": "write",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/issues"
   }
  },
  {
@@ -1096,7 +1096,7 @@
   "expect": {
    "operation": "pull.update",
    "kind": "write",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/pulls"
   }
  },
  {
@@ -1109,7 +1109,7 @@
   "expect": {
    "operation": "pull.branch.update",
    "kind": "write",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/pulls"
   }
  },
  {
@@ -1122,7 +1122,7 @@
   "expect": {
    "operation": "pull.merge",
    "kind": "write",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/pulls"
   }
  },
  {
@@ -1135,7 +1135,7 @@
   "expect": {
    "operation": "file.read",
    "kind": "read",
-   "resource": "github/repo/acme/payments"
+   "resource": "github/repo/acme/payments/code"
   }
  }
 ]

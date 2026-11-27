@@ -478,6 +478,13 @@ follow-up tracking.
   thing called by a former name) is to be designed before enforce. **G4d may be built
   from §7.6.3**; four additions to its text are made. The twentieth read's fixes are
   closed.
+- **The three maps changed as the reviewer asked (2026-11-27), on `build/gov-review-21`:**
+  GR-158 to GR-160 and GR-162 to GR-165. A tool is marked as one that can be put back only
+  where the server lists the tool that does it (`gov map build` now refuses otherwise); the
+  rule for "outward" is written down and applied to every write; a GitHub repository's
+  resource ends in an area. The changed maps are not yet read again, so none may back
+  shadow or enforce mode. GR-161 (a thing called by a former name) is open, to be
+  designed before enforce mode.
 
 ## Where the build stands (2026-11-23)
 
