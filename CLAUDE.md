@@ -519,6 +519,11 @@ follow-up tracking.
   and takes it only under its own pinned root key, only if it is the one named, and never
   backwards. Libraries and tests. Not yet read by the reviewer. Next: G4d-4 (key rotation,
   the witness's order in `gov verify`), then G4d-5 (the programs).
+- **Twenty-fifth read (2026-11-27), at `dcb71c1` and `e64062b`:** no High or Critical.
+  G4d-2 passes; G4d-3 may be built. Four Low notes (GR-177 to GR-180): a receipt's time and
+  its source mark to travel together; a shim's clock more than two minutes from the
+  Authority's opens no session; markers not to count among proven sessions. The reviewer
+  noted that its verdicts rest on its own test runs and have never vouched for the lint.
 
 ## Where the build stands (2026-11-23)
 

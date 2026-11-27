@@ -1062,6 +1062,25 @@ GR-171 are closed. It ran the Authority's tests without Postgres.
 | GR-175 | Low | Every renewal opens the latest bundle again and checks each online key again: the Authority's main cost once several gates renew every few seconds | Fixed on `build/gov-g4d3`: the bundle last opened is kept and used again while the store's latest has the same digest |
 | GR-176 | Low | A lease is good for the bundle's `standard` limit, two minutes by default, so a revoked agent's calls can be recorded as proven for up to that long after the revocation, plus the time between renewals | Stated in G4d-1's status note |
 
+### Twenty-fifth read, 2026-11-27: G4d-2 at `dcb71c1`, confirmed at `e64062b`
+
+**Verdict: no High or Critical; the gate still passes. G4d-2 passes as built, and G4d-3
+may be built.** The reviewer confirmed the two choices it was asked about: the order of
+reasons for a marker, with "revoked" said ahead of "no lease" ("a revocation is a fact the
+gate learned from an accepted feed; no lease is the gate not knowing"); and that a proof
+that holds under no lease is still used up. It ran the gate's forwarder and session tests
+and the two end-to-end tests, and nothing else. Told that the lint had failed unseen at
+`dcb71c1`, it confirmed from the diff that `e64062b` changes one line of a test and no
+behaviour, and noted that no verdict of its has ever vouched for the lint or the format:
+its verdicts rest on its own test runs.
+
+| Id | Severity | What | Done |
+|---|---|---|---|
+| GR-177 | Low | A receipt's time and the mark saying where it came from are set in two steps, so around the first lease a receipt can carry the lease's time without the mark, or the machine's time with it | To fix on `build/gov-review-25`: the source is passed with the time |
+| GR-178 | Low | With a lease held, a shim's request to open is compared with the Authority's time while the shim stamps it from its own machine: a shim more than two minutes off opens no session | Stated in G4d-2's limits; the refusal to get a reason of its own |
+| GR-179 | Low | After a renewal brings a newer bundle and before it is swapped in, every proof is `no_lease`; to be said, so that it is not read as the Authority being down | No longer so since G4d-3: the bundle is swapped in the same step as the lease is taken |
+| GR-180 | Low | A marker that had proven a call still counts among its key's proven sessions and can be the one closed to make room, after which its calls lose the agent's name | To fix: markers are kept out of that count |
+
 ## 1. What is being built
 
 Agent Governance is a second product, separate from PM OS. It has three parts.
