@@ -506,6 +506,44 @@ reviewer.
     under the root key before it is compared. (4) A gate's revoked key is not yet
     refused a renewal: no key can be revoked before G4d-4. (5) The limit of one answer a
     second is kept in memory and is each Authority process's own.
+  - **How long "proven" lags a revocation** (GR-176). A lease is good for the bundle's
+    `standard` limit, 120 seconds unless the bundle says otherwise. Until the gate's next
+    renewal brings the feed, or the lease runs out, a revoked agent's calls are still
+    recorded as proven: for at most that limit after the revocation, and in practice for
+    the time between two renewals. A proven receipt is to be read with that delay in mind.
+- **G4d-2 built (2026-11-27), from §7.6.3 points 4 to 6; not yet read by the reviewer.**
+  On `build/gov-g4d2`. The gate program is not wired to an Authority yet (G4d-5): this is
+  the gate's library, run in tests with answers made by hand.
+  - *The gate's time.* With a lease held, "now" for sessions and receipts is the lease's
+    time counted on by the gate's own clock, and every receipt from the first lease on
+    carries `at_from_lease`. Before the first lease, and with no Authority, nothing
+    changes: the machine's clock, and no mark. The clock that counts suspension is given
+    to the forwarder as a function; the real one comes with the program (G4d-5).
+  - *Proof under a lease.* With an Authority, a session is opened only under a complete,
+    fresh lease and for a chain nothing in which is revoked (refusals counted as
+    `no_lease` and `revoked`). A proof that holds is recorded as proven only under such a
+    lease; otherwise as the agent's failed proof with the reason `no_lease`. Complete, at
+    the forwarder, also means the lease names the bundle the forwarder's map came from.
+  - *Revoked sessions.* When an answer is taken that revokes something, every open
+    session's chain is checked again as a new one would be. One that no longer holds is
+    kept as a marker: a later call whose proof holds is recorded as that agent's, failed,
+    with `key_revoked`, `agent_revoked` or `mandate_revoked` (the nearest thing revoked:
+    the session's key, then an agent of the chain, then a mandate or the key that signed
+    one). A proof that does not hold keeps its own reason. A marker is never counted as
+    proven, pushes out no proven session, and is swept when its session would have been.
+  - Run with a gate and a shim in one process: a bare claim before the first lease; proven
+    under it, at the Authority's time; `no_lease` once it is two minutes old; proven again
+    after a renewal; `mandate_revoked`, twice, after the mandate is revoked, with the shim
+    keeping its session. 18 controls removed one at a time; each removal fails a test.
+  - **Limits.** (1) A bundle that changes while the gate runs is not put in use until
+    G4d-3: the lease then names a bundle the forwarder does not decide from, so the gate
+    has no complete lease and proves nothing until it is restarted on the new bundle.
+    (2) The shim's clock and the Authority's must agree to within the time a session's
+    opening allows (two minutes), since the gate's time is now the Authority's. (3) During
+    a long loss of the Authority a session runs out; the shim's next opening is refused
+    and its calls are then recorded as a client's bare claim, not as `no_lease`. (4) The
+    new reasons are new words in the receipt's closed list: a `gov verify` built before
+    this slice refuses a receipt that carries one.
 
 ## Security review of 2026-11-26 (first read; the gate did not pass)
 
@@ -967,6 +1005,23 @@ stated.
 | GR-171 | Low | A receipt's cause may point at receipt number 0; receipts are numbered from 1 | Fixed: refused |
 | GR-172 | Low | A call whose proof failed is still forwarded in observe and shadow modes, so the agent may have read the data, yet its receipt raises no label: the shadow flow check under-counts such reads | Stated in the access governance spec's status note |
 | GR-173 | Info | The library's maps carry no labels, so every read raises a mandate to restricted and untrusted until a deployment labels its resources: the shadow flow check will flag nearly everything at first | Noted in the access governance spec |
+
+### Twenty-fourth read, 2026-11-27: G4d-1 and the fixes for GR-170 and GR-171 at `25f0801`
+
+**Verdict: no High or Critical; the gate still passes. G4d-1 passes as built, and G4d-2
+may be built.** The reviewer confirmed all five departures and limits of G4d-1's status
+note: the limit that compares for the same second only; a gate naming a higher revocation
+number being answered from where the Authority stands; the lease naming the bundle by
+number and the first 16 hex digits of its digest ("enough, since only the root's holder
+could make two"); a revoked gate key not yet refused a renewal, **which must return with
+key rotation in G4d-4, with its test**; and the limit being each process's own. GR-170 and
+GR-171 are closed. It ran the Authority's tests without Postgres.
+
+| Id | Severity | What | Done |
+|---|---|---|---|
+| GR-174 | Low, with G4d-5 | The limit for each gate is applied after the key is looked up and the signature checked, so a caller with no valid key still costs a database read each time | Open: the listener limits by source before any of that work (G4d-5, with GR-169) |
+| GR-175 | Low | Every renewal opens the latest bundle again and checks each online key again: the Authority's main cost once several gates renew every few seconds | Open: to keep the opened bundle until another is published |
+| GR-176 | Low | A lease is good for the bundle's `standard` limit, two minutes by default, so a revoked agent's calls can be recorded as proven for up to that long after the revocation, plus the time between renewals | Stated in G4d-1's status note |
 
 ## 1. What is being built
 

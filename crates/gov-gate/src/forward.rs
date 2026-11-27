@@ -28,13 +28,14 @@ use base64::Engine;
 use gov_core::action::Salt;
 use gov_core::connector::{tool_digest, ServerMap};
 use gov_core::receipt::{Coverage, OutcomeStatus, ProofFailure};
+use gov_core::renew::{RenewRefused, Renewed, Standing, Taken};
 use gov_core::{Digest, Envelope, Id};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::Semaphore;
 
-use crate::sessions::{OpenRefused, Proved, Sessions, SessionsConfig};
+use crate::sessions::{Call, OpenRefused, Proved, Sessions, SessionsConfig, Trust};
 use crate::{
     Gate, GateError, LedgerLink, Observed, Shipped, Spool, Trimmed, Who, WitnessRead, WitnessReader,
 };
@@ -241,6 +242,8 @@ pub struct Counters {
     /// Tool calls that presented a session and did not prove the key. Kept apart from calls
     /// that offered no proof at all (review finding GR-91).
     pub proof_failed: AtomicU64,
+    /// Answers from the Authority this gate did not take, by why (spec §7.6.3, point 2).
+    pub renew_refused: Tally,
 }
 
 pub struct ForwarderConfig {
@@ -255,6 +258,21 @@ pub struct ForwarderConfig {
     /// The most tool calls recorded at once ([`MAX_IN_FLIGHT`] unless a deployment says
     /// otherwise).
     pub max_in_flight: usize,
+    /// What the gate holds from its Authority. Without it the gate has no Authority: its
+    /// time is its machine's, nothing is revoked, and no receipt says otherwise.
+    pub authority: Option<FromAuthority>,
+}
+
+/// A gate with an Authority (spec §7.6.3).
+pub struct FromAuthority {
+    /// The bundle, the lease and the revoked set, as the gate starts.
+    pub standing: Standing,
+    /// The gate's own count of time, in milliseconds, which must go on while the machine is
+    /// suspended. The lease's time is counted on with it.
+    pub mono: fn() -> u64,
+    /// The version of the bundle this forwarder's map and templates were loaded from. A
+    /// lease is complete only while it names that one.
+    pub policy_in_use: Id,
 }
 
 pub struct Forwarder<S> {
@@ -271,7 +289,15 @@ pub struct Forwarder<S> {
     /// server is done, whether or not its client stays (review finding GR-99).
     in_flight: Arc<Semaphore>,
     clock: fn() -> i64,
+    authority: Option<Held>,
     pub counters: Counters,
+}
+
+/// The forwarder's side of [`FromAuthority`].
+struct Held {
+    standing: Mutex<Standing>,
+    mono: fn() -> u64,
+    policy_in_use: Id,
 }
 
 fn wall_clock() -> i64 {
@@ -303,6 +329,11 @@ impl<S: Spool + 'static> Forwarder<S> {
     pub fn new(gate: Gate<S>, mut config: ForwarderConfig) -> Result<Arc<Self>, GateError> {
         config.map.validate()?;
         let sessions = config.sessions.take().map(|c| Mutex::new(Sessions::new(c)));
+        let authority = config.authority.take().map(|a| Held {
+            standing: Mutex::new(a.standing),
+            mono: a.mono,
+            policy_in_use: a.policy_in_use,
+        });
         let in_flight = Arc::new(Semaphore::new(config.max_in_flight));
         Ok(Arc::new(Forwarder {
             gate: Arc::new(AsyncMutex::new(gate)),
@@ -317,8 +348,97 @@ impl<S: Spool + 'static> Forwarder<S> {
             sessions,
             in_flight,
             clock: wall_clock,
+            authority,
             counters: Counters::default(),
         }))
+    }
+
+    /// Now. With a lease held, the Authority's time counted on by this gate's own clock;
+    /// before the first lease, and with no Authority, this machine's clock (spec §7.6.3,
+    /// point 4).
+    fn now(&self) -> i64 {
+        self.authority
+            .as_ref()
+            .and_then(|a| {
+                a.standing
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .now((a.mono)())
+            })
+            .unwrap_or_else(self.clock)
+    }
+
+    /// Do something with what the gate holds from its Authority, as sessions need it: is
+    /// the lease complete and fresh, and what is revoked. `None` is passed where the gate
+    /// has no Authority.
+    fn with_trust<R>(&self, work: impl FnOnce(Option<&Trust<'_>>) -> R) -> R {
+        let Some(a) = &self.authority else {
+            return work(None);
+        };
+        let standing = a
+            .standing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Complete also means that what this forwarder decides from is the bundle the
+        // lease names.
+        let fresh = standing.fresh((a.mono)())
+            && standing
+                .bundle()
+                .is_some_and(|b| b.policy_version() == a.policy_in_use);
+        work(Some(&Trust {
+            fresh,
+            revoked: standing.revoked(),
+        }))
+    }
+
+    /// A request to renew, for whoever carries it to the Authority, and this gate's memory
+    /// of having made it. `None` where the gate has no Authority.
+    pub fn renewal(
+        &self,
+        key: &gov_core::SigningKey,
+    ) -> Option<gov_core::Result<(Envelope, gov_core::lease::LeaseRequest)>> {
+        let a = self.authority.as_ref()?;
+        let standing = a
+            .standing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Some(standing.ask(key, (a.mono)()))
+    }
+
+    /// Take the Authority's answer to `request`: all of it or none (spec §7.6.3, point 2).
+    /// When it is taken, every session whose chain it revokes is closed to proof, and from
+    /// the first lease on this gate's receipts are stamped with the Authority's time.
+    pub async fn renewed(
+        &self,
+        answer: &Renewed,
+        request: gov_core::lease::LeaseRequest,
+    ) -> Option<Result<Taken, RenewRefused>> {
+        let a = self.authority.as_ref()?;
+        let taken = {
+            let mut standing = a
+                .standing
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let taken = standing.take(answer, request);
+            match &taken {
+                Ok(t) if !t.revoked.is_empty() => {
+                    if let (Some(sessions), Some(now)) = (&self.sessions, standing.now((a.mono)()))
+                    {
+                        sessions
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .revoke(standing.revoked(), now);
+                    }
+                }
+                Ok(_) => {}
+                Err(why) => self.counters.renew_refused.add(why.code()),
+            }
+            taken
+        };
+        if taken.is_ok() {
+            self.with_gate(Gate::stamp_from_lease).await;
+        }
+        Some(taken)
     }
 
     /// Whether a tool listing is held for an MCP session.
@@ -503,10 +623,13 @@ async fn open_session<S: Spool + 'static>(
     }) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    let opened = sessions
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .open(&asked.mandate, &asked.request, (f.clock)());
+    let now = f.now();
+    let opened = f.with_trust(|trust| {
+        sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .open_with(&asked.mandate, &asked.request, now, trust)
+    });
     match opened {
         Ok((session, challenge)) => {
             axum::Json(json!({"session": session, "challenge": challenge})).into_response()
@@ -741,23 +864,28 @@ async fn call<S: Spool + 'static>(
                         .unmapped_by_tool
                         .add(mapped.action.operation.as_str());
                 }
-                let now = (f.clock)();
+                let now = f.now();
                 // Who made the call. Proven is said by `Sessions::prove` alone, for the
                 // action computed just above from this gate's own map and listing.
                 let who = match (&shim, &f.sessions) {
                     (Some(shim), Some(sessions)) => {
                         let canonical = gov_core::action::args_digest(&args, &salt).is_ok();
-                        let proved = sessions
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .prove(
-                                &shim.session,
-                                shim.proof.as_ref(),
-                                shim.salt.as_ref(),
-                                &mapped.action.digest(),
-                                canonical,
-                                now,
-                            );
+                        let proved = f.with_trust(|trust| {
+                            sessions
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .prove_with(
+                                    &shim.session,
+                                    &Call {
+                                        proof: shim.proof.as_ref(),
+                                        salt: shim.salt.as_ref(),
+                                        digest: &mapped.action.digest(),
+                                        canonical,
+                                    },
+                                    now,
+                                    trust,
+                                )
+                        });
                         match &proved {
                             Proved::Proven(_) => {
                                 f.counters.proven.fetch_add(1, Ordering::Relaxed);
@@ -822,7 +950,7 @@ async fn call<S: Spool + 'static>(
                 }
             };
             if let Some(seq) = intent {
-                let now = (f.clock)();
+                let now = f.now();
                 let finished = f
                     .with_gate(move |gate| gate.finish(seq, status, None, now))
                     .await;

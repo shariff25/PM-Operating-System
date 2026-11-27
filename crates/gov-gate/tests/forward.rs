@@ -226,6 +226,7 @@ async fn stack_holding(spool_limit: usize, max_in_flight: usize) -> Stack {
     let forwarder = Forwarder::new(
         gate,
         ForwarderConfig {
+            authority: None,
             upstream: format!("http://{upstream}/mcp"),
             map: jira_map(),
             call_timeout: Duration::from_secs(2),
@@ -1092,6 +1093,7 @@ async fn a_client_that_leaves_while_the_intent_is_written_leaves_no_open_intent(
     let forwarder = Forwarder::new(
         gate,
         ForwarderConfig {
+            authority: None,
             upstream: format!("http://{upstream}/mcp"),
             map: jira_map(),
             call_timeout: Duration::from_secs(2),

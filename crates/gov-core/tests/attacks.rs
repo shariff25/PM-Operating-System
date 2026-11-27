@@ -866,6 +866,7 @@ fn receipt(seq: u64, prev: Option<Digest>, phase: Phase) -> Receipt {
         prev,
         at: NOW,
         at_clamped: false,
+        at_from_lease: false,
         phase,
         mode: Mode::Enforce,
         coverage: Coverage::Custody,
@@ -3134,4 +3135,45 @@ mod labels {
             [id("jira-mcp")]
         );
     }
+}
+
+// ----- the gate's time and the reasons a held key is not proven (spec §7.6.3; G4d-2) -----
+
+/// A receipt stamped with the Authority's time says so; one that does not is byte for byte
+/// what it was before gates had leases. The four new reasons are words of the closed list.
+#[test]
+fn a_receipt_says_when_its_time_is_the_authoritys() {
+    let gate = key("gate-1-key", 20);
+    let text = |r: &Receipt| {
+        let sealed = seal(r, &gate).unwrap();
+        String::from_utf8(URL_SAFE_NO_PAD.decode(&sealed.payload).unwrap()).unwrap()
+    };
+    let mut r = receipt(1, None, Phase::Intent);
+    assert!(!text(&r).contains("at_from_lease"));
+    r.at_from_lease = true;
+    r.validate().unwrap();
+    assert!(text(&r).contains(r#""at_from_lease":true"#));
+    let keys = KeySet::new([gate.public()]);
+    let back = open::<Receipt>(&seal(&r, &gate).unwrap(), &keys, &scope()).unwrap();
+    assert!(back.doc.at_from_lease);
+
+    use gov_core::receipt::ProofFailure;
+    for (why, word) in [
+        (ProofFailure::NoLease, "no_lease"),
+        (ProofFailure::KeyRevoked, "key_revoked"),
+        (ProofFailure::AgentRevoked, "agent_revoked"),
+        (ProofFailure::MandateRevoked, "mandate_revoked"),
+    ] {
+        assert_eq!(serde_json::to_value(why).unwrap(), json!(word));
+        // Each is a failed proof's reason, and only that.
+        let mut failed = receipt(1, None, Phase::Intent);
+        failed.mode = Mode::Observe;
+        failed.coverage = Coverage::InLine;
+        failed.agent.proof = Proof::Failed;
+        failed.agent.failure = Some(why);
+        failed.validate().unwrap();
+        failed.agent.proof = Proof::Proven;
+        assert!(failed.validate().is_err(), "{word} on a proven receipt");
+    }
+    assert!(serde_json::from_value::<ProofFailure>(json!("revoked")).is_err());
 }

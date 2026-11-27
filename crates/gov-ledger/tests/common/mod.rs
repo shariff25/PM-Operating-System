@@ -58,6 +58,7 @@ pub fn receipt(gate: &str, seq: u64, prev: Option<Digest>, at: i64) -> Receipt {
         prev,
         at,
         at_clamped: false,
+        at_from_lease: false,
         phase: if outcome {
             Phase::Outcome
         } else {

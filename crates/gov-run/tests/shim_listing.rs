@@ -137,6 +137,7 @@ async fn the_shim_keeps_its_listing_when_only_the_session_ran_out() {
     let forwarder = Forwarder::new(
         gate,
         ForwarderConfig {
+            authority: None,
             upstream: format!("http://{upstream}/mcp"),
             map: map(),
             call_timeout: Duration::from_secs(5),

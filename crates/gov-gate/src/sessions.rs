@@ -12,7 +12,7 @@ use gov_core::action::Salt;
 use gov_core::mandate::{verify_chain, ChainCheck, Mandate};
 use gov_core::receipt::ProofFailure;
 use gov_core::request::{Session, SessionOpen};
-use gov_core::revocation::RevocationSet;
+use gov_core::revocation::{Revocable, RevocationSet, Revocations};
 use gov_core::{open, random_id, Digest, Envelope, Error, Id, KeySet, PublicKey, Scope};
 
 pub struct SessionsConfig {
@@ -54,6 +54,27 @@ impl SessionsConfig {
             open_skew_secs: 120,
         }
     }
+}
+
+/// What the gate holds from its Authority at the moment of a call (spec §7.6.3, points 5
+/// and 6). Given to [`Sessions::open`] and [`Sessions::prove`] by a gate that has an
+/// Authority; a gate without one (tests, fake data) gives none, and neither is checked.
+pub struct Trust<'a> {
+    /// The gate holds a lease, the bundle it names and the feed through its number, and
+    /// the lease is no older than it says it is good for.
+    pub fresh: bool,
+    /// Everything the Authority's feed has revoked, as far as this gate has read.
+    pub revoked: &'a RevocationSet,
+}
+
+/// What a call presented, and the digest of the action the gate itself computed for it.
+#[derive(Clone, Copy)]
+pub struct Call<'a> {
+    pub proof: Option<&'a Envelope>,
+    pub salt: Option<&'a Salt>,
+    pub digest: &'a Digest,
+    /// False when the call's arguments have no canonical form.
+    pub canonical: bool,
 }
 
 /// Why a session was not opened. The answer says no more than this.
@@ -110,6 +131,12 @@ struct Entry {
     used_at: i64,
     calls: u64,
     salts: BTreeSet<Salt>,
+    /// The chain as it was presented, to check again when something is revoked.
+    presented: Envelope,
+    /// Set when the chain, its agent or its key was revoked after the session opened. The
+    /// session is then closed to proof and kept as a marker: a call that still proves the
+    /// key is recorded as this agent's, failed, with this reason (review finding GR-110).
+    revoked: Option<ProofFailure>,
 }
 
 pub struct Sessions {
@@ -136,6 +163,11 @@ pub mod why {
     pub const REPLAY: &str = "replay";
     /// The agent key has as many unproven sessions as it may.
     pub const BUSY: &str = "busy";
+    /// The gate has no complete, fresh lease from its Authority, and so cannot say that
+    /// nothing in the chain is revoked.
+    pub const NO_LEASE: &str = "no_lease";
+    /// The mandate, an agent in its chain, or a key is revoked.
+    pub const REVOKED: &str = "revoked";
 }
 
 impl Sessions {
@@ -195,9 +227,27 @@ impl Sessions {
         request: &Envelope,
         now: i64,
     ) -> Result<(Id, Id), OpenRefused> {
+        self.open_with(mandate, request, now, None)
+    }
+
+    /// As [`Sessions::open`], for a gate that has an Authority: `trust` is what it holds
+    /// from it now. Without a complete, fresh lease no session is opened, and none is
+    /// opened for a chain any part of which is revoked.
+    pub fn open_with(
+        &mut self,
+        mandate: &Envelope,
+        request: &Envelope,
+        now: i64,
+        trust: Option<&Trust<'_>>,
+    ) -> Result<(Id, Id), OpenRefused> {
         self.sweep(now);
-        // Revocation is not checked before there is an Authority to say what is revoked.
+        // With an Authority, no session is opened that it could not vouch for now.
+        if trust.is_some_and(|t| !t.fresh) {
+            return Err(self.refuse(why::NO_LEASE));
+        }
+        // Without one there is nobody to say what is revoked.
         let none_revoked = RevocationSet::default();
+        let revoked = trust.map_or(&none_revoked, |t| t.revoked);
         let checked = {
             let c = &self.config;
             verify_chain(
@@ -206,13 +256,14 @@ impl Sessions {
                     scope: &c.scope,
                     authority: &c.issuers,
                     now,
-                    revoked: &none_revoked,
+                    revoked,
                     templates: c.templates.as_deref(),
                 },
             )
         };
         let chain = match checked {
             Ok(chain) => chain,
+            Err(Error::Revoked) => return Err(self.refuse(why::REVOKED)),
             Err(gov_core::Error::UnknownTemplate | gov_core::Error::WiderThanTemplate(_)) => {
                 return Err(self.refuse(why::TEMPLATE))
             }
@@ -275,9 +326,62 @@ impl Sessions {
                 used_at: now,
                 calls: 0,
                 salts: BTreeSet::new(),
+                presented: mandate.clone(),
+                revoked: None,
             },
         );
         Ok((id, challenge))
+    }
+
+    /// Something was revoked: close to proof every open session it touches, and keep each
+    /// as a marker (spec §7.6.3, point 6). Every chain is checked again as it was when the
+    /// session opened, against `revoked`. Returns how many sessions were closed.
+    ///
+    /// The reason names the nearest thing revoked: the session's own key, then an agent of
+    /// the chain, then a mandate of it or the key one was signed with.
+    pub fn revoke(&mut self, revoked: &RevocationSet, now: i64) -> usize {
+        self.sweep(now);
+        let c = &self.config;
+        let mut closed = 0;
+        for entry in self.open.values_mut() {
+            if entry.revoked.is_some() {
+                continue;
+            }
+            let check = ChainCheck {
+                scope: &c.scope,
+                authority: &c.issuers,
+                now,
+                revoked,
+                templates: c.templates.as_deref(),
+            };
+            if !matches!(verify_chain(&entry.presented, &check), Err(Error::Revoked)) {
+                continue;
+            }
+            // The chain as it stood at opening names what to look for.
+            let none = RevocationSet::default();
+            let links = verify_chain(
+                &entry.presented,
+                &ChainCheck {
+                    revoked: &none,
+                    ..check
+                },
+            )
+            .map(|chain| chain.links().to_vec())
+            .unwrap_or_else(|_| vec![entry.mandate.clone()]);
+            let why = if revoked.is_revoked(Revocable::Key, &entry.key.kid) {
+                ProofFailure::KeyRevoked
+            } else if links
+                .iter()
+                .any(|m| revoked.is_revoked(Revocable::Agent, &m.agent.id))
+            {
+                ProofFailure::AgentRevoked
+            } else {
+                ProofFailure::MandateRevoked
+            };
+            entry.revoked = Some(why);
+            closed += 1;
+        }
+        closed
     }
 
     /// Decide whether a call is proven. `digest` is of the action the gate itself computed
@@ -295,6 +399,31 @@ impl Sessions {
         canonical: bool,
         now: i64,
     ) -> Proved {
+        let call = Call {
+            proof,
+            salt,
+            digest,
+            canonical,
+        };
+        self.prove_with(session, &call, now, None)
+    }
+
+    /// As [`Sessions::prove`], for a gate that has an Authority. A proof that holds is
+    /// recorded as proven only under a complete, fresh lease, and never for a session
+    /// whose chain has been revoked: each of those is a failed proof with its own reason.
+    pub fn prove_with(
+        &mut self,
+        session: &Id,
+        call: &Call<'_>,
+        now: i64,
+        trust: Option<&Trust<'_>>,
+    ) -> Proved {
+        let Call {
+            proof,
+            salt,
+            digest,
+            canonical,
+        } = *call;
         self.sweep(now);
         let c = &self.config;
         let Some(entry) = self.open.get_mut(session) else {
@@ -341,6 +470,16 @@ impl Sessions {
         entry.salts.insert(*salt);
         entry.calls += 1;
         entry.used_at = now;
+        // The proof holds: the caller has the key. Whether that makes the call the agent's
+        // act is another matter. A session whose chain was revoked says which part was;
+        // and without a complete, fresh lease the gate cannot know that nothing was.
+        // Neither is ever counted as proven, and neither pushes out a proven session.
+        if let Some(why) = entry.revoked {
+            return failed(&entry.who, why);
+        }
+        if trust.is_some_and(|t| !t.fresh) {
+            return failed(&entry.who, ProofFailure::NoLease);
+        }
         let first = !entry.proven;
         entry.proven = true;
         let (who, key) = (entry.who.clone(), entry.key.clone());

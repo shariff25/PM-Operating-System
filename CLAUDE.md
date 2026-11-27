@@ -495,6 +495,17 @@ follow-up tracking.
   three defaults are confirmed. Two Low findings to fix (GR-170: a `restore` must also name
   the tool that reads the old value; GR-171: a cause pointing at receipt 0) and two limits
   now stated in the access governance spec.
+- **G4d-2 built (2026-11-27), on `build/gov-g4d2`:** the gate's time from its lease
+  (receipts say so), proof recorded as proven only under a complete, fresh lease, and
+  sessions whose chain is revoked kept as markers that name the agent and what was
+  revoked. Library and tests only: the gate program is not wired to an Authority until
+  G4d-5. Not yet read by the reviewer. Next: G4d-3 (the bundle changed in place, the shim
+  following the gate).
+- **Twenty-fourth read (2026-11-27), at `25f0801`:** no High or Critical. G4d-1 passes,
+  with its five departures confirmed; G4d-2 may be built. The check that a revoked gate key
+  is refused a renewal must come back in G4d-4 with its test. Three Low notes: limit by
+  source before any work (G4d-5), keep the opened bundle between renewals, and say that
+  "proven" can lag a revocation by up to the lease's life (two minutes by default; said).
 
 ## Where the build stands (2026-11-23)
 
