@@ -1957,6 +1957,22 @@ Each slice ends with its attack tests (§3.3) passing and its commit sent to the
 
 | G9 | Undo (§4.7), after G6: before-values sealed at intent; the undo action and its receipts; refusal on a changed target; undo of a whole mandate; the undo cover page | On the fake Jira: forty issues changed by one mandate are put back by one undo with a receipt each; an issue someone edited in between is left alone and reported; a `none` operation cannot be undone and needed a person to run |
 
+**Added by the owner on 2026-11-27** ("Keep the existing feature and build and add the new
+things you suggested"). Nothing above is dropped or reordered: G4c to G9 and the access
+governance slices stand as they are. Three things are added, from the conductor's answer
+on what would make the product hard to replace.
+
+| Slice | Built | Done when |
+|---|---|---|
+| CM1 | **A library of connector maps** for the three systems to start with: Jira, GitHub and Slack. Each map is a directory in `governance/maps/<system>/` holding the map for one named MCP server at one named version, its sample calls (as `gov policy check` requires), and a note of what it was checked against. A map says, for every tool, the operation, its kind, whether and how it can be put back, whether it reaches outside, and the resource it acts on | `gov policy check` passes on each; every tool of the server is mapped or listed as deliberately unmapped with a reason; the reviewer has read each map (the standing condition of GR-65). A map made from a server's published tool definitions, and not yet run against that server, says so, and is not called verified |
+| CM2 | **Drift**: a command, `gov map drift`, that takes a server's current tool listing and a map and reports tools added, removed and changed (by the digest of the definition) since the map was reviewed; and the gate's count of calls to tools the map does not know, by tool digest, on the operator's address | A changed description, a new tool and a removed tool are each reported; a tool whose definition is unchanged is not |
+| CP | **Proof about the record**, beyond what `gov verify` shows today. Its design is **not written in this repository**: the owner is deciding whether to file for a patent first, and what is written here is published. It is built after that decision | Not stated here, for the same reason |
+
+Where they sit: CM1 and CM2 need nothing that is not built, so they are built beside G4c
+to G4e, one system at a time, Jira first. CP waits for the owner. Custody (G6), undo (G9)
+and access reviews (the access governance spec) were in the conductor's answer too and
+are already slices.
+
 After the first release, in no fixed order: reconciliation (§7.5); GitHub with tokens minted
 per repository; a key-service driver; object-storage witness with lock; SCIM; passkey approval
 inside PM OS; the HTTP gate; SDKs; runtime adapters; the log-platform stream; hosted cells;

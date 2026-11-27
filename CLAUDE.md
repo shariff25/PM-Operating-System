@@ -424,6 +424,22 @@ follow-up tracking.
   into any committed file** until the owner has decided about filing. The owner then:
   "Continue building G4c".
 
+- **What makes the product hard to replace (owner, 2026-11-27):** asked how to build a moat,
+  the conductor answered: a library of reviewed connector maps, being the record outsiders
+  accept (with proof that it is complete), the gate holding the credential, and undo and
+  access reviews as recurring work; and recommended narrowing. The owner chose otherwise:
+  "Keep the exiting feature and build and add the new things you suggested". So nothing is
+  dropped, and three slices are added to the main spec's §10: CM1 (connector maps for Jira,
+  GitHub and Slack), CM2 (drift) and CP (proof about the record). CP's design stays out of
+  every committed file until the owner decides about filing; the repository answered a
+  request with no login on 2026-11-27, so it is taken to be public until the owner says
+  otherwise. Not buildable by the conductor: design partners and a real deployment.
+- **G4c so far (2026-11-27), on `build/gov-g4c`, not merged:** templates in the bundle and
+  held at the gate (16 controls, all caught); issuing, delegating, listing, revoking and the
+  revocation feed in the Authority (31 controls, 8 not yet caught by a test). Still to do:
+  those eight, the gate's sessions using the bundle's templates, `gov verify` reporting a
+  mandate nobody issued, an end-to-end run, the full checks and the reviewer's read.
+
 ## Where the build stands (2026-11-23)
 
 - Pushed and checked: `claude/web-app` (draft pull request #10).
