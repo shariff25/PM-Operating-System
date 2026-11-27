@@ -472,6 +472,40 @@ reviewer.
     the tool's name). `gov map drift` prints the same name beside each tool it reports,
     so an operator can tell which tool a count is for. The count holds 256 names and
     adds the rest together; it is lost at a restart (the receipts are not).
+- **G4d-1 built (2026-11-27), from §7.6.3 points 1 to 3 after the twenty-second read; not
+  yet read by the reviewer.** Libraries only, on `build/gov-g4d1`: nothing is served and
+  no gate uses it yet.
+  - *The renewal* (`gov-core/src/renew.rs`): `gov.renew.v1`, signed with the gate's key,
+    with its name, the Authority's name, a fresh nonce, the bundle held and the
+    revocation number read through. It carries no time.
+  - *The Authority's answer* (`Authority::renew`): a lease with the request's nonce, the
+    Authority's time, the latest bundle's version and the newest revocation number, good
+    for the bundle's own `standard` limit; the feed from the number the gate named; the
+    bundle unless the gate says it holds that very one. Only a key enrolled for a gate,
+    asking in that gate's own name, for this Authority, while the gate is not disabled,
+    is answered; anyone else gets a bare refusal. One answer a second for each gate. It
+    writes nothing and makes no record.
+  - *What a gate holds and checks* (`Standing`, `Standing::take`): the checks of point 2,
+    in that order, with a closed list of reasons for the operator (`bundle`,
+    `bundle_older`, `bundle_forked`, `wrong_bundle`, `lease`, `not_this_request`,
+    `authority_behind`, `feed`). An answer that fails any check changes nothing. The
+    gate's time is the lease's plus its own count since the request left; a lease is
+    fresh for as long as it says.
+  - Run together on both of the Authority's stores: a first renewal brings the bundle; a
+    revoked mandate and a disabled agent reach the gate's revoked set; a new bundle
+    arrives with its lease; a gate started again is told everything from nothing; a
+    disabled gate is not answered. An Authority put back from an older copy, or with its
+    clock set back, is refused as `authority_behind` and taken again once it has caught
+    up. 23 controls removed one at a time; each removal fails a test.
+  - **Departures and limits.** (1) "At most once a second" compares for the same second
+    only: an Authority whose clock was set back still answers, so that the gate can say
+    it is behind. (2) A gate that names a higher revocation number than the Authority
+    has is answered from where the Authority stands, not refused, for the same reason.
+    (3) The lease names the bundle by `<number>-<first 16 hex of its digest>`, the
+    version a receipt carries, not by the whole digest; the bundle itself is opened
+    under the root key before it is compared. (4) A gate's revoked key is not yet
+    refused a renewal: no key can be revoked before G4d-4. (5) The limit of one answer a
+    second is kept in memory and is each Authority process's own.
 
 ## Security review of 2026-11-26 (first read; the gate did not pass)
 
@@ -916,6 +950,23 @@ reviewer ran the tests of `gov-core`, `gov-authority` and `gov-gate` without Pos
 | GR-167 | Low | What happens to a disabled gate was not said | §7.6.3, point 1: no answer, so no fresh lease |
 | GR-168 | Low | An Authority whose clock or database goes back has its leases refused by every gate; right, but unsaid and unshown | §7.6.3, point 2: stated, with a reason of its own on the operator's address |
 | GR-169 | Low | The renewal listener needs the Ledger listener's hardening, and the text should say what is not on it | §7.6.3, point 11 |
+
+### Twenty-third read, 2026-11-27: the revised maps and CG0a at `cc6f5b5`
+
+**Verdict: no High or Critical; the gate still passes. GR-158, GR-159 and GR-160 are
+closed, so the three maps may back shadow mode as well as observe mode. Enforce mode
+still waits on GR-161.** CG0a passes, and the reviewer confirmed its three defaults and
+the rule that the stricter of two entries wins. It compared every tool with the maps it
+read before and checked each of the eighteen remaining undo claims against the listings;
+as before, against the listings and not live systems. GR-162 to GR-165 are closed or
+stated.
+
+| Id | Severity | What | Done |
+|---|---|---|---|
+| GR-170 | Low | A `restore` needs the earlier value, and the build checks only that a tool exists to write it back. GitHub's two subscription tools are marked `restore` and the listing has no tool that reads a subscription | To fix on `build/gov-review-23` |
+| GR-171 | Low | A receipt's cause may point at receipt number 0; receipts are numbered from 1 | To fix |
+| GR-172 | Low | A call whose proof failed is still forwarded in observe and shadow modes, so the agent may have read the data, yet its receipt raises no label: the shadow flow check under-counts such reads | To state in the access governance spec |
+| GR-173 | Info | The library's maps carry no labels, so every read raises a mandate to restricted and untrusted until a deployment labels its resources: the shadow flow check will flag nearly everything at first | Noted in the access governance spec |
 
 ## 1. What is being built
 

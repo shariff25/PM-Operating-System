@@ -43,6 +43,17 @@ data only, and a control is not built until removing it fails a test.
   - The three maps in the library carry no labels: which project is confidential is each
     deployment's to say. `gov map build` passes a review's labels through to the map.
   - 22 checks removed one at a time; each removal fails a test.
+- **CG0a read by the reviewer on 2026-11-27 (its twenty-third read): it passes**, and the
+  three defaults and "the stricter wins" are confirmed. Two limits it asked to be said:
+  - **Reads under a failed proof are not counted** (GR-172). In observe and shadow modes a
+    call whose proof failed is still forwarded, so the agent may have read the data; its
+    receipt carries no label and raises none, because a failed proof is nobody's act. The
+    flow check in shadow mode therefore under-counts what such an agent has read. In
+    enforce mode the call is refused, and there is nothing to count.
+  - **Everything is restricted until a deployment says otherwise** (GR-173). No map in
+    the library carries labels, so every read will raise a mandate to restricted and
+    untrusted, and the flow check in shadow mode will flag nearly everything at first.
+    That is what the over-taint measure of §9 is there to show.
 - The PRD is `docs/prd-access-governance.md` and the graph explorer's design source is
   `docs/design/graph-explorer-design.dc.html`, both committed on 2026-11-27 at the owner's
   word, as the owner pasted them. The design file is a component source that does not run

@@ -54,6 +54,9 @@ pub enum AuthorityError {
     /// A request to enrol was refused. It says no more: the caller may be anyone.
     #[error("refused")]
     Refused,
+    /// A gate asked to renew again within the same second.
+    #[error("asked again too soon")]
+    TooSoon,
     /// The Ledger's answer does not agree with this Authority's own chain at this record.
     #[error("the Ledger disagrees with this Authority's chain at record {0}")]
     LedgerDisagrees(u64),
@@ -86,8 +89,10 @@ pub struct Authority<S> {
     /// Signs mandates, and nothing else. Absent until the installation has one; an
     /// Authority without it issues nothing.
     mandates_key: Option<SigningKey>,
-    /// Signs the revocation feed (and leases, G4d), and nothing else.
+    /// Signs the revocation feed and leases, and nothing else.
     leases_key: Option<SigningKey>,
+    /// When each gate was last answered a renewal, by this Authority's clock.
+    renewed: std::sync::Mutex<std::collections::BTreeMap<Id, i64>>,
 }
 
 /// Where a mandate being issued comes from: the person at the root of its chain, and the
@@ -189,6 +194,7 @@ impl<S: Store> Authority<S> {
             root,
             mandates_key: None,
             leases_key: None,
+            renewed: std::sync::Mutex::default(),
         }
     }
 
@@ -953,7 +959,17 @@ impl<S: Store> Authority<S> {
     /// entry whose subject expired longer ago than the clock allowance is left out and
     /// counted, so the asker sees that every number is accounted for.
     pub async fn revocation_feed(&self, after: u64, now: i64) -> Result<Envelope> {
-        use gov_core::revocation::RevocationFeed;
+        let (_, _, key) = self.leasing().await?;
+        let all = self.store.revocations_after(&self.scope, 0).await?;
+        if after > all.last().map_or(0, |e| e.seq) {
+            return Err(AuthorityError::Refused);
+        }
+        self.feed(all, after, now, key)
+    }
+
+    /// The latest published bundle, opened, and the key leases and the feed are signed
+    /// with, only if that bundle lists it under `leases`.
+    async fn leasing(&self) -> Result<(Published, gov_core::policy::OpenedBundle, &SigningKey)> {
         let latest = self
             .store
             .latest_bundle(&self.scope)
@@ -967,11 +983,19 @@ impl<S: Store> Authority<S> {
         if !opened.bundle.keys.leases.contains(&key.public()) {
             return Err(AuthorityError::Unknown("leases key in the bundle"));
         }
-        let all = self.store.revocations_after(&self.scope, 0).await?;
+        Ok((latest, opened, key))
+    }
+
+    /// The feed after `after`, from `all`, every revocation there is.
+    fn feed(
+        &self,
+        all: Vec<gov_core::revocation::RevocationEntry>,
+        after: u64,
+        now: i64,
+        key: &SigningKey,
+    ) -> Result<Envelope> {
+        use gov_core::revocation::RevocationFeed;
         let through = all.last().map_or(0, |e| e.seq);
-        if after > through {
-            return Err(AuthorityError::Refused);
-        }
         let later: Vec<_> = all.into_iter().filter(|e| e.seq > after).collect();
         let total = later.len() as u64;
         let entries: Vec<_> = later
@@ -991,6 +1015,80 @@ impl<S: Store> Authority<S> {
         };
         feed.validate()?;
         Ok(seal(&feed, key)?)
+    }
+
+    /// Answer a gate's renewal (spec §7.6.3, point 1): a lease that carries the request's
+    /// nonce, the revocation feed after the number the gate named, and the bundle when the
+    /// gate does not hold the one the lease names.
+    ///
+    /// The request is signed with a key enrolled for that gate, and the gate is not
+    /// disabled: a disabled gate gets no answer, so it has no fresh lease (GR-167). Anyone
+    /// else gets a bare refusal. Nothing is written and no record is made. A copy of a
+    /// request played by someone else gets an answer bound to that request's nonce, which
+    /// no gate is waiting for.
+    pub async fn renew(&self, request: &Envelope, now: i64) -> Result<gov_core::renew::Renewed> {
+        use gov_core::lease::Lease;
+        use gov_core::renew::{Renew, Renewed};
+        let signer = match self.store.key(&self.scope, &request.kid).await? {
+            Some(k) if k.kind == EnrolKind::Gate => k,
+            _ => return Err(AuthorityError::Refused),
+        };
+        let keys = KeySet::new([signer.key.clone()]);
+        let Ok(asked) = open::<Renew>(request, &keys, &self.scope) else {
+            return Err(AuthorityError::Refused);
+        };
+        let asked = asked.doc;
+        if asked.gate != signer.name || asked.authority != self.name {
+            return Err(AuthorityError::Refused);
+        }
+        match self.store.gate(&self.scope, &asked.gate).await? {
+            Some(g) if g.status == Status::Active => {}
+            _ => return Err(AuthorityError::Refused),
+        }
+        // Everything revoked, read once: the lease's number and the feed are made from it.
+        let all = self.store.revocations_after(&self.scope, 0).await?;
+        // A gate's key that was revoked is refused here once a key can be revoked (G4d-4).
+        let (latest, opened, key) = self.leasing().await?;
+        // One answer a second for each gate. The limit is counted only for a request that
+        // is the gate's own, checked above; whoever could play a gate's requests back to
+        // use it up could as well drop them on the way.
+        {
+            let mut renewed = self
+                .renewed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // The same second only: a clock that was set back must still be answered
+            // from, so that the gate can say its Authority is behind (GR-168).
+            if renewed.get(&asked.gate) == Some(&now) {
+                return Err(AuthorityError::TooSoon);
+            }
+            renewed.insert(asked.gate.clone(), now);
+        }
+        let through = all.last().map_or(0, |e| e.seq);
+        // A gate that names a higher number than there is has heard from an Authority
+        // further on than this one: this one's database was put back. It is answered from
+        // where this one stands, and the gate refuses the lease as behind (GR-168).
+        let feed = self.feed(all, asked.revocations_through.min(through), now, key)?;
+        let lease = Lease {
+            v: VERSION,
+            tenant: self.scope.tenant.clone(),
+            env: self.scope.env.clone(),
+            issuer: self.name.clone(),
+            gate: asked.gate.clone(),
+            nonce: asked.nonce.clone(),
+            authority_time: now,
+            policy_version: opened.policy_version(),
+            revocation_seq: through,
+            // No action of any class is decided on an older lease: the bundle's own limit.
+            valid_for_secs: opened.bundle.freshness.standard_secs,
+        };
+        // The bundle goes with the answer unless the gate says it holds this very one.
+        let bundle = (asked.bundle.as_ref() != Some(&opened.held())).then_some(latest.envelope);
+        Ok(Renewed {
+            lease: seal(&lease, key)?,
+            feed,
+            bundle,
+        })
     }
 
     /// The bundle gates are to hold: the last one published, as it was signed.

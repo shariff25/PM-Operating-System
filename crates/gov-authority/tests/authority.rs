@@ -2039,3 +2039,584 @@ async fn a_mandate_issued_while_its_issuer_is_leaving_is_revoked() {
     let last: Vec<AdminAction> = records.iter().rev().take(2).map(|r| r.action).collect();
     assert_eq!(last, [AdminAction::Revoked, AdminAction::PersonOffboarded]);
 }
+
+// ----- G4d-1: a gate's renewal, and what it does with the answer (spec §7.6.3) -----------
+
+mod renewal {
+    use super::*;
+    use gov_core::lease::Lease;
+    use gov_core::policy::{open_bundle, HeldBundle};
+    use gov_core::renew::{Renew, RenewRefused, Renewed, Standing};
+    use gov_core::revocation::{RevocationFeed, Revocations};
+
+    fn gate_key(name: &str) -> SigningKey {
+        // A key each: the same public key is never enrolled twice.
+        let seed = 30 + name.bytes().last().unwrap() % 10;
+        key(&format!("{name}:k1"), seed)
+    }
+
+    async fn enrol_gate<S: Store>(a: &Authority<S>, name: &str) -> SigningKey {
+        let k = gate_key(name);
+        let code = a
+            .offer_enrolment(&id("ana"), EnrolKind::Gate, &id(name), NOW)
+            .await
+            .unwrap();
+        let asked = request(&k, EnrolKind::Gate, name, k.public(), &code);
+        a.enrol(&code, &asked, NOW).await.unwrap();
+        k
+    }
+
+    fn standing(gate: &str) -> Standing {
+        Standing::new(scope(), id(gate), id("authority"), root(), None)
+    }
+
+    /// An Authority with people, agents, an enrolled gate and its first bundle.
+    async fn serving<S: Store>(store: S) -> (Authority<S>, SigningKey) {
+        let (a, _, _, _) = ready(store).await;
+        let gate = enrol_gate(&a, "gate-1").await;
+        a.publish_bundle(&id("ana"), &policy(1, vec![mandates_key().public()]), NOW)
+            .await
+            .unwrap();
+        (a, gate)
+    }
+
+    /// What a gate holds, to compare before and after an answer it refuses.
+    fn held(s: &Standing) -> (Option<Lease>, Option<HeldBundle>, u64, Option<i64>) {
+        (
+            s.lease().cloned(),
+            s.bundle().map(|b| b.held()),
+            s.revocations_through(),
+            s.now(9_000_000),
+        )
+    }
+
+    async fn round<S: Store>(
+        a: &Authority<S>,
+        s: &mut Standing,
+        gate: &SigningKey,
+        mono_ms: u64,
+        now: i64,
+    ) -> gov_core::renew::Taken {
+        let (request, asked) = s.ask(gate, mono_ms).unwrap();
+        let answer = a.renew(&request, now).await.unwrap();
+        s.take(&answer, asked).unwrap()
+    }
+
+    /// One request brings the lease, the feed and, when the gate lacks it, the bundle; the
+    /// gate's time, its revoked set and its bundle follow the Authority's.
+    async fn renewing<S: Store>(store: S) {
+        let (a, gate) = serving(store).await;
+        let (ana, ben) = (id("ana"), id("ben"));
+        let records = chain(&a).await.len();
+        let mut s = standing("gate-1");
+        assert!(s.now(0).is_none() && !s.fresh(0));
+
+        // The first renewal brings the bundle with it.
+        let (request, asked) = s.ask(&gate, 1_000).unwrap();
+        let answer = a.renew(&request, NOW).await.unwrap();
+        assert!(answer.bundle.is_some());
+        let taken = s.take(&answer, asked).unwrap();
+        assert!(taken.bundle_changed && taken.revoked.is_empty());
+        assert_eq!(s.bundle().unwrap().bundle.number, 1);
+        // The gate's time is the Authority's, counted on from when the request left.
+        assert_eq!(s.now(1_000), Some(NOW));
+        assert_eq!(s.now(6_999), Some(NOW + 5));
+        // Complete, and fresh for as long as the bundle's own limit says: two minutes.
+        assert!(s.fresh(1_000) && s.fresh(121_000));
+        assert!(!s.fresh(121_001));
+        // Still the gate's clock, however old the lease.
+        assert_eq!(s.now(1_000 + 3_600_000), Some(NOW + 3600));
+
+        // The next brings no bundle: the gate said which it holds.
+        let (request, asked) = s.ask(&gate, 11_000).unwrap();
+        let answer = a.renew(&request, NOW + 10).await.unwrap();
+        assert!(answer.bundle.is_none());
+        let taken = s.take(&answer, asked).unwrap();
+        assert!(!taken.bundle_changed && taken.revoked.is_empty());
+        assert!(s.fresh(131_000) && !s.fresh(131_001));
+
+        // A mandate is revoked: the next renewal says so, once.
+        let good = ask("refund-bot", "refund-bot:k1", "triage");
+        let m = as_a_gate(
+            &a.issue_mandate(&ben, &good, NOW).await.unwrap(),
+            &RevocationSet::default(),
+        )
+        .unwrap()[0]
+            .id
+            .clone();
+        assert!(!s.revoked().is_revoked(Revocable::Mandate, &m));
+        a.revoke_mandate(&ben, &m, NOW + 12).await.unwrap();
+        let taken = round(&a, &mut s, &gate, 21_000, NOW + 20).await;
+        assert_eq!(taken.revoked.len(), 1);
+        assert_eq!(
+            (taken.revoked[0].kind, &taken.revoked[0].id),
+            (Revocable::Mandate, &m)
+        );
+        assert!(s.revoked().is_revoked(Revocable::Mandate, &m));
+        assert_eq!(
+            (s.revocations_through(), s.lease().unwrap().revocation_seq),
+            (1, 1)
+        );
+        let taken = round(&a, &mut s, &gate, 31_000, NOW + 30).await;
+        assert!(taken.revoked.is_empty() && !taken.bundle_changed);
+
+        // An agent is disabled, and a new bundle published: both arrive together.
+        a.disable_agent(&ana, &id("helper-bot"), NOW + 31)
+            .await
+            .unwrap();
+        a.publish_bundle(&ana, &policy(2, vec![mandates_key().public()]), NOW + 32)
+            .await
+            .unwrap();
+        let taken = round(&a, &mut s, &gate, 41_000, NOW + 40).await;
+        assert!(taken.bundle_changed);
+        assert_eq!(s.bundle().unwrap().bundle.number, 2);
+        assert!(s.revoked().is_revoked(Revocable::Agent, &id("helper-bot")));
+        assert!(s.fresh(41_000));
+
+        // A gate started again has no lease and no revoked set: it asks from nothing and
+        // is told everything still worth telling.
+        let mut again = standing("gate-1");
+        let taken = round(&a, &mut again, &gate, 5, NOW + 50).await;
+        assert!(taken.bundle_changed);
+        assert_eq!(again.revocations_through(), s.revocations_through());
+        assert!(again.revoked().is_revoked(Revocable::Mandate, &m));
+        assert!(again
+            .revoked()
+            .is_revoked(Revocable::Agent, &id("helper-bot")));
+
+        // A renewal writes nothing: every record since the start is one of the acts above.
+        let acts = chain(&a).await.len() - records;
+        assert_eq!(acts, 4, "issued, revoked, agent disabled, published");
+
+        // A disabled gate gets no answer, so it has no fresh lease from then on (GR-167).
+        a.disable_gate(&ana, &id("gate-1"), NOW + 60).await.unwrap();
+        let (request, _) = s.ask(&gate, 71_000).unwrap();
+        assert!(matches!(
+            a.renew(&request, NOW + 70).await,
+            Err(AuthorityError::Refused)
+        ));
+        assert!(s.fresh(41_000 + 120_000) && !s.fresh(41_000 + 120_001));
+    }
+    both_stores!(a_renewal_brings_the_lease_the_feed_and_the_bundle, renewing);
+
+    /// Who the Authority answers, and who gets a bare refusal.
+    #[tokio::test]
+    async fn only_an_enrolled_gate_that_is_not_disabled_is_answered() {
+        let (a, gate) = serving(MemoryStore::default()).await;
+        let s = standing("gate-1");
+        let (good, _) = s.ask(&gate, 0).unwrap();
+        let refused = |r: Result<Renewed, AuthorityError>| {
+            assert!(matches!(r, Err(AuthorityError::Refused)), "{:?}", r.err());
+        };
+        // A key nobody enrolled, under the gate's own key id and under another.
+        let (forged, _) = s.ask(&key("gate-1:k1", 99), 0).unwrap();
+        refused(a.renew(&forged, NOW).await);
+        let (stranger, _) = s.ask(&key("gate-1:k9", 99), 0).unwrap();
+        refused(a.renew(&stranger, NOW).await);
+        // An agent's enrolled key is not a gate's.
+        let (agent, _) = s.ask(&key("refund-bot:k1", 9), 0).unwrap();
+        refused(a.renew(&agent, NOW).await);
+        // A gate asking in another gate's name.
+        a.register_gate(&id("ana"), &id("gate-2"), NOW)
+            .await
+            .unwrap();
+        let (other, _) = standing("gate-2").ask(&gate, 0).unwrap();
+        refused(a.renew(&other, NOW).await);
+        // A request meant for another Authority.
+        let elsewhere = Standing::new(scope(), id("gate-1"), id("authority-2"), root(), None);
+        let (misdirected, _) = elsewhere.ask(&gate, 0).unwrap();
+        refused(a.renew(&misdirected, NOW).await);
+        // Something signed by the gate that is not a renewal at all.
+        let not_a_renewal = request(&gate, EnrolKind::Gate, "gate-1", gate.public(), "code");
+        refused(a.renew(&not_a_renewal, NOW).await);
+
+        // The gate itself is answered, and not twice in one second.
+        a.renew(&good, NOW).await.unwrap();
+        let (second, _) = s.ask(&gate, 0).unwrap();
+        assert!(matches!(
+            a.renew(&second, NOW).await,
+            Err(AuthorityError::TooSoon)
+        ));
+        // A refused request does not use the second up for the gate.
+        refused(a.renew(&forged, NOW + 1).await);
+        a.renew(&second, NOW + 1).await.unwrap();
+        // Another gate's second is its own.
+        let gate_2 = enrol_gate(&a, "gate-2").await;
+        let (theirs, _) = standing("gate-2").ask(&gate_2, 0).unwrap();
+        a.renew(&theirs, NOW + 1).await.unwrap();
+
+        // With no bundle published there is nothing to lease from.
+        let (bare, _, _, _) = ready(MemoryStore::default()).await;
+        let gate = enrol_gate(&bare, "gate-1").await;
+        let (request, _) = standing("gate-1").ask(&gate, 0).unwrap();
+        assert!(matches!(
+            bare.renew(&request, NOW).await,
+            Err(AuthorityError::Unknown("published bundle"))
+        ));
+        // Nor with a bundle that does not list this Authority's leases key.
+        let other = key("authority:leases-9", 78).public();
+        bare.publish_bundle(
+            &id("ana"),
+            &policy_with(1, vec![mandates_key().public()], other),
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            bare.renew(&request, NOW).await,
+            Err(AuthorityError::Unknown("leases key in the bundle"))
+        ));
+    }
+
+    /// An agent and a gate never share a name, so an agent's key is never under a gate's.
+    /// Were one ever written there all the same, it would still not be answered: the key
+    /// must be one enrolled for a gate.
+    #[tokio::test]
+    async fn an_agents_key_under_a_gates_name_is_not_answered() {
+        let (a, gate) = serving(MemoryStore::default()).await;
+        // Written straight into the store, past the Authority's own checks.
+        let planted = key("gate-1:k7", 88);
+        let records = a.store().records_after(&scope(), 0, 1000).await.unwrap();
+        let next = StoredRecord {
+            seq: records.last().unwrap().seq + 1,
+            ..records.last().unwrap().clone()
+        };
+        let as_agent = Effect::AddKey(EnrolledKey {
+            kind: EnrolKind::Agent,
+            name: id("gate-1"),
+            key: planted.public(),
+        });
+        a.store()
+            .commit(&scope(), &next, &[as_agent])
+            .await
+            .unwrap();
+
+        let s = standing("gate-1");
+        let (request, _) = s.ask(&planted, 0).unwrap();
+        assert!(matches!(
+            a.renew(&request, NOW).await,
+            Err(AuthorityError::Refused)
+        ));
+        // The gate's own key is answered as before.
+        let (request, _) = s.ask(&gate, 0).unwrap();
+        a.renew(&request, NOW).await.unwrap();
+    }
+
+    fn lease_of(answer: &Renewed) -> Lease {
+        let keys = KeySet::new([leases_key().public()]);
+        open::<Lease>(&answer.lease, &keys, &scope()).unwrap().doc
+    }
+    fn feed_of(answer: &Renewed) -> RevocationFeed {
+        let keys = KeySet::new([leases_key().public()]);
+        open::<RevocationFeed>(&answer.feed, &keys, &scope())
+            .unwrap()
+            .doc
+    }
+
+    /// Every part of an answer is checked, and one that fails any check changes nothing.
+    #[tokio::test]
+    async fn a_gate_takes_the_whole_answer_or_none_of_it() {
+        let (a, gate) = serving(MemoryStore::default()).await;
+        let ben = id("ben");
+        // Something is revoked, so that the feed has an entry to tamper with.
+        let good = ask("refund-bot", "refund-bot:k1", "triage");
+        for _ in 0..2 {
+            let m = as_a_gate(
+                &a.issue_mandate(&ben, &good, NOW).await.unwrap(),
+                &RevocationSet::default(),
+            )
+            .unwrap()[0]
+                .id
+                .clone();
+            a.revoke_mandate(&ben, &m, NOW).await.unwrap();
+        }
+        let mut s = standing("gate-1");
+        round(&a, &mut s, &gate, 1_000, NOW + 1).await;
+        let before = held(&s);
+        assert_eq!(before.2, 2);
+
+        // An honest answer to this request, to change one part of at a time.
+        let mut now = NOW + 10;
+        let mut attempt = 0u64;
+        let refuse = |s: &mut Standing,
+                      change: &dyn Fn(&mut Renewed),
+                      why: RenewRefused,
+                      answer: Renewed,
+                      asked| {
+            let mut answer = answer;
+            change(&mut answer);
+            assert_eq!(s.take(&answer, asked), Err(why), "{}", why.code());
+            assert_eq!(
+                held(s),
+                before,
+                "{} changed what the gate holds",
+                why.code()
+            );
+        };
+        macro_rules! refused {
+            ($why:expr, $change:expr) => {{
+                now += 1;
+                attempt += 1;
+                let (request, asked) = s.ask(&gate, 20_000 + attempt).unwrap();
+                let answer = a.renew(&request, now).await.unwrap();
+                refuse(&mut s, &$change, $why, answer, asked);
+            }};
+        }
+        let resign_lease =
+            |answer: &mut Renewed, change: &dyn Fn(&mut Lease), with: &SigningKey| {
+                let mut lease = lease_of(answer);
+                change(&mut lease);
+                answer.lease = seal(&lease, with).unwrap();
+            };
+        let resign_feed =
+            |answer: &mut Renewed, change: &dyn Fn(&mut RevocationFeed), with: &SigningKey| {
+                let mut feed = feed_of(answer);
+                change(&mut feed);
+                answer.feed = seal(&feed, with).unwrap();
+            };
+        let leases = leases_key();
+        let mandates = mandates_key();
+
+        // --- the lease
+        // Signed with a key the bundle lists for something else, or lists nowhere.
+        refused!(RenewRefused::Lease, |r: &mut Renewed| resign_lease(
+            r,
+            &|_| {},
+            &mandates
+        ));
+        refused!(RenewRefused::Lease, |r: &mut Renewed| resign_lease(
+            r,
+            &|_| {},
+            &key("authority:leases-1", 99)
+        ));
+        // Another Authority's lease, under a key this bundle does list.
+        refused!(RenewRefused::Lease, |r: &mut Renewed| resign_lease(
+            r,
+            &|l| l.issuer = id("authority-2"),
+            &leases
+        ));
+        // It names a bundle the gate does not have in hand.
+        refused!(RenewRefused::WrongBundle, |r: &mut Renewed| resign_lease(
+            r,
+            &|l| l.policy_version = id("2-0123456789abcdef"),
+            &leases
+        ));
+        // For another gate, or answering a request this gate did not make.
+        refused!(
+            RenewRefused::NotThisRequest,
+            |r: &mut Renewed| resign_lease(r, &|l| l.gate = id("gate-2"), &leases)
+        );
+        refused!(
+            RenewRefused::NotThisRequest,
+            |r: &mut Renewed| resign_lease(r, &|l| l.nonce = id("n-someone-elses"), &leases)
+        );
+        // Behind what the gate holds, in time or in revocations (GR-168).
+        refused!(RenewRefused::AuthorityBehind, |r: &mut Renewed| {
+            resign_lease(r, &|l| l.authority_time = NOW, &leases)
+        });
+        refused!(RenewRefused::AuthorityBehind, |r: &mut Renewed| {
+            resign_lease(r, &|l| l.revocation_seq = 1, &leases)
+        });
+
+        // --- the feed
+        refused!(RenewRefused::Feed, |r: &mut Renewed| resign_feed(
+            r,
+            &|_| {},
+            &mandates
+        ));
+        refused!(RenewRefused::Feed, |r: &mut Renewed| resign_feed(
+            r,
+            &|f| f.issuer = id("authority-2"),
+            &leases
+        ));
+        // It does not start where the gate has read to: something between would be missed.
+        refused!(RenewRefused::Feed, |r: &mut Renewed| resign_feed(
+            r,
+            &|f| {
+                f.after = 3;
+                f.through = 3;
+            },
+            &leases
+        ));
+        // It stops short of the number the lease says the gate must hold.
+        refused!(RenewRefused::Feed, |r: &mut Renewed| {
+            resign_lease(r, &|l| l.revocation_seq = 3, &leases);
+        });
+        // It leaves a number out without saying so.
+        refused!(RenewRefused::Feed, |r: &mut Renewed| resign_feed(
+            r,
+            &|f| f.through = 5,
+            &leases
+        ));
+
+        // --- the bundle
+        let offered = |bundle: Envelope| move |r: &mut Renewed| r.bundle = Some(bundle.clone());
+        // Not signed by the root key.
+        let mut unsigned = serde_json::to_value(policy(1, vec![mandates_key().public()])).unwrap();
+        unsigned["kid"] = serde_json::json!("authority-root-9");
+        refused!(
+            RenewRefused::Bundle,
+            offered(serde_json::from_value(unsigned).unwrap())
+        );
+        // Signed by the root, for another Authority.
+        refused!(
+            RenewRefused::Bundle,
+            offered(signed_bundle(2, "authority-2", &[], &root_key()))
+        );
+        // Another bundle under the number the gate already holds.
+        refused!(
+            RenewRefused::BundleForked,
+            offered(signed_bundle(1, "authority", &["extra"], &root_key()))
+        );
+
+        // After all of that the honest answer is still taken, and an answer taken once is
+        // not taken again.
+        let (request, asked) = s.ask(&gate, 30_000).unwrap();
+        let answer = a.renew(&request, now + 1).await.unwrap();
+        s.take(&answer, asked).unwrap();
+        assert_ne!(held(&s), before);
+        let (_, another) = s.ask(&gate, 31_000).unwrap();
+        let after = held(&s);
+        assert_eq!(s.take(&answer, another), Err(RenewRefused::NotThisRequest));
+        assert_eq!(held(&s), after);
+    }
+
+    /// A gate is never taken back to an older bundle, and takes no lease before it has the
+    /// bundle the lease names.
+    #[tokio::test]
+    async fn a_gate_does_not_go_back_to_an_older_bundle() {
+        let (a, gate) = serving(MemoryStore::default()).await;
+        let ana = id("ana");
+        let first = a.latest_bundle().await.unwrap().unwrap().envelope;
+        let mut s = standing("gate-1");
+        round(&a, &mut s, &gate, 1_000, NOW + 1).await;
+        a.publish_bundle(&ana, &policy(2, vec![mandates_key().public()]), NOW + 2)
+            .await
+            .unwrap();
+        round(&a, &mut s, &gate, 2_000, NOW + 3).await;
+        assert_eq!(s.bundle().unwrap().bundle.number, 2);
+        let before = held(&s);
+
+        // Bundle 1 again, with a lease for it: both were signed by the right keys, once.
+        let (request, asked) = s.ask(&gate, 3_000).unwrap();
+        let mut answer = a.renew(&request, NOW + 4).await.unwrap();
+        let old = open_bundle(&first, &root(), &scope()).unwrap();
+        let mut lease = lease_of(&answer);
+        lease.policy_version = old.policy_version();
+        answer.lease = seal(&lease, &leases_key()).unwrap();
+        answer.bundle = Some(first.clone());
+        assert_eq!(s.take(&answer, asked), Err(RenewRefused::BundleOlder));
+        // The same lease without the bundle: it names one the gate does not hold.
+        let (_, asked) = s.ask(&gate, 3_500).unwrap();
+        answer.bundle = None;
+        assert_eq!(s.take(&answer, asked), Err(RenewRefused::WrongBundle));
+        assert_eq!(held(&s), before);
+
+        // A gate with nothing, handed a lease and no bundle, takes neither.
+        let mut empty = standing("gate-1");
+        let (request, asked) = empty.ask(&gate, 10).unwrap();
+        let mut answer = a.renew(&request, NOW + 5).await.unwrap();
+        answer.bundle = None;
+        assert_eq!(empty.take(&answer, asked), Err(RenewRefused::WrongBundle));
+        assert!(empty.lease().is_none() && empty.bundle().is_none());
+
+        // A gate started with a bundle file that is older than what the Authority
+        // publishes is brought forward by its first renewal (GR-132)...
+        let mut stale = Standing::new(scope(), id("gate-1"), id("authority"), root(), Some(old));
+        assert!(!stale.fresh(0));
+        let taken = round(&a, &mut stale, &gate, 20, NOW + 6).await;
+        assert!(taken.bundle_changed && stale.fresh(20));
+        assert_eq!(stale.bundle().unwrap().bundle.number, 2);
+        // ...and one started with a newer bundle than its Authority publishes keeps its
+        // own, and has no lease: something handed it that bundle, or the Authority was
+        // put back.
+        let third =
+            open_bundle(&policy(3, vec![mandates_key().public()]), &root(), &scope()).unwrap();
+        let mut ahead = Standing::new(scope(), id("gate-1"), id("authority"), root(), Some(third));
+        let (request, asked) = ahead.ask(&gate, 30).unwrap();
+        let answer = a.renew(&request, NOW + 7).await.unwrap();
+        assert_eq!(ahead.take(&answer, asked), Err(RenewRefused::BundleOlder));
+        assert_eq!(ahead.bundle().unwrap().bundle.number, 3);
+        assert!(ahead.lease().is_none() && !ahead.fresh(30));
+    }
+
+    /// An Authority whose database was put back from an older copy answers from where it
+    /// stands, and every gate that has heard more refuses it, under a reason of its own
+    /// (review finding GR-168).
+    #[tokio::test]
+    async fn an_authority_that_has_gone_back_is_refused_as_behind() {
+        let (ahead, gate) = serving(MemoryStore::default()).await;
+        let ben = id("ben");
+        let good = ask("refund-bot", "refund-bot:k1", "triage");
+        for _ in 0..3 {
+            let m = as_a_gate(
+                &ahead.issue_mandate(&ben, &good, NOW).await.unwrap(),
+                &RevocationSet::default(),
+            )
+            .unwrap()[0]
+                .id
+                .clone();
+            ahead.revoke_mandate(&ben, &m, NOW).await.unwrap();
+        }
+        let mut s = standing("gate-1");
+        round(&ahead, &mut s, &gate, 1_000, NOW + 1).await;
+        assert_eq!(s.revocations_through(), 3);
+        let before = held(&s);
+
+        // The same installation as it was before those three revocations.
+        let (behind, _) = serving(MemoryStore::default()).await;
+        let (request, asked) = s.ask(&gate, 2_000).unwrap();
+        // The gate names a number this Authority has never reached: it still answers.
+        let answer = behind.renew(&request, NOW + 100).await.unwrap();
+        assert_eq!(lease_of(&answer).revocation_seq, 0);
+        assert_eq!(s.take(&answer, asked), Err(RenewRefused::AuthorityBehind));
+        assert_eq!(held(&s), before);
+
+        // And a clock set back, with nothing else wrong.
+        let (request, asked) = s.ask(&gate, 3_000).unwrap();
+        let answer = ahead.renew(&request, NOW - 3600).await.unwrap();
+        assert_eq!(s.take(&answer, asked), Err(RenewRefused::AuthorityBehind));
+        assert_eq!(held(&s), before);
+        // Once it has caught up, the gate takes its leases again.
+        round(&ahead, &mut s, &gate, 4_000, NOW + 200).await;
+    }
+
+    /// The renewal is a signed document of its own kind: nothing else the gate signs is
+    /// taken for one, and it carries no time.
+    #[test]
+    fn a_renewal_says_what_the_gate_holds_and_no_time() {
+        let gate = gate_key("gate-1");
+        let s = standing("gate-1");
+        let (request, asked) = s.ask(&gate, 77).unwrap();
+        let keys = KeySet::new([gate.public()]);
+        let renew = open::<Renew>(&request, &keys, &scope()).unwrap().doc;
+        assert_eq!(
+            (
+                &renew.gate,
+                &renew.authority,
+                &renew.bundle,
+                renew.revocations_through
+            ),
+            (&id("gate-1"), &id("authority"), &None, 0)
+        );
+        assert_eq!((&asked.nonce, asked.sent_mono_ms), (&renew.nonce, 77));
+        // Two requests never share a nonce.
+        let (again, _) = s.ask(&gate, 77).unwrap();
+        assert_ne!(
+            open::<Renew>(&again, &keys, &scope()).unwrap().doc.nonce,
+            renew.nonce
+        );
+        // It is not a lease, a feed or a request to enrol, whoever signs it.
+        assert!(open::<Lease>(&request, &keys, &scope()).is_err());
+        assert!(open::<RevocationFeed>(&request, &keys, &scope()).is_err());
+        assert!(open::<EnrolRequest>(&request, &keys, &scope()).is_err());
+        let text = {
+            use base64::Engine;
+            let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(&request.payload)
+                .unwrap();
+            String::from_utf8(bytes).unwrap()
+        };
+        assert!(!text.contains("\"at\"") && !text.contains("time"));
+    }
+}
