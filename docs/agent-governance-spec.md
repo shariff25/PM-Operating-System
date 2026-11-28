@@ -644,6 +644,20 @@ reviewer.
   the program; nothing speaks TLS; the Authority's acknowledged position is not kept
   across a restart, so it sends its chain again from the start (the Ledger holds it
   already). With this G4d is built.
+- **G4e-1 built (2026-11-28), from §7.6.4 point 1; not yet read by the reviewer.** On
+  `build/gov-g4e1`. A new crate, `gov-signin`: PM OS's Entra verifier written again with
+  nothing of PM OS in it. Changed from the original: no name or email is read at all;
+  `auth_time` is required beside `acct`, and may not be ahead of the clock; a response is
+  read in pieces up to the size limit. Every test of validation in `crates/entra` is
+  ported (bad signature, algorithm, audience, issuer, tenant, times, nonce, object id,
+  guest, another identity provider, key rotation, a slow or failed key fetch), with three
+  added: the keys are not fetched from an address off the authority that the discovery
+  document names, a redirect is not followed, and an oversized answer is refused. Five
+  rules removed on purpose, each caught. Not ported: the one-use key for PM OS's first
+  link, which Governance has no use for. Limits: tested against a fake identity provider
+  only, never Microsoft; the size limit on a response sent without a length is not
+  tested on its own; asking for `openid` only and discarding the tokens belong to the
+  flow, in G4e-3. Nothing uses the crate yet.
 
 ## Security review of 2026-11-26 (first read; the gate did not pass)
 
