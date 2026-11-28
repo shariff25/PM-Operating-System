@@ -616,6 +616,13 @@ follow-up tracking.
   carries a tag made with the code), and an agent can ask for a delegated mandate. Both
   are on the listener the Authority program already serves. Not yet read by the reviewer;
   no client command uses them yet.
+- **G4e-5 built (2026-11-28), on `build/gov-g4e5`:** the Authority program now serves
+  people (sign-in and the admin routes, on loopback behind a proxy), names its first
+  admin by a command, and has its own key replaced by a command that refuses to run
+  while the program does and can be stopped and run again. Run as programs with fake
+  data and a fake identity provider. With it G4e, and all of G4, is built; not yet read
+  by the reviewer. Still never run against Microsoft: that waits on the owner's Entra
+  app registration.
 
 ## Where the build stands (2026-11-23)
 

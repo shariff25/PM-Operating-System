@@ -718,6 +718,31 @@ reviewer.
   command sends these requests yet (the shim and gate programs still enrol by library in
   the tests); the routes are in the `gov-authority` program through the listener it
   already serves.
+- **G4e-5 built (2026-11-28), from §7.6.4 points 3, 6 and 9; not yet read by the
+  reviewer.** On `build/gov-g4e5`. In the library: an Authority refuses to sign with a key
+  its chain says was replaced (GR-194), and one started with the new key can still ask
+  for the shipment that carries the replacement under the old one. A lock in the
+  Authority's database, held on a session of its own so that a crash frees it. In the
+  `gov-authority` program: it holds that lock while it runs, so a second instance does
+  not start; it serves the listener for people when told its origin, the tenant and
+  client ids and the client secret's file (owner-only, fake data only), on a literal
+  loopback address only; `first-admin` names the first admin and links their account,
+  once; `replace-admin-key` writes the record, ships it under the old key, has the
+  Ledger take the new key, and only then deletes the old private key, keeping its public
+  half. It refuses to run while the program holds the lock, and run again after a stop
+  it goes on from where it was. **Run as programs with fake data and a fake identity
+  provider:** the first admin named; a sign-in through the tenant and a gate registered
+  under the session; a second instance and the key command both refused while the
+  program runs; the key command stopped after the record, then after the shipment, then
+  finished, then run once more with nothing left to do; a program started with the
+  replaced key signing nobody in; the program started with the new key serving again;
+  and the auditor's check passing over the chain across the change of key. Limits and
+  what is not tested: the stops are made with a hidden test flag (fake data only), not
+  by killing the process or taking the Ledger away; the old private key is removed by
+  the file system's delete, not overwritten; a Ledger that never takes the record
+  leaves the command failing with "run this again"; no command enrols a gate or agent
+  over the network yet; the admin listener's limits are not exercised through the
+  program; nothing has run against Microsoft. With this G4e is built, and G4 with it.
 
 ## Security review of 2026-11-26 (first read; the gate did not pass)
 

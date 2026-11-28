@@ -710,6 +710,9 @@ impl Store for Failing {
     async fn forget_session(&self, scope: &Scope, id: &gov_core::Digest) -> StoreResult<()> {
         self.inner.forget_session(scope, id).await
     }
+    async fn admin_key(&self, scope: &Scope) -> StoreResult<Option<gov_authority::NamedKey>> {
+        self.inner.admin_key(scope).await
+    }
     async fn session(
         &self,
         scope: &Scope,
@@ -3051,4 +3054,78 @@ async fn an_agent_delegates_over_the_listener() {
         (again.status().as_u16(), again.text().await.unwrap()),
         (403, String::new())
     );
+}
+
+/// Two instances on one database, as the serving program and the operator's command are.
+/// Once one has replaced the admin-record key, the other, still holding the old one,
+/// writes nothing more (review finding GR-194); started again with the new key, and told
+/// the old one, it ships the replacement under the old key.
+#[tokio::test]
+async fn an_instance_left_with_a_replaced_key_stops_writing() {
+    let Some(mut pg) = TestPg::new().await else {
+        return;
+    };
+    let store = pg.store.take().unwrap();
+    let serving = installed(store.clone()).await;
+    let mut command = authority(store.clone());
+    let ana = id("ana");
+    let next = || key("authority-admin-2", 62);
+    let at = command.replace_admin_key(&ana, next(), NOW).await.unwrap();
+
+    let before = command.records().await.unwrap().len();
+    assert!(matches!(
+        serving.register_gate(&ana, &id("gate-9"), NOW).await,
+        Err(AuthorityError::KeyReplaced)
+    ));
+    assert_eq!(command.records().await.unwrap().len(), before);
+
+    // Started again with the new key alone, it writes; told the old key, it still asks
+    // for the shipment that carries the replacement under it, and stops there.
+    let restarted = Authority::new(store.clone(), scope(), id("authority"), next(), root());
+    restarted
+        .register_gate(&ana, &id("gate-9"), NOW)
+        .await
+        .unwrap();
+    let alone = restarted.shipment(0, 100).await.unwrap().unwrap();
+    assert_eq!(alone.request.kid, next().public().kid);
+    let finishing = Authority::new(store.clone(), scope(), id("authority"), next(), root())
+        .with_replaced_key(admin_key())
+        .await
+        .unwrap();
+    let first = finishing.shipment(0, 100).await.unwrap().unwrap();
+    assert_eq!(first.request.kid, admin_key().public().kid);
+    assert_eq!(first.batch.len() as u64, at);
+    // An Authority whose key no replacement named has nothing to finish.
+    let never = Authority::new(store, scope(), id("authority"), admin_key(), root())
+        .with_replaced_key(next())
+        .await;
+    assert!(matches!(never, Err(AuthorityError::Unknown(_))));
+    pg.drop_schema().await;
+}
+
+/// The lock between the serving program and the command that replaces its key: one holder
+/// at a time, and a holder that goes away without a word frees it.
+#[tokio::test]
+async fn one_holder_of_the_serving_lock_at_a_time() {
+    let Some(mut pg) = TestPg::new().await else {
+        return;
+    };
+    let store = pg.store.take().unwrap();
+    let held = store.serving_lock(&scope()).await.unwrap().unwrap();
+    assert!(store.serving_lock(&scope()).await.unwrap().is_none());
+    let other = Scope::new("acme", "staging").unwrap();
+    let elsewhere = store.serving_lock(&other).await.unwrap().unwrap();
+    // Dropped, as when the program dies: no release is called.
+    drop(held);
+    let mut again = None;
+    for _ in 0..50 {
+        again = store.serving_lock(&scope()).await.unwrap();
+        if again.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    again.unwrap().release().await;
+    elsewhere.release().await;
+    pg.drop_schema().await;
 }
