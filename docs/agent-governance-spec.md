@@ -607,6 +607,22 @@ reviewer.
   (GR-130). Tested for a disabled gate, with and without the earlier checkpoint; the same
   code serves a revoked key, which has no test of its own yet. `clock_skew_secs` no longer
   bears on this finding. Not built: replacing the Authority's admin-record key (point 9).
+- **G4d-4, the Authority's own key, built (2026-11-28), from §7.6.3 point 9; not yet read
+  by the reviewer.** On `build/gov-g4d4c`. An admin replaces the key admin records are
+  signed with: a new record, `admin_key_replaced`, is the last the old key signs and
+  carries the digest of the new key. The Ledger takes the new key only when it matches
+  that digest, answers the old key nothing afterwards, and refuses any later record under
+  it; `gov verify` reports a record signed by any key but the one the chain's last
+  replacement names (GR-166). The shipment that carries the replacement is asked for
+  under the old key, since the Ledger does not know the new one yet. A key enrolled for a
+  gate that bears the Authority's name is never taken as the Authority's. Nine controls
+  broken on purpose, each caught. Limits: this is a planned change, and whoever holds a
+  taken key can write the same record; the Authority keeps the replaced key in memory
+  until the Ledger has the new one, so a restart between the two leaves the replacement
+  unshipped and the old key is needed once more (the program in G4d-5 does the three
+  steps as one); the Authority must be given its earlier public keys to read its own
+  chain. Not built, and moved to G4d-5: the Authority checking that the witness covers
+  its own chain. With this G4d-4 is built as libraries.
 
 ## Security review of 2026-11-26 (first read; the gate did not pass)
 

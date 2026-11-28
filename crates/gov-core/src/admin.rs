@@ -45,6 +45,10 @@ pub enum AdminAction {
     MandateIssued,
     /// An agent, a mandate, a countersignature or a key was revoked.
     Revoked,
+    /// The key these records are signed with was replaced. The record is signed with the
+    /// old key and carries the digest of the new one; every record after it is signed with
+    /// the new key, and the old one is refused from here on (spec §7.6.3, point 9).
+    AdminKeyReplaced,
 }
 
 /// The kind of thing an action was done to.
@@ -151,6 +155,7 @@ impl AdminRecord {
             A::PolicyPublished => (&[K::Policy], &[None], true),
             A::ModeSet => (&[K::System], &[None], true),
             A::MandateIssued => (&[K::Mandate], &[Some(K::Agent)], true),
+            A::AdminKeyReplaced => (&[K::Key], &[None], true),
             A::Revoked => (
                 &[K::Agent, K::Mandate, K::Countersignature, K::Key],
                 &[None],

@@ -238,6 +238,10 @@ impl<S: Store> Ledger<S> {
                 Err(refused())
             };
         }
+        // An Authority's own next key, named by a record in its chain.
+        if self.store.chain_kind(&self.scope, &gate).await? == Some(ChainKind::Admin) {
+            return self.enrol_admin_key(&gate, key).await;
+        }
         self.enrol_gate_key(&gate, key).await
     }
 
@@ -257,7 +261,8 @@ impl<S: Store> Ledger<S> {
             let keys = KeySet::new(held.iter().cloned());
             for stored in self.store.receipts(&self.scope, &authority).await? {
                 let record = open::<AdminRecord>(&stored.envelope, &keys, &self.scope)?.doc;
-                self.grant_trust(&authority, &record).await?;
+                self.grant_trust(&authority, &record, &stored.envelope.kid)
+                    .await?;
                 self.end_trust(&authority, &record).await?;
                 read += 1;
             }
@@ -269,11 +274,33 @@ impl<S: Store> Ledger<S> {
     /// that the key it names can be supplied. Done only for a record the chain holds, and
     /// again when the record comes again, in case the Ledger stopped between keeping it and
     /// noting it. Safe to do twice.
-    async fn grant_trust(&self, authority: &Id, record: &AdminRecord) -> Result<(), LedgerError> {
+    async fn grant_trust(
+        &self,
+        authority: &Id,
+        record: &AdminRecord,
+        signer: &Id,
+    ) -> Result<(), LedgerError> {
+        // The Authority's own key replaced: the new key may be supplied, and the key that
+        // signed this record signs nothing after it (review finding GR-166).
+        if let (AdminAction::AdminKeyReplaced, Some(digest)) = (&record.action, &record.value) {
+            let successor = Enrolment {
+                authority: authority.clone(),
+                gate: authority.clone(),
+                digest: digest.clone(),
+                ended: false,
+            };
+            self.store
+                .note_enrolment(&self.scope, &record.subject.id, &successor)
+                .await?;
+            self.store
+                .retire_keys(&self.scope, authority, Some(signer))
+                .await?;
+        }
         if let (AdminAction::KeyEnrolled, Some(about), Some(digest)) =
             (&record.action, &record.about, &record.value)
         {
-            if about.kind == SubjectKind::Gate {
+            // Never under the Authority's own name: only a replacement names its next key.
+            if about.kind == SubjectKind::Gate && &about.id != authority {
                 let enrolment = Enrolment {
                     authority: authority.clone(),
                     gate: about.id.clone(),
@@ -356,13 +383,18 @@ impl<S: Store> Ledger<S> {
                             // Sent again, perhaps because the Ledger stopped before it
                             // had acted on it: act on it again (GR-123).
                             self.end_trust(authority, &opened.doc).await?;
-                            self.grant_trust(authority, &opened.doc).await?;
+                            self.grant_trust(authority, &opened.doc, &envelope.kid)
+                                .await?;
                             Ok(Ingested::AlreadyHeld)
                         }
                         Some(_) => self.refuse(envelope, "fork", true, now).await,
                         None => self.refuse(envelope, "already_pruned", true, now).await,
                     };
                 }
+            }
+            // A key the Authority has replaced signs no further record.
+            if self.store.key_retired(&self.scope, &envelope.kid).await? {
+                return self.refuse(envelope, "retired_key", true, now).await;
             }
             let new_head = match gov_core::admin::follow(head.as_ref(), &opened) {
                 Ok(h) => h,
@@ -382,7 +414,8 @@ impl<S: Store> Ledger<S> {
                 .await
             {
                 Ok(()) => {
-                    self.grant_trust(authority, &opened.doc).await?;
+                    self.grant_trust(authority, &opened.doc, &envelope.kid)
+                        .await?;
                     return Ok(Ingested::Added);
                 }
                 Err(StoreError::HeadMoved) => continue,

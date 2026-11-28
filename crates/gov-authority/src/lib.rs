@@ -84,6 +84,12 @@ pub struct Authority<S> {
     name: Id,
     /// Signs admin records, and nothing else.
     admin_key: SigningKey,
+    /// The public keys that signed this chain before `admin_key`, to read it with.
+    earlier_admin: Vec<PublicKey>,
+    /// The key just replaced and the number of the record that replaced it. The Ledger
+    /// learns the new key from that record, so the shipment that carries it is still
+    /// asked for under the old one.
+    outgoing: Option<(SigningKey, u64)>,
     /// The root key gates and agents pin when they enrol. This step only hands it out.
     root: PublicKey,
     /// Signs mandates, and nothing else. Absent until the installation has one; an
@@ -196,6 +202,8 @@ impl<S: Store> Authority<S> {
             scope,
             name,
             admin_key,
+            earlier_admin: Vec::new(),
+            outgoing: None,
             root,
             mandates_key: None,
             leases_key: None,
@@ -211,6 +219,19 @@ impl<S: Store> Authority<S> {
         self.mandates_key = Some(mandates);
         self.leases_key = Some(leases);
         self
+    }
+
+    /// The keys this chain was signed with before the one this Authority now holds.
+    pub fn with_earlier_admin_keys(mut self, keys: Vec<PublicKey>) -> Self {
+        self.earlier_admin = keys;
+        self
+    }
+
+    /// Forget the replaced key. For when the Ledger has taken the new one: it answers the
+    /// old key nothing from then on, so anything still to send again is asked for under
+    /// the new key.
+    pub fn settle_admin_key(&mut self) {
+        self.outgoing = None;
     }
 
     pub fn store(&self) -> &S {
@@ -972,6 +993,34 @@ impl<S: Store> Authority<S> {
         })
     }
 
+    /// Replace the key admin records are signed with (spec §7.6.3, point 9). A planned
+    /// change only: whoever holds a taken key can write the same record.
+    pub async fn replace_admin_key(
+        &mut self,
+        actor: &Id,
+        next: SigningKey,
+        now: i64,
+    ) -> Result<u64> {
+        let public = next.public();
+        public.enrolable()?;
+        if public.same_key(&self.admin_key.public()) || public.kid == self.admin_key.public().kid {
+            return Err(AuthorityError::Exists("key"));
+        }
+        let digest = gov_core::enrol::key_digest(&public)?;
+        let seq = on_head!(self, head, {
+            self.admin(actor).await?;
+            let did = Did {
+                value: Some(digest.clone()),
+                ..Did::to(AdminAction::AdminKeyReplaced, SubjectKind::Key, &public.kid)
+            };
+            self.commit(head, actor, did, &[], now).await
+        })?;
+        let old = std::mem::replace(&mut self.admin_key, next);
+        self.earlier_admin.push(old.public());
+        self.outgoing = Some((old, seq));
+        Ok(seq)
+    }
+
     /// Revoke an enrolled key, an agent's or a gate's (spec §7.6.3, point 8). Its number in
     /// the feed is returned. Nothing is issued to it or answered for it afterwards, and
     /// the Ledger retires it when the record arrives.
@@ -1318,7 +1367,12 @@ impl<S: Store> Authority<S> {
 
     /// Every record of this Authority's chain, opened under its own key, in order.
     pub async fn records(&self) -> Result<Vec<AdminRecord>> {
-        let keys = KeySet::new([self.admin_key.public()]);
+        let keys = KeySet::new(
+            self.earlier_admin
+                .iter()
+                .cloned()
+                .chain([self.admin_key.public()]),
+        );
         let mut out = Vec::new();
         let mut after = 0;
         loop {
@@ -1350,11 +1404,13 @@ impl<S: Store> Authority<S> {
     /// The records after `acked`, as a shipment for the Ledger. `None` when there are none.
     /// The Authority's chain goes to the Ledger as a gate's does, and is witnessed with it.
     pub async fn shipment(&self, acked: u64, limit: usize) -> Result<Option<Shipment>> {
+        let outgoing = self.outgoing.as_ref().filter(|(_, last)| acked < *last);
         let batch: Vec<Envelope> = self
             .store
             .records_after(&self.scope, acked, limit)
             .await?
             .into_iter()
+            .take_while(|r| outgoing.is_none_or(|(_, last)| r.seq <= *last))
             .map(|r| r.envelope)
             .collect();
         if batch.is_empty() {
@@ -1371,7 +1427,7 @@ impl<S: Store> Authority<S> {
                 count: batch.len() as u64,
                 batch: batch_digest(&batch),
             },
-            &self.admin_key,
+            outgoing.map_or(&self.admin_key, |(old, _)| old),
         )?;
         Ok(Some(Shipment {
             request,

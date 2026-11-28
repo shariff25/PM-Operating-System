@@ -126,6 +126,9 @@ pub enum Problem {
     /// before the first one that covered the retirement. A receipt written honestly before
     /// and shipped late is reported too.
     ReceiptAfterRetirement,
+    /// An Authority's record is signed with a key other than the one its chain's last
+    /// replacement names: the key was replaced, and went on signing (finding GR-166).
+    RecordUnderReplacedKey,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -273,6 +276,7 @@ pub fn verify(check: &Check<'_>) -> Report {
             prune_tied: false,
         };
         let mut head: Option<ChainHead> = None;
+        let mut successor: Option<Digest> = None;
         if let Some(record) = &gate.pruned {
             match open::<Pruned>(record, &ledger_keys, check.scope) {
                 Ok(p) if p.doc.gate == gate.gate && p.doc.through_seq >= 1 => {
@@ -364,6 +368,24 @@ pub fn verify(check: &Check<'_>) -> Report {
                         }
                         Link::Admin(opened) => {
                             let record = &opened.doc;
+                            if let Some(named) = &successor {
+                                let signer = gate_keys
+                                    .iter()
+                                    .find(|k| k.kid == envelope.kid)
+                                    .and_then(|k| key_digest(k).ok());
+                                if signer.as_ref() != Some(named) {
+                                    find(
+                                        Problem::RecordUnderReplacedKey,
+                                        Some(&gate.gate),
+                                        Some(h.seq),
+                                    );
+                                }
+                            }
+                            if let (AdminAction::AdminKeyReplaced, Some(next)) =
+                                (&record.action, &record.value)
+                            {
+                                successor = Some(next.clone());
+                            }
                             if record.action == AdminAction::MandateIssued {
                                 issued
                                     .entry(record.subject.id.clone())

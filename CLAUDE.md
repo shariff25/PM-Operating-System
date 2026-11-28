@@ -549,6 +549,11 @@ follow-up tracking.
   whether a receipt is earlier than its key's retirement by the witness's checkpoints, not
   by dates (GR-130). Not yet read by the reviewer. Still to build in G4d-4: replacing the
   Authority's admin-record key.
+- **The Authority's own key replaced, built (2026-11-28), on `build/gov-g4d4c`:** a record
+  in the Authority's chain, signed with the old key, names the new one; the Ledger and
+  `gov verify` take nothing under the old key after it. A planned change only: it does not
+  help once a key is taken. With it G4d-4 is built as libraries; not yet read by the
+  reviewer. Next: G4d-5, the programs.
 
 ## Where the build stands (2026-11-23)
 
