@@ -545,6 +545,42 @@ async fn a_gate_with_a_new_key_goes_on_from_receipts_under_its_old_one() {
         .unwrap()
         .doc;
     assert_eq!((closed.phase, closed.intent), (Phase::Outcome, Some(3)));
+
+    // The old key is revoked before what it signed has been shipped: the Ledger still
+    // takes the whole chain, asked for under the new key (review finding GR-187).
+    let link = ledger().await;
+    link.ledger
+        .enrol_gate_key(&id("gate-1"), &new_key().public())
+        .await
+        .unwrap();
+    gov_ledger::Store::retire_keys(
+        link.ledger.store(),
+        &scope(),
+        &id("gate-1"),
+        Some(&gate_key().public().kid),
+    )
+    .await
+    .unwrap();
+    assert!(link.ledger.ingest(&held[0].envelope, T0).await.is_err());
+    gate.ship(&link).await.unwrap();
+    let at_ledger = gov_ledger::Store::head(link.ledger.store(), &scope(), &id("gate-1"))
+        .await
+        .unwrap();
+    assert_eq!(at_ledger.map(|h| h.seq), Some(6));
+    drop(gate);
+
+    // A key does not come back once a later one has signed (GR-188).
+    let backwards = Gate::open_after(
+        config(100),
+        gate_key(),
+        &[new_key().public()],
+        FileSpool::open(dir.path()).unwrap(),
+        T0 + 20,
+    );
+    assert!(matches!(
+        backwards,
+        Err(GateError::Spool(gov_gate::SpoolError::Corrupt))
+    ));
 }
 
 /// Review finding GR-10: an answer the Ledger did not sign, or one that names another hash,

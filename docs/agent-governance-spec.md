@@ -1145,6 +1145,24 @@ shim needs write access to its bundle file, or it follows nothing; and the bundl
 the state file must not share a name stem in one directory, since both write through a
 temporary file named from it.
 
+### Twenty-eighth read, 2026-11-28: G4d-4 (first part and the auditor's order) at `afd7f78`
+
+**Verdict: no High or Critical; the gate passes for both parts.** The reviewer ran the
+tests of the six `gov-*` crates without Postgres (213 passed), not the lint or format
+check. GR-130 is not closed until GR-186 is fixed. Fixed on `build/gov-review-28`; the
+re-read is owed.
+
+| Finding | Severity | What was wrong | What was done |
+|---|---|---|---|
+| GR-186 | Medium, confirmed by a probe | The auditor's order compared a checkpoint's position in one chain's list with a position in another's; the Authority's chain starts earlier, so a receipt first covered after the retirement could pass | Fixed: the checkpoints' own numbers are compared. Tested with the Authority's chain witnessed first, alone |
+| GR-187 | Medium | Revoking a gate's key made the Ledger refuse the receipts it had not yet shipped, and so every receipt after them | Fixed, rule in §7.6.3 point 8: taken only in a shipment asked for under a key of that gate still in use; the auditor reports them. Tested by shipping a rotated chain after the revocation. The test found a second fault: the Ledger read an intent only under the key of the outcome that answers it; it now reads it under its own signer |
+| GR-188 | Low | An earlier key was accepted anywhere in a gate's spool | Fixed: refused once a later key has signed |
+
+Not done: refusing `revoke_key` until the Ledger has acknowledged that key's last receipt
+(the Authority does not see those answers); a test of a revoked key, as distinct from a
+disabled gate, in `gov verify`; the reviewer did not verify that issuing to a revoked
+agent key is refused by the chain check.
+
 ## 1. What is being built
 
 Agent Governance is a second product, separate from PM OS. It has three parts.
@@ -2341,6 +2359,16 @@ check exist in `gov-core` since G1 (§4.6); nothing has used them yet.
    - An admin then revokes the old key (`Revoked`, of a key): the Ledger retires it, and
      the feed carries it, so no gate opens a session for an agent key revoked the same
      way.
+   - **Receipts under a revoked key that were not yet shipped** (GR-187). A chain cannot
+     skip, so refusing them would stop the gate's record at the Ledger from the
+     revocation on. The Ledger takes a receipt under a revoked key of a gate only inside
+     a shipment asked for under a key of that gate still in use; sent any other way it
+     is refused as before. `gov verify` reports each such receipt that no checkpoint
+     shows to be earlier than the revocation (point 10): the record is kept, and marked.
+     A disabled gate has no key in use, so nothing more of its is taken. In a planned
+     change the gate ships what the old key signed before the admin revokes it; the
+     Authority cannot check that, since it does not see the Ledger's answers to a gate.
+   - In a spool, a key does not come back once a later one has signed (GR-188).
 9. **Replacing the Authority's admin-record key** (GR-126). A planned change is a record
    in the Authority's own chain, signed with the old key, that names the new one; records
    after it are signed with the new key, and the Ledger and `gov verify` follow the chain

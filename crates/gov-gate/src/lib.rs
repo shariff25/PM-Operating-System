@@ -239,8 +239,22 @@ impl<S: Spool> Gate<S> {
         // number and hash the spool says it has (review finding GR-51).
         let keys = KeySet::new(earlier.iter().cloned().chain([key.public()]));
         let mut docs = Vec::with_capacity(held.len());
+        // Keys in the order they were used: none comes back once a later one has signed
+        // (review finding GR-188).
+        let order = |kid: &Id| {
+            earlier
+                .iter()
+                .position(|k| &k.kid == kid)
+                .unwrap_or(earlier.len())
+        };
+        let mut latest = 0;
         for r in &held {
             let opened = open::<Receipt>(&r.envelope, &keys, &config.scope)?;
+            let used = order(&r.envelope.kid);
+            if used < latest {
+                return Err(GateError::Spool(SpoolError::Corrupt));
+            }
+            latest = used;
             if opened.doc.seq != r.seq || opened.hash != r.hash || opened.doc.gate != config.gate {
                 return Err(GateError::Spool(SpoolError::Corrupt));
             }

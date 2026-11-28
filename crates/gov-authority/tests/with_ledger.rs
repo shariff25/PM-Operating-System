@@ -358,6 +358,29 @@ async fn the_authoritys_chain_is_witnessed_and_a_gates_key_follows_from_it() {
     let late_only = &checkpoints[1..];
     assert!(problems(&keys, late_only, 60)
         .contains(&(Problem::ReceiptAfterRetirement, Some(id("gate-1")))));
+    // The order is by the checkpoints' own numbers, not by where each stands among those
+    // that name a chain (GR-186): the Authority's chain is witnessed first, alone, and then
+    // one checkpoint covers the receipts and the disabling together.
+    let open_cp = |bytes: &[u8]| {
+        let envelope: Envelope = serde_json::from_slice(bytes).unwrap();
+        gov_core::open::<gov_core::lease::Checkpoint>(&envelope, &ledger_keys(), &scope())
+            .unwrap()
+            .doc
+    };
+    let sealed = |cp: &gov_core::lease::Checkpoint| {
+        (
+            cp.seq,
+            serde_json::to_vec(&seal(cp, &ledger_key()).unwrap()).unwrap(),
+        )
+    };
+    let mut alone_first = open_cp(&checkpoints[0].1);
+    alone_first.heads.retain(|h| h.gate == id("authority"));
+    let mut together = open_cp(&checkpoints[1].1);
+    together.seq = 2;
+    assert!(
+        problems(&keys, &[sealed(&alone_first), sealed(&together)], 60)
+            .contains(&(Problem::ReceiptAfterRetirement, Some(id("gate-1"))))
+    );
     // What was witnessed says which key was enrolled for which gate or agent, in order.
     let enrolled: Vec<Id> = a
         .records()
