@@ -17,7 +17,7 @@ fn listener(per_second: u32, sources: usize) -> Listener<MemoryStore> {
         key("authority-root-1", 61).public(),
     );
     Listener::new(
-        authority,
+        std::sync::Arc::new(authority),
         || 0,
         SourceLimit {
             per_second,

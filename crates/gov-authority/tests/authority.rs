@@ -706,6 +706,9 @@ impl Store for Failing {
     async fn linked(&self, scope: &Scope, link: &gov_core::Digest) -> StoreResult<Option<Id>> {
         self.inner.linked(scope, link).await
     }
+    async fn forget_session(&self, scope: &Scope, id: &gov_core::Digest) -> StoreResult<()> {
+        self.inner.forget_session(scope, id).await
+    }
     async fn session(
         &self,
         scope: &Scope,
@@ -2857,8 +2860,14 @@ async fn signing_in<S: Store>(store: S) {
     let short = a.sign_in(&anas, NOW - 28_000, NOW).await.unwrap();
     assert!(a.session(&short.value, NOW + 799).await.is_ok());
     assert!(a.session(&short.value, NOW + 800).await.is_err());
+    // Signing out of a session that has run out forgets it and records nothing: the
+    // record would be dated after the session's end (GR-203).
+    let records = chain(&a).await.len();
+    assert_eq!(a.sign_out(&short.value, NOW + 800).await.unwrap(), None);
+    assert!(a.sign_out(&short.value, NOW + 800).await.is_err());
+    assert_eq!(chain(&a).await.len(), records);
     let out = a.sign_in(&anas, NOW, NOW).await.unwrap();
-    a.sign_out(&out.value, NOW + 5).await.unwrap();
+    assert!(a.sign_out(&out.value, NOW + 5).await.unwrap().is_some());
     assert!(a.session(&out.value, NOW + 6).await.is_err());
     assert!(a.sign_out(&out.value, NOW + 6).await.is_err());
     assert_eq!(

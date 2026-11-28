@@ -207,6 +207,8 @@ pub trait Store: Send + Sync {
     async fn session(&self, scope: &Scope, id: &Digest) -> StoreResult<Option<SessionRow>>;
     /// Note that a session was used. Not an admin action: nothing is recorded.
     async fn touch_session(&self, scope: &Scope, id: &Digest, now: i64) -> StoreResult<()>;
+    /// Forget a session that has run out. Not an admin action: nothing is recorded.
+    async fn forget_session(&self, scope: &Scope, id: &Digest) -> StoreResult<()>;
     async fn agent(&self, scope: &Scope, id: &Id) -> StoreResult<Option<Agent>>;
     async fn agents_of(&self, scope: &Scope, owner: &Id) -> StoreResult<Vec<Agent>>;
     async fn gate(&self, scope: &Scope, id: &Id) -> StoreResult<Option<Gate>>;
@@ -427,6 +429,12 @@ impl Store for MemoryStore {
     async fn session(&self, scope: &Scope, id: &Digest) -> StoreResult<Option<SessionRow>> {
         let s = self.0.lock().unwrap();
         Ok(s.sessions.get(&(k(scope), id.clone())).cloned())
+    }
+
+    async fn forget_session(&self, scope: &Scope, id: &Digest) -> StoreResult<()> {
+        let mut s = self.0.lock().unwrap();
+        s.sessions.remove(&(k(scope), id.clone()));
+        Ok(())
     }
 
     async fn touch_session(&self, scope: &Scope, id: &Digest, now: i64) -> StoreResult<()> {

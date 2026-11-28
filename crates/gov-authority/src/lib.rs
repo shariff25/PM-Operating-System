@@ -11,6 +11,7 @@
 //! refuses the commit if the head has moved, and the action starts again. Nothing changes
 //! the registry without moving the head, so no check can be overtaken.
 
+pub mod admin_http;
 pub mod http;
 pub mod pg;
 pub mod store;
@@ -119,7 +120,8 @@ struct Origin<'a> {
 }
 
 /// What a person asks for when they ask for a mandate (spec §7.6.2, point 2).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MandateAsk {
     pub agent: Id,
     /// Which of the agent's enrolled keys the mandate is bound to.
@@ -130,11 +132,12 @@ pub struct MandateAsk {
     pub grants: Vec<gov_core::action::Grant>,
     pub life_secs: u64,
     /// Absent ceilings take the template's.
+    #[serde(default)]
     pub limits: gov_core::mandate::Limits,
 }
 
 /// What listing shows of a mandate: never its grants' resources.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct MandateInfo {
     pub id: Id,
     pub agent: Id,
@@ -588,11 +591,16 @@ impl<S: Store> Authority<S> {
         })
     }
 
-    pub async fn sign_out(&self, value: &str, now: i64) -> Result<u64> {
+    /// End a session. One that has already run out is forgotten with no record.
+    pub async fn sign_out(&self, value: &str, now: i64) -> Result<Option<u64>> {
         let id = session_digest(value);
         let Some(row) = self.store.session(&self.scope, &id).await? else {
             return Err(AuthorityError::Refused);
         };
+        if now >= row.until || now.saturating_sub(row.last_used) > self.session_limits.idle_secs {
+            self.store.forget_session(&self.scope, &id).await?;
+            return Ok(None);
+        }
         let by = By {
             id: row.person.clone(),
             session: Some(SessionRef {
@@ -605,6 +613,7 @@ impl<S: Store> Authority<S> {
             self.commit(head, &by, did, &[Effect::DropSession(id.clone())], now)
                 .await
         })
+        .map(Some)
     }
 
     /// Name the installation's first admin. Possible exactly once, while nobody is known.
