@@ -572,6 +572,12 @@ follow-up tracking.
   for all of G4d-4. One Low (GR-189), fixed on `build/gov-review-29` with two of the
   reviewer's points for the programs (a bundle kept before use; a refused gate says so
   and backs off) and the owed test of a revoked key in `gov verify`. Not read again yet.
+- **G4e's design written (2026-11-28), spec §7.6.4,** and sent to the reviewer before any
+  code: people and sign-in against Entra, sessions, and an admin listener. The verifier
+  is written again in Governance, since `crates/entra` depends on a PM OS crate. Each
+  sign-in is a record, so a "verified" act can be checked against one. It will be tested
+  against a fake identity provider only: a run against Microsoft waits on the owner's
+  app registration.
 
 ## Where the build stands (2026-11-23)
 

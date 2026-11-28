@@ -2459,6 +2459,124 @@ program and the gate's renewal loop (point 11), run as four programs with fake d
 the Authority at the moment of an outward call (access governance spec §11; the owner's
 decision).
 
+#### 7.6.4 G4e, people and sign-in (design of 2026-11-28; not built; for the reviewer)
+
+Ends the last stand-in of G4: admin actions made by whoever can run a command. Written
+before any code. Fake data only, as everywhere before the gate passes for a pilot; the
+Entra app registration is the owner's to make, so the tests run against a fake identity
+provider and **nothing here will have been run against Microsoft** when it is first built.
+
+1. **The verifier is written again in Governance** (§7.6, choice 8). `crates/entra`
+   depends on `pmos-contract`, which carries PM OS's roles, and Governance never depends
+   on PM OS (§1.2). A new crate, `gov-signin`, holds the same claim rules and nothing of
+   PM OS: one configured tenant; discovery and keys fetched over HTTPS only (a literal
+   loopback address for tests), with a size cap, a time limit, and a limit on how often
+   an unknown key id causes a fetch; RS256 only; `iss`, `aud` (exactly one, this client),
+   `exp`, `nbf`, `iat`, `nonce` and `tid` all checked; `oid` a GUID; guests refused
+   (`acct` must say member, so the registration needs that optional claim). A person is
+   `(tid, oid)` and nothing else: `email` and `preferred_username` never decide who
+   someone is.
+2. **The flow.** Authorization code with PKCE, as a confidential client of one tenant;
+   the ID token comes from the code exchange, never the front channel. `state`, `nonce`
+   and the PKCE verifier are random, kept at the Authority under a digest of a
+   pre-sign-in cookie, used once, and gone after ten minutes. The return address after
+   sign-in is fixed, not taken from the request. The client secret is read from a file
+   under the key-file rule (owner only; fake data only until a key service exists) and
+   is never logged or put in an error.
+3. **Who a person is in Governance.** Governance's own people table, as built: a name and
+   a role (admin, owner, approver, auditor). An admin links a person to an Entra account
+   by giving the account's object id; the link is an admin record (`PersonLinked`, naming
+   the person and a digest of `(tid, oid)`; the object id itself is not in the chain).
+   There is no linking by name or email at first sign-in. A person with no link cannot
+   sign in; an account linked to nobody is refused with the same bare answer as any other
+   failure. The first admin is made on the Authority's machine by a command, with their
+   object id, and that record says its actor is unverified, as now.
+4. **Sessions.** An opaque 256-bit random value in a cookie (`HttpOnly`, `Secure`,
+   `SameSite=Strict`, host-only, path `/`); the Authority stores only its digest, with
+   the person, the time of sign-in and the time last used. Idle limit 15 minutes,
+   absolute limit 8 hours; both set by the operator, neither unlimited. Every request
+   re-reads the person: offboarded or with a changed role, the session ends or acts with
+   the new role at once. Signing out deletes it. A person removed in Entra keeps a
+   Governance session until its limits run out: a stated limit, bounded by the absolute
+   limit, and ended at once by offboarding them here.
+   - **Each sign-in is a record** (`SignedIn`: the person, a session reference, the
+     time). The reference is a digest of the session value with a label, so it names the
+     session without being usable as one. The witness then covers the fact that a
+     session existed before any act made under it.
+   - **Acts under a session say so.** An admin record's actor is `verified` and carries
+     the session reference; a mandate's `issued_by.session` carries it. `gov verify`
+     reports a verified record, or a mandate with a session, whose reference no earlier
+     `SignedIn` record of the same person in the same chain bears out. This is what the
+     condition on G6 (§7.6.2, point 3) rests on.
+   - **What "verified" proves.** That the Authority, holding its admin-record key, says
+     this person was signed in. Whoever takes that key or the Authority's database can
+     write the same records. It is evidence of who acted while the Authority is honest,
+     and no more; said in the product wherever "verified" is shown.
+   - **Recent sign-in for the acts that change who is trusted:** adding or offboarding
+     an admin, publishing a bundle, revoking a key, disabling a gate. These need a
+     sign-in no older than five minutes (`max_age` asked for, `auth_time` checked);
+     otherwise the answer says to sign in again.
+5. **Requests that change something.** `SameSite=Strict` is not relied on alone: every
+   request that is not a read must carry an `Origin` equal to the configured admin
+   origin, a JSON content type, and a header whose value is a second random value given
+   to the page at sign-in and kept with the session. A read changes nothing.
+6. **Two listeners, two purposes.**
+   - **The admin listener** (new): sign-in, sign-out, and people's calls. It is told its
+     own public origin (`https://…`) and refuses to start with any other scheme unless
+     the address is a literal loopback one and the data is fake. The program still does
+     not speak TLS: it listens on loopback behind a proxy that does, which is the only
+     supported way to serve it. `--plain-http-on-network` does not apply to it.
+   - **The machines' listener** (as built for renewals) gains two routes, each a signed
+     document and no session: `POST /v1/enrol` (a one-time code and the signed request,
+     so a gate or agent on another machine can enrol) and `POST /v1/delegate` (a parent
+     agent's signed request). The per-source limit applies before any work, and wrong
+     codes are also limited per source (GR-117), beside the count per name that cancels
+     a code.
+7. **Routes on the admin listener, first cut.** JSON only; the console's screens are a
+   later slice and will use these.
+
+   | Who | Calls |
+   |---|---|
+   | Anyone signed in | who am I; sign out |
+   | Admin | add, link and offboard a person; register, suspend, resume and disable an agent; register and disable a gate; offer an enrolment code; publish a signed bundle; revoke a key; revoke any mandate |
+   | Owner | issue a mandate to an agent they own; list and revoke their own |
+   | Auditor, admin | list people, agents, gates, keys and mandates, under the rule of §7.6.2 point 5 |
+
+   Each call is the library function that exists, with the session's person as the
+   actor; the library's own checks (role, ownership, last admin) stay the authority, and
+   the listener adds none of its own that the library lacks.
+8. **Bare answers and limits.** Sign-in failures all answer alike and say nothing of
+   why; the reason is counted for the operator. A per-source limit applies to the
+   sign-in routes before any work. No token, code, secret, cookie or object id is
+   logged.
+9. **The Authority's own key, in the program** (the reviewer's points from the
+   twenty-ninth read). Replacing the admin-record key stays an operator's command on
+   the Authority's machine, never a route. The command keeps both private key files
+   until the Ledger has taken the new key: it writes the record; ships under the old key
+   until the Ledger accepts the new one; then moves the old file aside and deletes it.
+   Stopped at any point and run again, it goes on from where it was: if the Ledger
+   already holds the new key (a lost acknowledgement), it asks under the new key.
+
+**Threats this adds, and the answer to each.** A stolen session cookie: short limits,
+`HttpOnly`, recent sign-in for the acts that matter, and offboarding ends it. A forged
+request from another site: point 5. Sign-in started by an attacker and finished by the
+victim: `state` is tied to the victim's own pre-sign-in cookie. A token from another
+tenant or client, or replayed: `tid`, `aud` and a one-use `nonce`. A redirect to
+somewhere else after sign-in: the return address is fixed. A flood of unknown key ids
+making the Authority fetch keys: the fetch limit. An admin who removes every admin: the
+library already refuses.
+
+**Steps.** G4e-1: `gov-signin`, the verifier, against a fake identity provider. G4e-2:
+the link, sessions and their records in the Authority library and both stores, and the
+auditor's check of session references. G4e-3: the admin listener and its routes.
+G4e-4: enrolment and delegation on the machines' listener. G4e-5: the commands (the
+first admin; replacing the admin-record key), and the run as programs, with fake data
+and a fake identity provider.
+
+**Not in G4e:** the console's screens; groups from the token; approvals and the page
+the gate serves for them (G6); any sign-in other than Entra; a run against Microsoft,
+which waits on the owner's app registration.
+
 ## 8. The seam in PM OS
 
 ### 8.1 Where
