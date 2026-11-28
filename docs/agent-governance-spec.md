@@ -1119,6 +1119,16 @@ its findings are from reading. **GR-181 and GR-182 are to be fixed before G4d-5.
 | GR-184 | Low | The bundle is handed to anyone who knows an open session's id, which is on every receipt | Accepted for this release on a condition now stated here: **a bundle never holds a secret, and every agent of the tenant may read all of it.** With more than one tenant, or a rule an agent should not learn, the request must carry a proof under the session's key |
 | GR-185 | Info | The call that crosses a bundle change fails its proof; an operator cannot tell a publish from an attack without reading receipts | Open: before enforce mode the shim retries once after it follows, or the call gets a reason of its own |
 
+### Twenty-seventh read, 2026-11-28: the fixes at `f0bcd06`
+
+**Verdict: no High or Critical, and no new findings.** GR-177, GR-178, GR-180, GR-181 and
+GR-182 are closed; GR-183 is closed from reading only; GR-184 is accepted on its stated
+condition; GR-185 stays open before enforce mode. The reviewer ran the tests of four crates
+without Postgres, and did not run the lint or the format check. Two notes for G4d-5: a
+shim needs write access to its bundle file, or it follows nothing; and the bundle file and
+the state file must not share a name stem in one directory, since both write through a
+temporary file named from it.
+
 ## 1. What is being built
 
 Agent Governance is a second product, separate from PM OS. It has three parts.

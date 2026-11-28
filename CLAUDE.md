@@ -543,6 +543,12 @@ follow-up tracking.
   from the receipts it signed with the old one. Libraries and tests; not yet read by the
   reviewer. Still to build in G4d-4: replacing the Authority's admin-record key, and the
   witness's order in `gov verify`.
+- **Twenty-seventh read (2026-11-28), at `f0bcd06`:** no High or Critical and no new
+  findings; the fixes from the twenty-fifth and twenty-sixth reads are closed.
+- **The auditor's order built (2026-11-28), on `build/gov-g4d4b`:** `gov verify` judges
+  whether a receipt is earlier than its key's retirement by the witness's checkpoints, not
+  by dates (GR-130). Not yet read by the reviewer. Still to build in G4d-4: replacing the
+  Authority's admin-record key.
 
 ## Where the build stands (2026-11-23)
 
