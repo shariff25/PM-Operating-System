@@ -1379,6 +1379,27 @@ before real use. Fixed on `build/gov-g4e3`, not yet read again.
 | GR-203 | Low | Signing out of a session that had run out wrote a verified record dated after its end, which the auditor then reported | Fixed: past either limit the session is forgotten and nothing is recorded |
 | GR-204 | Low, with G4e-3 | A route passing a bare name where the session is meant would compile, record the act as unverified and skip the recent-sign-in rule | A test walks every changing route of the listener and holds its record to "verified" and the session. Not done: a type only a session can produce |
 
+### Thirty-fourth and thirty-fifth reads, 2026-11-28: G4e-3 at `078a098`, G4e-4 at `36990de`
+
+**Verdict: no High or Critical; G4e-3 and G4e-4 pass.** GR-193, GR-199, GR-200 (the
+caller's side) and GR-202 to GR-204 are closed. The reviewer ran the governance crates'
+tests without Postgres (234, then 122 for two crates), not the lint or format check, and
+did not repeat the control removals. G4e-4 has no finding. Fixed on `build/gov-g4e5`,
+before the listener went into a pushed program; not yet read again.
+
+| Finding | Severity | What was wrong | What was done |
+|---|---|---|---|
+| GR-205 | Medium, before G4e-5 | A refused request still counted toward the overall sign-in limit, so one address could use it up for everyone | Fixed: a client is held to its own limit first; only what passes counts overall |
+| GR-206 | Low, before G4e-5 | The client's address was the whole first header value, so a caller behind an appending proxy could vary it | Fixed: the last entry of the last line, parsed as an address (IPv6 by its /64); a request with the header named and no address in it is refused |
+| GR-207 | Low | The pre-sign-in cookie could be planted from a sibling host | Fixed: `__Host-gov_pre` with `Path=/` on https |
+| GR-208 | Low | An ordinary sign-in asked the tenant for no bounded age, and a too-old one was counted as an unlinked account | Fixed: `max_age` is always sent (the absolute limit; 0 when a recent sign-in is asked); a too-old sign-in has its own reason |
+
+Also done: a refused delegation's reason is counted for the operator. Notes kept for
+later: a client command for enrolment must treat a refusal after sending as "possibly
+enrolled"; a sweep of run-out sessions is needed before real use (through the listener
+such a session is removed only by offboarding); the auditor's listings of people,
+agents, gates and keys are still owed.
+
 ## 1. What is being built
 
 Agent Governance is a second product, separate from PM OS. It has three parts.
@@ -2761,7 +2782,10 @@ provider and **nothing here will have been run against Microsoft** when it is fi
    in the header the operator's proxy sets. A stranger drops the cookie each time and
    would meet only the overall limit, using it up for everyone, so **the header must be
    named whenever the origin is not loopback**: without it the listener does not start.
-   That header is read on the admin listener only. The verifier's own reason for a
+   That header is read on the admin listener only, and only its last entry: the proxy
+   must set or append it itself, and must pass the browser's `Host` through unchanged.
+   A client is held to its own limit first, and only what that lets through counts
+   toward the overall one (GR-205). The verifier's own reason for a
    failure (a guest, a missing claim, a bad token) goes to the operator's count and
    never to the caller. No token, code, secret, cookie or object id is
    logged.

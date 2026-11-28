@@ -47,6 +47,8 @@ pub struct Counters {
     pub renewed: AtomicU64,
     pub enrolled: AtomicU64,
     pub delegated: AtomicU64,
+    /// Why delegations were refused. The caller is told none of it.
+    pub delegation_refused: Mutex<std::collections::BTreeMap<String, u64>>,
     pub refused: AtomicU64,
     pub limited: AtomicU64,
     pub failed: AtomicU64,
@@ -69,7 +71,7 @@ struct Seen {
 }
 
 /// An IPv6 source is its /64: one host is given that many addresses.
-fn source_of(ip: IpAddr) -> [u8; 16] {
+pub(crate) fn source_of(ip: IpAddr) -> [u8; 16] {
     match ip {
         IpAddr::V4(v4) => v4.to_ipv6_mapped().octets(),
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
@@ -203,7 +205,13 @@ async fn delegate<S: Store + 'static>(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
         // Whatever the reason, a caller that may be anyone is told only that.
-        Err(_) => {
+        Err(why) => {
+            *l.counters
+                .delegation_refused
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .entry(why.to_string())
+                .or_insert(0) += 1;
             l.counters.refused.fetch_add(1, Ordering::Relaxed);
             StatusCode::FORBIDDEN.into_response()
         }

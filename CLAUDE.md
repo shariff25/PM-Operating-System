@@ -623,6 +623,10 @@ follow-up tracking.
   data and a fake identity provider. With it G4e, and all of G4, is built; not yet read
   by the reviewer. Still never run against Microsoft: that waits on the owner's Entra
   app registration.
+- **Thirty-fourth and thirty-fifth reads (2026-11-28), at `078a098` and `36990de`:** no
+  High or Critical; G4e-3 and G4e-4 pass. One Medium (GR-205: one caller could use up the
+  sign-in limit for everyone) and three Low on the listener, fixed on `build/gov-g4e5`
+  before the listener reached a pushed program; not read again yet.
 
 ## Where the build stands (2026-11-23)
 

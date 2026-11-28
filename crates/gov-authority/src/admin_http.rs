@@ -29,7 +29,7 @@ const MAX_TOKEN_ANSWER: usize = 64 * 1024;
 /// How long a sign-in may take from its start to the code coming back.
 const FLOW_SECS: i64 = 600;
 const MAX_FLOWS: usize = 10_000;
-const PRE_COOKIE: &str = "gov_pre";
+
 const CSRF_HEADER: &str = "x-gov-csrf";
 
 pub struct AdminConfig {
@@ -55,7 +55,7 @@ struct Flow {
 struct Rate {
     second: i64,
     total: u32,
-    by_client: HashMap<String, u32>,
+    by_client: HashMap<[u8; 16], u32>,
 }
 
 #[derive(Default)]
@@ -177,14 +177,34 @@ impl<S: Store + 'static> Admin<S> {
             .unwrap_or(HeaderValue::from_static(""))
     }
 
+    /// The pre-sign-in cookie. Host-only on https, so a sibling host cannot plant one
+    /// (review finding GR-207).
+    fn pre_cookie(&self) -> (&'static str, &'static str) {
+        if self.secure {
+            ("__Host-gov_pre", "/")
+        } else {
+            ("gov_pre", "/v1/signin")
+        }
+    }
+
+    /// The caller's address as the proxy wrote it: the last entry of the last line of
+    /// the named header. What comes before it is the caller's own text (GR-206).
+    fn client(&self, headers: &HeaderMap) -> Option<Option<[u8; 16]>> {
+        let name = self.config.client_header.as_ref()?;
+        Some(
+            headers
+                .get_all(name)
+                .iter()
+                .next_back()
+                .and_then(|v| v.to_str().ok())
+                .and_then(|line| line.rsplit(',').next())
+                .and_then(|last| last.trim().parse::<std::net::IpAddr>().ok())
+                .map(crate::http::source_of),
+        )
+    }
+
     fn within_limit(&self, headers: &HeaderMap, now: i64) -> bool {
-        let client = self
-            .config
-            .client_header
-            .as_ref()
-            .and_then(|name| headers.get(name))
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
+        let client = self.client(headers);
         let mut rate = self.rate.lock().unwrap_or_else(|p| p.into_inner());
         if rate.second != now {
             *rate = Rate {
@@ -192,14 +212,24 @@ impl<S: Store + 'static> Admin<S> {
                 ..Rate::default()
             };
         }
-        rate.total += 1;
-        let mut ok = rate.total <= self.config.sign_ins_per_second;
-        if let Some(client) = client {
-            let seen = rate.by_client.len();
-            let count = rate.by_client.entry(client).or_insert(0);
-            *count += 1;
-            ok &= *count <= self.config.sign_ins_per_client_per_second && seen < MAX_FLOWS;
-        }
+        // A client is held to its own limit first, and only what that lets through
+        // counts toward everyone's: one caller cannot use the whole up (GR-205).
+        let own = match client {
+            None => true,
+            // The header is named and this request has none the proxy could have set.
+            Some(None) => false,
+            Some(Some(client)) => {
+                let known =
+                    rate.by_client.len() < MAX_FLOWS || rate.by_client.contains_key(&client);
+                let count = rate.by_client.entry(client).or_insert(0);
+                *count += 1;
+                known && *count <= self.config.sign_ins_per_client_per_second
+            }
+        };
+        let ok = own && {
+            rate.total += 1;
+            rate.total <= self.config.sign_ins_per_second
+        };
         if !ok {
             self.counters.limited.fetch_add(1, Ordering::Relaxed);
         }
@@ -331,9 +361,13 @@ async fn start<S: Store + 'static>(
         ("code_challenge", challenge),
         ("code_challenge_method", "S256".into()),
     ];
-    if asked.recent {
-        params.push(("max_age", "0".into()));
-    }
+    // Always bounded: a tenant sign-in older than a session may last opens none here.
+    let max_age = if asked.recent {
+        0
+    } else {
+        a.authority.session_limits().absolute_secs
+    };
+    params.push(("max_age", max_age.to_string()));
     let Ok(to) = reqwest::Url::parse_with_params(&meta.authorization_endpoint, &params) else {
         return a.failed("unavailable");
     };
@@ -354,10 +388,11 @@ async fn start<S: Store + 'static>(
         );
     }
     // Lax, not Strict: it must come back on the navigation from the tenant.
+    let (pre_name, pre_path) = a.pre_cookie();
     let kept = a.set_cookie(
-        PRE_COOKIE,
+        pre_name,
         &pre,
-        &format!("SameSite=Lax; Path=/v1/signin; Max-Age={FLOW_SECS}"),
+        &format!("SameSite=Lax; Path={pre_path}; Max-Age={FLOW_SECS}"),
     );
     (
         StatusCode::FOUND,
@@ -388,7 +423,8 @@ async fn callback<S: Store + 'static>(
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     }
     // The flow is used once, whatever comes of it.
-    let flow = cookie(&headers, PRE_COOKIE).and_then(|pre| {
+    let (pre_name, pre_path) = a.pre_cookie();
+    let flow = cookie(&headers, pre_name).and_then(|pre| {
         a.flows
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -453,6 +489,13 @@ async fn callback<S: Store + 'static>(
         tid: who.tid,
         oid: who.oid,
     };
+    if now
+        >= who
+            .auth_time
+            .saturating_add(a.authority.session_limits().absolute_secs)
+    {
+        return a.failed("signed_in_too_long_ago");
+    }
     let signed = match a.authority.sign_in(&account, who.auth_time, now).await {
         Ok(signed) => signed,
         Err(_) => return a.failed("not_linked"),
@@ -466,7 +509,11 @@ async fn callback<S: Store + 'static>(
     );
     headers.append(
         header::SET_COOKIE,
-        a.set_cookie(PRE_COOKIE, "", "SameSite=Lax; Path=/v1/signin; Max-Age=0"),
+        a.set_cookie(
+            pre_name,
+            "",
+            &format!("SameSite=Lax; Path={pre_path}; Max-Age=0"),
+        ),
     );
     // This page's address holds the spent code.
     headers.insert(

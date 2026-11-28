@@ -373,6 +373,10 @@ impl<S: Store> Authority<S> {
         self
     }
 
+    pub fn session_limits(&self) -> SessionLimits {
+        self.session_limits
+    }
+
     pub fn with_session_limits(mut self, limits: SessionLimits) -> Self {
         self.session_limits = limits;
         self
