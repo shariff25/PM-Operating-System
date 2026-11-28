@@ -588,6 +588,10 @@ follow-up tracking.
 - **G4e-1 built (2026-11-28), on `build/gov-g4e1`:** `gov-signin`, the Entra token
   verifier written again for Governance with no PM OS dependency, tested against a fake
   identity provider only. Nothing uses it yet; not yet read by the reviewer.
+- **Thirty-second read (2026-11-28), at `47a0278`:** no High or Critical. G4e-1 passes
+  and **G4e-2 may be built**. Four Low points (the rest of GR-190 and GR-196; GR-200:
+  `localhost` taken for loopback; GR-201: an unchecked sum) are fixed or written into
+  §7.6.4 on `build/gov-review-32`; not read again yet.
 
 ## Where the build stands (2026-11-23)
 

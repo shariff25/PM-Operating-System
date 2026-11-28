@@ -1,5 +1,5 @@
 //! Microsoft Entra ID tokens for Agent Governance (spec §7.6.4, point 1): the claim rules
-//! of Governance's verifier, written again here because Governance depends on nothing of Governance.
+//! of PM OS's verifier, written again here because Governance depends on nothing of PM OS.
 //!
 //! [`Verifier::validate`] checks: RS256 only, signed by a key the tenant publishes, `iss`
 //! exactly the tenant's v2.0 issuer, `aud` this client alone, `exp`/`nbf`/`iat` within
@@ -37,8 +37,7 @@ pub const DEFAULT_REFETCH_AFTER: StdDuration = StdDuration::from_secs(60);
 /// After a failed fetch, the least time before the next (shortened to the refetch interval
 /// when that is shorter).
 pub const FAILED_FETCH_BACKOFF: StdDuration = StdDuration::from_secs(5);
-/// The longest a discovery or JWKS fetch may take. Under the tool server client's 5 seconds,
-/// so a first link on a cold cache still answers within the caller's budget.
+/// The longest a discovery or JWKS fetch may take.
 pub const FETCH_TIMEOUT: StdDuration = StdDuration::from_secs(4);
 /// The largest discovery or JWKS response read.
 pub const MAX_RESPONSE: usize = 256 * 1024;
@@ -55,10 +54,10 @@ pub fn is_guid(v: &str) -> bool {
             .all(|(g, n)| g.len() == n && g.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
-/// Does `url` name a loopback host (`localhost`, `127.0.0.0/8`, `::1`)?
+/// Does `url` name a literal loopback address (`127.0.0.0/8`, `::1`)? Not `localhost`,
+/// which is whatever the machine's resolver says (review finding GR-200).
 pub fn is_loopback_host(url: &reqwest::Url) -> bool {
     match url.host_str() {
-        Some(h) if h.eq_ignore_ascii_case("localhost") => true,
         Some(h) => h
             .trim_start_matches('[')
             .trim_end_matches(']')
@@ -143,6 +142,12 @@ impl Tenant {
             authority: authority_setting(vars[2], authority)?,
             jwks_refetch_after: DEFAULT_REFETCH_AFTER,
         })
+    }
+
+    /// Whether the authority is reached without TLS, which only a literal loopback
+    /// address can be. A caller serving anything but fake data refuses such a tenant.
+    pub fn plain_http(&self) -> bool {
+        self.authority.starts_with("http://")
     }
 
     /// The only issuer accepted: `<authority>/<tenant id>/v2.0`.
@@ -319,8 +324,8 @@ pub struct Verifier {
     tenant: Tenant,
     http: reqwest::Client,
     metadata: tokio::sync::Mutex<MetadataCache>,
-    /// The keys. Never held across a fetch (the re-check of eb24d28, LC): a token under a
-    /// known key is checked at once, even while the keys are being fetched.
+    /// The keys. Never held across a fetch: a token under a known key is checked at once,
+    /// even while the keys are being fetched.
     keys: std::sync::Mutex<KeyCache>,
     /// One fetch of the keys at a time: concurrent requests for an unknown `kid` wait for the
     /// one fetch in flight (at most [`FETCH_TIMEOUT`]) and read what it found.
@@ -465,9 +470,8 @@ impl Verifier {
     /// day old (after a failure, not again for the backoff), and an unknown `kid` refetches
     /// them at most once per `jwks_refetch_after`. A fetch runs outside the cache's lock, one
     /// at a time (concurrent requests wait for it and read its result), within
-    /// [`FETCH_TIMEOUT`] for the discovery document and the keys together, so a first link
-    /// on a cold cache answers inside the caller's 5 seconds (LC). Fails closed: a key that
-    /// can't be read signs nothing in.
+    /// [`FETCH_TIMEOUT`] for the discovery document and the keys together. Fails closed: a
+    /// key that can't be read signs nothing in.
     async fn key(&self, kid: &str) -> Result<DecodingKey, Failure> {
         if let Some(found) = self.cached(kid) {
             return found;
@@ -576,13 +580,14 @@ impl Verifier {
             return Err(Failure::Failed("token audience"));
         }
         let t = now.timestamp();
-        if t >= claims.exp + SKEW_SECONDS {
+        if t >= claims.exp.saturating_add(SKEW_SECONDS) {
             return Err(Failure::Failed("token expired"));
         }
-        if claims.nbf.is_some_and(|nbf| t + SKEW_SECONDS < nbf) {
+        let soon = t.saturating_add(SKEW_SECONDS);
+        if claims.nbf.is_some_and(|nbf| soon < nbf) {
             return Err(Failure::Failed("token not yet valid"));
         }
-        if t + SKEW_SECONDS < claims.iat || claims.iat > claims.exp {
+        if soon < claims.iat || claims.iat > claims.exp {
             return Err(Failure::Failed("token issued in the future"));
         }
         if !claims
@@ -623,7 +628,7 @@ impl Verifier {
         let auth_time = claims
             .auth_time
             .ok_or(Failure::Misconfigured("no auth_time claim"))?;
-        if auth_time > t + SKEW_SECONDS {
+        if auth_time > soon {
             return Err(Failure::Failed("token authenticated in the future"));
         }
         Ok(Identity {

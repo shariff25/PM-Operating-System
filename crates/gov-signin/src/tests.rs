@@ -46,6 +46,7 @@ fn settings_are_checked() {
         .contains("CLIENT must be a GUID"));
     for (authority, want) in [
         ("http://idp.example.com", "https unless"),
+        ("http://localhost:9", "https unless"),
         ("https://idp.example.com/tenant", "no path"),
         ("not a url", "must be a URL"),
     ] {
@@ -54,6 +55,7 @@ fn settings_are_checked() {
     }
     let t = Tenant::from_settings(vars, TENANT, CLIENT, Some("http://127.0.0.1:9/")).unwrap();
     assert_eq!(t.authority, "http://127.0.0.1:9");
+    assert!(t.plain_http() && !ok.plain_http());
 }
 
 #[tokio::test]
@@ -216,7 +218,7 @@ async fn every_bad_token_is_refused() {
             sign(&base, keys::KEY_A_DER, "key-z"),
             Failure::Failed("unknown signing key"),
         ),
-        // The re-check of eb24d28's missing tests. A v1-format token (issuer
+        // A v1-format token (issuer
         // `https://sts.windows.net/<tid>/`, `ver` 1.0) for this very tenant and app: refused,
         // only the v2.0 issuer is accepted.
         (
@@ -273,6 +275,11 @@ async fn every_bad_token_is_refused() {
         let token = good(&with("idp", json!(idp_value)));
         assert!(v.validate(&token, NONCE, now).await.is_ok(), "{idp_value}");
     }
+    // Times at the top of the range are compared without overflow (GR-201).
+    assert!(v
+        .validate(&good(&with("exp", json!(i64::MAX))), NONCE, now)
+        .await
+        .is_ok());
     // And `acct` as the string "0".
     assert!(v
         .validate(&good(&with("acct", json!("0"))), NONCE, now)

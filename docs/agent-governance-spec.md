@@ -1260,6 +1260,26 @@ answered in §7.6.4 on `build/gov-review-30`; the reviewer has not read the chan
 The reviewer's conditions on the new verifier, and its notes on what a sign-in record
 does and does not show, are in points 1 and 4.
 
+### Thirty-second read, 2026-11-28: the fixes, the changed G4e text and G4e-1, at `47a0278`
+
+**Verdict: no High or Critical; G4e-1 passes, and G4e-2 may be built** on the changed
+text for GR-195 and GR-198. GR-191, GR-192, GR-193 to GR-195 and GR-197 to GR-199 are
+closed or answered. The reviewer ran the tests of the six `gov-*` crates (220 passed)
+and of `gov-signin` (7 passed) without Postgres, not the lint or format check. Fixed on
+`build/gov-review-32`, not yet read again.
+
+| Finding | Severity | What was wrong | What was done |
+|---|---|---|---|
+| GR-190, the rest | Low | Late sources shared one source's allowance (20 a second), so filling the table and 20 more requests still shut gates out; a /48 is enough | Fixed: late sources have an allowance of their own, 1,000 a second by default |
+| GR-196, the rest | Low, before G4e-3 | Without the proxy's header a stranger meets only the overall sign-in limit and can use it up | In the text, point 8: the header must be named whenever the origin is not loopback |
+| GR-200 | Low, before the verifier is wired to a listener | `localhost` counted as loopback for a plain-HTTP authority, and nothing tied a plain authority to fake data | Fixed: a literal loopback address only; `Tenant::plain_http` for the caller, which refuses it unless the data is fake (G4e-3) |
+| GR-201 | Low | Unchecked addition on a token's times | Fixed: saturating; a token whose `exp` is the largest number is checked without overflow |
+
+Also done: `Referrer-Policy: no-referrer` on the page the callback serves, and a lock a
+crash releases, are in the text (points 4 and 9); the verifier's comments no longer
+speak of PM OS's services; the verifier's reason for a failure is not to reach the
+caller (point 8).
+
 ## 1. What is being built
 
 Agent Governance is a second product, separate from PM OS. It has three parts.
@@ -2557,7 +2577,8 @@ provider and **nothing here will have been run against Microsoft** when it is fi
 4. **Sessions.** An opaque 256-bit random value in a cookie named with the `__Host-`
    prefix (`HttpOnly`, `Secure`, `SameSite=Strict`, host-only, path `/`). The first page
    after sign-in is served directly by the callback, not by a redirect that would need
-   the new cookie (GR-197). The Authority stores only the value's digest, with
+   the new cookie (GR-197); its address holds the spent code, so it is sent with
+   `Referrer-Policy: no-referrer`. The Authority stores only the value's digest, with
    the person, the time of sign-in and the time last used. Idle limit 15 minutes,
    absolute limit 8 hours; both set by the operator, neither unlimited. Every request
    re-reads the person: offboarded or with a changed role, the session ends or acts with
@@ -2636,9 +2657,13 @@ provider and **nothing here will have been run against Microsoft** when it is fi
 8. **Bare answers and limits.** Sign-in failures all answer alike and say nothing of
    why; the reason is counted for the operator. Behind the proxy every caller is
    loopback, so the limit on the sign-in routes is not by address (GR-196): there is
-   one overall limit, one for each pre-sign-in cookie, and, where the operator names the
-   header their proxy sets, one for each client address in it. That header is read on
-   the admin listener only. No token, code, secret, cookie or object id is
+   one overall limit, one for each pre-sign-in cookie, and one for each client address
+   in the header the operator's proxy sets. A stranger drops the cookie each time and
+   would meet only the overall limit, using it up for everyone, so **the header must be
+   named whenever the origin is not loopback**: without it the listener does not start.
+   That header is read on the admin listener only. The verifier's own reason for a
+   failure (a guest, a missing claim, a bad token) goes to the operator's count and
+   never to the caller. No token, code, secret, cookie or object id is
    logged.
 9. **The Authority's own key, in the program** (the reviewer's points from the
    twenty-ninth read). Replacing the admin-record key stays an operator's command on
@@ -2655,6 +2680,8 @@ provider and **nothing here will have been run against Microsoft** when it is fi
      Ledger refuses. And the command runs only with the program stopped: the program
      holds a lock in the Authority's database while it serves, the command refuses
      while that lock is held, and the program is then started with the new key's file.
+     The lock is one a crash releases (a database session lock), not a row that outlives
+     the process.
 
 **Threats this adds, and the answer to each.** A stolen session cookie: short limits,
 `HttpOnly`, recent sign-in for the acts that matter, and offboarding ends it. A forged

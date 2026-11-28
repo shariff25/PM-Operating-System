@@ -27,6 +27,9 @@ pub const MAX_ANSWER: usize = 8 * 1024 * 1024;
 pub struct SourceLimit {
     pub per_second: u32,
     pub sources: usize,
+    /// Requests a second answered to sources that came after the table was full: sized
+    /// to what the machine can check, not to one source's share (GR-190).
+    pub late_per_second: u32,
 }
 
 impl Default for SourceLimit {
@@ -34,6 +37,7 @@ impl Default for SourceLimit {
         SourceLimit {
             per_second: 20,
             sources: 4096,
+            late_per_second: 1000,
         }
     }
 }
@@ -103,11 +107,10 @@ impl<S> Listener<S> {
                 *count += 1;
                 true
             }
-            // A full table must not shut out every gate not yet in it: late sources
-            // share one source's allowance (review finding GR-190).
+            // A full table must not shut out every gate not yet in it.
             None if sources >= self.limit.sources => {
                 seen.late += 1;
-                seen.late <= self.limit.per_second
+                seen.late <= self.limit.late_per_second
             }
             None => {
                 seen.by_source.insert(source_of(source), 1);
