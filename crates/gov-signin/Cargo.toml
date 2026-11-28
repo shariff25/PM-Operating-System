@@ -1,0 +1,27 @@
+[package]
+name = "gov-signin"
+description = "Agent Governance: Microsoft Entra ID token validation for people's sign-in. Nothing of PM OS is depended on."
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+base64.workspace = true
+chrono.workspace = true
+jsonwebtoken.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+tokio.workspace = true
+# `testing` only: a fake identity provider for other crates' tests.
+axum = { workspace = true, optional = true }
+
+[features]
+test-support = ["dep:axum"]
+
+[dev-dependencies]
+axum.workspace = true

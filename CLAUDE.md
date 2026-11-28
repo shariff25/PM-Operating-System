@@ -585,6 +585,9 @@ follow-up tracking.
   GR-194: the serving program after the admin-record key is replaced; GR-195: guarding
   the link between a person and an account) and four Low are answered in §7.6.4, not yet
   read again. The app registration now needs `auth_time` as well as `acct`.
+- **G4e-1 built (2026-11-28), on `build/gov-g4e1`:** `gov-signin`, the Entra token
+  verifier written again for Governance with no PM OS dependency, tested against a fake
+  identity provider only. Nothing uses it yet; not yet read by the reviewer.
 
 ## Where the build stands (2026-11-23)
 
