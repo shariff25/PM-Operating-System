@@ -231,7 +231,11 @@ async fn an_agents_calls_are_proven_only_while_the_gate_holds_a_fresh_lease_and_
     let forwarder = Forwarder::new(
         gate,
         ForwarderConfig {
-            authority: Some(FromAuthority { standing, mono }),
+            authority: Some(FromAuthority {
+                standing,
+                mono,
+                keep: None,
+            }),
             upstream: format!("http://{upstream}/mcp"),
             map: map(),
             call_timeout: Duration::from_secs(5),
@@ -446,6 +450,7 @@ async fn a_lease_for_another_bundle_than_the_gate_decides_from_is_not_complete()
                     standing,
                     // This test's own clock, which stands still: the other test moves its.
                     mono: || 5,
+                    keep: None,
                 }),
                 upstream: format!("http://{upstream}/mcp"),
                 map: map(),
@@ -656,6 +661,9 @@ fn answer_with(request: &Envelope, at: i64, latest: &Envelope) -> Renewed {
     }
 }
 
+/// Every bundle a gate here was asked to keep for its next start.
+static KEPT: std::sync::Mutex<Vec<Envelope>> = std::sync::Mutex::new(Vec::new());
+
 /// A gate started on `first`, with an Authority, and its address.
 async fn gate_on(
     dir: &std::path::Path,
@@ -698,6 +706,12 @@ async fn gate_on(
             authority: Some(FromAuthority {
                 standing,
                 mono: || 5,
+                keep: Some(Box::new(|bundle| {
+                    KEPT.lock().unwrap().push(bundle.clone());
+                    // The third cannot be kept, as when the disk is full.
+                    open_bundle(bundle, &root().public(), &scope())
+                        .is_ok_and(|b| b.bundle.number != 3)
+                })),
             }),
             upstream: format!("http://{upstream}/mcp"),
             map: opened.bundle.connectors[0].clone(),
@@ -833,6 +847,11 @@ async fn the_gate_changes_bundle_without_a_restart_and_the_shim_follows_it() {
     //    not heard yet: its proof is for the action as the old map reads it, and fails.
     assert!(renew_to(&forwarder, wall + 1, &second).await);
     assert_eq!(forwarder.policy().version, Some(version(&second)));
+    assert!(KEPT.lock().unwrap().contains(&second));
+    assert_eq!(
+        forwarder.counters.bundle_not_kept.load(Ordering::Relaxed),
+        0
+    );
     tool_call(shim_addr, 20).await;
     // 3. The gate's answer named its bundle; the shim fetched and checked it. Proven again,
     //    under the same session.
@@ -863,6 +882,10 @@ async fn the_gate_changes_bundle_without_a_restart_and_the_shim_follows_it() {
     //    With no session the shim is handed no bundle, so it cannot follow: it keeps the
     //    second map, which matters to nobody, since a bare claim proves nothing.
     assert!(renew_to(&forwarder, wall + 2, &third).await);
+    assert_eq!(
+        forwarder.counters.bundle_not_kept.load(Ordering::Relaxed),
+        1
+    );
     tool_call(shim_addr, 40).await;
     tool_call(shim_addr, 50).await;
     assert_eq!(

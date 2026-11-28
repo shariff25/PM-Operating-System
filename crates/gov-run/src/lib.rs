@@ -190,3 +190,33 @@ pub async fn bind(addr: SocketAddr) -> anyhow::Result<tokio::net::TcpListener> {
     std::io::stdout().flush()?;
     Ok(listener)
 }
+
+/// Milliseconds on a clock that goes on while the machine is suspended (spec §7.6.3,
+/// point 4). `None` where this program knows no such clock.
+#[cfg(target_os = "linux")]
+pub fn boot_millis() -> Option<u64> {
+    let t = rustix::time::clock_gettime(rustix::time::ClockId::Boottime);
+    let secs = u64::try_from(t.tv_sec).ok()?;
+    let nanos = u64::try_from(t.tv_nsec).ok()?;
+    secs.checked_mul(1000)?.checked_add(nanos / 1_000_000)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn boot_millis() -> Option<u64> {
+    None
+}
+
+/// The gate's count of time: the suspension-counting clock where there is one, and
+/// otherwise the time since the program started, which stops while the machine sleeps.
+pub fn mono_millis() -> u64 {
+    static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    boot_millis().unwrap_or_else(|| {
+        u64::try_from(
+            STARTED
+                .get_or_init(std::time::Instant::now)
+                .elapsed()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX)
+    })
+}

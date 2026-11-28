@@ -54,6 +54,16 @@ enum Command {
         #[arg(long)]
         public_key: PathBuf,
     },
+    /// Enrol an Authority's admin-record key, once, at installation. Gates' keys then
+    /// follow from that Authority's records.
+    EnrolAuthority {
+        #[command(flatten)]
+        which: Which,
+        #[arg(long)]
+        authority: String,
+        #[arg(long)]
+        public_key: PathBuf,
+    },
     /// Take shipments and publish checkpoints.
     Serve {
         #[command(flatten)]
@@ -125,6 +135,22 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .map_err(|e| anyhow::anyhow!("the key was not enrolled: {e}"))?;
             println!("enrolled key {} for gate {gate}", key.kid);
+        }
+        Command::EnrolAuthority {
+            which,
+            authority,
+            public_key,
+        } => {
+            let authority = Id::new(&authority)
+                .map_err(|_| anyhow::anyhow!("the Authority's name is not an identifier"))?;
+            let key: PublicKey = serde_json::from_slice(&std::fs::read(&public_key)?)
+                .context("the file does not hold a public key")?;
+            ledger(&which)
+                .await?
+                .enrol_admin_key(&authority, &key)
+                .await
+                .map_err(|e| anyhow::anyhow!("the key was not enrolled: {e}"))?;
+            println!("enrolled key {} for Authority {authority}", key.kid);
         }
         Command::Serve {
             which,

@@ -245,6 +245,8 @@ pub struct Counters {
     pub proof_failed: AtomicU64,
     /// Answers from the Authority this gate did not take, by why (spec §7.6.3, point 2).
     pub renew_refused: Tally,
+    /// Bundles taken that could not be kept for the next start.
+    pub bundle_not_kept: AtomicU64,
 }
 
 pub struct ForwarderConfig {
@@ -271,7 +273,12 @@ pub struct FromAuthority {
     /// The gate's own count of time, in milliseconds, which must go on while the machine is
     /// suspended. The lease's time is counted on with it.
     pub mono: fn() -> u64,
+    /// Keeps a bundle the gate takes, so that a restart begins from it. Called before any
+    /// call is read under that bundle; `false` says it could not be kept.
+    pub keep: Option<Keep>,
 }
+
+pub type Keep = Box<dyn Fn(&Envelope) -> bool + Send + Sync>;
 
 /// The policy a call is read under: the connector map, and the version of the bundle it
 /// came from. Taken together, so that a receipt never names one bundle for a call read
@@ -307,6 +314,7 @@ pub struct Forwarder<S> {
 struct Held {
     standing: Mutex<Standing>,
     mono: fn() -> u64,
+    keep: Option<Keep>,
 }
 
 fn wall_clock() -> i64 {
@@ -341,6 +349,7 @@ impl<S: Spool + 'static> Forwarder<S> {
         let authority = config.authority.take().map(|a| Held {
             standing: Mutex::new(a.standing),
             mono: a.mono,
+            keep: a.keep,
         });
         let policy = std::sync::RwLock::new(Arc::new(InUse {
             map: config.map.clone(),
@@ -454,6 +463,15 @@ impl<S: Spool + 'static> Forwarder<S> {
                     // templates change together, between calls. A call already begun
                     // keeps the map and the version it started with (point 7).
                     if let (true, Some(bundle)) = (t.bundle_changed, standing.bundle()) {
+                        let kept = match (&a.keep, standing.signed_bundle()) {
+                            (Some(keep), Some(signed)) => keep(signed),
+                            _ => true,
+                        };
+                        if !kept {
+                            self.counters
+                                .bundle_not_kept
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                         let server = self.policy().map.clone();
                         let map = bundle
                             .bundle
@@ -503,6 +521,16 @@ impl<S: Spool + 'static> Forwarder<S> {
             taken
         };
         Some(taken)
+    }
+
+    /// The bundle held from the Authority, as signed, for whoever keeps it across a restart.
+    pub fn signed_bundle(&self) -> Option<Envelope> {
+        let a = self.authority.as_ref()?;
+        let standing = a
+            .standing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        standing.signed_bundle().cloned()
     }
 
     /// Whether a tool listing is held for an MCP session.

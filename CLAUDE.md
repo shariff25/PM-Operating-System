@@ -562,6 +562,16 @@ follow-up tracking.
 - **A failure the check script caught (2026-11-28):** the key-replacement commit did not
   compile in the CLI (a new finding had no wording). Nothing was merged or pushed; fixed
   on `build/gov-review-28` before the merge.
+- **G4d-5 built (2026-11-28), on `build/gov-g4d5`:** the `gov-authority` program, with a
+  listener for gates' renewals only, and the gate program wired to it. Run as four
+  programs with fake data: a proven call under a lease, a bundle taken without a restart,
+  a revoked mandate recorded as a failed proof, a key change across a restart, and the
+  auditor's check passing over both chains. Admin actions are still library calls on the
+  Authority's database until G4e. With it G4d is built; not yet read by the reviewer.
+- **Twenty-ninth read (2026-11-28), at `e4dd4d7`:** no High or Critical; the gate passes
+  for all of G4d-4. One Low (GR-189), fixed on `build/gov-review-29` with two of the
+  reviewer's points for the programs (a bundle kept before use; a refused gate says so
+  and backs off) and the owed test of a revoked key in `gov verify`. Not read again yet.
 
 ## Where the build stands (2026-11-23)
 
