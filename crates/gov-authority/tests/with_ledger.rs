@@ -682,6 +682,7 @@ async fn a_record_about_a_gate_never_retires_the_authoritys_own_key() {
             id: id("ana"),
             kind: Default::default(),
             verified: false,
+            session: None,
         },
         action: AdminAction::GateDisabled,
         subject: Subject {
@@ -690,6 +691,7 @@ async fn a_record_about_a_gate_never_retires_the_authoritys_own_key() {
         },
         about: None,
         value: None,
+        until: None,
     };
     let envelope = seal(&by_hand, &admin_key()).unwrap();
     ledger.ingest(&envelope, NOW).await.unwrap();
@@ -723,6 +725,7 @@ fn by_hand(
             id: id("ana"),
             kind: Default::default(),
             verified: false,
+            session: None,
         },
         action,
         subject: Subject {
@@ -731,6 +734,7 @@ fn by_hand(
         },
         about: about.map(|(kind, name)| Subject { kind, id: id(name) }),
         value,
+        until: None,
     };
     seal(&record, signer).unwrap()
 }
@@ -965,6 +969,101 @@ async fn a_receipt_under_a_revoked_key_is_judged_by_the_witness() {
         after_retirement(findings_of(&ledger, &witness, NOW + 91).await),
         vec![(Some(id("gate-1")), Some(3))]
     );
+}
+
+/// The auditor's check holds an act said to be made under a sign-in to the record of that
+/// sign-in (spec §7.6.4, point 4; GR-198).
+#[tokio::test]
+async fn a_signed_in_act_is_held_to_the_record_of_its_sign_in() {
+    use gov_core::admin::{Actor, AdminRecord, Subject, SubjectKind};
+    let (a, ledger) = installed().await;
+    let (ana, ben) = (id("ana"), id("ben"));
+    let account = |oid: &str| gov_authority::Account {
+        tid: "t".into(),
+        oid: oid.into(),
+    };
+    a.link_person(&ana, &ana, &account("a"), NOW).await.unwrap();
+    a.link_person(&ana, &ben, &account("b"), NOW).await.unwrap();
+    let out = a.sign_in(&account("a"), NOW, NOW).await.unwrap();
+    a.sign_out(&out.value, NOW + 1).await.unwrap();
+    let bens = a.sign_in(&account("b"), NOW, NOW + 1).await.unwrap();
+    a.offboard_person(&ana, &ben, NOW + 2).await.unwrap();
+    let live = a.sign_in(&account("a"), NOW, NOW + 2).await.unwrap();
+    let session = a.session(&live.value, NOW + 3).await.unwrap();
+    a.register_gate(&session, &id("gate-7"), NOW + 3)
+        .await
+        .unwrap();
+    let reference = |signed: &gov_authority::SignedIn| signed.reference().clone();
+    let acked = ship(&a, &ledger, 0).await;
+    let dir = tempfile::tempdir().unwrap();
+    let witness = DirWitness::new(dir.path());
+    ledger
+        .checkpoint(&ledger_key(), &id("ledger"), NOW + 60, &witness)
+        .await
+        .unwrap();
+    assert_eq!(findings_of(&ledger, &witness, NOW + 61).await, vec![]);
+
+    // One more record, by hand, as a faulty or taken-over Authority would write it.
+    let batch = a.shipment(0, 100).await.unwrap().unwrap().batch;
+    let admin_keys = KeySet::new([a.admin_public()]);
+    let last = gov_core::open::<AdminRecord>(batch.last().unwrap(), &admin_keys, &scope()).unwrap();
+    let export = ledger.export().await.unwrap();
+    let keys = ledger.keys(&ledger_key()).await.unwrap();
+    let checkpoints = witness.all().unwrap();
+    let reported = |who: &Id, session: &str, at: i64| {
+        let record = AdminRecord {
+            v: 1,
+            tenant: id("acme"),
+            env: id("prod"),
+            authority: id("authority"),
+            seq: acked + 1,
+            prev: Some(last.hash.clone()),
+            at,
+            actor: Actor {
+                id: who.clone(),
+                kind: Default::default(),
+                verified: true,
+                session: Some(id(session)),
+            },
+            action: AdminAction::GateRegistered,
+            subject: Subject {
+                kind: SubjectKind::Gate,
+                id: id("gate-8"),
+            },
+            about: None,
+            value: None,
+            until: None,
+        };
+        let mut export = export.clone();
+        let chain = export
+            .gates
+            .iter_mut()
+            .find(|g| g.gate == id("authority"))
+            .unwrap();
+        chain.receipts.push(seal(&record, &admin_key()).unwrap());
+        verify(&Check {
+            scope: &scope(),
+            keys: &keys,
+            export: &export,
+            checkpoints: &checkpoints,
+            interval_secs: 60,
+            now: Some(NOW + 61),
+            gate_quiet_secs: None,
+            clock_skew_secs: 60,
+            retention_secs: None,
+        })
+        .findings
+        .iter()
+        .any(|f| f.problem == Problem::SessionNotBorneOut && f.seq == Some(acked + 1))
+    };
+    let (signed_out, offboarded, in_force) = (reference(&out), reference(&bens), reference(&live));
+    let until = NOW + 8 * 3600;
+    assert!(!reported(&ana, in_force.as_str(), until - 1));
+    assert!(reported(&ana, in_force.as_str(), until));
+    assert!(reported(&ana, "s-nobody-signed-this-in", NOW + 4));
+    assert!(reported(&ben, in_force.as_str(), NOW + 4));
+    assert!(reported(&ana, signed_out.as_str(), NOW + 4));
+    assert!(reported(&ben, offboarded.as_str(), NOW + 4));
 }
 
 /// The auditor's check holds a proven receipt to a mandate the Authority recorded issuing

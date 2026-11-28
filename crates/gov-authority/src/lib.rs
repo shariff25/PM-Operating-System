@@ -29,7 +29,7 @@ use gov_core::{
 
 pub use store::{
     Agent, Effect, EnrolledKey, Gate, IssuedMandate, MemoryStore, PendingCode, Person, Published,
-    Role, Status, Store, StoreError, StoredRecord,
+    Role, SessionRow, Status, Store, StoreError, StoredRecord,
 };
 
 /// How long a one-time code is good for, in seconds.
@@ -56,6 +56,9 @@ pub enum AuthorityError {
     #[error("refused")]
     Refused,
     /// A gate asked to renew again within the same second.
+    /// The act needs a sign-in more recent than the session's.
+    #[error("sign in again")]
+    SignInAgain,
     #[error("asked again too soon")]
     TooSoon,
     /// The Ledger's answer does not agree with this Authority's own chain at this record.
@@ -85,6 +88,7 @@ pub struct Authority<S> {
     name: Id,
     /// Signs admin records, and nothing else.
     admin_key: SigningKey,
+    session_limits: SessionLimits,
     /// The public keys that signed this chain before `admin_key`, to read it with.
     earlier_admin: Vec<PublicKey>,
     /// The key just replaced and the number of the record that replaced it. The Ledger
@@ -153,6 +157,139 @@ struct Did {
     on: Subject,
     about: Option<Subject>,
     value: Option<Digest>,
+    until: Option<i64>,
+}
+
+/// Who acts, and under which signed-in session if any. Without a session the act is
+/// recorded as unverified: someone on the Authority's machine said who they were.
+#[derive(Debug, Clone)]
+pub struct By {
+    id: Id,
+    session: Option<SessionRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRef {
+    pub reference: Id,
+    /// When the person proved who they are to the identity provider.
+    pub started: i64,
+}
+
+impl PartialEq<Id> for By {
+    fn eq(&self, other: &Id) -> bool {
+        &self.id == other
+    }
+}
+
+impl std::ops::Deref for By {
+    type Target = Id;
+    fn deref(&self) -> &Id {
+        &self.id
+    }
+}
+
+pub trait Who {
+    fn who(&self) -> By;
+}
+
+impl Who for Id {
+    fn who(&self) -> By {
+        By {
+            id: self.clone(),
+            session: None,
+        }
+    }
+}
+
+impl Who for By {
+    fn who(&self) -> By {
+        self.clone()
+    }
+}
+
+/// An act that changes who is trusted needs a sign-in no older than this.
+pub const RECENT_SECS: i64 = 300;
+
+/// How long a session lasts: without use, and at most.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionLimits {
+    pub idle_secs: i64,
+    pub absolute_secs: i64,
+}
+
+impl Default for SessionLimits {
+    fn default() -> Self {
+        SessionLimits {
+            idle_secs: 15 * 60,
+            absolute_secs: 8 * 60 * 60,
+        }
+    }
+}
+
+/// The account a person signs in with: the tenant and the object id in it.
+pub struct Account {
+    pub tid: String,
+    pub oid: String,
+}
+
+impl Account {
+    fn digest(&self) -> Digest {
+        Digest::of(&[
+            b"gov.signin.account.v1\0",
+            self.tid.as_bytes(),
+            b"\0",
+            self.oid.as_bytes(),
+        ])
+    }
+}
+
+fn session_digest(value: &str) -> Digest {
+    Digest::of(&[b"gov.session.v1\0", value.as_bytes()])
+}
+
+fn csrf_digest(value: &str) -> Digest {
+    Digest::of(&[b"gov.session.csrf.v1\0", value.as_bytes()])
+}
+
+/// What a sign-in hands back, once: the session's value for the cookie and the second
+/// value a changing request must carry. Neither is kept here.
+pub struct SignedIn {
+    pub value: String,
+    pub csrf: String,
+    reference: Id,
+}
+
+impl SignedIn {
+    pub fn reference(&self) -> &Id {
+        &self.reference
+    }
+}
+
+/// A session in use.
+pub struct Session {
+    by: By,
+    pub role: Role,
+    csrf: Digest,
+}
+
+impl Session {
+    pub fn person(&self) -> &Id {
+        &self.by.id
+    }
+
+    pub fn reference(&self) -> Option<&Id> {
+        self.by.session.as_ref().map(|s| &s.reference)
+    }
+
+    pub fn carries(&self, presented: &str) -> bool {
+        csrf_digest(presented) == self.csrf
+    }
+}
+
+impl Who for Session {
+    fn who(&self) -> By {
+        self.by.clone()
+    }
 }
 
 impl Did {
@@ -162,6 +299,7 @@ impl Did {
             on: subject(kind, id),
             about: None,
             value: None,
+            until: None,
         }
     }
 }
@@ -203,6 +341,7 @@ impl<S: Store> Authority<S> {
             scope,
             name,
             admin_key,
+            session_limits: SessionLimits::default(),
             earlier_admin: Vec::new(),
             outgoing: None,
             root,
@@ -228,6 +367,11 @@ impl<S: Store> Authority<S> {
         self
     }
 
+    pub fn with_session_limits(mut self, limits: SessionLimits) -> Self {
+        self.session_limits = limits;
+        self
+    }
+
     /// Forget the replaced key. For when the Ledger has taken the new one: it answers the
     /// old key nothing from then on, so anything still to send again is asked for under
     /// the new key.
@@ -249,7 +393,7 @@ impl<S: Store> Authority<S> {
     async fn commit(
         &self,
         head: Option<ChainHead>,
-        actor: &Id,
+        actor: &By,
         did: Did,
         effects: &[Effect],
         now: i64,
@@ -262,7 +406,7 @@ impl<S: Store> Authority<S> {
     async fn commit_as(
         &self,
         head: Option<ChainHead>,
-        (actor, kind): (&Id, gov_core::admin::ActorKind),
+        (actor, kind): (&By, gov_core::admin::ActorKind),
         did: Did,
         effects: &[Effect],
         now: i64,
@@ -286,15 +430,16 @@ impl<S: Store> Authority<S> {
             prev: head.map(|h| h.hash),
             at,
             actor: Actor {
-                id: actor.clone(),
+                id: actor.id.clone(),
                 kind,
-                // Nobody is signed in before G4e.
-                verified: false,
+                verified: actor.session.is_some(),
+                session: actor.session.as_ref().map(|s| s.reference.clone()),
             },
             action: did.action,
             subject: did.on,
             about: did.about,
             value: did.value,
+            until: did.until,
         };
         record.validate()?;
         let envelope = seal(&record, &self.admin_key)?;
@@ -319,6 +464,149 @@ impl<S: Store> Authority<S> {
         }
     }
 
+    fn recent(&self, by: &By, now: i64) -> Result<()> {
+        match &by.session {
+            Some(s) if now.saturating_sub(s.started) > RECENT_SECS => {
+                Err(AuthorityError::SignInAgain)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Link a person to the account they sign in with (spec §7.6.4, point 3). Written
+    /// once, one account to one person: the link is what lets someone act as that person.
+    pub async fn link_person(
+        &self,
+        actor: &impl Who,
+        person: &Id,
+        account: &Account,
+        now: i64,
+    ) -> Result<u64> {
+        let actor = &actor.who();
+        self.recent(actor, now)?;
+        let link = account.digest();
+        let done = on_head!(self, head, {
+            self.admin(actor).await?;
+            let mut linked = match self.store.person(&self.scope, person).await? {
+                Some(p) if p.active => p,
+                _ => return Err(AuthorityError::Unknown("person")),
+            };
+            if linked.link.is_some() {
+                return Err(AuthorityError::Exists("link"));
+            }
+            linked.link = Some(link.clone());
+            let did = Did {
+                value: Some(link.clone()),
+                ..Did::to(AdminAction::PersonLinked, SubjectKind::Person, person)
+            };
+            let effects = [
+                Effect::PutPerson(linked),
+                Effect::AddLink(link.clone(), person.clone()),
+            ];
+            self.commit(head, actor, did, &effects, now).await
+        });
+        match done {
+            Err(AuthorityError::Store(StoreError::KeyTaken)) => Err(AuthorityError::Exists("link")),
+            other => other,
+        }
+    }
+
+    /// Open a session for whoever a checked ID token names. The record of it and the
+    /// session are written together. Every refusal looks the same.
+    pub async fn sign_in(&self, account: &Account, auth_time: i64, now: i64) -> Result<SignedIn> {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let until = auth_time.saturating_add(self.session_limits.absolute_secs);
+        if auth_time > now.saturating_add(60) || now >= until {
+            return Err(AuthorityError::Refused);
+        }
+        let Some(person) = self.store.linked(&self.scope, &account.digest()).await? else {
+            return Err(AuthorityError::Refused);
+        };
+        let value = b64.encode(gov_core::keys::random_salt()?);
+        let csrf = b64.encode(gov_core::keys::random_salt()?);
+        let row = SessionRow {
+            id: session_digest(&value),
+            person: person.clone(),
+            reference: random_id("s")?,
+            started: auth_time,
+            until,
+            last_used: now,
+            csrf: csrf_digest(&csrf),
+        };
+        let by = By {
+            id: person.clone(),
+            session: Some(SessionRef {
+                reference: row.reference.clone(),
+                started: auth_time,
+            }),
+        };
+        on_head!(self, head, {
+            match self.store.person(&self.scope, &person).await? {
+                Some(p) if p.active => {}
+                _ => return Err(AuthorityError::Refused),
+            }
+            let did = Did {
+                until: Some(until),
+                ..Did::to(AdminAction::SignedIn, SubjectKind::Person, &person)
+            };
+            self.commit(head, &by, did, &[Effect::PutSession(row.clone())], now)
+                .await
+        })?;
+        Ok(SignedIn {
+            value,
+            csrf,
+            reference: row.reference,
+        })
+    }
+
+    /// The session a presented value names, if it is still good: within both limits, and
+    /// its person still active. The person is read again every time.
+    pub async fn session(&self, value: &str, now: i64) -> Result<Session> {
+        let id = session_digest(value);
+        let Some(row) = self.store.session(&self.scope, &id).await? else {
+            return Err(AuthorityError::Refused);
+        };
+        if now >= row.until || now.saturating_sub(row.last_used) > self.session_limits.idle_secs {
+            return Err(AuthorityError::Refused);
+        }
+        let person = match self.store.person(&self.scope, &row.person).await? {
+            Some(p) if p.active => p,
+            _ => return Err(AuthorityError::Refused),
+        };
+        self.store.touch_session(&self.scope, &id, now).await?;
+        Ok(Session {
+            by: By {
+                id: row.person,
+                session: Some(SessionRef {
+                    reference: row.reference,
+                    started: row.started,
+                }),
+            },
+            role: person.role,
+            csrf: row.csrf,
+        })
+    }
+
+    pub async fn sign_out(&self, value: &str, now: i64) -> Result<u64> {
+        let id = session_digest(value);
+        let Some(row) = self.store.session(&self.scope, &id).await? else {
+            return Err(AuthorityError::Refused);
+        };
+        let by = By {
+            id: row.person.clone(),
+            session: Some(SessionRef {
+                reference: row.reference,
+                started: row.started,
+            }),
+        };
+        on_head!(self, head, {
+            let did = Did::to(AdminAction::SignedOut, SubjectKind::Person, &row.person);
+            self.commit(head, &by, did, &[Effect::DropSession(id.clone())], now)
+                .await
+        })
+    }
+
     /// Name the installation's first admin. Possible exactly once, while nobody is known.
     pub async fn bootstrap(&self, first_admin: &Id, now: i64) -> Result<u64> {
         on_head!(self, head, {
@@ -329,14 +617,31 @@ impl<S: Store> Authority<S> {
                 id: first_admin.clone(),
                 role: Role::Admin,
                 active: true,
+                link: None,
             };
             let did = Did::to(AdminAction::PersonAdded, SubjectKind::Person, first_admin);
-            self.commit(head, first_admin, did, &[Effect::PutPerson(person)], now)
-                .await
+            self.commit(
+                head,
+                &first_admin.who(),
+                did,
+                &[Effect::PutPerson(person)],
+                now,
+            )
+            .await
         })
     }
 
-    pub async fn add_person(&self, actor: &Id, person: &Id, role: Role, now: i64) -> Result<u64> {
+    pub async fn add_person(
+        &self,
+        actor: &impl Who,
+        person: &Id,
+        role: Role,
+        now: i64,
+    ) -> Result<u64> {
+        let actor = &actor.who();
+        if role == Role::Admin {
+            self.recent(actor, now)?;
+        }
         on_head!(self, head, {
             self.admin(actor).await?;
             if self.store.person(&self.scope, person).await?.is_some() {
@@ -346,6 +651,7 @@ impl<S: Store> Authority<S> {
                 id: person.clone(),
                 role,
                 active: true,
+                link: None,
             };
             let did = Did::to(AdminAction::PersonAdded, SubjectKind::Person, person);
             self.commit(head, actor, did, &[Effect::PutPerson(added)], now)
@@ -364,14 +670,17 @@ impl<S: Store> Authority<S> {
     /// can be issued to their agents, so the second round leaves none (review findings
     /// GR-152 and GR-153). Offboarding someone who has already left makes the rounds again,
     /// which finishes an offboarding that was interrupted.
-    pub async fn offboard_person(&self, actor: &Id, person: &Id, now: i64) -> Result<u64> {
-        if actor == person {
+    pub async fn offboard_person(&self, actor: &impl Who, person: &Id, now: i64) -> Result<u64> {
+        let actor = &actor.who();
+        if &actor.id == person {
             // The last admin cannot remove themselves and leave nobody able to act.
             return Err(AuthorityError::NotAllowed);
         }
         self.admin(actor).await?;
-        if self.store.person(&self.scope, person).await?.is_none() {
-            return Err(AuthorityError::Unknown("person"));
+        match self.store.person(&self.scope, person).await? {
+            None => return Err(AuthorityError::Unknown("person")),
+            Some(p) if p.role == Role::Admin => self.recent(actor, now)?,
+            Some(_) => {}
         }
         self.stop_what_a_leaver_holds(actor, person, now).await?;
         let seq = on_head!(self, head, {
@@ -381,8 +690,11 @@ impl<S: Store> Authority<S> {
             };
             leaving.active = false;
             let did = Did::to(AdminAction::PersonOffboarded, SubjectKind::Person, person);
-            self.commit(head, actor, did, &[Effect::PutPerson(leaving)], now)
-                .await
+            let effects = [
+                Effect::PutPerson(leaving),
+                Effect::DropSessionsOf(person.clone()),
+            ];
+            self.commit(head, actor, did, &effects, now).await
         })?;
         self.stop_what_a_leaver_holds(actor, person, now).await?;
         Ok(seq)
@@ -391,7 +703,13 @@ impl<S: Store> Authority<S> {
     /// Suspend a person's agents, and revoke every live mandate the person is at the root
     /// of: also those for agents other people own, which a template may let them issue
     /// (review finding GR-153). Revoking the root covers what was delegated from it.
-    async fn stop_what_a_leaver_holds(&self, actor: &Id, person: &Id, now: i64) -> Result<()> {
+    async fn stop_what_a_leaver_holds(
+        &self,
+        actor: &impl Who,
+        person: &Id,
+        now: i64,
+    ) -> Result<()> {
+        let actor = &actor.who();
         for agent in self.store.agents_of(&self.scope, person).await? {
             match self.suspend_agent(actor, &agent.id, now).await {
                 // Suspended or disabled already.
@@ -413,12 +731,13 @@ impl<S: Store> Authority<S> {
     /// Name an agent and the person who answers for it. It has no key until it enrols.
     pub async fn register_agent(
         &self,
-        actor: &Id,
+        actor: &impl Who,
         agent: &Id,
         owner: &Id,
         labels: BTreeSet<Id>,
         now: i64,
     ) -> Result<u64> {
+        let actor = &actor.who();
         on_head!(self, head, {
             self.admin(actor).await?;
             if self.store.agent(&self.scope, agent).await?.is_some() {
@@ -448,7 +767,8 @@ impl<S: Store> Authority<S> {
         })
     }
 
-    pub async fn register_gate(&self, actor: &Id, gate: &Id, now: i64) -> Result<u64> {
+    pub async fn register_gate(&self, actor: &impl Who, gate: &Id, now: i64) -> Result<u64> {
+        let actor = &actor.who();
         on_head!(self, head, {
             self.admin(actor).await?;
             if self.store.gate(&self.scope, gate).await?.is_some() {
@@ -469,13 +789,14 @@ impl<S: Store> Authority<S> {
 
     async fn set_agent(
         &self,
-        actor: &Id,
+        actor: &impl Who,
         agent: &Id,
         action: AdminAction,
         from: &[Status],
         to: Status,
         now: i64,
     ) -> Result<u64> {
+        let actor = &actor.who();
         // Stopping an agent revokes its live mandates, each with its own record (spec
         // §7.6.2, point 6): once before the agent is marked, so that a stop halfway leaves
         // it with less authority and never more, and once after, for any mandate issued
@@ -537,26 +858,31 @@ impl<S: Store> Authority<S> {
         Ok(seq)
     }
 
-    pub async fn suspend_agent(&self, actor: &Id, agent: &Id, now: i64) -> Result<u64> {
+    pub async fn suspend_agent(&self, actor: &impl Who, agent: &Id, now: i64) -> Result<u64> {
+        let actor = &actor.who();
         let (action, to) = (AdminAction::AgentSuspended, Status::Suspended);
         self.set_agent(actor, agent, action, &[Status::Active], to, now)
             .await
     }
 
-    pub async fn resume_agent(&self, actor: &Id, agent: &Id, now: i64) -> Result<u64> {
+    pub async fn resume_agent(&self, actor: &impl Who, agent: &Id, now: i64) -> Result<u64> {
+        let actor = &actor.who();
         let (action, to) = (AdminAction::AgentResumed, Status::Active);
         self.set_agent(actor, agent, action, &[Status::Suspended], to, now)
             .await
     }
 
     /// For good: a disabled agent is not resumed.
-    pub async fn disable_agent(&self, actor: &Id, agent: &Id, now: i64) -> Result<u64> {
+    pub async fn disable_agent(&self, actor: &impl Who, agent: &Id, now: i64) -> Result<u64> {
+        let actor = &actor.who();
         let from = [Status::Active, Status::Suspended];
         let (action, to) = (AdminAction::AgentDisabled, Status::Disabled);
         self.set_agent(actor, agent, action, &from, to, now).await
     }
 
-    pub async fn disable_gate(&self, actor: &Id, gate: &Id, now: i64) -> Result<u64> {
+    pub async fn disable_gate(&self, actor: &impl Who, gate: &Id, now: i64) -> Result<u64> {
+        let actor = &actor.who();
+        self.recent(actor, now)?;
         on_head!(self, head, {
             self.admin(actor).await?;
             match self.store.gate(&self.scope, gate).await? {
@@ -580,7 +906,14 @@ impl<S: Store> Authority<S> {
     /// key, from the reviewed repository; here it is opened under that root, must be this
     /// Authority's and carry the next number, and is kept together with a record of its
     /// number and digest. Returns the digest, for whoever signed it to compare.
-    pub async fn publish_bundle(&self, actor: &Id, signed: &Envelope, now: i64) -> Result<Digest> {
+    pub async fn publish_bundle(
+        &self,
+        actor: &impl Who,
+        signed: &Envelope,
+        now: i64,
+    ) -> Result<Digest> {
+        let actor = &actor.who();
+        self.recent(actor, now)?;
         on_head!(self, head, {
             self.admin(actor).await?;
             let opened = gov_core::policy::open_bundle(signed, &self.root, &self.scope)?;
@@ -681,12 +1014,13 @@ impl<S: Store> Authority<S> {
     async fn issue(
         &self,
         head: Option<ChainHead>,
-        actor: &Id,
+        actor: &impl Who,
         mandate: gov_core::mandate::Mandate,
         origin: Origin<'_>,
         with: (&gov_core::policy::OpenedBundle, &SigningKey),
         now: i64,
     ) -> Result<Envelope> {
+        let actor = &actor.who();
         use gov_core::mandate::{verify_chain, ChainCheck};
         let (opened, key) = with;
         let Origin {
@@ -745,8 +1079,15 @@ impl<S: Store> Authority<S> {
     /// agent's owner, or one the template names; being an admin is not enough. Nobody is
     /// signed in before G4e, so the mandate carries no session, and an enforcing gate will
     /// refuse it (point 3).
-    pub async fn issue_mandate(&self, person: &Id, ask: &MandateAsk, now: i64) -> Result<Envelope> {
+    pub async fn issue_mandate(
+        &self,
+        person: &impl Who,
+        ask: &MandateAsk,
+        now: i64,
+    ) -> Result<Envelope> {
         use gov_core::mandate::{AgentRef, IssuedBy, IssuerKind, Limits, Mandate, Requires};
+        let by = &person.who();
+        let person = &by.id;
         on_head!(self, head, {
             let (opened, key) = self.issuing().await?;
             match self.store.person(&self.scope, person).await? {
@@ -785,7 +1126,7 @@ impl<S: Store> Authority<S> {
                 issued_by: IssuedBy {
                     kind: IssuerKind::Person,
                     id: person.clone(),
-                    session: None,
+                    session: by.session.as_ref().map(|s| s.reference.clone()),
                 },
                 template: Id::new(&format!("{}@{}", template.id, opened.bundle.number))?,
                 grants: ask.grants.clone(),
@@ -800,7 +1141,7 @@ impl<S: Store> Authority<S> {
                 root_person: person,
                 parent: None,
             };
-            self.issue(head, person, mandate, origin, (&opened, key), now)
+            self.issue(head, by, mandate, origin, (&opened, key), now)
                 .await
         })
     }
@@ -948,7 +1289,14 @@ impl<S: Store> Authority<S> {
     /// Revoke one mandate (point 6): its number in the feed is returned. One entry covers
     /// its descendants, since a gate checks every link of a chain. `by_right` skips the
     /// check of who asks, for the Authority's own use when an agent is stopped.
-    async fn revoke(&self, actor: &Id, mandate: &Id, by_right: bool, now: i64) -> Result<u64> {
+    async fn revoke(
+        &self,
+        actor: &impl Who,
+        mandate: &Id,
+        by_right: bool,
+        now: i64,
+    ) -> Result<u64> {
+        let actor = &actor.who();
         use gov_core::revocation::{Revocable, RevocationEntry};
         on_head!(self, head, {
             let Some(mut found) = self.store.mandate(&self.scope, mandate).await? else {
@@ -968,8 +1316,8 @@ impl<S: Store> Authority<S> {
                     .await?
                     .map(|a| a.owner);
                 let may = asker.role == Role::Admin
-                    || actor == &found.root_person
-                    || owner.as_ref() == Some(actor);
+                    || actor.id == found.root_person
+                    || owner.as_ref() == Some(&actor.id);
                 if !may {
                     return Err(AuthorityError::NotAllowed);
                 }
@@ -998,10 +1346,11 @@ impl<S: Store> Authority<S> {
     /// change only: whoever holds a taken key can write the same record.
     pub async fn replace_admin_key(
         &mut self,
-        actor: &Id,
+        actor: &impl Who,
         next: SigningKey,
         now: i64,
     ) -> Result<u64> {
+        let actor = &actor.who();
         let public = next.public();
         public.enrolable()?;
         if public.same_key(&self.admin_key.public()) || public.kid == self.admin_key.public().kid {
@@ -1034,7 +1383,9 @@ impl<S: Store> Authority<S> {
     /// Revoke an enrolled key, an agent's or a gate's (spec §7.6.3, point 8). Its number in
     /// the feed is returned. Nothing is issued to it or answered for it afterwards, and
     /// the Ledger retires it when the record arrives.
-    pub async fn revoke_key(&self, actor: &Id, kid: &Id, now: i64) -> Result<u64> {
+    pub async fn revoke_key(&self, actor: &impl Who, kid: &Id, now: i64) -> Result<u64> {
+        let actor = &actor.who();
+        self.recent(actor, now)?;
         use gov_core::revocation::{Revocable, RevocationEntry};
         on_head!(self, head, {
             self.admin(actor).await?;
@@ -1059,13 +1410,15 @@ impl<S: Store> Authority<S> {
         })
     }
 
-    pub async fn revoke_mandate(&self, actor: &Id, mandate: &Id, now: i64) -> Result<u64> {
+    pub async fn revoke_mandate(&self, actor: &impl Who, mandate: &Id, now: i64) -> Result<u64> {
+        let actor = &actor.who();
         self.revoke(actor, mandate, false, now).await
     }
 
     /// Revoke every live mandate of an agent, each with its own record. Done before the
     /// change that stops the agent and again after it: see [`Authority::set_agent`].
-    async fn revoke_agents_mandates(&self, actor: &Id, agent: &Id, now: i64) -> Result<()> {
+    async fn revoke_agents_mandates(&self, actor: &impl Who, agent: &Id, now: i64) -> Result<()> {
+        let actor = &actor.who();
         for m in self.store.mandates(&self.scope).await? {
             if &m.agent == agent && !m.revoked && m.expires_at > now {
                 match self.revoke(actor, &m.id, true, now).await {
@@ -1249,11 +1602,15 @@ impl<S: Store> Authority<S> {
     /// same name is replaced. The code also names the root key its holder is to pin.
     pub async fn offer_enrolment(
         &self,
-        actor: &Id,
+        actor: &impl Who,
         kind: EnrolKind,
         name: &Id,
         now: i64,
     ) -> Result<String> {
+        let actor = &actor.who();
+        if kind == EnrolKind::Gate {
+            self.recent(actor, now)?;
+        }
         let code = new_code(&self.root)?;
         on_head!(self, head, {
             self.admin(actor).await?;
@@ -1265,7 +1622,7 @@ impl<S: Store> Authority<S> {
                 name: name.clone(),
                 digest: code_digest(&code),
                 expires_at: now + CODE_SECS,
-                by: actor.clone(),
+                by: actor.id.clone(),
                 wrong: 0,
             };
             let did = Did::to(AdminAction::EnrolmentOffered, of(kind), name);
@@ -1339,10 +1696,11 @@ impl<S: Store> Authority<S> {
                 on: subject(SubjectKind::Key, &asked.key.kid),
                 about: Some(subject(of(kind), &name)),
                 value: Some(key_digest(&asked.key)?),
+                until: None,
             };
             self.commit(
                 head,
-                &pending.by,
+                &pending.by.who(),
                 did,
                 &[Effect::AddKey(enrolled.clone())],
                 now,
@@ -1370,7 +1728,8 @@ impl<S: Store> Authority<S> {
             }
             let did = Did::to(AdminAction::EnrolmentCancelled, of(kind), name);
             let effects = [Effect::DropCode(kind, name.clone())];
-            self.commit(head, &self.name, did, &effects, now).await?;
+            self.commit(head, &self.name.who(), did, &effects, now)
+                .await?;
             Ok(())
         })
     }

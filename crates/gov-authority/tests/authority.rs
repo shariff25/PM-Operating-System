@@ -703,6 +703,24 @@ impl Store for Failing {
     async fn person(&self, scope: &Scope, id: &Id) -> StoreResult<Option<Person>> {
         self.inner.person(scope, id).await
     }
+    async fn linked(&self, scope: &Scope, link: &gov_core::Digest) -> StoreResult<Option<Id>> {
+        self.inner.linked(scope, link).await
+    }
+    async fn session(
+        &self,
+        scope: &Scope,
+        id: &gov_core::Digest,
+    ) -> StoreResult<Option<gov_authority::SessionRow>> {
+        self.inner.session(scope, id).await
+    }
+    async fn touch_session(
+        &self,
+        scope: &Scope,
+        id: &gov_core::Digest,
+        now: i64,
+    ) -> StoreResult<()> {
+        self.inner.touch_session(scope, id, now).await
+    }
     async fn agent(&self, scope: &Scope, id: &Id) -> StoreResult<Option<Agent>> {
         self.inner.agent(scope, id).await
     }
@@ -2696,3 +2714,169 @@ mod renewal {
         assert!(!text.contains("\"at\"") && !text.contains("time"));
     }
 }
+
+fn account(oid: &str) -> gov_authority::Account {
+    gov_authority::Account {
+        tid: "72f988bf-0000-4000-8000-0000000000aa".into(),
+        oid: oid.into(),
+    }
+}
+
+/// People sign in (spec §7.6.4, points 3 and 4): the link that lets them, the session, what
+/// a record says of an act under one, and the acts that need a recent sign-in.
+async fn signing_in<S: Store>(store: S) {
+    let (a, _, _, _) = ready(store).await;
+    let (ana, ben) = (id("ana"), id("ben"));
+    let (anas, bens) = (
+        account("00000000-0000-0000-0000-00000000a0a0"),
+        account("00000000-0000-0000-0000-00000000b0b0"),
+    );
+    let refused = |r: Result<gov_authority::SignedIn, AuthorityError>| {
+        assert!(matches!(r, Err(AuthorityError::Refused)), "signed in")
+    };
+
+    // An account linked to nobody signs nobody in.
+    refused(a.sign_in(&anas, NOW, NOW).await);
+    // The link: by an admin, written once, one account to one person.
+    assert!(matches!(
+        a.link_person(&ben, &ben, &bens, NOW).await,
+        Err(AuthorityError::NotAllowed)
+    ));
+    a.link_person(&ana, &ana, &anas, NOW).await.unwrap();
+    for (person, acct) in [(&ana, &bens), (&ben, &anas)] {
+        assert!(matches!(
+            a.link_person(&ana, person, acct, NOW).await,
+            Err(AuthorityError::Exists("link"))
+        ));
+    }
+    assert!(a.link_person(&ana, &id("eve"), &bens, NOW).await.is_err());
+    a.link_person(&ana, &ben, &bens, NOW).await.unwrap();
+
+    // A sign-in ahead of the clock, or older than a session may last, opens nothing.
+    refused(a.sign_in(&anas, NOW + 61, NOW).await);
+    refused(a.sign_in(&anas, NOW - 8 * 3600, NOW).await);
+    let before = chain(&a).await.len();
+    let signed = a.sign_in(&anas, NOW - 10, NOW).await.unwrap();
+    let session = a.session(&signed.value, NOW + 1).await.unwrap();
+    assert_eq!((session.person(), session.role), (&ana, Role::Admin));
+    assert!(session.carries(&signed.csrf) && !session.carries(&signed.value));
+    assert!(a.session(&signed.csrf, NOW + 1).await.is_err());
+    let reference = session.reference().unwrap().clone();
+    assert_ne!(reference.as_str(), signed.value);
+
+    // The sign-in is a record, and an act under the session names it; an act by someone
+    // on the Authority's machine still reads as unverified.
+    a.register_gate(&session, &id("gate-7"), NOW + 2)
+        .await
+        .unwrap();
+    a.register_gate(&ana, &id("gate-8"), NOW + 2).await.unwrap();
+    let records = chain(&a).await;
+    let said: Vec<_> = records[before..]
+        .iter()
+        .map(|r| (r.action, r.actor.verified, r.actor.session.clone(), r.until))
+        .collect();
+    assert_eq!(
+        said,
+        vec![
+            (
+                AdminAction::SignedIn,
+                true,
+                Some(reference.clone()),
+                Some(NOW - 10 + 8 * 3600)
+            ),
+            (
+                AdminAction::GateRegistered,
+                true,
+                Some(reference.clone()),
+                None
+            ),
+            (AdminAction::GateRegistered, false, None, None),
+        ]
+    );
+
+    // A mandate issued under a session carries it.
+    a.publish_bundle(&session, &policy(1, vec![mandates_key().public()]), NOW + 2)
+        .await
+        .unwrap();
+    let bens_in = a.sign_in(&bens, NOW, NOW + 2).await.unwrap();
+    let bens_session = a.session(&bens_in.value, NOW + 3).await.unwrap();
+    let issued = a
+        .issue_mandate(
+            &bens_session,
+            &ask("refund-bot", "refund-bot:k1", "triage"),
+            NOW + 3,
+        )
+        .await
+        .unwrap();
+    let mandate = open::<gov_core::mandate::Mandate>(
+        &issued,
+        &KeySet::new([mandates_key().public()]),
+        &scope(),
+    )
+    .unwrap()
+    .doc;
+    assert_eq!(mandate.issued_by.session.as_ref(), bens_session.reference());
+
+    // What changes who is trusted needs a sign-in no older than five minutes.
+    let later = NOW + 400;
+    let old = a.session(&signed.value, later).await.unwrap();
+    let again = |r: Result<u64, AuthorityError>| {
+        assert!(matches!(r, Err(AuthorityError::SignInAgain)), "{r:?}")
+    };
+    again(a.add_person(&old, &id("dee"), Role::Admin, later).await);
+    again(
+        a.offboard_person(&old, &id("dee2"), later)
+            .await
+            .or_else(|e| match e {
+                // Nobody of that name: the rule is for an admin's offboarding, tested below.
+                AuthorityError::Unknown(_) => Err(AuthorityError::SignInAgain),
+                other => Err(other),
+            }),
+    );
+    again(a.link_person(&old, &id("cy"), &account("c"), later).await);
+    again(a.disable_gate(&old, &id("gate-7"), later).await);
+    again(a.revoke_key(&old, &id("refund-bot:k1"), later).await);
+    again(
+        a.offer_enrolment(&old, EnrolKind::Gate, &id("gate-7"), later)
+            .await
+            .map(|_| 0),
+    );
+    assert!(matches!(
+        a.publish_bundle(&old, &policy(2, vec![mandates_key().public()]), later)
+            .await,
+        Err(AuthorityError::SignInAgain)
+    ));
+    // The rest it may still do.
+    a.add_person(&old, &id("dee"), Role::Owner, later)
+        .await
+        .unwrap();
+    a.offer_enrolment(&old, EnrolKind::Agent, &id("helper-bot"), later)
+        .await
+        .unwrap();
+    // Offboarding an admin is one of them.
+    a.add_person(&ana, &id("adm"), Role::Admin, later)
+        .await
+        .unwrap();
+    again(a.offboard_person(&old, &id("adm"), later).await);
+
+    // A session ends when it is not used, at its latest time, at sign-out, and when its
+    // person is offboarded.
+    assert!(a.session(&signed.value, later + 900).await.is_ok());
+    assert!(a.session(&signed.value, later + 900 + 901).await.is_err());
+    let short = a.sign_in(&anas, NOW - 28_000, NOW).await.unwrap();
+    assert!(a.session(&short.value, NOW + 799).await.is_ok());
+    assert!(a.session(&short.value, NOW + 800).await.is_err());
+    let out = a.sign_in(&anas, NOW, NOW).await.unwrap();
+    a.sign_out(&out.value, NOW + 5).await.unwrap();
+    assert!(a.session(&out.value, NOW + 6).await.is_err());
+    assert!(a.sign_out(&out.value, NOW + 6).await.is_err());
+    assert_eq!(
+        chain(&a).await.last().map(|r| r.action),
+        Some(AdminAction::SignedOut)
+    );
+    assert!(a.session(&bens_in.value, NOW + 4).await.is_ok());
+    a.offboard_person(&ana, &ben, NOW + 5).await.unwrap();
+    assert!(a.session(&bens_in.value, NOW + 6).await.is_err());
+    refused(a.sign_in(&bens, NOW + 6, NOW + 6).await);
+}
+both_stores!(people_sign_in_and_their_acts_say_so, signing_in);

@@ -2241,11 +2241,13 @@ fn admin(
             id: id("ana"),
             kind: Default::default(),
             verified: false,
+            session: None,
         },
         action,
         subject: what,
         about,
         value,
+        until: None,
     }
 }
 
@@ -2279,6 +2281,40 @@ fn an_admin_record_keeps_its_rules_and_is_never_a_receipt() {
     let mut wrong = admin(1, None, A::PersonAdded);
     wrong.value = Some(Digest::of(&[b"x"]));
     assert!(wrong.validate().is_err());
+    // A record is verified exactly when it names a session; only a sign-in carries an
+    // end; and a session is opened and closed by the person whose it is.
+    let signed_in = |action| {
+        let mut r = admin(1, None, action);
+        r.actor.verified = true;
+        r.actor.session = Some(id("s-1"));
+        r.until = (action == A::SignedIn).then_some(NOW + 60);
+        r
+    };
+    for action in [A::SignedIn, A::SignedOut, A::PersonAdded] {
+        signed_in(action).validate().unwrap();
+    }
+    let mut wrong = signed_in(A::PersonAdded);
+    wrong.actor.session = None;
+    assert!(wrong.validate().is_err());
+    let mut wrong = signed_in(A::PersonAdded);
+    wrong.actor.verified = false;
+    assert!(wrong.validate().is_err());
+    let mut wrong = signed_in(A::PersonAdded);
+    wrong.until = Some(NOW);
+    assert!(wrong.validate().is_err());
+    let mut wrong = signed_in(A::SignedIn);
+    wrong.until = None;
+    assert!(wrong.validate().is_err());
+    for action in [A::SignedIn, A::SignedOut] {
+        let mut wrong = signed_in(action);
+        wrong.subject.id = id("ben");
+        assert!(wrong.validate().is_err());
+        assert!(admin(1, None, action).validate().is_err());
+    }
+    let mut linked = admin(1, None, A::PersonLinked);
+    assert!(linked.validate().is_err());
+    linked.value = Some(Digest::of(&[b"an account"]));
+    linked.validate().unwrap();
     let mut wrong = admin(1, None, A::MandateIssued);
     wrong.about = Some(Subject {
         kind: K::Gate,

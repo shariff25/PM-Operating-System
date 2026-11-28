@@ -658,6 +658,27 @@ reviewer.
   only, never Microsoft; the size limit on a response sent without a length is not
   tested on its own; asking for `openid` only and discarding the tokens belong to the
   flow, in G4e-3. Nothing uses the crate yet.
+- **G4e-2 built (2026-11-28), from §7.6.4 points 3 and 4; not yet read by the reviewer.**
+  On `build/gov-g4e2`. In the Authority library, on both stores: an admin links a person
+  to an account (once; one to one; the record carries a digest); a sign-in for a linked,
+  active person opens a session and writes its record together; a session is good within
+  its idle and latest times and while its person is active, and the person is read again
+  each time; sign-out and offboarding end it. Every action takes either a name (someone
+  on the Authority's machine: recorded as unverified, as before) or a session (recorded
+  as verified, with the session's reference); a mandate issued under a session carries
+  it. Adding or offboarding an admin, linking, publishing a bundle, revoking a key,
+  disabling a gate and offering a gate's enrolment code refuse a session whose sign-in
+  is more than five minutes old. Three new records (`person_linked`, `signed_in`,
+  `signed_out`), a session on a record's actor, and an end time on a sign-in; records
+  written before still verify. `gov verify` reports a verified record that no earlier
+  sign-in of the same person, still in force, bears out. Eighteen controls removed on
+  purpose, each caught. Departures and limits, for the reviewer: a session's reference
+  is a random id of its own, not a digest of the session's value; a role cannot be
+  changed yet, so that rule has nothing to guard; the recent-sign-in rule binds
+  sessions only, since an act without one is already someone on the machine; a session
+  that ran out stays stored until sign-out or offboarding; the auditor's check reads the
+  Authority's records, not the mandate inside a receipt. Nothing is served: the listener
+  is G4e-3.
 
 ## Security review of 2026-11-26 (first read; the gate did not pass)
 

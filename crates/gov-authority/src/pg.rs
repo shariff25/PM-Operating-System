@@ -14,8 +14,8 @@ use sqlx::types::Json;
 use sqlx::Row;
 
 use crate::store::{
-    Agent, Effect, EnrolledKey, Gate, IssuedMandate, PendingCode, Person, Published, Store,
-    StoreError, StoreResult, StoredRecord,
+    Agent, Effect, EnrolledKey, Gate, IssuedMandate, PendingCode, Person, Published, SessionRow,
+    Store, StoreError, StoreResult, StoredRecord,
 };
 
 impl From<sqlx::Error> for StoreError {
@@ -128,6 +128,26 @@ fn row(effect: &Effect) -> (String, String, Option<String>, Option<serde_json::V
             None,
             None,
         ),
+        Effect::AddLink(link, person) => (
+            "link".into(),
+            link.as_str().to_string(),
+            Some(person.to_string()),
+            Some(json(person)),
+        ),
+        Effect::PutSession(row) => (
+            "session".into(),
+            row.id.as_str().to_string(),
+            Some(row.person.to_string()),
+            Some(json(row)),
+        ),
+        Effect::DropSession(id) => ("session".into(), id.as_str().to_string(), None, None),
+        // Handled by its own statement: it removes by owner, not by name.
+        Effect::DropSessionsOf(person) => (
+            "session".into(),
+            String::new(),
+            Some(person.to_string()),
+            None,
+        ),
     }
 }
 
@@ -226,7 +246,19 @@ impl Store for PgStore {
             // A key is enrolled once: no replacing. The key id is the row's name and the
             // public key has a unique index of its own, so either being taken fails the
             // insert, and with it the whole transaction.
-            if let (Effect::AddKey(_), Some(doc)) = (effect, &doc) {
+            if let Effect::DropSessionsOf(_) = effect {
+                sqlx::query(
+                    "DELETE FROM authority_registry \
+                     WHERE tenant = $1 AND env = $2 AND kind = 'session' AND owner = $3",
+                )
+                .bind(scope.tenant.as_str())
+                .bind(scope.env.as_str())
+                .bind(&owner)
+                .execute(&mut *tx)
+                .await?;
+                continue;
+            }
+            if let (Effect::AddKey(_) | Effect::AddLink(..), Some(doc)) = (effect, &doc) {
                 let added = sqlx::query(
                     "INSERT INTO authority_registry (tenant, env, kind, name, owner, doc) \
                      VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
@@ -312,6 +344,28 @@ impl Store for PgStore {
 
     async fn person(&self, scope: &Scope, id: &Id) -> StoreResult<Option<Person>> {
         self.entry(scope, "person", id.as_str()).await
+    }
+
+    async fn linked(&self, scope: &Scope, link: &Digest) -> StoreResult<Option<Id>> {
+        self.entry(scope, "link", link.as_str()).await
+    }
+
+    async fn session(&self, scope: &Scope, id: &Digest) -> StoreResult<Option<SessionRow>> {
+        self.entry(scope, "session", id.as_str()).await
+    }
+
+    async fn touch_session(&self, scope: &Scope, id: &Digest, now: i64) -> StoreResult<()> {
+        sqlx::query(
+            "UPDATE authority_registry SET doc = jsonb_set(doc, '{last_used}', to_jsonb($4::bigint)) \
+             WHERE tenant = $1 AND env = $2 AND kind = 'session' AND name = $3",
+        )
+        .bind(scope.tenant.as_str())
+        .bind(scope.env.as_str())
+        .bind(id.as_str())
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     async fn agent(&self, scope: &Scope, id: &Id) -> StoreResult<Option<Agent>> {

@@ -195,6 +195,9 @@ fn describe(problem: &Problem) -> String {
         Problem::ReceiptAfterRetirement => {
             "a receipt under a disabled gate's or revoked key is not shown to be earlier than that: no checkpoint covered it before one covered the retirement".into()
         }
+        Problem::SessionNotBorneOut => {
+            "a record says its actor was signed in, and no earlier sign-in of that person still in force bears it out".into()
+        }
         Problem::RecordUnderReplacedKey => {
             "an Authority's record is signed with a key its chain says was replaced".into()
         }

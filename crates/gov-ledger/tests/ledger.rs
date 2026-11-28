@@ -1154,6 +1154,7 @@ fn admin_record(seq: u64, prev: Option<gov_core::Digest>, at: i64) -> gov_core::
             id: id("ana"),
             kind: Default::default(),
             verified: false,
+            session: None,
         },
         action: AdminAction::GateRegistered,
         subject: Subject {
@@ -1162,6 +1163,7 @@ fn admin_record(seq: u64, prev: Option<gov_core::Digest>, at: i64) -> gov_core::
         },
         about: None,
         value: None,
+        until: None,
     }
 }
 

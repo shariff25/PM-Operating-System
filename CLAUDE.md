@@ -592,6 +592,11 @@ follow-up tracking.
   and **G4e-2 may be built**. Four Low points (the rest of GR-190 and GR-196; GR-200:
   `localhost` taken for loopback; GR-201: an unchecked sum) are fixed or written into
   §7.6.4 on `build/gov-review-32`; not read again yet.
+- **G4e-2 built (2026-11-28), on `build/gov-g4e2`:** in the Authority library, a person
+  is linked to an account, signs in to a session, and acts under it; each sign-in is a
+  record, an act under a session is recorded as verified, and `gov verify` holds it to
+  the sign-in. The acts that change who is trusted need a sign-in under five minutes
+  old. Nothing is served yet (G4e-3); not yet read by the reviewer.
 
 ## Where the build stands (2026-11-23)
 
