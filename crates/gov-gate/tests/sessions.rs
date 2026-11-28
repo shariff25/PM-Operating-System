@@ -932,6 +932,18 @@ mod with_an_authority {
             why(call(&mut s, &sid, &chal, 2, true, &set)),
             ProofFailure::MandateRevoked
         );
+        // Revoked, and its issuer's key retired in the same bundle, as after a key is
+        // taken: still a marker with its reason, not an unknown session (finding GR-182).
+        let mut s = sessions();
+        let (sid, chal) = opened(&mut s, "n-1");
+        let other = KeySet::new([key("issuer-2", 2).public()]);
+        let same = Some(vec![template("triage", "jira/project/pay/*")]);
+        assert_eq!(s.rebundle(other, same, &set, NOW), 0);
+        assert!(s.holds(&sid));
+        assert_eq!(
+            why(call(&mut s, &sid, &chal, 2, true, &set)),
+            ProofFailure::MandateRevoked
+        );
         // What a new bundle's arrival also revokes is marked in the same step.
         let mut s = sessions();
         let (sid, chal) = opened(&mut s, "n-1");

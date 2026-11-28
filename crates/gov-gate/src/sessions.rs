@@ -408,9 +408,11 @@ impl Sessions {
         revoked: &RevocationSet,
         now: i64,
     ) -> usize {
+        // Revoked first, under the bundle the sessions opened under: a chain whose issuer
+        // key the new bundle drops would otherwise fail for that and lose its reason.
+        self.revoke(revoked, now);
         self.config.issuers = issuers;
         self.config.templates = templates;
-        self.revoke(revoked, now);
         let c = &self.config;
         let none = RevocationSet::default();
         let before = self.open.len();

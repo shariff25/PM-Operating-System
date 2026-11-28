@@ -63,6 +63,9 @@ pub struct Follow {
     pub held: HeldBundle,
     /// Where the newest bundle accepted is noted, before it is used.
     pub state: Option<PathBuf>,
+    /// The bundle file the shim starts from. A bundle taken from the gate is written over
+    /// it before it is noted, so that the shim can start again (review finding GR-181).
+    pub file: Option<PathBuf>,
     /// The server whose map this shim uses, as bundles name it.
     pub server: Id,
 }
@@ -100,6 +103,8 @@ pub struct Shim {
     session: AsyncMutex<Option<Open>>,
     listed: Mutex<Listings>,
     using: Mutex<Using>,
+    /// One follow at a time, so that a slower one cannot put an older bundle back.
+    following: AsyncMutex<()>,
     /// Bundles taken from the gate, and bundles the gate offered that were not taken.
     pub followed: AtomicU64,
     pub not_followed: AtomicU64,
@@ -135,6 +140,7 @@ impl Shim {
                 held: config.follow.as_ref().map(|f| f.held.clone()),
                 version: config.follow.as_ref().map(|f| version_of(&f.held)),
             }),
+            following: AsyncMutex::new(()),
             followed: AtomicU64::new(0),
             not_followed: AtomicU64::new(0),
             config,
@@ -204,6 +210,7 @@ impl Shim {
         let Some(follow) = &self.config.follow else {
             return;
         };
+        let _one = self.following.lock().await;
         let held = {
             let using = self.using.lock().expect("the map's lock");
             if using.version.as_ref().is_some_and(|v| v.as_str() == said) {
@@ -236,6 +243,9 @@ impl Shim {
                 return None;
             }
             may_replace(held.as_ref(), &opened.held()).ok()?;
+            if let Some(file) = &follow.file {
+                crate::policy_source::replace(file, &serde_json::to_vec(&envelope).ok()?).ok()?;
+            }
             if let Some(state) = &follow.state {
                 crate::policy_source::note(state, &opened.held()).ok()?;
             }

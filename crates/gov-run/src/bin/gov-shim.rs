@@ -75,6 +75,7 @@ async fn main() -> anyhow::Result<()> {
         root: signed.root,
         held: signed.held,
         state: Some(signed.state),
+        file: Some(signed.file),
         server: signed.server,
     });
     // The secret is in its file before the shim says it is listening: whoever reads that
