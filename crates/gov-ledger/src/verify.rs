@@ -121,8 +121,10 @@ pub enum Problem {
     /// or one from an issuer that is not the Authority. Reported only when the auditor
     /// names an Authority.
     MandateNotIssued,
-    /// A receipt is signed by a key and dated after the Authority's record that disabled its
-    /// gate or revoked the key, by more than the clocks may differ.
+    /// A receipt is signed by a key that the Authority retired (its gate disabled, or the
+    /// key revoked), and is not shown to be earlier than that: no checkpoint covered it
+    /// before the first one that covered the retirement. A receipt written honestly before
+    /// and shipped late is reported too.
     ReceiptAfterRetirement,
 }
 
@@ -189,7 +191,8 @@ struct Enrolment {
     seq: u64,
     gate: Id,
     digest: Digest,
-    retired_at: Option<i64>,
+    /// The number, in that Authority's chain, of the record that retired the key.
+    retired_by: Option<u64>,
 }
 
 struct Chain {
@@ -220,7 +223,8 @@ pub fn verify(check: &Check<'_>) -> Report {
     // By key id: what the Authorities recorded, and the latest receipt each key signed
     // (gate, time, number).
     let mut enrolments: BTreeMap<Id, Enrolment> = BTreeMap::new();
-    let mut signed_last: BTreeMap<Id, (Id, i64, u64)> = BTreeMap::new();
+    // For each key, the last receipt it signed: its gate and its number.
+    let mut signed_last: BTreeMap<Id, (Id, u64)> = BTreeMap::new();
     // Mandates the Authorities recorded issuing (by id: the Authority and the record's
     // number), and those that proven receipts name (by gate and id: the first receipt).
     let mut issued: BTreeMap<Id, (Id, u64)> = BTreeMap::new();
@@ -346,12 +350,9 @@ pub fn verify(check: &Check<'_>) -> Report {
                     }
                     match &link {
                         Link::Receipt(opened) => {
-                            let last = signed_last.get(&opened.kid).map(|(_, at, _)| *at);
-                            if last.is_none_or(|at| opened.doc.at >= at) {
-                                signed_last.insert(
-                                    opened.kid.clone(),
-                                    (gate.gate.clone(), opened.doc.at, h.seq),
-                                );
+                            let last = signed_last.get(&opened.kid).map(|(_, seq)| *seq);
+                            if last.is_none_or(|seq| h.seq >= seq) {
+                                signed_last.insert(opened.kid.clone(), (gate.gate.clone(), h.seq));
                             }
                             if opened.doc.agent.proof == gov_core::receipt::Proof::Proven {
                                 for mandate in &opened.doc.mandate {
@@ -379,7 +380,7 @@ pub fn verify(check: &Check<'_>) -> Report {
                                             seq: h.seq,
                                             gate: about.id.clone(),
                                             digest: digest.clone(),
-                                            retired_at: None,
+                                            retired_by: None,
                                         },
                                     );
                                 }
@@ -387,7 +388,7 @@ pub fn verify(check: &Check<'_>) -> Report {
                                     for e in enrolments.values_mut().filter(|e| {
                                         e.authority == gate.gate && e.gate == record.subject.id
                                     }) {
-                                        e.retired_at.get_or_insert(record.at);
+                                        e.retired_by.get_or_insert(h.seq);
                                     }
                                 }
                                 (AdminAction::Revoked, _, _)
@@ -397,7 +398,7 @@ pub fn verify(check: &Check<'_>) -> Report {
                                         .get_mut(&record.subject.id)
                                         .filter(|e| e.authority == gate.gate)
                                     {
-                                        e.retired_at.get_or_insert(record.at);
+                                        e.retired_by.get_or_insert(h.seq);
                                     }
                                 }
                                 _ => {}
@@ -662,9 +663,25 @@ pub fn verify(check: &Check<'_>) -> Report {
                 find(Problem::MandateNotIssued, Some(gate), Some(*seq));
             }
         }
-        for (kid, (gate, at, seq)) in &signed_last {
-            let retired = enrolments.get(kid).and_then(|e| e.retired_at);
-            if retired.is_some_and(|t| at.saturating_sub(t) > i64::from(check.clock_skew_secs)) {
+        // The witness's order decides, not the dates either side wrote (finding GR-130):
+        // a receipt counts as earlier than a retirement only if a checkpoint before the
+        // first one covering the retirement already covered the receipt.
+        let first_cover = |chain: &Id, seq: u64| {
+            witnessed
+                .get(chain)
+                .and_then(|heads| heads.iter().position(|(head, _, _)| *head >= seq))
+        };
+        for (kid, (gate, seq)) in &signed_last {
+            let Some((authority, record)) = enrolments
+                .get(kid)
+                .and_then(|e| Some((&e.authority, e.retired_by?)))
+            else {
+                continue;
+            };
+            let Some(retired) = first_cover(authority, record) else {
+                continue;
+            };
+            if first_cover(gate, *seq).is_none_or(|covered| covered >= retired) {
                 find(Problem::ReceiptAfterRetirement, Some(gate), Some(*seq));
             }
         }
