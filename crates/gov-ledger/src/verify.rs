@@ -129,6 +129,10 @@ pub enum Problem {
     /// An Authority's record is signed with a key other than the one its chain's last
     /// replacement names: the key was replaced, and went on signing (finding GR-166).
     RecordUnderReplacedKey,
+    /// A record says its actor was signed in, and no earlier record of that person's
+    /// sign-in in the same chain bears the session out: there is none, it is another
+    /// person's, it was ended by a sign-out or an offboarding, or its time had run out.
+    SessionNotBorneOut,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -277,6 +281,8 @@ pub fn verify(check: &Check<'_>) -> Report {
         };
         let mut head: Option<ChainHead> = None;
         let mut successor: Option<Digest> = None;
+        // Each session a sign-in opened: whose, until when, and whether it was ended.
+        let mut sessions: BTreeMap<Id, (Id, i64, bool)> = BTreeMap::new();
         if let Some(record) = &gate.pruned {
             match open::<Pruned>(record, &ledger_keys, check.scope) {
                 Ok(p) if p.doc.gate == gate.gate && p.doc.through_seq >= 1 => {
@@ -385,6 +391,45 @@ pub fn verify(check: &Check<'_>) -> Report {
                                 (&record.action, &record.value)
                             {
                                 successor = Some(next.clone());
+                            }
+                            if let Some(reference) = &record.actor.session {
+                                let opened_now = match (&record.action, record.until) {
+                                    (AdminAction::SignedIn, Some(until)) => sessions
+                                        .insert(
+                                            reference.clone(),
+                                            (record.actor.id.clone(), until, false),
+                                        )
+                                        .is_none(),
+                                    _ => false,
+                                };
+                                let borne_out = opened_now
+                                    || sessions.get(reference).is_some_and(
+                                        |(person, until, ended)| {
+                                            person == &record.actor.id
+                                                && !ended
+                                                && record.at < *until
+                                        },
+                                    );
+                                if !borne_out {
+                                    find(
+                                        Problem::SessionNotBorneOut,
+                                        Some(&gate.gate),
+                                        Some(h.seq),
+                                    );
+                                }
+                                if record.action == AdminAction::SignedOut {
+                                    if let Some(session) = sessions.get_mut(reference) {
+                                        session.2 = true;
+                                    }
+                                }
+                            }
+                            if record.action == AdminAction::PersonOffboarded {
+                                for session in sessions
+                                    .values_mut()
+                                    .filter(|(person, _, _)| person == &record.subject.id)
+                                {
+                                    session.2 = true;
+                                }
                             }
                             if record.action == AdminAction::MandateIssued {
                                 issued

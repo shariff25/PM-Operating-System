@@ -49,6 +49,13 @@ pub enum AdminAction {
     /// old key and carries the digest of the new one; every record after it is signed with
     /// the new key, and the old one is refused from here on (spec §7.6.3, point 9).
     AdminKeyReplaced,
+    /// A person was linked to the account they sign in with. Carries a digest of the
+    /// account, never the account's id (spec §7.6.4, point 3).
+    PersonLinked,
+    /// A person signed in: the session is the actor's, and `until` is when it ends at the
+    /// latest. A later act under that session is checked against this record.
+    SignedIn,
+    SignedOut,
 }
 
 /// The kind of thing an action was done to.
@@ -102,6 +109,10 @@ pub struct Actor {
     /// every record says false, as `claimed` does for an agent, so that none reads as a
     /// person's proven act (review finding GR-111).
     pub verified: bool,
+    /// The signed-in session the person acted under: a reference to it, not the session.
+    /// There is one exactly when `verified` is true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<Id>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +140,9 @@ pub struct AdminRecord {
     /// The digest of what was set, where something was: a public key, a bundle, a mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<Digest>,
+    /// For a sign-in: the latest time the session can last to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<i64>,
 }
 
 document!(AdminRecord, "gov.admin.v1");
@@ -156,6 +170,8 @@ impl AdminRecord {
             A::ModeSet => (&[K::System], &[None], true),
             A::MandateIssued => (&[K::Mandate], &[Some(K::Agent)], true),
             A::AdminKeyReplaced => (&[K::Key], &[None], true),
+            A::PersonLinked => (&[K::Person], &[None], true),
+            A::SignedIn | A::SignedOut => (&[K::Person], &[None], false),
             A::Revoked => (
                 &[K::Agent, K::Mandate, K::Countersignature, K::Key],
                 &[None],
@@ -169,6 +185,18 @@ impl AdminRecord {
         }
         if !also.contains(&about) {
             return Err(Error::Malformed("the action names the wrong second thing"));
+        }
+        if self.actor.verified != self.actor.session.is_some() {
+            return Err(Error::Malformed("verified without a session, or not"));
+        }
+        if self.until.is_some() != (self.action == A::SignedIn) {
+            return Err(Error::Malformed("an end is carried by a sign-in only"));
+        }
+        // A session is opened and closed by the person whose it is.
+        if matches!(self.action, A::SignedIn | A::SignedOut)
+            && !(self.actor.verified && self.actor.id == self.subject.id)
+        {
+            return Err(Error::Malformed("a session is its own person's"));
         }
         if value != self.value.is_some() {
             return Err(Error::Malformed(

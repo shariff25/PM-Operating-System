@@ -53,6 +53,26 @@ pub struct Person {
     pub role: Role,
     /// False once the person is offboarded.
     pub active: bool,
+    /// A digest of the account the person signs in with. Written once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<Digest>,
+}
+
+/// A signed-in session, as kept: never the value the person's browser holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionRow {
+    /// A digest of the session's value: what it is looked up by.
+    pub id: Digest,
+    pub person: Id,
+    /// What records carry: it names the session and cannot be used as one.
+    pub reference: Id,
+    /// When the person proved who they are to the identity provider.
+    pub started: i64,
+    pub until: i64,
+    pub last_used: i64,
+    /// A digest of the second value a changing request must carry.
+    pub csrf: Digest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,6 +163,12 @@ pub enum Effect {
     /// Add one numbered revocation. Its number must be the next one: if it is not, the
     /// whole commit fails with [`StoreError::HeadMoved`] and nothing is written.
     AddRevocation(gov_core::revocation::RevocationEntry),
+    /// Link an account to a person. Like a key, an account is linked once: if it is linked
+    /// already the whole commit fails with [`StoreError::KeyTaken`].
+    AddLink(Digest, Id),
+    PutSession(SessionRow),
+    DropSession(Digest),
+    DropSessionsOf(Id),
 }
 
 /// One admin record as stored.
@@ -176,6 +202,11 @@ pub trait Store: Send + Sync {
 
     async fn any_person(&self, scope: &Scope) -> StoreResult<bool>;
     async fn person(&self, scope: &Scope, id: &Id) -> StoreResult<Option<Person>>;
+    /// The person an account's digest is linked to.
+    async fn linked(&self, scope: &Scope, link: &Digest) -> StoreResult<Option<Id>>;
+    async fn session(&self, scope: &Scope, id: &Digest) -> StoreResult<Option<SessionRow>>;
+    /// Note that a session was used. Not an admin action: nothing is recorded.
+    async fn touch_session(&self, scope: &Scope, id: &Digest, now: i64) -> StoreResult<()>;
     async fn agent(&self, scope: &Scope, id: &Id) -> StoreResult<Option<Agent>>;
     async fn agents_of(&self, scope: &Scope, owner: &Id) -> StoreResult<Vec<Agent>>;
     async fn gate(&self, scope: &Scope, id: &Id) -> StoreResult<Option<Gate>>;
@@ -234,6 +265,8 @@ struct State {
     bundles: BTreeMap<(Key, u64), Published>,
     mandates: BTreeMap<(Key, Id), IssuedMandate>,
     revocations: BTreeMap<(Key, u64), gov_core::revocation::RevocationEntry>,
+    links: BTreeMap<(Key, Digest), Id>,
+    sessions: BTreeMap<(Key, Digest), SessionRow>,
 }
 
 /// A store in memory, for tests and for the library's own use where nothing must outlive
@@ -278,6 +311,11 @@ impl Store for MemoryStore {
                         && (kid == &e.key.kid || held.key.bytes().ok() == e.key.bytes().ok())
                 });
                 if taken {
+                    return Err(StoreError::KeyTaken);
+                }
+            }
+            if let Effect::AddLink(link, _) = effect {
+                if s.links.contains_key(&(key.clone(), link.clone())) {
                     return Err(StoreError::KeyTaken);
                 }
             }
@@ -329,6 +367,19 @@ impl Store for MemoryStore {
                 Effect::AddRevocation(e) => {
                     s.revocations.insert((key.clone(), e.seq), e);
                 }
+                Effect::AddLink(link, person) => {
+                    s.links.insert((key.clone(), link), person);
+                }
+                Effect::PutSession(row) => {
+                    s.sessions.insert((key.clone(), row.id.clone()), row);
+                }
+                Effect::DropSession(id) => {
+                    s.sessions.remove(&(key.clone(), id));
+                }
+                Effect::DropSessionsOf(person) => {
+                    s.sessions
+                        .retain(|(scope_key, _), row| *scope_key != key || row.person != person);
+                }
             }
         }
         Ok(())
@@ -366,6 +417,24 @@ impl Store for MemoryStore {
             .people
             .get(&(k(scope), id.clone()))
             .cloned())
+    }
+
+    async fn linked(&self, scope: &Scope, link: &Digest) -> StoreResult<Option<Id>> {
+        let s = self.0.lock().unwrap();
+        Ok(s.links.get(&(k(scope), link.clone())).cloned())
+    }
+
+    async fn session(&self, scope: &Scope, id: &Digest) -> StoreResult<Option<SessionRow>> {
+        let s = self.0.lock().unwrap();
+        Ok(s.sessions.get(&(k(scope), id.clone())).cloned())
+    }
+
+    async fn touch_session(&self, scope: &Scope, id: &Digest, now: i64) -> StoreResult<()> {
+        let mut s = self.0.lock().unwrap();
+        if let Some(row) = s.sessions.get_mut(&(k(scope), id.clone())) {
+            row.last_used = now;
+        }
+        Ok(())
     }
 
     async fn agent(&self, scope: &Scope, id: &Id) -> StoreResult<Option<Agent>> {
