@@ -972,6 +972,34 @@ impl<S: Store> Authority<S> {
         })
     }
 
+    /// Revoke an enrolled key, an agent's or a gate's (spec §7.6.3, point 8). Its number in
+    /// the feed is returned. Nothing is issued to it or answered for it afterwards, and
+    /// the Ledger retires it when the record arrives.
+    pub async fn revoke_key(&self, actor: &Id, kid: &Id, now: i64) -> Result<u64> {
+        use gov_core::revocation::{Revocable, RevocationEntry};
+        on_head!(self, head, {
+            self.admin(actor).await?;
+            if self.store.key(&self.scope, kid).await?.is_none() {
+                return Err(AuthorityError::Unknown("key"));
+            }
+            let all = self.store.revocations_after(&self.scope, 0).await?;
+            if all.iter().any(|e| e.kind == Revocable::Key && &e.id == kid) {
+                return Err(AuthorityError::Unknown("key in that state"));
+            }
+            let seq = all.last().map_or(1, |e| e.seq + 1);
+            let entry = RevocationEntry {
+                seq,
+                kind: Revocable::Key,
+                id: kid.clone(),
+                until: i64::MAX,
+            };
+            let did = Did::to(AdminAction::Revoked, SubjectKind::Key, kid);
+            self.commit(head, actor, did, &[Effect::AddRevocation(entry)], now)
+                .await?;
+            Ok(seq)
+        })
+    }
+
     pub async fn revoke_mandate(&self, actor: &Id, mandate: &Id, now: i64) -> Result<u64> {
         self.revoke(actor, mandate, false, now).await
     }
@@ -1082,7 +1110,12 @@ impl<S: Store> Authority<S> {
         }
         // Everything revoked, read once: the lease's number and the feed are made from it.
         let all = self.store.revocations_after(&self.scope, 0).await?;
-        // A gate's key that was revoked is refused here once a key can be revoked (G4d-4).
+        if all
+            .iter()
+            .any(|e| e.kind == gov_core::revocation::Revocable::Key && e.id == request.kid)
+        {
+            return Err(AuthorityError::Refused);
+        }
         let (latest, opened, key) = self.leasing().await?;
         // One answer a second for each gate. The limit is counted only for a request that
         // is the gate's own, checked above; whoever could play a gate's requests back to

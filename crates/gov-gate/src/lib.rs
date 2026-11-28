@@ -198,6 +198,7 @@ pub struct Observed<'a> {
 pub struct Gate<S> {
     config: GateConfig,
     key: SigningKey,
+
     spool: S,
     state: SpoolState,
     /// The number and hash of every receipt held, and which intents are still open. Built
@@ -213,6 +214,19 @@ impl<S: Spool> Gate<S> {
     pub fn open(
         config: GateConfig,
         key: SigningKey,
+        spool: S,
+        now: i64,
+    ) -> Result<Self, GateError> {
+        Self::open_after(config, key, &[], spool, now)
+    }
+
+    /// As [`Gate::open`], for a gate whose key has been replaced: `earlier` are the public
+    /// halves of the keys it signed with before, under which its spool may still hold
+    /// receipts (review finding GR-59). A receipt under any other key still stops it.
+    pub fn open_after(
+        config: GateConfig,
+        key: SigningKey,
+        earlier: &[gov_core::PublicKey],
         mut spool: S,
         now: i64,
     ) -> Result<Self, GateError> {
@@ -223,7 +237,7 @@ impl<S: Spool> Gate<S> {
         let held = spool.held()?;
         // Nothing in the spool is trusted until it opens under this gate's own key with the
         // number and hash the spool says it has (review finding GR-51).
-        let keys = KeySet::new([key.public()]);
+        let keys = KeySet::new(earlier.iter().cloned().chain([key.public()]));
         let mut docs = Vec::with_capacity(held.len());
         for r in &held {
             let opened = open::<Receipt>(&r.envelope, &keys, &config.scope)?;
@@ -416,6 +430,8 @@ impl<S: Spool> Gate<S> {
             .spool
             .get(intent)?
             .ok_or(GateError::NoSuchIntent(intent))?;
+        // Signed with the key in use: an intent an earlier key left open was closed when
+        // the gate opened.
         let keys = KeySet::new([self.key.public()]);
         let doc = open::<Receipt>(&held.envelope, &keys, &self.config.scope)?.doc;
         self.write_outcome(&doc, status, upstream_ref, when)
