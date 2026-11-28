@@ -486,6 +486,67 @@ async fn each_receipt_says_whether_its_own_time_is_the_authoritys() {
     );
 }
 
+/// A gate given a new key goes on from the receipts it signed with the old one, when it
+/// is told the old key was its own; with no word of it, or of another key, it does not
+/// start (review finding GR-59).
+#[tokio::test]
+async fn a_gate_with_a_new_key_goes_on_from_receipts_under_its_old_one() {
+    use gov_core::receipt::follow;
+    let dir = tempfile::tempdir().unwrap();
+    let agent = id("triage-bot");
+    let a = action(1);
+    {
+        let mut gate = gate_at(dir.path(), 100, T0);
+        call(&mut gate, 1, T0 + 1);
+        // Left open by a stop.
+        gate.begin(&observed(&agent, &a), T0 + 2).unwrap();
+    }
+    let new_key = || SigningKey::from_seed(id("gate-1-key-2"), &[21; 32]).unwrap();
+    let old = gate_key().public();
+    let open_with = |earlier: &[gov_core::PublicKey]| {
+        Gate::open_after(
+            config(100),
+            new_key(),
+            earlier,
+            FileSpool::open(dir.path()).unwrap(),
+            T0 + 10,
+        )
+    };
+    assert!(open_with(&[]).is_err());
+    let stranger = SigningKey::from_seed(id("gate-1-key"), &[99; 32]).unwrap();
+    assert!(open_with(&[stranger.public()]).is_err());
+
+    let mut gate = open_with(std::slice::from_ref(&old)).unwrap();
+    // The intent the old key signed was closed by the new one, and work goes on.
+    let third = gate.begin(&observed(&agent, &a), T0 + 11).unwrap();
+    gate.finish(third, OutcomeStatus::Ok, None, T0 + 12)
+        .unwrap();
+    let both = KeySet::new([old, new_key().public()]);
+    let held = FileSpool::open(dir.path()).unwrap().held().unwrap();
+    let signers: Vec<&str> = held.iter().map(|r| r.envelope.kid.as_str()).collect();
+    assert_eq!(
+        signers,
+        [
+            "gate-1-key",
+            "gate-1-key",
+            "gate-1-key",
+            "gate-1-key-2",
+            "gate-1-key-2",
+            "gate-1-key-2"
+        ]
+    );
+    // One chain across the change of key.
+    let mut head = None;
+    for r in &held {
+        let opened = open::<Receipt>(&r.envelope, &both, &scope()).unwrap();
+        head = Some(follow(head.as_ref(), &opened).unwrap());
+    }
+    let closed = open::<Receipt>(&held[3].envelope, &both, &scope())
+        .unwrap()
+        .doc;
+    assert_eq!((closed.phase, closed.intent), (Phase::Outcome, Some(3)));
+}
+
 /// Review finding GR-10: an answer the Ledger did not sign, or one that names another hash,
 /// moves nothing.
 #[tokio::test]

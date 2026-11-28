@@ -538,6 +538,11 @@ follow-up tracking.
   Low, fixed on `build/gov-review-26` on 2026-11-28. Accepted on a stated condition: a
   policy bundle holds no secret and every agent of the tenant may read it. Open before
   enforce mode: the one call that crosses a bundle change fails its proof.
+- **G4d-4, first part, built (2026-11-28), on `build/gov-g4d4a`:** an admin can revoke an
+  enrolled key, a revoked gate key is refused a renewal, and a gate given a new key goes on
+  from the receipts it signed with the old one. Libraries and tests; not yet read by the
+  reviewer. Still to build in G4d-4: replacing the Authority's admin-record key, and the
+  witness's order in `gov verify`.
 
 ## Where the build stands (2026-11-23)
 

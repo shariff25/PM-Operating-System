@@ -583,6 +583,22 @@ reviewer.
     in G4d-5, and until then a gate started again begins from the bundle file it is given
     and is brought forward by its first renewal. (4) The bundle is policy, and any agent
     with a mandate that opens a session can read it.
+- **G4d-4, first part, built (2026-11-28), from §7.6.3 point 8; not yet read by the
+  reviewer.** On `build/gov-g4d4a`, libraries and tests.
+  - `Authority::revoke_key`: an admin revokes an enrolled key, an agent's or a gate's,
+    once, with a record and an entry in the feed that never runs out. A revoked gate key
+    is refused a renewal (the check the twenty-fourth read asked to come back, with its
+    test). Nothing is issued to a revoked agent key: the chain check the Authority makes
+    before it signs already refuses it.
+  - `Gate::open_after`: a gate given a new key opens its spool under the keys it is told
+    were its own before, closes what the old key left open, and goes on in one chain. A
+    receipt under any other key still stops it (GR-59).
+  - Six controls removed one at a time; each removal fails a test. Two checks added at
+    first were taken out again, since another check already did their work.
+  - **Not built here:** keeping the earlier keys as files and deleting the old private
+    half once the Ledger has acknowledged its last receipt (the program, G4d-5); the
+    Authority's own admin-record key (point 9) and the witness's order in `gov verify`
+    (point 10), which are the second part.
 
 ## Security review of 2026-11-26 (first read; the gate did not pass)
 

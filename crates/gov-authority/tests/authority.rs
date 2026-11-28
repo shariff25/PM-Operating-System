@@ -2273,6 +2273,61 @@ mod renewal {
         ));
     }
 
+    /// A gate's key is replaced: it enrols a second, the first is revoked, and from then
+    /// on the first is answered nothing while the second is. A revoked agent key is issued
+    /// nothing. Gates learn of both from the feed.
+    #[tokio::test]
+    async fn a_revoked_key_is_answered_and_issued_nothing() {
+        let (a, first) = serving(MemoryStore::default()).await;
+        let (ana, ben) = (id("ana"), id("ben"));
+        let second = key("gate-1:k2", 41);
+        let code = a
+            .offer_enrolment(&ana, EnrolKind::Gate, &id("gate-1"), NOW)
+            .await
+            .unwrap();
+        let asked = request(&second, EnrolKind::Gate, "gate-1", second.public(), &code);
+        a.enrol(&code, &asked, NOW).await.unwrap();
+
+        // Only an admin revokes a key, and only one that is enrolled, once.
+        assert!(matches!(
+            a.revoke_key(&ben, &id("gate-1:k1"), NOW).await,
+            Err(AuthorityError::NotAllowed)
+        ));
+        assert!(a.revoke_key(&ana, &id("gate-1:k9"), NOW).await.is_err());
+        let before = chain(&a).await.len();
+        a.revoke_key(&ana, &id("gate-1:k1"), NOW).await.unwrap();
+        assert!(a.revoke_key(&ana, &id("gate-1:k1"), NOW).await.is_err());
+        let records = chain(&a).await;
+        assert_eq!(records.len(), before + 1);
+        let last = records.last().unwrap();
+        assert_eq!(
+            (last.action, last.subject.kind, &last.subject.id),
+            (AdminAction::Revoked, SubjectKind::Key, &id("gate-1:k1"))
+        );
+
+        let s = standing("gate-1");
+        let (old, _) = s.ask(&first, 0).unwrap();
+        assert!(matches!(
+            a.renew(&old, NOW + 1).await,
+            Err(AuthorityError::Refused)
+        ));
+        let mut s = standing("gate-1");
+        round(&a, &mut s, &second, 0, NOW + 1).await;
+        assert!(s.revoked().is_revoked(Revocable::Key, &id("gate-1:k1")));
+
+        // An agent's key: nothing more is issued to it, and gates hear of it.
+        let good = ask("refund-bot", "refund-bot:k1", "triage");
+        a.issue_mandate(&ben, &good, NOW).await.unwrap();
+        a.revoke_key(&ana, &id("refund-bot:k1"), NOW).await.unwrap();
+        assert!(a.issue_mandate(&ben, &good, NOW).await.is_err());
+        round(&a, &mut s, &second, 5_000, NOW + 5).await;
+        assert!(s.revoked().is_revoked(Revocable::Key, &id("refund-bot:k1")));
+        // Long after, a key's entry is still in the feed: a key does not run out.
+        let mut late = standing("gate-1");
+        round(&a, &mut late, &second, 0, NOW + 100_000).await;
+        assert!(late.revoked().is_revoked(Revocable::Key, &id("gate-1:k1")));
+    }
+
     /// An agent and a gate never share a name, so an agent's key is never under a gate's.
     /// Were one ever written there all the same, it would still not be answered: the key
     /// must be one enrolled for a gate.
