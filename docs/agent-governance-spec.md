@@ -1081,6 +1081,20 @@ its verdicts rest on its own test runs.
 | GR-179 | Low | After a renewal brings a newer bundle and before it is swapped in, every proof is `no_lease`; to be said, so that it is not read as the Authority being down | No longer so since G4d-3: the bundle is swapped in the same step as the lease is taken |
 | GR-180 | Low | A marker that had proven a call still counts among its key's proven sessions and can be the one closed to make room, after which its calls lose the agent's name | Fixed: a marker is not among the proven sessions closed to make room |
 
+### Twenty-sixth read, 2026-11-27: G4d-3 at `1ddddc7`
+
+**Verdict: no High or Critical; G4d-3 passes.** GR-133 and GR-175 are closed. The reviewer
+ran the tests of `gov-core`, `gov-gate`, `gov-run` and `gov-authority` without Postgres;
+its findings are from reading. **GR-181 and GR-182 are to be fixed before G4d-5.**
+
+| Id | Severity | What | Done |
+|---|---|---|---|
+| GR-181 | Medium, before G4d-5 | A shim that followed its gate noted the new bundle but did not keep it, so on its next start its old bundle file was refused as older | Fixed on `build/gov-review-26`: the bundle taken is written over the shim's bundle file before it is noted |
+| GR-182 | Low | Under a bundle that both revokes a chain and drops its issuer's key, the session was dropped and lost its reason | Fixed: revocation is checked under the old bundle before the new keys and templates replace it |
+| GR-183 | Low | Two overlapping calls could put an older bundle back in the shim's state | Fixed: one follow at a time, each reading what is held after it has the lock. No test removes this one: it needs two bundle changes inside one call |
+| GR-184 | Low | The bundle is handed to anyone who knows an open session's id, which is on every receipt | Accepted for this release on a condition now stated here: **a bundle never holds a secret, and every agent of the tenant may read all of it.** With more than one tenant, or a rule an agent should not learn, the request must carry a proof under the session's key |
+| GR-185 | Info | The call that crosses a bundle change fails its proof; an operator cannot tell a publish from an attack without reading receipts | Open: before enforce mode the shim retries once after it follows, or the call gets a reason of its own |
+
 ## 1. What is being built
 
 Agent Governance is a second product, separate from PM OS. It has three parts.

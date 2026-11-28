@@ -533,6 +533,11 @@ follow-up tracking.
   receipt's time and its source travel together), GR-178 (a clock mismatch at a session's
   opening is counted under its own reason) and GR-180 (a marker is not closed to make room
   for new sessions). Not yet read by the reviewer.
+- **Twenty-sixth read (2026-11-27), G4d-3 at `1ddddc7`:** no High or Critical; G4d-3
+  passes. One Medium (GR-181: a shim that followed its gate could not start again) and two
+  Low, fixed on `build/gov-review-26` on 2026-11-28. Accepted on a stated condition: a
+  policy bundle holds no secret and every agent of the tenant may read it. Open before
+  enforce mode: the one call that crosses a bundle change fails its proof.
 
 ## Where the build stands (2026-11-23)
 

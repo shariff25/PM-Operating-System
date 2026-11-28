@@ -51,6 +51,8 @@ pub struct Signed {
     pub held: HeldBundle,
     /// Where the newest bundle accepted is noted, before it is used.
     pub state: PathBuf,
+    /// The bundle file the program was started with.
+    pub file: PathBuf,
     /// The server whose map this program uses.
     pub server: Id,
 }
@@ -94,6 +96,20 @@ fn read<T: serde::de::DeserializeOwned>(path: &Path, what: &str) -> anyhow::Resu
     let value = gov_core::strict::parse(&bytes)
         .map_err(|_| anyhow::anyhow!("{what} is not strict JSON"))?;
     serde_json::from_value(value).with_context(|| format!("{what} is not in the form expected"))
+}
+
+/// Write `bytes` to `path`, whole or not at all.
+pub fn replace(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let tmp = path.with_extension("tmp");
+    let mut file = std::fs::File::create(&tmp)
+        .with_context(|| format!("{} cannot be written", tmp.display()))?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    std::fs::rename(&tmp, path).with_context(|| format!("{} cannot be written", path.display()))?;
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
 }
 
 /// Note `held` in `path`, whole or not at all, before the bundle is used.
@@ -172,6 +188,7 @@ impl PolicyArgs {
                 root,
                 held: opened.held(),
                 state: state.clone(),
+                file: bundle.clone(),
                 server: Id::new(server)
                     .map_err(|_| anyhow::anyhow!("the server's name is not an identifier"))?,
             }),

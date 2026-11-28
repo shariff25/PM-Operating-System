@@ -808,7 +808,12 @@ async fn the_gate_changes_bundle_without_a_restart_and_the_shim_follows_it() {
     };
     let (forwarder, gate) = gate_on(dir.path(), &first, wall).await;
     let state = dir.path().join("shim.bundle-state");
+    let file = dir.path().join("shim.bundle.json");
+    let root_file = dir.path().join("root.json");
+    std::fs::write(&file, serde_json::to_vec(&first).unwrap()).unwrap();
+    std::fs::write(&root_file, serde_json::to_vec(&root().public()).unwrap()).unwrap();
     let follow = gov_run::shim::Follow {
+        file: Some(file.clone()),
         root: root().public(),
         held: open_bundle(&first, &root().public(), &scope())
             .unwrap()
@@ -837,6 +842,19 @@ async fn the_gate_changes_bundle_without_a_restart_and_the_shim_follows_it() {
     let noted: gov_core::policy::HeldBundle =
         serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
     assert_eq!(noted.number, 2);
+    // And kept it, so that it can start again: its files now load as the second bundle.
+    let again = gov_run::policy_source::PolicyArgs {
+        bundle: Some(file.clone()),
+        root_key: Some(root_file.clone()),
+        bundle_state: Some(state.clone()),
+        server: Some("jira-mcp".into()),
+        unsigned_policy_for_tests: false,
+        map: None,
+        mandate_issuers: None,
+    }
+    .load(&scope())
+    .unwrap();
+    assert_eq!(again.version, version(&second));
 
     assert_eq!(shim.not_followed.load(Ordering::Relaxed), 0);
 
@@ -924,6 +942,7 @@ async fn a_shim_takes_no_bundle_its_own_root_did_not_sign_and_none_older_than_it
         assert!(renew_to(&forwarder, wall + 1, &second).await);
         let state = dir.path().join("shim.bundle-state");
         let follow = gov_run::shim::Follow {
+            file: None,
             root: root_key,
             held: starts_with,
             state: Some(state.clone()),
@@ -980,6 +999,7 @@ async fn a_shim_behind_its_gate_catches_up_before_its_first_call() {
     assert!(!renew_to(&forwarder, wall, &first).await);
     assert!(renew_to(&forwarder, wall + 1, &second).await);
     let follow = gov_run::shim::Follow {
+        file: None,
         root: root().public(),
         held: open_bundle(&first, &root().public(), &scope())
             .unwrap()
@@ -1051,6 +1071,7 @@ async fn a_shim_takes_only_the_bundle_its_gate_named() {
             .route("/mcp", post(fake_jira));
     let gate = serve(lying).await;
     let follow = gov_run::shim::Follow {
+        file: None,
         root: root().public(),
         held: open_bundle(&first, &root().public(), &scope())
             .unwrap()
@@ -1089,6 +1110,7 @@ async fn a_shim_takes_only_the_bundle_its_gate_named() {
             .route("/mcp", post(fake_jira));
     let gate = serve(honest).await;
     let follow = gov_run::shim::Follow {
+        file: None,
         root: root().public(),
         held: open_bundle(&first, &root().public(), &scope())
             .unwrap()
