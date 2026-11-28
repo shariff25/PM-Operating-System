@@ -172,7 +172,7 @@ async fn serve(s: Serve) -> anyhow::Result<()> {
     .with_earlier_admin_keys(earlier);
     let operator_secret = new_secret(&s.operator_secret_file)?;
     let listener = Arc::new(Listener::new(
-        authority,
+        Arc::new(authority),
         now,
         SourceLimit {
             per_second: s.renewals_per_source_per_second,

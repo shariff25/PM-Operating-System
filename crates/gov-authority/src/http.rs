@@ -51,7 +51,7 @@ pub struct Counters {
 }
 
 pub struct Listener<S> {
-    pub authority: Authority<S>,
+    pub authority: Arc<Authority<S>>,
     pub clock: fn() -> i64,
     pub limit: SourceLimit,
     pub counters: Counters,
@@ -82,7 +82,7 @@ fn source_of(ip: IpAddr) -> [u8; 16] {
 }
 
 impl<S> Listener<S> {
-    pub fn new(authority: Authority<S>, clock: fn() -> i64, limit: SourceLimit) -> Self {
+    pub fn new(authority: Arc<Authority<S>>, clock: fn() -> i64, limit: SourceLimit) -> Self {
         Listener {
             authority,
             clock,

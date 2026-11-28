@@ -11,6 +11,7 @@
 //! refuses the commit if the head has moved, and the action starts again. Nothing changes
 //! the registry without moving the head, so no check can be overtaken.
 
+pub mod admin_http;
 pub mod http;
 pub mod pg;
 pub mod store;
@@ -119,7 +120,8 @@ struct Origin<'a> {
 }
 
 /// What a person asks for when they ask for a mandate (spec §7.6.2, point 2).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MandateAsk {
     pub agent: Id,
     /// Which of the agent's enrolled keys the mandate is bound to.
@@ -130,11 +132,12 @@ pub struct MandateAsk {
     pub grants: Vec<gov_core::action::Grant>,
     pub life_secs: u64,
     /// Absent ceilings take the template's.
+    #[serde(default)]
     pub limits: gov_core::mandate::Limits,
 }
 
 /// What listing shows of a mandate: never its grants' resources.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct MandateInfo {
     pub id: Id,
     pub agent: Id,

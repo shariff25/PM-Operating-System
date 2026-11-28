@@ -597,6 +597,12 @@ follow-up tracking.
   record, an act under a session is recorded as verified, and `gov verify` holds it to
   the sign-in. The acts that change who is trusted need a sign-in under five minutes
   old. Nothing is served yet (G4e-3); not yet read by the reviewer.
+- **G4e-3 built (2026-11-28), on `build/gov-g4e3`:** the listener for people, as a
+  library: sign-in through the tenant, a session cookie, guards on every request, and
+  sixteen routes that call the library with the session as the actor. Tested against a
+  fake identity provider only; not yet in the program (G4e-5); not yet read by the
+  reviewer. Testing found that a header or cookie sent twice was judged by the first;
+  it is now refused.
 
 ## Where the build stands (2026-11-23)
 

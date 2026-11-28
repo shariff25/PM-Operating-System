@@ -92,6 +92,69 @@ struct IdpState {
     keys_moved_to: Mutex<Option<String>>,
     /// Bytes of padding in the keys' answer.
     keys_padding: AtomicUsize,
+    /// The client this provider answers, and its secret.
+    client: Mutex<(String, String)>,
+    /// Codes given out and not yet redeemed: the nonce, the PKCE challenge and the
+    /// redirect address each was asked with.
+    codes: Mutex<std::collections::HashMap<String, (String, String, String)>>,
+    /// The claims of whoever is at the keyboard, over a member's.
+    person: Mutex<serde_json::Map<String, Value>>,
+    /// What the last request to authorize asked for.
+    asked: Mutex<std::collections::HashMap<String, String>>,
+}
+
+/// The front door: gives a code and sends the browser back.
+async fn authorize(
+    State(idp): State<Arc<IdpState>>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let get = |k: &str| q.get(k).cloned().unwrap_or_default();
+    *idp.asked.lock().unwrap() = q.clone();
+    let mut codes = idp.codes.lock().unwrap();
+    let code = format!(
+        "code-{}",
+        codes.len() + 1 + idp.jwks_hits.load(Ordering::SeqCst)
+    );
+    codes.insert(
+        code.clone(),
+        (get("nonce"), get("code_challenge"), get("redirect_uri")),
+    );
+    let to = format!("{}?code={code}&state={}", get("redirect_uri"), get("state"));
+    (StatusCode::FOUND, [(axum::http::header::LOCATION, to)]).into_response()
+}
+
+/// The back door: a code, the client's secret and the PKCE verifier for an ID token.
+async fn token(
+    State(idp): State<Arc<IdpState>>,
+    Path(tenant): Path<String>,
+    axum::extract::Form(form): axum::extract::Form<std::collections::HashMap<String, String>>,
+) -> Response {
+    use sha2::Digest;
+    let get = |k: &str| form.get(k).cloned().unwrap_or_default();
+    let (client, secret) = idp.client.lock().unwrap().clone();
+    let Some((nonce, challenge, redirect)) = idp.codes.lock().unwrap().remove(&get("code")) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let proved = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(sha2::Sha256::digest(get("code_verifier").as_bytes()));
+    if get("grant_type") != "authorization_code"
+        || get("client_id") != client
+        || get("client_secret") != secret
+        || get("redirect_uri") != redirect
+        || proved != challenge
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let base = idp.base.lock().unwrap().clone();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let mut claims = member_claims(&base, &tenant, &client, "", "", &nonce, now);
+    for (k, v) in idp.person.lock().unwrap().iter() {
+        claims[k] = v.clone();
+    }
+    let id_token = sign(&claims, keys::KEY_A_DER, "key-a");
+    Json(json!({"token_type": "Bearer", "id_token": id_token})).into_response()
 }
 
 /// A fake Entra tenant: `GET /{tenant}/v2.0/.well-known/openid-configuration` and
@@ -168,6 +231,8 @@ impl FakeIdp {
                 get(discovery),
             )
             .route("/{tenant}/discovery/v2.0/keys", get(jwks))
+            .route("/{tenant}/oauth2/v2.0/authorize", get(authorize))
+            .route("/{tenant}/oauth2/v2.0/token", axum::routing::post(token))
             .with_state(state.clone());
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         tokio::spawn(async move {
@@ -199,6 +264,22 @@ impl FakeIdp {
         self.state
             .jwks_delay_ms
             .store(delay.as_millis() as u64, Ordering::SeqCst);
+    }
+
+    /// The client this provider redeems codes for.
+    pub fn set_client(&self, client_id: &str, secret: &str) {
+        *self.state.client.lock().unwrap() = (client_id.into(), secret.into());
+    }
+
+    /// A claim of whoever signs in next, over a member's: their `oid`, or one to leave
+    /// wrong.
+    pub fn set_claim(&self, name: &str, value: Value) {
+        self.state.person.lock().unwrap().insert(name.into(), value);
+    }
+
+    /// What the last request to authorize asked for.
+    pub fn asked(&self) -> std::collections::HashMap<String, String> {
+        self.state.asked.lock().unwrap().clone()
     }
 
     /// Have the discovery document name another address for the keys.

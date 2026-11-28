@@ -679,6 +679,28 @@ reviewer.
   that ran out stays stored until sign-out or offboarding; the auditor's check reads the
   Authority's records, not the mandate inside a receipt. Nothing is served: the listener
   is G4e-3.
+- **G4e-3 built (2026-11-28), from §7.6.4 points 2 and 5 to 8; not yet read by the
+  reviewer.** On `build/gov-g4e3`. The listener for people, as a library
+  (`gov_authority::admin_http`): sign-in by code with PKCE (only `openid` asked for; a
+  fresh sign-in on request; the flow kept under a digest of a `Lax` pre-sign-in cookie,
+  used once, ten minutes at most; the code redeemed with the client's secret; the token
+  checked by `gov-signin` and then discarded); a session cookie (`HttpOnly`, `Strict`,
+  `__Host-` and `Secure` on an https origin); the page after sign-in served by the
+  callback itself with `Referrer-Policy: no-referrer`; `Cache-Control: no-store` on every
+  answer. Every request must be for this host, and any that is not a read must carry this
+  origin, a JSON body and the session's second value. Sixteen routes, each the library
+  call with the session as the actor. A refused sign-in answers 403 with nothing, and the
+  reason is counted for the operator. It starts only on an https origin, or a literal
+  loopback address with fake data; a plain-HTTP identity provider is for fake data; and
+  beyond loopback the proxy's header must be named (GR-196). Sign-ins are limited
+  overall and for each client address in that header. Eighteen controls removed on
+  purpose, each caught. **Found while testing:** a request with two `Origin` headers, or
+  two session cookies, was judged by the first; a header or cookie sent twice is now
+  refused. Limits: a library only, not yet in the `gov-authority` program (G4e-5); fake
+  identity provider only; no listing of people, agents, gates or keys (the stores have
+  no such reads yet), only of mandates; no limit for each pre-sign-in cookie beyond a
+  flow being used once; the count of flows in progress is capped at 10,000, so a flood
+  of starts can hold up new sign-ins for up to ten minutes within the overall limit.
 
 ## Security review of 2026-11-26 (first read; the gate did not pass)
 
