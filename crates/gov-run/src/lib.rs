@@ -41,7 +41,16 @@ fn file_keys_allowed() -> anyhow::Result<()> {
 /// Read a private key from its file. The file must be a plain file that nobody but its owner
 /// can read or write: a key any other account on the machine can read is not this program's
 /// key alone (threat T13). Nothing from the file is ever printed, in an error or otherwise.
-pub fn read_key(path: &Path) -> anyhow::Result<SigningKey> {
+/// A secret kept in a file, under the same rule as a key: fake data only, a plain file,
+/// its owner's alone. For the client secret of the sign-in.
+pub fn read_secret(path: &Path) -> anyhow::Result<String> {
+    let text = owners_file(path)?;
+    let secret = text.trim();
+    anyhow::ensure!(!secret.is_empty(), "the file {} is empty", path.display());
+    Ok(secret.to_string())
+}
+
+fn owners_file(path: &Path) -> anyhow::Result<String> {
     file_keys_allowed()?;
     let meta = std::fs::symlink_metadata(path)
         .with_context(|| format!("the key file {} cannot be read", path.display()))?;
@@ -58,8 +67,12 @@ pub fn read_key(path: &Path) -> anyhow::Result<SigningKey> {
             );
         }
     }
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("the key file {} cannot be read", path.display()))?;
+    std::fs::read_to_string(path)
+        .with_context(|| format!("the key file {} cannot be read", path.display()))
+}
+
+pub fn read_key(path: &Path) -> anyhow::Result<SigningKey> {
+    let text = owners_file(path)?;
     SigningKey::from_file_text(&text)
         .map_err(|_| anyhow::anyhow!("the key file {} does not hold a key", path.display()))
 }

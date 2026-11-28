@@ -215,9 +215,10 @@ async fn a_person_signs_in_and_acts_under_the_session() {
             asked["response_type"].as_str(),
             asked["response_mode"].as_str(),
             asked["code_challenge_method"].as_str(),
-            asked.get("max_age"),
+            asked["max_age"].as_str(),
         ),
-        ("openid", "code", "query", "S256", None)
+        // A tenant sign-in no older than a session here may last.
+        ("openid", "code", "query", "S256", "28800")
     );
     let me: Value = site
         .http
@@ -394,9 +395,16 @@ async fn every_refused_sign_in_looks_the_same() {
         site.idp.set_claim("auth_time", json!(clock()));
         site.idp.set_claim("tid", json!(TENANT));
     }
+    // A tenant sign-in older than a session here may last, counted under its own reason.
+    site.idp.set_claim("auth_time", json!(clock() - 9 * 3600));
+    let (pre, to) = site.start("").await;
+    let back = site.at_the_tenant(&to).await;
+    assert_eq!(landing(back, Some(pre)).await, refused);
+    site.idp.set_claim("auth_time", json!(clock()));
     // The operator sees why; the caller did not.
     let why = site.admin.counters.failed.lock().unwrap().clone();
     for reason in [
+        "signed_in_too_long_ago",
         "no_flow",
         "state",
         "not_linked",
@@ -491,15 +499,69 @@ async fn sign_ins_are_limited_overall_and_for_each_client() {
     for _ in 0..3 {
         assert_eq!(start("10.0.0.1").await, 302);
     }
-    assert_eq!(start("10.0.0.1").await, 429);
-    assert_eq!(start("10.0.0.2").await, 302);
-    // Overall: twelve in the second, whoever asks.
-    for n in 0..7 {
-        assert_eq!(start(["a", "b", "c", "d", "e", "f", "g"][n]).await, 302);
+    // One client past its own limit is refused, and uses up nobody else's (GR-205).
+    for _ in 0..40 {
+        assert_eq!(start("10.0.0.1").await, 429);
     }
-    assert_eq!(start("h").await, 429);
+    // The address is the last one in the header, which the proxy wrote: what a caller
+    // puts before it does not make it someone else (GR-206).
+    assert_eq!(start("203.0.113.9, 10.0.0.1").await, 429);
+    assert_eq!(start("10.0.0.1, 10.0.0.2").await, 302);
+    // Not an address, or no header at all: not through the proxy.
+    assert_eq!(start("someone").await, 429);
+    let bare = http.get(format!("{origin}/v1/signin/start"));
+    assert_eq!(bare.send().await.unwrap().status(), 429);
+    // Overall: twelve in the second, whoever asks.
+    for n in 3..11 {
+        assert_eq!(
+            start(Box::leak(format!("10.0.0.{n}").into_boxed_str())).await,
+            302
+        );
+    }
+    assert_eq!(start("10.0.0.99").await, 429);
     AT.fetch_add(1, Ordering::SeqCst);
     assert_eq!(start("10.0.0.1").await, 302);
+}
+
+/// On an https origin both cookies are the host's alone: a sibling host cannot plant the
+/// pre-sign-in cookie (GR-207).
+#[tokio::test]
+async fn on_https_the_cookies_are_the_hosts_alone() {
+    let idp = FakeIdp::start(TENANT).await;
+    let authority = Arc::new(Authority::new(
+        MemoryStore::default(),
+        Scope::new("acme", "prod").unwrap(),
+        id("authority"),
+        key("authority-admin-1", 60),
+        key("authority-root-1", 61).public(),
+    ));
+    let tenant = Tenant::from_settings(["T", "C", "A"], TENANT, CLIENT, Some(&idp.base)).unwrap();
+    let mut behind = config("https://gov.example");
+    behind.client_header = Some("x-client".into());
+    let admin =
+        Arc::new(Admin::new(authority, Verifier::new(tenant).unwrap(), behind, clock).unwrap());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let at = listener.local_addr().unwrap();
+    let app = router(admin);
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let begun = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap()
+        .get(format!("http://{at}/v1/signin/start"))
+        .header("host", "gov.example")
+        .header("x-client", "10.0.0.1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(begun.status(), 302);
+    let kept = begun.headers()["set-cookie"].to_str().unwrap();
+    assert!(kept.starts_with("__Host-gov_pre="), "{kept}");
+    for part in ["Secure", "HttpOnly", "SameSite=Lax", "Path=/;"] {
+        assert!(kept.contains(part), "{part}: {kept}");
+    }
+    let to = begun.headers()["location"].to_str().unwrap();
+    assert!(to.contains("redirect_uri=https%3A%2F%2Fgov.example%2Fv1%2Fsignin%2Fcallback"));
 }
 
 /// Every route that changes something acts as the session, never as a bare name: its

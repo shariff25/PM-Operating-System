@@ -29,8 +29,8 @@ use gov_core::{
 };
 
 pub use store::{
-    Agent, Effect, EnrolledKey, Gate, IssuedMandate, MemoryStore, PendingCode, Person, Published,
-    Role, SessionRow, Status, Store, StoreError, StoredRecord,
+    Agent, Effect, EnrolledKey, Gate, IssuedMandate, MemoryStore, NamedKey, PendingCode, Person,
+    Published, Role, SessionRow, Status, Store, StoreError, StoredRecord,
 };
 
 /// How long a one-time code is good for, in seconds.
@@ -57,6 +57,9 @@ pub enum AuthorityError {
     #[error("refused")]
     Refused,
     /// A gate asked to renew again within the same second.
+    /// This Authority holds an admin-record key its chain says was replaced.
+    #[error("the admin-record key this Authority holds was replaced")]
+    KeyReplaced,
     /// The act needs a sign-in more recent than the session's.
     #[error("sign in again")]
     SignInAgain,
@@ -370,9 +373,30 @@ impl<S: Store> Authority<S> {
         self
     }
 
+    pub fn session_limits(&self) -> SessionLimits {
+        self.session_limits
+    }
+
     pub fn with_session_limits(mut self, limits: SessionLimits) -> Self {
         self.session_limits = limits;
         self
+    }
+
+    /// For an Authority started with the new key while the Ledger may not have the
+    /// replacement record yet: `old` is the key that record was signed with, so the
+    /// shipment that carries it can still be asked for under it.
+    pub async fn with_replaced_key(mut self, old: SigningKey) -> Result<Self> {
+        let named = self.store.admin_key(&self.scope).await?;
+        let Some(named) = named
+            .filter(|n| key_digest(&self.admin_key.public()).is_ok_and(|held| held == n.digest))
+        else {
+            return Err(AuthorityError::Unknown("replacement of this key"));
+        };
+        if !self.earlier_admin.iter().any(|k| k.same_key(&old.public())) {
+            self.earlier_admin.push(old.public());
+        }
+        self.outgoing = Some((old, named.seq));
+        Ok(self)
     }
 
     /// Forget the replaced key. For when the Ledger has taken the new one: it answers the
@@ -414,6 +438,13 @@ impl<S: Store> Authority<S> {
         effects: &[Effect],
         now: i64,
     ) -> Result<u64> {
+        // An instance left holding a replaced key stops writing: the Ledger would refuse
+        // its records and the chain would end there (review finding GR-194).
+        if let Some(named) = self.store.admin_key(&self.scope).await? {
+            if named.digest != key_digest(&self.admin_key.public())? {
+                return Err(AuthorityError::KeyReplaced);
+            }
+        }
         // A record's time never goes back along the chain, whatever the clock does.
         let at = match &head {
             Some(h) => self
@@ -1381,7 +1412,12 @@ impl<S: Store> Authority<S> {
                 value: Some(digest.clone()),
                 ..Did::to(AdminAction::AdminKeyReplaced, SubjectKind::Key, &public.kid)
             };
-            self.commit(head, actor, did, &[], now).await
+            let named = NamedKey {
+                digest: digest.clone(),
+                seq: head.as_ref().map_or(1, |h| h.seq + 1),
+            };
+            self.commit(head, actor, did, &[Effect::NameAdminKey(named)], now)
+                .await
         })?;
         let old = std::mem::replace(&mut self.admin_key, next);
         self.earlier_admin.push(old.public());

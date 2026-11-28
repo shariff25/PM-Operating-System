@@ -14,8 +14,8 @@ use sqlx::types::Json;
 use sqlx::Row;
 
 use crate::store::{
-    Agent, Effect, EnrolledKey, Gate, IssuedMandate, PendingCode, Person, Published, SessionRow,
-    Store, StoreError, StoreResult, StoredRecord,
+    Agent, Effect, EnrolledKey, Gate, IssuedMandate, NamedKey, PendingCode, Person, Published,
+    SessionRow, Store, StoreError, StoreResult, StoredRecord,
 };
 
 impl From<sqlx::Error> for StoreError {
@@ -47,6 +47,18 @@ fn stored(r: &PgRow) -> StoreResult<StoredRecord> {
     })
 }
 
+/// Held while its holder lives. Its session is its own, not the pool's, so dropping it
+/// closes the session and frees the lock.
+pub struct ServingLock(sqlx::PgConnection);
+
+impl ServingLock {
+    pub async fn release(self) {
+        use sqlx::Connection;
+        let _ = self.0.close().await;
+    }
+}
+
+#[derive(Clone)]
 pub struct PgStore {
     pool: PgPool,
 }
@@ -55,6 +67,20 @@ impl PgStore {
     pub async fn connect(url: &str) -> StoreResult<Self> {
         let pool = PgPoolOptions::new().max_connections(8).connect(url).await?;
         Ok(PgStore { pool })
+    }
+
+    /// The lock the serving program holds for as long as it runs, and the command that
+    /// replaces the admin-record key must get: `None` when another holds it. It is the
+    /// database session's, so a crash releases it (review finding GR-194).
+    pub async fn serving_lock(&self, scope: &Scope) -> StoreResult<Option<ServingLock>> {
+        let mut session = self.pool.acquire().await?;
+        let got: bool = sqlx::query_scalar(
+            "SELECT pg_try_advisory_lock(hashtext('gov-authority:' || current_schema() || ':' || $1))",
+        )
+        .bind(format!("{}:{}", scope.tenant, scope.env))
+        .fetch_one(&mut *session)
+        .await?;
+        Ok(got.then(|| ServingLock(session.detach())))
     }
 
     pub fn from_pool(pool: PgPool) -> Self {
@@ -133,6 +159,12 @@ fn row(effect: &Effect) -> (String, String, Option<String>, Option<serde_json::V
             link.as_str().to_string(),
             Some(person.to_string()),
             Some(json(person)),
+        ),
+        Effect::NameAdminKey(named) => (
+            "admin-key".into(),
+            "current".into(),
+            None,
+            Some(json(named)),
         ),
         Effect::PutSession(row) => (
             "session".into(),
@@ -344,6 +376,10 @@ impl Store for PgStore {
 
     async fn person(&self, scope: &Scope, id: &Id) -> StoreResult<Option<Person>> {
         self.entry(scope, "person", id.as_str()).await
+    }
+
+    async fn admin_key(&self, scope: &Scope) -> StoreResult<Option<NamedKey>> {
+        self.entry(scope, "admin-key", "current").await
     }
 
     async fn linked(&self, scope: &Scope, link: &Digest) -> StoreResult<Option<Id>> {

@@ -776,6 +776,292 @@ async fn four_programs_a_gate_renews_from_its_authority() {
     site.db.drop_schema().await;
 }
 
+/// Slice G4e-5: the Authority program serves people, and its own key is replaced by a
+/// command that can be stopped and run again. Fake data and a fake identity provider.
+#[tokio::test]
+async fn people_sign_in_to_the_program_and_its_key_is_replaced_by_a_command() {
+    use gov_core::admin::AdminAction;
+    use gov_core::SigningKey;
+    use gov_signin::testing::FakeIdp;
+    use std::os::unix::fs::PermissionsExt;
+    const TENANT: &str = "72f988bf-0000-4000-8000-0000000000aa";
+    const CLIENT: &str = "0b7f0c6e-1111-4222-8333-444455556666";
+    const ANA: &str = "00000000-0000-0000-0000-00000000a0a0";
+    let (Some(db), Some(authority_db)) = (Database::new().await, Database::new().await) else {
+        return;
+    };
+    let site = Site {
+        dir: tempfile::tempdir().unwrap(),
+        db,
+        upstream: serve(Router::new().route("/mcp", post(quiet_jira))).await,
+    };
+    let idp = FakeIdp::start(TENANT).await;
+    idp.set_client(CLIENT, "the-client-secret");
+    idp.set_claim("oid", json!(ANA));
+    let keygen = |program_path: &str, kid: &str, file: &str| -> PublicKey {
+        let (ok, public, err) = run(program(program_path)
+            .args(["keygen", "--kid", kid, "--out"])
+            .arg(site.path(file)));
+        assert!(ok, "{err}");
+        std::fs::write(site.path(&format!("{file}.pub")), &public).unwrap();
+        serde_json::from_str(&public).unwrap()
+    };
+    let ledger_public = keygen(LEDGER, "ledger-k1", "ledger.key");
+    keygen(AUTHORITY, "authority-admin-1", "admin.key");
+    keygen(AUTHORITY, "authority-admin-2", "admin-next.key");
+    keygen(AUTHORITY, "authority:mandates-1", "mandates.key");
+    keygen(AUTHORITY, "authority:leases-1", "leases.key");
+    let root = SigningKey::from_seed(id("root-1"), &[70; 32]).unwrap();
+    std::fs::write(
+        site.path("root.pub.json"),
+        serde_json::to_vec(&root.public()).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        site.path("ledger-keys.json"),
+        serde_json::to_vec(&[ledger_public]).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(site.path("client.secret"), "the-client-secret\n").unwrap();
+    std::fs::set_permissions(
+        site.path("client.secret"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+
+    let command = |name: &str, key_file: &str| {
+        let mut c = program(AUTHORITY);
+        c.env("GOV_AUTHORITY_DATABASE_URL", &authority_db.url)
+            .args([name, "--tenant", "acme", "--env", "prod"])
+            .args(["--name", "authority"])
+            .arg("--admin-key-file")
+            .arg(site.path(key_file))
+            .arg("--root-key")
+            .arg(site.path("root.pub.json"));
+        c
+    };
+    // The first admin, named once on the Authority's machine.
+    let first = |oid: &str| {
+        run(command("first-admin", "admin.key").args([
+            "--person",
+            "ana",
+            "--entra-tenant-id",
+            TENANT,
+            "--oid",
+            oid,
+        ]))
+    };
+    assert!(!first("not-an-object-id").0);
+    let (ok, said, err) = first(ANA);
+    assert!(
+        ok && said.contains("ana is the first admin"),
+        "{said} {err}"
+    );
+    assert!(!first(ANA).0);
+
+    let (ok, _, err) = run(site
+        .ledger()
+        .args(["enrol-authority", "--tenant", "acme", "--env", "prod"])
+        .args(["--authority", "authority", "--public-key"])
+        .arg(site.path("admin.key.pub")));
+    assert!(ok, "{err}");
+    let ledger = start({
+        let mut c = site.ledger();
+        c.args(["serve", "--tenant", "acme", "--env", "prod"])
+            .args(["--listen", "127.0.0.1:0", "--checkpoint-interval", "1"])
+            .arg("--key-file")
+            .arg(site.path("ledger.key"))
+            .arg("--witness")
+            .arg(site.path("witness"));
+        c
+    });
+    let ledger_url = format!("http://{}", ledger.addr);
+
+    // A port for the admin listener, so that its origin can be told to it.
+    let port = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        probe.local_addr().unwrap().port()
+    };
+    let origin = format!("http://127.0.0.1:{port}");
+    let serving_at = |key_file: &str, earlier: Option<&str>, admin_listen: &str| {
+        let mut c = command("serve", key_file);
+        c.args([
+            "--listen",
+            "127.0.0.1:0",
+            "--operator-listen",
+            "127.0.0.1:0",
+        ])
+        .args(["--ship-interval", "1"])
+        .arg("--operator-secret-file")
+        .arg(site.path("authority.secret"))
+        .arg("--mandates-key-file")
+        .arg(site.path("mandates.key"))
+        .arg("--leases-key-file")
+        .arg(site.path("leases.key"))
+        .arg("--ledger-keys")
+        .arg(site.path("ledger-keys.json"))
+        .args(["--ledger", &ledger_url])
+        .args(["--admin-listen", admin_listen])
+        .args(["--admin-origin", &origin])
+        .args(["--entra-tenant-id", TENANT, "--entra-client-id", CLIENT])
+        .args(["--entra-authority", &idp.base])
+        .arg("--entra-client-secret-file")
+        .arg(site.path("client.secret"));
+        if let Some(earlier) = earlier {
+            c.arg("--earlier-admin-key").arg(site.path(earlier));
+        }
+        c
+    };
+    let serving = |key_file: &str, earlier: Option<&str>| {
+        serving_at(key_file, earlier, &format!("127.0.0.1:{port}"))
+    };
+    // Sign in through the tenant and register a gate: the answer's status.
+    let sign_in_and_act = |gate: &'static str| {
+        let origin = origin.clone();
+        async move {
+            // A client of its own each time: the program is stopped and started between.
+            let http = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap();
+            let begun = http
+                .get(format!("{origin}/v1/signin/start"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(begun.status(), 302);
+            let cookie = |answer: &reqwest::Response, name: &str| {
+                answer
+                    .headers()
+                    .get_all("set-cookie")
+                    .iter()
+                    .filter_map(|v| v.to_str().ok())
+                    .find(|v| v.starts_with(name))
+                    .map(|v| v.split(';').next().unwrap().to_string())
+            };
+            let pre = cookie(&begun, "gov_pre=").unwrap();
+            let to = begun.headers()["location"].to_str().unwrap().to_string();
+            let back = http.get(to).send().await.unwrap();
+            let back = back.headers()["location"].to_str().unwrap().to_string();
+            let landed = http.get(back).header("cookie", pre).send().await.unwrap();
+            if landed.status() != 200 {
+                return landed.status().as_u16();
+            }
+            let session = cookie(&landed, "gov_session=").unwrap();
+            let body: Value = landed.json().await.unwrap();
+            http.post(format!("{origin}/v1/gates"))
+                .header("cookie", session)
+                .header("origin", &origin)
+                .header("x-gov-csrf", body["csrf"].as_str().unwrap())
+                .json(&json!({"id": gate}))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }
+    };
+
+    // The listener for people is on loopback, behind a proxy; nowhere else.
+    let (ok, _, err) = run(&mut serving_at("admin.key", None, "0.0.0.0:0"));
+    assert!(!ok && err.contains("loopback"), "{err}");
+    let mut authority = start(serving("admin.key", None));
+    assert_eq!(authority.said("admin on "), format!("127.0.0.1:{port}"));
+    assert_eq!(sign_in_and_act("gate-1").await, 200);
+    // While it runs: no second instance, and no change of its key.
+    let (ok, _, err) = run(&mut serving("admin.key", None));
+    assert!(!ok && err.contains("another instance"), "{err}");
+    let replace = |stop: Option<&str>| {
+        let mut c = command("replace-admin-key", "admin.key");
+        c.arg("--new-key-file")
+            .arg(site.path("admin-next.key"))
+            .args(["--as", "ana", "--ledger", &ledger_url])
+            .arg("--ledger-keys")
+            .arg(site.path("ledger-keys.json"));
+        if let Some(step) = stop {
+            c.args(["--stop-after", step]);
+        }
+        run(&mut c)
+    };
+    let (ok, _, err) = replace(None);
+    assert!(!ok && err.contains("stop it first"), "{err}");
+    drop(authority);
+
+    // Stopped after the record, then after the shipment, then run to the end; and once
+    // more, with nothing left to do. The old private key is gone only at the end.
+    let (ok, said, err) = replace(Some("record"));
+    assert!(ok && said.contains("recorded"), "{said} {err}");
+    // An instance started with the old key writes nothing: nobody can sign in.
+    let mut stale = start(serving("admin.key", None));
+    stale.said("admin on ");
+    assert_eq!(sign_in_and_act("gate-2").await, 403);
+    drop(stale);
+    let (ok, said, err) = replace(Some("shipped"));
+    assert!(ok && !said.contains("recorded"), "{said} {err}");
+    assert!(site.path("admin.key").exists());
+    let (ok, said, err) = replace(None);
+    assert!(ok && said.contains("done"), "{said} {err}");
+    assert!(!site.path("admin.key").exists() && site.path("admin.pub.json").exists());
+    let (ok, said, err) = replace(None);
+    assert!(ok && said.contains("done"), "{said} {err}");
+
+    // Started with the new key, and told the old one's public half, it serves again.
+    let mut authority = start(serving("admin-next.key", Some("admin.pub.json")));
+    authority.said("admin on ");
+    assert_eq!(sign_in_and_act("gate-3").await, 200);
+
+    // The chain as kept: one admin key replaced, and the acts under a session verified.
+    let store = gov_authority::pg::PgStore::connect(&authority_db.url)
+        .await
+        .unwrap();
+    let reader = gov_authority::Authority::new(
+        store,
+        Scope::new("acme", "prod").unwrap(),
+        id("authority"),
+        SigningKey::from_file_text(&std::fs::read_to_string(site.path("admin-next.key")).unwrap())
+            .unwrap(),
+        root.public(),
+    )
+    .with_earlier_admin_keys(vec![serde_json::from_slice(
+        &std::fs::read(site.path("admin.pub.json")).unwrap(),
+    )
+    .unwrap()]);
+    let records = reader.records().await.unwrap();
+    let said: Vec<(AdminAction, bool)> = records
+        .iter()
+        .map(|r| (r.action, r.actor.verified))
+        .collect();
+    use AdminAction as A;
+    assert_eq!(
+        said,
+        vec![
+            (A::PersonAdded, false),
+            (A::PersonLinked, false),
+            (A::SignedIn, true),
+            (A::GateRegistered, true),
+            (A::AdminKeyReplaced, false),
+            (A::SignedIn, true),
+            (A::GateRegistered, true),
+        ]
+    );
+    // An auditor's check passes over the Authority's chain across the change of key.
+    let mut report = site.audit();
+    for _ in 0..40 {
+        let covered = report.gates.iter().all(|g| g.unwitnessed == 0);
+        if report.ok() && report.receipts_verified == records.len() as u64 && covered {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        report = site.audit();
+    }
+    assert!(report.ok(), "{:?}", report.findings);
+    assert_eq!(report.receipts_verified, records.len() as u64);
+
+    drop((authority, ledger));
+    authority_db.drop_schema().await;
+    site.db.drop_schema().await;
+}
+
 /// A file's text, and with it the text of everything in it that is base64: a receipt's body
 /// is carried encoded, so a search of the raw file alone would miss what is inside it.
 fn laid_bare(bytes: &[u8]) -> String {

@@ -58,6 +58,14 @@ pub struct Person {
     pub link: Option<Digest>,
 }
 
+/// The admin-record key a replacement named, and the number of the record that did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamedKey {
+    pub digest: Digest,
+    pub seq: u64,
+}
+
 /// A signed-in session, as kept: never the value the person's browser holds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -171,6 +179,8 @@ pub enum Effect {
     /// already the whole commit fails with [`StoreError::KeyTaken`].
     AddLink(Digest, Id),
     PutSession(SessionRow),
+    /// Name the key admin records are signed with from the next record on.
+    NameAdminKey(NamedKey),
     DropSession(Digest),
     DropSessionsOf(Id),
 }
@@ -208,6 +218,8 @@ pub trait Store: Send + Sync {
     async fn person(&self, scope: &Scope, id: &Id) -> StoreResult<Option<Person>>;
     /// The person an account's digest is linked to.
     async fn linked(&self, scope: &Scope, link: &Digest) -> StoreResult<Option<Id>>;
+    /// The admin-record key the chain's last replacement named, if there was one.
+    async fn admin_key(&self, scope: &Scope) -> StoreResult<Option<NamedKey>>;
     async fn session(&self, scope: &Scope, id: &Digest) -> StoreResult<Option<SessionRow>>;
     /// Note that a session was used. Not an admin action: nothing is recorded.
     async fn touch_session(&self, scope: &Scope, id: &Digest, now: i64) -> StoreResult<()>;
@@ -272,6 +284,7 @@ struct State {
     mandates: BTreeMap<(Key, Id), IssuedMandate>,
     revocations: BTreeMap<(Key, u64), gov_core::revocation::RevocationEntry>,
     links: BTreeMap<(Key, Digest), Id>,
+    admin_keys: BTreeMap<Key, NamedKey>,
     sessions: BTreeMap<(Key, Digest), SessionRow>,
 }
 
@@ -376,6 +389,9 @@ impl Store for MemoryStore {
                 Effect::AddLink(link, person) => {
                     s.links.insert((key.clone(), link), person);
                 }
+                Effect::NameAdminKey(named) => {
+                    s.admin_keys.insert(key.clone(), named);
+                }
                 Effect::PutSession(row) => {
                     s.sessions.insert((key.clone(), row.id.clone()), row);
                 }
@@ -423,6 +439,10 @@ impl Store for MemoryStore {
             .people
             .get(&(k(scope), id.clone()))
             .cloned())
+    }
+
+    async fn admin_key(&self, scope: &Scope) -> StoreResult<Option<NamedKey>> {
+        Ok(self.0.lock().unwrap().admin_keys.get(&k(scope)).cloned())
     }
 
     async fn linked(&self, scope: &Scope, link: &Digest) -> StoreResult<Option<Id>> {
