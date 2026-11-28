@@ -1064,6 +1064,57 @@ async fn a_signed_in_act_is_held_to_the_record_of_its_sign_in() {
     assert!(reported(&ben, in_force.as_str(), NOW + 4));
     assert!(reported(&ana, signed_out.as_str(), NOW + 4));
     assert!(reported(&ben, offboarded.as_str(), NOW + 4));
+
+    // A second sign-in under a reference already used does not reopen it (GR-202).
+    let mut again = AdminRecord {
+        v: 1,
+        tenant: id("acme"),
+        env: id("prod"),
+        authority: id("authority"),
+        seq: acked + 1,
+        prev: Some(last.hash.clone()),
+        at: NOW + 4,
+        actor: Actor {
+            id: ana.clone(),
+            kind: Default::default(),
+            verified: true,
+            session: Some(signed_out.clone()),
+        },
+        action: AdminAction::SignedIn,
+        subject: Subject {
+            kind: SubjectKind::Person,
+            id: ana.clone(),
+        },
+        about: None,
+        value: None,
+        until: Some(NOW + 9 * 3600),
+    };
+    let findings = |record: &AdminRecord| {
+        let mut export = export.clone();
+        let chain = export
+            .gates
+            .iter_mut()
+            .find(|g| g.gate == id("authority"))
+            .unwrap();
+        chain.receipts.push(seal(record, &admin_key()).unwrap());
+        verify(&Check {
+            scope: &scope(),
+            keys: &keys,
+            export: &export,
+            checkpoints: &checkpoints,
+            interval_secs: 60,
+            now: Some(NOW + 61),
+            gate_quiet_secs: None,
+            clock_skew_secs: 60,
+            retention_secs: None,
+        })
+        .findings
+        .iter()
+        .any(|f| f.problem == Problem::SessionNotBorneOut && f.seq == Some(acked + 1))
+    };
+    assert!(findings(&again));
+    again.actor.session = Some(id("s-a-new-one"));
+    assert!(!findings(&again));
 }
 
 /// The auditor's check holds a proven receipt to a mandate the Authority recorded issuing

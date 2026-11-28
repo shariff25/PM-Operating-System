@@ -701,6 +701,8 @@ reviewer.
   no such reads yet), only of mandates; no limit for each pre-sign-in cookie beyond a
   flow being used once; the count of flows in progress is capped at 10,000, so a flood
   of starts can hold up new sign-ins for up to ten minutes within the overall limit.
+  Every changing route is walked by a test that holds its record to "verified" and the
+  session (GR-204).
 
 ## Security review of 2026-11-26 (first read; the gate did not pass)
 
@@ -1322,6 +1324,20 @@ Also done: `Referrer-Policy: no-referrer` on the page the callback serves, and a
 crash releases, are in the text (points 4 and 9); the verifier's comments no longer
 speak of PM OS's services; the verifier's reason for a failure is not to reach the
 caller (point 8).
+
+### Thirty-third read, 2026-11-28: the fixes and G4e-2, at `321d315`
+
+**Verdict: no High or Critical; G4e-2 passes.** GR-190, GR-200 (in the crate) and GR-201
+are closed. The reviewer ran the tests of the seven `gov-*` crates with a Postgres of its
+own (229 passed), not the lint or format check, and did not repeat the control removals.
+The departures stated for G4e-2 are confirmed; a sweep of run-out sessions is needed
+before real use. Fixed on `build/gov-g4e3`, not yet read again.
+
+| Finding | Severity | What was wrong | What was done |
+|---|---|---|---|
+| GR-202 | Low | In the auditor's check a second sign-in record under a used reference replaced the first, reopening a session that was ended | Fixed: a reference is opened once; a second sign-in under it is reported |
+| GR-203 | Low | Signing out of a session that had run out wrote a verified record dated after its end, which the auditor then reported | Fixed: past either limit the session is forgotten and nothing is recorded |
+| GR-204 | Low, with G4e-3 | A route passing a bare name where the session is meant would compile, record the act as unverified and skip the recent-sign-in rule | A test walks every changing route of the listener and holds its record to "verified" and the session. Not done: a type only a session can produce |
 
 ## 1. What is being built
 
@@ -2629,14 +2645,15 @@ provider and **nothing here will have been run against Microsoft** when it is fi
    Governance session until its limits run out: a stated limit, bounded by the absolute
    limit, and ended at once by offboarding them here.
    - **Each sign-in is a record** (`SignedIn`: the person, a session reference, the
-     time). The reference is a digest of the session value with a label, so it names the
-     session without being usable as one. The witness then covers the fact that a
+     time). The reference is a random id of its own, tied to nothing in the cookie, so it
+     names the session without being usable as one. The witness then covers the fact that a
      session existed before any act made under it.
    - **Acts under a session say so.** An admin record's actor is `verified` and carries
      the session reference; a mandate's `issued_by.session` carries it. `gov verify`
      reports a verified record, or a mandate with a session, whose reference no earlier
      `SignedIn` record of the same person in the same chain bears out. This is what the
-     condition on G6 (§7.6.2, point 3) rests on.
+     condition on G6 (§7.6.2, point 3) rests on: the auditor checks the record of a
+     mandate's issue, which carries the session, not the mandate inside a receipt.
    - **A session reference has an end** (GR-198). The record carries the absolute limit
      then in force; sign-out and offboarding are records too. `gov verify` also reports
      an act later than its session's limit, or after that person's sign-out of it or

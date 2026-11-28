@@ -393,23 +393,27 @@ pub fn verify(check: &Check<'_>) -> Report {
                                 successor = Some(next.clone());
                             }
                             if let Some(reference) = &record.actor.session {
-                                let opened_now = match (&record.action, record.until) {
-                                    (AdminAction::SignedIn, Some(until)) => sessions
-                                        .insert(
-                                            reference.clone(),
-                                            (record.actor.id.clone(), until, false),
-                                        )
-                                        .is_none(),
-                                    _ => false,
-                                };
-                                let borne_out = opened_now
-                                    || sessions.get(reference).is_some_and(
+                                // A reference is opened once: a second sign-in under it
+                                // would reopen a session that was ended (GR-202).
+                                let borne_out = match (&record.action, record.until) {
+                                    (AdminAction::SignedIn, Some(until)) => {
+                                        let fresh = !sessions.contains_key(reference);
+                                        if fresh {
+                                            sessions.insert(
+                                                reference.clone(),
+                                                (record.actor.id.clone(), until, false),
+                                            );
+                                        }
+                                        fresh
+                                    }
+                                    _ => sessions.get(reference).is_some_and(
                                         |(person, until, ended)| {
                                             person == &record.actor.id
                                                 && !ended
                                                 && record.at < *until
                                         },
-                                    );
+                                    ),
+                                };
                                 if !borne_out {
                                     find(
                                         Problem::SessionNotBorneOut,

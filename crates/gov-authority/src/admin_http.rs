@@ -217,14 +217,14 @@ impl<S: Store + 'static> Admin<S> {
         StatusCode::FORBIDDEN.into_response()
     }
 
-    async fn signed_in(&self, headers: &HeaderMap) -> Result<Session, Response> {
+    async fn signed_in(&self, headers: &HeaderMap) -> Result<Session, StatusCode> {
         let Some(value) = cookie(headers, self.session_cookie()) else {
-            return Err(StatusCode::UNAUTHORIZED.into_response());
+            return Err(StatusCode::UNAUTHORIZED);
         };
         self.authority
             .session(&value, (self.clock)())
             .await
-            .map_err(|_| StatusCode::UNAUTHORIZED.into_response())
+            .map_err(|_| StatusCode::UNAUTHORIZED)
     }
 }
 
@@ -285,7 +285,7 @@ async fn guard<S: Store + 'static>(
                 next.run(request).await
             }
             Ok(_) => StatusCode::FORBIDDEN.into_response(),
-            Err(refused) => refused,
+            Err(refused) => refused.into_response(),
         }
     };
     answer
@@ -502,15 +502,15 @@ fn done<T: serde::Serialize>(result: Result<T, AuthorityError>) -> Response {
     }
 }
 
-fn read<T: DeserializeOwned>(body: &Bytes) -> Result<T, Response> {
+fn read<T: DeserializeOwned>(body: &Bytes) -> Result<T, StatusCode> {
     gov_core::strict::parse(body)
         .ok()
         .and_then(|v| serde_json::from_value(v).ok())
-        .ok_or_else(|| StatusCode::BAD_REQUEST.into_response())
+        .ok_or(StatusCode::BAD_REQUEST)
 }
 
-fn name(text: &str) -> Result<Id, Response> {
-    Id::new(text).map_err(|_| StatusCode::BAD_REQUEST.into_response())
+fn name(text: &str) -> Result<Id, StatusCode> {
+    Id::new(text).map_err(|_| StatusCode::BAD_REQUEST)
 }
 
 /// Run one call as the signed-in person: read the session, the body, then act.
@@ -518,7 +518,7 @@ macro_rules! call {
     ($a:ident, $headers:ident, |$session:ident, $now:ident| $act:expr) => {{
         let $session = match $a.signed_in(&$headers).await {
             Ok(session) => session,
-            Err(refused) => return refused,
+            Err(refused) => return refused.into_response(),
         };
         let $now = ($a.clock)();
         done($act.await)
@@ -529,7 +529,7 @@ async fn me<S: Store + 'static>(State(a): State<Arc<Admin<S>>>, headers: HeaderM
     match a.signed_in(&headers).await {
         Ok(s) => Json(json!({"person": s.person(), "role": s.role, "session": s.reference()}))
             .into_response(),
-        Err(refused) => refused,
+        Err(refused) => refused.into_response(),
     }
 }
 
@@ -562,7 +562,7 @@ async fn add_person<S: Store + 'static>(
 ) -> Response {
     let new: NewPerson = match read(&body) {
         Ok(new) => new,
-        Err(bad) => return bad,
+        Err(bad) => return bad.into_response(),
     };
     call!(a, headers, |s, now| a
         .authority
@@ -584,7 +584,7 @@ async fn link<S: Store + 'static>(
 ) -> Response {
     let (person, link) = match (name(&person), read::<Link>(&body)) {
         (Ok(person), Ok(link)) => (person, link),
-        (Err(bad), _) | (_, Err(bad)) => return bad,
+        (Err(bad), _) | (_, Err(bad)) => return bad.into_response(),
     };
     let oid = link.oid.trim().to_ascii_lowercase();
     if !gov_signin::is_guid(&oid) {
@@ -606,7 +606,7 @@ async fn offboard<S: Store + 'static>(
 ) -> Response {
     let person = match name(&person) {
         Ok(person) => person,
-        Err(bad) => return bad,
+        Err(bad) => return bad.into_response(),
     };
     call!(a, headers, |s, now| a
         .authority
@@ -629,7 +629,7 @@ async fn register_agent<S: Store + 'static>(
 ) -> Response {
     let new: NewAgent = match read(&body) {
         Ok(new) => new,
-        Err(bad) => return bad,
+        Err(bad) => return bad.into_response(),
     };
     call!(a, headers, |s, now| a.authority.register_agent(
         &s,
@@ -647,11 +647,11 @@ async fn change_agent<S: Store + 'static>(
 ) -> Response {
     let agent = match name(&agent) {
         Ok(agent) => agent,
-        Err(bad) => return bad,
+        Err(bad) => return bad.into_response(),
     };
     let session = match a.signed_in(&headers).await {
         Ok(session) => session,
-        Err(refused) => return refused,
+        Err(refused) => return refused.into_response(),
     };
     let now = (a.clock)();
     done(match change.as_str() {
@@ -675,7 +675,7 @@ async fn register_gate<S: Store + 'static>(
 ) -> Response {
     let new: Named = match read(&body) {
         Ok(new) => new,
-        Err(bad) => return bad,
+        Err(bad) => return bad.into_response(),
     };
     call!(a, headers, |s, now| a
         .authority
@@ -689,7 +689,7 @@ async fn disable_gate<S: Store + 'static>(
 ) -> Response {
     let gate = match name(&gate) {
         Ok(gate) => gate,
-        Err(bad) => return bad,
+        Err(bad) => return bad.into_response(),
     };
     call!(a, headers, |s, now| a
         .authority
@@ -710,11 +710,11 @@ async fn offer<S: Store + 'static>(
 ) -> Response {
     let asked: Offer = match read(&body) {
         Ok(asked) => asked,
-        Err(bad) => return bad,
+        Err(bad) => return bad.into_response(),
     };
     let session = match a.signed_in(&headers).await {
         Ok(session) => session,
-        Err(refused) => return refused,
+        Err(refused) => return refused.into_response(),
     };
     let offered = a
         .authority
@@ -730,7 +730,7 @@ async fn publish<S: Store + 'static>(
 ) -> Response {
     let signed: Envelope = match read(&body) {
         Ok(signed) => signed,
-        Err(bad) => return bad,
+        Err(bad) => return bad.into_response(),
     };
     call!(a, headers, |s, now| a
         .authority
@@ -744,7 +744,7 @@ async fn revoke_key<S: Store + 'static>(
 ) -> Response {
     let kid = match name(&kid) {
         Ok(kid) => kid,
-        Err(bad) => return bad,
+        Err(bad) => return bad.into_response(),
     };
     call!(a, headers, |s, now| a.authority.revoke_key(&s, &kid, now))
 }
@@ -756,7 +756,7 @@ async fn issue<S: Store + 'static>(
 ) -> Response {
     let ask: MandateAsk = match read(&body) {
         Ok(ask) => ask,
-        Err(bad) => return bad,
+        Err(bad) => return bad.into_response(),
     };
     call!(a, headers, |s, now| a
         .authority
@@ -769,7 +769,7 @@ async fn mandates<S: Store + 'static>(
 ) -> Response {
     let session = match a.signed_in(&headers).await {
         Ok(session) => session,
-        Err(refused) => return refused,
+        Err(refused) => return refused.into_response(),
     };
     done(a.authority.list_mandates(session.person()).await)
 }
@@ -781,7 +781,7 @@ async fn revoke_mandate<S: Store + 'static>(
 ) -> Response {
     let mandate = match name(&mandate) {
         Ok(mandate) => mandate,
-        Err(bad) => return bad,
+        Err(bad) => return bad.into_response(),
     };
     call!(a, headers, |s, now| a
         .authority

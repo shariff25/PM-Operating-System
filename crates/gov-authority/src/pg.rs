@@ -354,6 +354,19 @@ impl Store for PgStore {
         self.entry(scope, "session", id.as_str()).await
     }
 
+    async fn forget_session(&self, scope: &Scope, id: &Digest) -> StoreResult<()> {
+        sqlx::query(
+            "DELETE FROM authority_registry \
+             WHERE tenant = $1 AND env = $2 AND kind = 'session' AND name = $3",
+        )
+        .bind(scope.tenant.as_str())
+        .bind(scope.env.as_str())
+        .bind(id.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn touch_session(&self, scope: &Scope, id: &Digest, now: i64) -> StoreResult<()> {
         sqlx::query(
             "UPDATE authority_registry SET doc = jsonb_set(doc, '{last_used}', to_jsonb($4::bigint)) \

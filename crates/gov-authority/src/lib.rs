@@ -591,11 +591,16 @@ impl<S: Store> Authority<S> {
         })
     }
 
-    pub async fn sign_out(&self, value: &str, now: i64) -> Result<u64> {
+    /// End a session. One that has already run out is forgotten with no record.
+    pub async fn sign_out(&self, value: &str, now: i64) -> Result<Option<u64>> {
         let id = session_digest(value);
         let Some(row) = self.store.session(&self.scope, &id).await? else {
             return Err(AuthorityError::Refused);
         };
+        if now >= row.until || now.saturating_sub(row.last_used) > self.session_limits.idle_secs {
+            self.store.forget_session(&self.scope, &id).await?;
+            return Ok(None);
+        }
         let by = By {
             id: row.person.clone(),
             session: Some(SessionRef {
@@ -608,6 +613,7 @@ impl<S: Store> Authority<S> {
             self.commit(head, &by, did, &[Effect::DropSession(id.clone())], now)
                 .await
         })
+        .map(Some)
     }
 
     /// Name the installation's first admin. Possible exactly once, while nobody is known.

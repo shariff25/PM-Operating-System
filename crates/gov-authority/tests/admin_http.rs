@@ -65,6 +65,10 @@ async fn site() -> Site {
         id("authority"),
         key("authority-admin-1", 60),
         key("authority-root-1", 61).public(),
+    )
+    .with_online_keys(
+        key("authority:mandates-1", 71),
+        key("authority:leases-1", 72),
     );
     let (ana, ben) = (id("ana"), id("ben"));
     let now = clock();
@@ -496,4 +500,135 @@ async fn sign_ins_are_limited_overall_and_for_each_client() {
     assert_eq!(start("h").await, 429);
     AT.fetch_add(1, Ordering::SeqCst);
     assert_eq!(start("10.0.0.1").await, 302);
+}
+
+/// Every route that changes something acts as the session, never as a bare name: its
+/// record is verified and carries the session (review finding GR-204).
+#[tokio::test]
+async fn every_changing_route_records_a_verified_act() {
+    use gov_core::enrol::{code_digest, EnrolKind, EnrolRequest};
+    use gov_core::policy::{OnlineKeys, PolicyBundle};
+    let site = site().await;
+    let ana = site.sign_in(ANA).await;
+    let me: Value = site
+        .http
+        .get(format!("{}/v1/me", site.origin))
+        .header("cookie", &ana.session)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let grants = json!([{
+        "system": "jira",
+        "operations": ["issue.update"],
+        "resources": ["jira/project/pay/*"],
+    }]);
+    let bundle = PolicyBundle {
+        v: 1,
+        tenant: id("acme"),
+        env: id("prod"),
+        issuer: id("authority"),
+        version: id("v"),
+        number: 1,
+        issued_at: clock(),
+        keys: OnlineKeys {
+            mandates: vec![key("authority:mandates-1", 71).public()],
+            leases: vec![key("authority:leases-1", 72).public()],
+        },
+        freshness: Default::default(),
+        rules: Vec::new(),
+        connectors: Vec::new(),
+        templates: vec![gov_core::mandate::Template {
+            id: id("triage"),
+            grants: serde_json::from_value(grants.clone()).unwrap(),
+            max_life_secs: 3600,
+            limits: Default::default(),
+            delegable: false,
+            people: Default::default(),
+            receivers: Default::default(),
+        }],
+    };
+    let signed = gov_core::seal(&bundle, &key("authority-root-1", 61)).unwrap();
+
+    let act = |path: String, body: Value, want: AdminAction| {
+        let request = site.post(&ana, &path, body);
+        let (site, session) = (&site, me["session"].clone());
+        async move {
+            let answer = request.send().await.unwrap();
+            assert_eq!(answer.status(), 200, "{path}");
+            let body: Value = answer.json().await.unwrap();
+            let last = site.records().await.pop().unwrap();
+            assert_eq!(
+                (last.action, last.actor.verified, json!(last.actor.session)),
+                (want, true, session),
+                "{path}"
+            );
+            body
+        }
+    };
+    use AdminAction as A;
+    let none = || json!({});
+    act(
+        "/v1/people".into(),
+        json!({"id": "cy", "role": "owner"}),
+        A::PersonAdded,
+    )
+    .await;
+    let cys = json!({"oid": "00000000-0000-0000-0000-00000000c0c0"});
+    act("/v1/people/cy/link".into(), cys, A::PersonLinked).await;
+    let bot = json!({"id": "bot", "owner": "ana"});
+    act("/v1/agents".into(), bot, A::AgentRegistered).await;
+    act(
+        "/v1/gates".into(),
+        json!({"id": "gate-1"}),
+        A::GateRegistered,
+    )
+    .await;
+    let offer = json!({"kind": "agent", "name": "bot"});
+    let offered = act("/v1/enrolments".into(), offer, A::EnrolmentOffered).await;
+    // The agent enrols its own key with the code: not a person's act.
+    let code = offered["code"].as_str().unwrap();
+    let bots = key("bot:k1", 9);
+    let asked = gov_core::seal(
+        &EnrolRequest {
+            v: 1,
+            tenant: id("acme"),
+            env: id("prod"),
+            authority: id("authority"),
+            kind: EnrolKind::Agent,
+            name: id("bot"),
+            key: bots.public(),
+            code: code_digest(code),
+        },
+        &bots,
+    )
+    .unwrap();
+    site.authority.enrol(code, &asked, clock()).await.unwrap();
+    act("/v1/bundles".into(), json!(signed), A::PolicyPublished).await;
+    let ask = json!({
+        "agent": "bot", "key": "bot:k1", "template": "triage",
+        "grants": grants, "life_secs": 600,
+    });
+    act("/v1/mandates".into(), ask, A::MandateIssued).await;
+    let listed: Value = site
+        .http
+        .get(format!("{}/v1/mandates", site.origin))
+        .header("cookie", &ana.session)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mandate = listed[0]["id"].as_str().unwrap();
+    act(format!("/v1/mandates/{mandate}/revoke"), none(), A::Revoked).await;
+    act("/v1/agents/bot/suspend".into(), none(), A::AgentSuspended).await;
+    act("/v1/agents/bot/resume".into(), none(), A::AgentResumed).await;
+    act("/v1/keys/bot:k1/revoke".into(), none(), A::Revoked).await;
+    act("/v1/agents/bot/disable".into(), none(), A::AgentDisabled).await;
+    act("/v1/gates/gate-1/disable".into(), none(), A::GateDisabled).await;
+    act("/v1/people/cy/offboard".into(), none(), A::PersonOffboarded).await;
+    act("/v1/signout".into(), none(), A::SignedOut).await;
 }

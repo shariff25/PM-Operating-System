@@ -603,6 +603,14 @@ follow-up tracking.
   fake identity provider only; not yet in the program (G4e-5); not yet read by the
   reviewer. Testing found that a header or cookie sent twice was judged by the first;
   it is now refused.
+- **Thirty-third read (2026-11-28), at `321d315`:** no High or Critical; G4e-2 passes and
+  its departures are confirmed. Three Low (GR-202: a repeated sign-in reference reopened
+  a session in the auditor's check; GR-203: a late sign-out wrote a record the auditor
+  reports; GR-204: a route passing a bare name would go unverified unnoticed), fixed on
+  `build/gov-g4e3` with G4e-3; not read again yet.
+- **A lint failure the check script caught (2026-11-28):** G4e-3's first full run failed
+  the lint (an error type too large) with every test passing. Nothing was merged; fixed
+  before the merge.
 
 ## Where the build stands (2026-11-23)
 
