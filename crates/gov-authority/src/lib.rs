@@ -1630,6 +1630,7 @@ impl<S: Store> Authority<S> {
                 kind,
                 name: name.clone(),
                 digest: code_digest(&code),
+                mac_key: Some(gov_core::enrol::mac_key(&code)),
                 expires_at: now + CODE_SECS,
                 by: actor.id.clone(),
                 wrong: 0,
@@ -1668,6 +1669,47 @@ impl<S: Store> Authority<S> {
             self.wrong_code(kind, &name, now).await?;
             return Err(AuthorityError::Refused);
         };
+        self.enrol_with(pending, request, claimed, now).await
+    }
+
+    /// Enrol a key at a request sent over the network: no code travels, only a tag that
+    /// whoever holds the code can make over this very request (spec §7.6.4, point 6).
+    /// Wrong attempts are not counted against the code: a stranger who knows a name must
+    /// not be able to cancel its enrolment from anywhere.
+    pub async fn enrol_remote(&self, request: &Envelope, tag: &str, now: i64) -> Result<PublicKey> {
+        let claimed: EnrolRequest = URL_SAFE_NO_PAD
+            .decode(&request.payload)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .ok_or(AuthorityError::Refused)?;
+        let waiting = self
+            .store
+            .code(&self.scope, claimed.kind, &claimed.name)
+            .await?;
+        let Some((waiting, key)) = waiting.and_then(|c| Some((c.clone(), c.mac_key?))) else {
+            return Err(AuthorityError::Refused);
+        };
+        if !gov_core::enrol::mac_holds(&key, request, tag) {
+            return Err(AuthorityError::Refused);
+        }
+        let Some(pending) = self
+            .store
+            .take_code(&self.scope, claimed.kind, &claimed.name, &waiting.digest)
+            .await?
+        else {
+            return Err(AuthorityError::Refused);
+        };
+        self.enrol_with(pending, request, claimed, now).await
+    }
+
+    async fn enrol_with(
+        &self,
+        pending: PendingCode,
+        request: &Envelope,
+        claimed: EnrolRequest,
+        now: i64,
+    ) -> Result<PublicKey> {
+        let (kind, name) = (claimed.kind, claimed.name.clone());
         if now >= pending.expires_at {
             return Err(AuthorityError::Refused);
         }

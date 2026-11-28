@@ -14,6 +14,7 @@ use crate::envelope::document;
 use crate::error::{Error, Result};
 use crate::ids::{Digest, Id};
 use crate::keys::{random_salt, PublicKey};
+use crate::Envelope;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -61,6 +62,36 @@ pub fn new_code(root: &PublicKey) -> Result<String> {
 /// What the Authority stores of a code, and what a request to enrol is signed over.
 pub fn code_digest(code: &str) -> Digest {
     Digest::of(&[b"gov.enrol.code.v1\0", code.as_bytes()])
+}
+
+/// The key a request sent over the network is authenticated with, in place of the code
+/// itself: derived from the code under a label of its own, so neither it nor the code's
+/// digest gives the other (spec §7.6.4, point 6).
+pub fn mac_key(code: &str) -> Digest {
+    Digest::of(&[b"gov.enrol.mac.v1\0", code.as_bytes()])
+}
+
+fn mac_input(request: &Envelope) -> Vec<u8> {
+    [
+        request.kid.as_str(),
+        request.payload.as_str(),
+        request.sig.as_str(),
+    ]
+    .join("\n")
+    .into_bytes()
+}
+
+/// The tag whoever holds the code sends with a signed request to enrol.
+pub fn request_mac(key: &Digest, request: &Envelope) -> String {
+    let key = aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA256, key.as_str().as_bytes());
+    URL_SAFE_NO_PAD.encode(aws_lc_rs::hmac::sign(&key, &mac_input(request)))
+}
+
+pub fn mac_holds(key: &Digest, request: &Envelope, tag: &str) -> bool {
+    let key = aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA256, key.as_str().as_bytes());
+    URL_SAFE_NO_PAD
+        .decode(tag)
+        .is_ok_and(|tag| aws_lc_rs::hmac::verify(&key, &mac_input(request), &tag).is_ok())
 }
 
 /// Whether `root` is the root key the code was made for. The enrolling party pins a root
