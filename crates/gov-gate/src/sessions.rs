@@ -12,7 +12,7 @@ use gov_core::action::Salt;
 use gov_core::mandate::{verify_chain, ChainCheck, Mandate};
 use gov_core::receipt::ProofFailure;
 use gov_core::request::{Session, SessionOpen};
-use gov_core::revocation::RevocationSet;
+use gov_core::revocation::{Revocable, RevocationSet, Revocations};
 use gov_core::{open, random_id, Digest, Envelope, Error, Id, KeySet, PublicKey, Scope};
 
 pub struct SessionsConfig {
@@ -21,6 +21,10 @@ pub struct SessionsConfig {
     /// The keys mandates are issued under. Until there is an Authority (G4) these are a test
     /// issuer's, from a file.
     pub issuers: KeySet,
+    /// The templates of the policy bundle held: every mandate a session is opened for is
+    /// held to the one it names (review finding GR-138). `None` only where no bundle was
+    /// loaded.
+    pub templates: Option<Vec<gov_core::mandate::Template>>,
     /// Sessions one agent key may hold that have proven a call.
     pub max_proven: usize,
     /// Sessions one agent key may hold that have not yet.
@@ -41,6 +45,7 @@ impl SessionsConfig {
             scope,
             gate,
             issuers,
+            templates: None,
             max_proven: 4,
             max_unproven: 2,
             unproven_secs: 30,
@@ -49,6 +54,27 @@ impl SessionsConfig {
             open_skew_secs: 120,
         }
     }
+}
+
+/// What the gate holds from its Authority at the moment of a call (spec §7.6.3, points 5
+/// and 6). Given to [`Sessions::open`] and [`Sessions::prove`] by a gate that has an
+/// Authority; a gate without one (tests, fake data) gives none, and neither is checked.
+pub struct Trust<'a> {
+    /// The gate holds a lease, the bundle it names and the feed through its number, and
+    /// the lease is no older than it says it is good for.
+    pub fresh: bool,
+    /// Everything the Authority's feed has revoked, as far as this gate has read.
+    pub revoked: &'a RevocationSet,
+}
+
+/// What a call presented, and the digest of the action the gate itself computed for it.
+#[derive(Clone, Copy)]
+pub struct Call<'a> {
+    pub proof: Option<&'a Envelope>,
+    pub salt: Option<&'a Salt>,
+    pub digest: &'a Digest,
+    /// False when the call's arguments have no canonical form.
+    pub canonical: bool,
 }
 
 /// Why a session was not opened. The answer says no more than this.
@@ -105,6 +131,12 @@ struct Entry {
     used_at: i64,
     calls: u64,
     salts: BTreeSet<Salt>,
+    /// The chain as it was presented, to check again when something is revoked.
+    presented: Envelope,
+    /// Set when the chain, its agent or its key was revoked after the session opened. The
+    /// session is then closed to proof and kept as a marker: a call that still proves the
+    /// key is recorded as this agent's, failed, with this reason (review finding GR-110).
+    revoked: Option<ProofFailure>,
 }
 
 pub struct Sessions {
@@ -112,6 +144,36 @@ pub struct Sessions {
     open: BTreeMap<Id, Entry>,
     /// Nonces of requests to open, with when they were seen, kept for twice the skew.
     nonces: BTreeMap<Id, i64>,
+    /// Requests to open that were refused, by why. The asker is told none of this; the
+    /// operator is (review finding GR-155).
+    refused: BTreeMap<&'static str, u64>,
+}
+
+/// Why a request to open was refused, for the operator's count.
+pub mod why {
+    /// The mandate chain does not hold: a signature, a time, a link.
+    pub const MANDATE: &str = "mandate";
+    /// The chain holds, and names a template the bundle lacks or goes wider than it. Signed
+    /// with a real mandates key, this is what a taken key looks like (GR-138).
+    pub const TEMPLATE: &str = "template";
+    /// The request is not signed by the mandate's agent, or is for another gate, mandate
+    /// or time.
+    pub const REQUEST: &str = "request";
+    /// The request is properly signed, and its time is further from this gate's than a
+    /// session's opening allows. The request's time is the shim's machine's; this gate's is
+    /// its Authority's once it holds a lease, and its own machine's before. Two clocks more
+    /// than that apart open no session (review finding GR-178). An old request played back
+    /// is counted here too.
+    pub const CLOCK: &str = "clock";
+    /// The request has been seen before.
+    pub const REPLAY: &str = "replay";
+    /// The agent key has as many unproven sessions as it may.
+    pub const BUSY: &str = "busy";
+    /// The gate has no complete, fresh lease from its Authority, and so cannot say that
+    /// nothing in the chain is revoked.
+    pub const NO_LEASE: &str = "no_lease";
+    /// The mandate, an agent in its chain, or a key is revoked.
+    pub const REVOKED: &str = "revoked";
 }
 
 impl Sessions {
@@ -120,6 +182,22 @@ impl Sessions {
             config,
             open: BTreeMap::new(),
             nonces: BTreeMap::new(),
+            refused: BTreeMap::new(),
+        }
+    }
+
+    /// How many requests to open were refused, by why (see [`why`]).
+    pub fn refusals(&self) -> BTreeMap<&'static str, u64> {
+        self.refused.clone()
+    }
+
+    fn refuse(&mut self, why: &'static str) -> OpenRefused {
+        let n = self.refused.entry(why).or_default();
+        *n = n.saturating_add(1);
+        if why == why::BUSY {
+            OpenRefused::Busy
+        } else {
+            OpenRefused::Invalid
         }
     }
 
@@ -155,33 +233,65 @@ impl Sessions {
         request: &Envelope,
         now: i64,
     ) -> Result<(Id, Id), OpenRefused> {
+        self.open_with(mandate, request, now, None)
+    }
+
+    /// As [`Sessions::open`], for a gate that has an Authority: `trust` is what it holds
+    /// from it now. Without a complete, fresh lease no session is opened, and none is
+    /// opened for a chain any part of which is revoked.
+    pub fn open_with(
+        &mut self,
+        mandate: &Envelope,
+        request: &Envelope,
+        now: i64,
+        trust: Option<&Trust<'_>>,
+    ) -> Result<(Id, Id), OpenRefused> {
         self.sweep(now);
-        let c = &self.config;
-        // Revocation is not checked before there is an Authority to say what is revoked.
+        // With an Authority, no session is opened that it could not vouch for now.
+        if trust.is_some_and(|t| !t.fresh) {
+            return Err(self.refuse(why::NO_LEASE));
+        }
+        // Without one there is nobody to say what is revoked.
         let none_revoked = RevocationSet::default();
-        let chain = verify_chain(
-            mandate,
-            &ChainCheck {
-                scope: &c.scope,
-                authority: &c.issuers,
-                now,
-                revoked: &none_revoked,
-            },
-        )
-        .map_err(|_| OpenRefused::Invalid)?;
+        let revoked = trust.map_or(&none_revoked, |t| t.revoked);
+        let checked = {
+            let c = &self.config;
+            verify_chain(
+                mandate,
+                &ChainCheck {
+                    scope: &c.scope,
+                    authority: &c.issuers,
+                    now,
+                    revoked,
+                    templates: c.templates.as_deref(),
+                },
+            )
+        };
+        let chain = match checked {
+            Ok(chain) => chain,
+            Err(Error::Revoked) => return Err(self.refuse(why::REVOKED)),
+            Err(gov_core::Error::UnknownTemplate | gov_core::Error::WiderThanTemplate(_)) => {
+                return Err(self.refuse(why::TEMPLATE))
+            }
+            Err(_) => return Err(self.refuse(why::MANDATE)),
+        };
         let leaf = chain.leaf();
         let agent_key = KeySet::new([leaf.agent.key.clone()]);
-        let asked = open::<SessionOpen>(request, &agent_key, &c.scope)
-            .map_err(|_| OpenRefused::Invalid)?
-            .doc;
-        if asked.gate != c.gate
-            || asked.mandate != leaf.id
-            // Compared without arithmetic that can overflow: a time at the far end of the
-            // range is refused like any other, and never panics (review finding GR-102).
-            || asked.at.abs_diff(now) > c.open_skew_secs.unsigned_abs()
-            || self.nonces.contains_key(&asked.nonce)
-        {
-            return Err(OpenRefused::Invalid);
+        let Ok(asked) = open::<SessionOpen>(request, &agent_key, &self.config.scope) else {
+            return Err(self.refuse(why::REQUEST));
+        };
+        let asked = asked.doc;
+        let c = &self.config;
+        if asked.gate != c.gate || asked.mandate != leaf.id {
+            return Err(self.refuse(why::REQUEST));
+        }
+        // Compared without arithmetic that can overflow: a time at the far end of the
+        // range is refused like any other, and never panics (review finding GR-102).
+        if asked.at.abs_diff(now) > c.open_skew_secs.unsigned_abs() {
+            return Err(self.refuse(why::CLOCK));
+        }
+        if self.nonces.contains_key(&asked.nonce) {
+            return Err(self.refuse(why::REPLAY));
         }
         let key = leaf.agent.key.clone();
         let unproven = self
@@ -190,8 +300,9 @@ impl Sessions {
             .filter(|e| e.key == key && !e.proven)
             .count();
         if unproven >= c.max_unproven {
-            return Err(OpenRefused::Busy);
+            return Err(self.refuse(why::BUSY));
         }
+        let c = &self.config;
         let id = random_id("sess").map_err(|_| OpenRefused::Invalid)?;
         let challenge = random_id("chal").map_err(|_| OpenRefused::Invalid)?;
         self.nonces.insert(asked.nonce, now);
@@ -221,9 +332,106 @@ impl Sessions {
                 used_at: now,
                 calls: 0,
                 salts: BTreeSet::new(),
+                presented: mandate.clone(),
+                revoked: None,
             },
         );
         Ok((id, challenge))
+    }
+
+    /// Something was revoked: close to proof every open session it touches, and keep each
+    /// as a marker (spec §7.6.3, point 6). Every chain is checked again as it was when the
+    /// session opened, against `revoked`. Returns how many sessions were closed.
+    ///
+    /// The reason names the nearest thing revoked: the session's own key, then an agent of
+    /// the chain, then a mandate of it or the key one was signed with.
+    pub fn revoke(&mut self, revoked: &RevocationSet, now: i64) -> usize {
+        self.sweep(now);
+        let c = &self.config;
+        let mut closed = 0;
+        for entry in self.open.values_mut() {
+            if entry.revoked.is_some() {
+                continue;
+            }
+            let check = ChainCheck {
+                scope: &c.scope,
+                authority: &c.issuers,
+                now,
+                revoked,
+                templates: c.templates.as_deref(),
+            };
+            if !matches!(verify_chain(&entry.presented, &check), Err(Error::Revoked)) {
+                continue;
+            }
+            // The chain as it stood at opening names what to look for.
+            let none = RevocationSet::default();
+            let links = verify_chain(
+                &entry.presented,
+                &ChainCheck {
+                    revoked: &none,
+                    ..check
+                },
+            )
+            .map(|chain| chain.links().to_vec())
+            .unwrap_or_else(|_| vec![entry.mandate.clone()]);
+            let why = if revoked.is_revoked(Revocable::Key, &entry.key.kid) {
+                ProofFailure::KeyRevoked
+            } else if links
+                .iter()
+                .any(|m| revoked.is_revoked(Revocable::Agent, &m.agent.id))
+            {
+                ProofFailure::AgentRevoked
+            } else {
+                ProofFailure::MandateRevoked
+            };
+            entry.revoked = Some(why);
+            closed += 1;
+        }
+        closed
+    }
+
+    /// Is this session open here? A marker counts: it is still this gate's session.
+    pub fn holds(&self, session: &Id) -> bool {
+        self.open.contains_key(session)
+    }
+
+    /// The gate has taken another policy bundle (spec §7.6.3, point 7): from now on chains
+    /// are held to its issuers' keys and its templates. Every open session's chain is
+    /// checked again as a new one would be. One that is revoked is kept as a marker, as in
+    /// [`Sessions::revoke`]; one that no longer holds for any other reason (its issuer's
+    /// key is gone from the bundle, its template is gone or narrower) is dropped, and its
+    /// next call is an unknown session. Returns how many were dropped.
+    pub fn rebundle(
+        &mut self,
+        issuers: KeySet,
+        templates: Option<Vec<gov_core::mandate::Template>>,
+        revoked: &RevocationSet,
+        now: i64,
+    ) -> usize {
+        // Revoked first, under the bundle the sessions opened under: a chain whose issuer
+        // key the new bundle drops would otherwise fail for that and lose its reason.
+        self.revoke(revoked, now);
+        self.config.issuers = issuers;
+        self.config.templates = templates;
+        let c = &self.config;
+        let none = RevocationSet::default();
+        let before = self.open.len();
+        self.open.retain(|_, entry| {
+            // A marker stays whatever the new bundle says: it records what was revoked.
+            entry.revoked.is_some()
+                || verify_chain(
+                    &entry.presented,
+                    &ChainCheck {
+                        scope: &c.scope,
+                        authority: &c.issuers,
+                        now,
+                        revoked: &none,
+                        templates: c.templates.as_deref(),
+                    },
+                )
+                .is_ok()
+        });
+        before - self.open.len()
     }
 
     /// Decide whether a call is proven. `digest` is of the action the gate itself computed
@@ -241,6 +449,31 @@ impl Sessions {
         canonical: bool,
         now: i64,
     ) -> Proved {
+        let call = Call {
+            proof,
+            salt,
+            digest,
+            canonical,
+        };
+        self.prove_with(session, &call, now, None)
+    }
+
+    /// As [`Sessions::prove`], for a gate that has an Authority. A proof that holds is
+    /// recorded as proven only under a complete, fresh lease, and never for a session
+    /// whose chain has been revoked: each of those is a failed proof with its own reason.
+    pub fn prove_with(
+        &mut self,
+        session: &Id,
+        call: &Call<'_>,
+        now: i64,
+        trust: Option<&Trust<'_>>,
+    ) -> Proved {
+        let Call {
+            proof,
+            salt,
+            digest,
+            canonical,
+        } = *call;
         self.sweep(now);
         let c = &self.config;
         let Some(entry) = self.open.get_mut(session) else {
@@ -287,6 +520,16 @@ impl Sessions {
         entry.salts.insert(*salt);
         entry.calls += 1;
         entry.used_at = now;
+        // The proof holds: the caller has the key. Whether that makes the call the agent's
+        // act is another matter. A session whose chain was revoked says which part was;
+        // and without a complete, fresh lease the gate cannot know that nothing was.
+        // Neither is ever counted as proven, and neither pushes out a proven session.
+        if let Some(why) = entry.revoked {
+            return failed(&entry.who, why);
+        }
+        if trust.is_some_and(|t| !t.fresh) {
+            return failed(&entry.who, ProofFailure::NoLease);
+        }
         let first = !entry.proven;
         entry.proven = true;
         let (who, key) = (entry.who.clone(), entry.key.clone());
@@ -296,7 +539,9 @@ impl Sessions {
             let mut proven: Vec<(i64, Id)> = self
                 .open
                 .iter()
-                .filter(|(id, e)| e.proven && e.key == key && *id != session)
+                // A marker is not among them: it is not closed to make room, since its
+                // calls would then lose the agent's name (review finding GR-180).
+                .filter(|(id, e)| e.proven && e.revoked.is_none() && e.key == key && *id != session)
                 .map(|(id, e)| (e.used_at, id.clone()))
                 .collect();
             proven.sort();

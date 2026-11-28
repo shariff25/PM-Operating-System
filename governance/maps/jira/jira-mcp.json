@@ -1,0 +1,574 @@
+{
+  "server": "jira-mcp",
+  "system": "jira",
+  "fold_case": true,
+  "tools": [
+    {
+      "tool": "jira_add_comment",
+      "digest": "138c0befc5c39637fa446bc281a307468f8249db8fb2f739002591b2b7e88e69",
+      "operation": "comment.add",
+      "kind": "write",
+      "reversal": "none",
+      "outward": true,
+      "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}"
+    },
+    {
+      "tool": "jira_add_issues_to_sprint",
+      "digest": "3d4d5dc0338acbd79b8bb0f48e14504e663536429620131217adda419dc5a89d",
+      "operation": "sprint.issues.add",
+      "kind": "write",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/sprint/{sprint_id}"
+    },
+    {
+      "tool": "jira_add_watcher",
+      "digest": "51606897912e46cfc984125fa950a99d72a1938bc110595c7d33366adcac8423",
+      "operation": "issue.watcher.add",
+      "kind": "write",
+      "reversal": "inverse",
+      "outward": true,
+      "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}"
+    },
+    {
+      "tool": "jira_add_worklog",
+      "digest": "f9806f219cbeb30fa1026c1ddfd94ae8b660518a6e1d778bc87d6513446e7d2c",
+      "operation": "worklog.add",
+      "kind": "write",
+      "reversal": "none",
+      "outward": true,
+      "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}"
+    },
+    {
+      "tool": "jira_assign_issue",
+      "digest": "a4c4aa1b5b29ffb12f67e3975089d9e3a3a25edfbaec187c75d490657ebf0daa",
+      "operation": "issue.assign",
+      "kind": "write",
+      "reversal": "restore",
+      "outward": true,
+      "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}"
+    },
+    {
+      "tool": "jira_batch_create_issues",
+      "digest": "9021c7c607932ca419b21573ee047945718f6c2501f914cbca4dbbc17bfe6a32",
+      "operation": "issue.batch-create",
+      "kind": "write",
+      "reversal": "inverse",
+      "outward": true,
+      "resource": "jira/batch"
+    },
+    {
+      "tool": "jira_batch_create_versions",
+      "digest": "b952c64d8afc5736e6241a0fb40a1c1da95bbffcb1ecf2db8e29a654b98ed451",
+      "operation": "version.batch-create",
+      "kind": "write",
+      "reversal": "none",
+      "outward": true,
+      "resource": "jira/project/{project_key}"
+    },
+    {
+      "tool": "jira_batch_get_changelogs",
+      "digest": "9fa53e5b175ceecbcca1aeb3a71c132a91ad2dd8384b2973fd2da650af0f005c",
+      "operation": "issue.changelog.batch-read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/batch"
+    },
+    {
+      "tool": "jira_create_customer_request",
+      "digest": "9b41d7167a5c21a29f4df0fb29f690be4332eb7de1dc26743ac06571d88cfa75",
+      "operation": "servicedesk.request.create",
+      "kind": "write",
+      "reversal": "none",
+      "outward": true,
+      "resource": "jira/servicedesk/{service_desk_id}"
+    },
+    {
+      "tool": "jira_create_issue",
+      "digest": "b74abc1140c9c83e1566990de05ee1a61931da63bf874576ce16948bf0428213",
+      "operation": "issue.create",
+      "kind": "write",
+      "reversal": "inverse",
+      "outward": true,
+      "resource": "jira/project/{project_key}"
+    },
+    {
+      "tool": "jira_create_issue_link",
+      "digest": "1569e4e4819b85ff009d0679459498ee2a757e2063adc7bab23826b7536a95ac",
+      "operation": "issuelink.create",
+      "kind": "write",
+      "reversal": "none",
+      "outward": true,
+      "resource": "jira/project/{inward_issue_key:before(-)}/issue/{inward_issue_key}"
+    },
+    {
+      "tool": "jira_create_remote_issue_link",
+      "digest": "bda31ffc69307fa809347c9ee40263b852df8e9795b51da836e5af57d8d505b8",
+      "operation": "remotelink.create",
+      "kind": "write",
+      "reversal": "none",
+      "outward": true,
+      "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}"
+    },
+    {
+      "tool": "jira_create_sprint",
+      "digest": "9064dacc8b7769db20753ee83c321f83762906ff7ba2d8edcbf25025e286f829",
+      "operation": "sprint.create",
+      "kind": "write",
+      "reversal": "none",
+      "outward": true,
+      "resource": "jira/board/{board_id}"
+    },
+    {
+      "tool": "jira_create_version",
+      "digest": "718dceba10426aa878d4694a56d39458db8f5b6169c504b3ad530d2ef806bdb1",
+      "operation": "version.create",
+      "kind": "write",
+      "reversal": "none",
+      "outward": true,
+      "resource": "jira/project/{project_key}"
+    },
+    {
+      "tool": "jira_delete_issue",
+      "digest": "6296ccf80953b1df15fbe9bdcdcf4caec65c7ac8beee6f5ca1fe771d8f17d93f",
+      "operation": "issue.delete",
+      "kind": "destructive",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}"
+    },
+    {
+      "tool": "jira_download_attachments",
+      "digest": "f5ec9cbfb6c00aff4277cb42e53cc64d905ed253c2f01be992e59b21d1710aec",
+      "operation": "issue.attachments.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}"
+    },
+    {
+      "tool": "jira_edit_comment",
+      "digest": "ecf9d06530ed9d72bfe559e4c28c6351fa3042279bc5d47732973b80e20c42ab",
+      "operation": "comment.edit",
+      "kind": "write",
+      "reversal": "restore",
+      "outward": true,
+      "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}"
+    },
+    {
+      "tool": "jira_get_agile_boards",
+      "digest": "353ffeb694056d43705bfeec4580b69c63fa366489f7b3ee00062c45a0df5370",
+      "operation": "board.list",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/board"
+    },
+    {
+      "tool": "jira_get_all_projects",
+      "digest": "d27cd724cf671dbc35c44cad6baa8408b2c58fc818a05efd8fec1448d53bb6e0",
+      "operation": "project.list",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/project"
+    },
+    {
+      "tool": "jira_get_board_issues",
+      "digest": "923bd59fc27a0dc917342ac10cea6b9c5d80f393ef740db8e4665051b20dcf2f",
+      "operation": "board.issues.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/board/{board_id}"
+    },
+    {
+      "tool": "jira_get_create_fields",
+      "digest": "ed4f8bcd99fc794df2f3d12956e631b29d4e71f0b10bc2f76e198b3a6f338fdf",
+      "operation": "project.createfields.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/project/{project_key}"
+    },
+    {
+      "tool": "jira_get_cross_project_dependencies",
+      "digest": "e6d1ed5ccaa0a802b09813a695326f4aaf4203536d22fa7c3ec216d36cc20ddf",
+      "operation": "project.dependencies.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/dependencies"
+    },
+    {
+      "tool": "jira_get_field_options",
+      "digest": "429e291859fbfe0df4c962aef1875702944f27e3a55e9abe68708050250c87fa",
+      "operation": "field.options.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/field/{field_id}"
+    },
+    {
+      "tool": "jira_get_issue",
+      "digest": "9d0b8ecced58ed1871e3112f95ebbeea8877221102e4213fea4c2c802496364f",
+      "operation": "issue.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}"
+    },
+    {
+      "tool": "jira_get_issue_dates",
+      "digest": "1ce6ba9ee7db2ba0a17dacbd2911192f66e0dd7e4c681ce9dea71aefd26c37c4",
+      "operation": "issue.dates.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}"
+    },
+    {
+      "tool": "jira_get_issue_development_info",
+      "digest": "47a47191a88c1f8f052ffce71cda5218b0c0215e2673f16266f479cb0f2cd4ba",
+      "operation": "issue.devinfo.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}"
+    },
+    {
+      "tool": "jira_get_issue_images",
+      "digest": "cb3e4afdf1cb96494ec9279d53332a17d04eb7d914beb60a6fb279f31219abf3",
+      "operation": "issue.images.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}"
+    },
+    {
+      "tool": "jira_get_issue_proforma_forms",
+      "digest": "f85c6d3e2c4813630ebda977353af15763fafe8f8bdfafa31b12b3a471a15ba1",
+      "operation": "issue.forms.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}"
+    },
+    {
+      "tool": "jira_get_issue_sla",
+      "digest": "bd782f5259c006835cdd383c60b9308a77ddbb407205a5b79c7fd65b4a8ce807",
+      "operation": "issue.sla.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}"
+    },
+    {
+      "tool": "jira_get_issue_watchers",
+      "digest": "ec8dbbeeef310c36f06cb20cd31f9250ab5e955fd29312a5cb2dab25c2725499",
+      "operation": "issue.watchers.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}"
+    },
+    {
+      "tool": "jira_get_issues_development_info",
+      "digest": "49accdacf35dce6542110fd469381b0c47d62b617c76e1678ac3ca92c54ff71d",
+      "operation": "issue.devinfo.batch-read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/batch"
+    },
+    {
+      "tool": "jira_get_link_types",
+      "digest": "dbbb4cc1d33f22117108b74dd589cad4a49034698fdded7b7c0d34d59e7dec28",
+      "operation": "linktype.list",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/linktype"
+    },
+    {
+      "tool": "jira_get_proforma_form_details",
+      "digest": "2b76631a00a5e9fabb00fc8d3e476ec5de6f1135ab72b7854128eb87f78e0a26",
+      "operation": "issue.form.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}"
+    },
+    {
+      "tool": "jira_get_project_components",
+      "digest": "0533b09cb2df1aa58bdf51d522d7e810904225c5075d8eff1f42c105133a1710",
+      "operation": "project.components.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/project/{project_key}"
+    },
+    {
+      "tool": "jira_get_project_epic_hierarchy",
+      "digest": "eddf7ed46b8605b6647ec3822b732dda746e8a46b749c6b6c8cd17fb08181aae",
+      "operation": "project.epics.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/project/{project_key}"
+    },
+    {
+      "tool": "jira_get_project_fields",
+      "digest": "88e9ab71fc24970a26a8a94482b7251770643b4dd037f7d41660682f2e5cf0e0",
+      "operation": "project.fields.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/project/{project_key}"
+    },
+    {
+      "tool": "jira_get_project_issue_types",
+      "digest": "a8aff1cc50e9ac3eb17828cd5eb18780cffc6dd04a820ebe571814d32f934082",
+      "operation": "project.issuetypes.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/project/{project_key}"
+    },
+    {
+      "tool": "jira_get_project_issues",
+      "digest": "970f069d56309a56e0440d7eb92aca2df520f6e21a62a9f61921f56ac91de0d8",
+      "operation": "issue.list",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/project/{project_key}"
+    },
+    {
+      "tool": "jira_get_project_versions",
+      "digest": "7439a8f68f6fa9db30a51a9755b3e27360709edd147907d98827c7634e92e980",
+      "operation": "project.versions.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/project/{project_key}"
+    },
+    {
+      "tool": "jira_get_queue_issues",
+      "digest": "9a0eddb805b2dda18ab501b5a8aa5301bfef4687160bda6ca6cdd422f95bf6bb",
+      "operation": "servicedesk.queue.issues.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/servicedesk/{service_desk_id}"
+    },
+    {
+      "tool": "jira_get_request_type_fields",
+      "digest": "e2b34c6710288bbeb485ae617e593cbca7719d546b0175463af1c93c4b1f90a0",
+      "operation": "servicedesk.requesttype.fields.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/servicedesk/{service_desk_id}"
+    },
+    {
+      "tool": "jira_get_request_types",
+      "digest": "e97a3ddb45eb272e38bc72ae038c557284e32f6e16d80a23d168d5fc07d9c759",
+      "operation": "servicedesk.requesttypes.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/servicedesk/{service_desk_id}"
+    },
+    {
+      "tool": "jira_get_service_desk_for_project",
+      "digest": "bf0e1887fcad9a042831651aeed497a4ef0fc8fb3a60825ad1f900a7c66c4111",
+      "operation": "servicedesk.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/project/{project_key}"
+    },
+    {
+      "tool": "jira_get_service_desk_queues",
+      "digest": "00da09bf0a56fd3849b4a55ed12847e770ba035b9b2386f1bce1bab6a2780da2",
+      "operation": "servicedesk.queues.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/servicedesk/{service_desk_id}"
+    },
+    {
+      "tool": "jira_get_sprint_issues",
+      "digest": "5226bb013596d8f787429668afdbcd413a3df4b803842114c12b6fe4385eeb66",
+      "operation": "sprint.issues.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/sprint/{sprint_id}"
+    },
+    {
+      "tool": "jira_get_sprints_from_board",
+      "digest": "5c21497f52f24a0dc113ce0da8dce8ce0784464982be5c6ffb9372fe0208924a",
+      "operation": "board.sprints.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/board/{board_id}"
+    },
+    {
+      "tool": "jira_get_transitions",
+      "digest": "a6fcabcc401a300a0923773ee00c80e3d474b178bc2e7172164deed03b4cdf46",
+      "operation": "issue.transitions.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}"
+    },
+    {
+      "tool": "jira_get_user_profile",
+      "digest": "03d72ae96ab0046926d9e4ada98a5425b56d3b163b977b45d22ad8f184501331",
+      "operation": "user.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/user"
+    },
+    {
+      "tool": "jira_get_worklog",
+      "digest": "1313069926082d164c158530c7e1542ef51680ee526f0e6580a384b6d9944780",
+      "operation": "issue.worklog.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}"
+    },
+    {
+      "tool": "jira_link_to_epic",
+      "digest": "cc77f185023d025cb8837ccddb3fa0ec42509b7df45c131380bce31436f21898",
+      "operation": "issue.epic.link",
+      "kind": "write",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}"
+    },
+    {
+      "tool": "jira_move_issue",
+      "digest": "c2d7e7f777ab216bc51310f58a4a630502e1cfc37b11252043e31496332103d2",
+      "operation": "issue.move",
+      "kind": "destructive",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}"
+    },
+    {
+      "tool": "jira_move_issues_to_backlog",
+      "digest": "f271a0fb13214d934f62b5ba46b44d6961b5f8c19297dbb432a1ac21e3da0039",
+      "operation": "backlog.issues.move",
+      "kind": "write",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/batch"
+    },
+    {
+      "tool": "jira_remove_issue_link",
+      "digest": "afa22b796bf0db511f28ea09d9160782715b1f900111bbecb4396203d9ae0f08",
+      "operation": "issuelink.remove",
+      "kind": "write",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/issuelink/{link_id}"
+    },
+    {
+      "tool": "jira_remove_watcher",
+      "digest": "72696bc9c7850a975e047681ac07a50feccfe83314263b2a3d5c274c9a2f2109",
+      "operation": "issue.watcher.remove",
+      "kind": "write",
+      "reversal": "inverse",
+      "outward": false,
+      "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}"
+    },
+    {
+      "tool": "jira_search",
+      "digest": "cfdfc5d4f26e20da9dd7c60fbbc60ed2dde778f5d13a4ec3f8864c663315d5c1",
+      "operation": "issue.search",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/search"
+    },
+    {
+      "tool": "jira_search_assignable_users",
+      "digest": "c365de6b91ff8acc85189dce3d27c9e27fa6c0622c0ea3b7eee9a92f45477f4d",
+      "operation": "user.search",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/user"
+    },
+    {
+      "tool": "jira_search_fields",
+      "digest": "dcdb540447b45e13844c2a0b0c0739c63d41c3290df13e1287e903e6173fc3b1",
+      "operation": "field.search",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/field"
+    },
+    {
+      "tool": "jira_search_projects",
+      "digest": "03c19635c33b0be1cccea1ad6d969f3e654bd814c035b586dcdc8e9d6c926182",
+      "operation": "project.search",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "jira/project"
+    },
+    {
+      "tool": "jira_transition_issue",
+      "digest": "e5945e0c62a77d2a142ae2d52773a82fc0bfd0fb9cb5652ea1deff80da5c64e4",
+      "operation": "issue.transition",
+      "kind": "write",
+      "reversal": "none",
+      "outward": true,
+      "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}"
+    },
+    {
+      "tool": "jira_update_issue",
+      "digest": "6573f15bcb5d5610bb776f3dea9e1c58ca40ed500a1764465a7c03ede4ce0e36",
+      "operation": "issue.update",
+      "kind": "write",
+      "reversal": "none",
+      "outward": true,
+      "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}"
+    },
+    {
+      "tool": "jira_update_proforma_form_answers",
+      "digest": "309731d774ccb81862e6d2e5d6872a17d2e11b7acabacb3bd06ff660ea2946f4",
+      "operation": "issue.form.update",
+      "kind": "write",
+      "reversal": "restore",
+      "outward": true,
+      "resource": "jira/project/{issue_key:before(-)}/issue/{issue_key}"
+    },
+    {
+      "tool": "jira_update_sprint",
+      "digest": "d8bc200171cf20a291de6054b00105e17d7f22f4b7f845b286fe08197c96a63b",
+      "operation": "sprint.update",
+      "kind": "write",
+      "reversal": "none",
+      "outward": true,
+      "resource": "jira/sprint/{sprint_id}"
+    },
+    {
+      "tool": "jira_update_version",
+      "digest": "beada2a62686ddb2982756fcb43d86cbdddef308ce7b9e65053eb92b5f3eea12",
+      "operation": "version.update",
+      "kind": "write",
+      "reversal": "none",
+      "outward": true,
+      "resource": "jira/version/{version_id}"
+    }
+  ]
+}

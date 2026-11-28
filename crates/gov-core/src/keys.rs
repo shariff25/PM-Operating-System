@@ -182,6 +182,11 @@ impl PublicKey {
     /// on a list. A signature of "the neutral point, zero" verifies under a key only when the
     /// key has small order, and then for about one message in eight; a key of full order
     /// never accepts it. 256 fixed messages are tried.
+    /// The same key, whatever id it is listed under.
+    pub fn same_key(&self, other: &PublicKey) -> bool {
+        self.key == other.key
+    }
+
     pub fn enrolable(&self) -> Result<()> {
         let bytes = self.bytes()?;
         let mut trivial = [0u8; 64];

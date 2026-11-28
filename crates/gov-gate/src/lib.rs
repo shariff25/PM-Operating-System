@@ -115,6 +115,10 @@ pub struct GateConfig {
     pub spool_limit: usize,
     /// The most receipts in one batch to the Ledger.
     pub batch: usize,
+    /// What every receipt carries as its policy version: the bundle the gate's connector
+    /// map came from, or a word saying it came from no bundle. Absent where nothing loaded
+    /// a policy at all.
+    pub policy_version: Option<Id>,
 }
 
 /// Who made a call, and how the gate knows. There are two ways to make one, and no other:
@@ -163,6 +167,26 @@ impl Who {
     }
 }
 
+/// A time for a receipt, and where it came from. The two travel together, so that no
+/// receipt carries the lease's time without saying so, or the machine's time while saying
+/// it is the lease's (review finding GR-177).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct When {
+    pub at: i64,
+    /// The time is the Authority's: a held lease's time counted on by the gate's own clock.
+    pub from_lease: bool,
+}
+
+impl When {
+    /// This machine's clock.
+    pub fn here(at: i64) -> Self {
+        When {
+            at,
+            from_lease: false,
+        }
+    }
+}
+
 /// One observed call: who said they made it, and what it was.
 pub struct Observed<'a> {
     pub who: Who,
@@ -174,6 +198,7 @@ pub struct Observed<'a> {
 pub struct Gate<S> {
     config: GateConfig,
     key: SigningKey,
+
     spool: S,
     state: SpoolState,
     /// The number and hash of every receipt held, and which intents are still open. Built
@@ -189,6 +214,19 @@ impl<S: Spool> Gate<S> {
     pub fn open(
         config: GateConfig,
         key: SigningKey,
+        spool: S,
+        now: i64,
+    ) -> Result<Self, GateError> {
+        Self::open_after(config, key, &[], spool, now)
+    }
+
+    /// As [`Gate::open`], for a gate whose key has been replaced: `earlier` are the public
+    /// halves of the keys it signed with before, under which its spool may still hold
+    /// receipts (review finding GR-59). A receipt under any other key still stops it.
+    pub fn open_after(
+        config: GateConfig,
+        key: SigningKey,
+        earlier: &[gov_core::PublicKey],
         mut spool: S,
         now: i64,
     ) -> Result<Self, GateError> {
@@ -199,10 +237,24 @@ impl<S: Spool> Gate<S> {
         let held = spool.held()?;
         // Nothing in the spool is trusted until it opens under this gate's own key with the
         // number and hash the spool says it has (review finding GR-51).
-        let keys = KeySet::new([key.public()]);
+        let keys = KeySet::new(earlier.iter().cloned().chain([key.public()]));
         let mut docs = Vec::with_capacity(held.len());
+        // Keys in the order they were used: none comes back once a later one has signed
+        // (review finding GR-188).
+        let order = |kid: &Id| {
+            earlier
+                .iter()
+                .position(|k| &k.kid == kid)
+                .unwrap_or(earlier.len())
+        };
+        let mut latest = 0;
         for r in &held {
             let opened = open::<Receipt>(&r.envelope, &keys, &config.scope)?;
+            let used = order(&r.envelope.kid);
+            if used < latest {
+                return Err(GateError::Spool(SpoolError::Corrupt));
+            }
+            latest = used;
             if opened.doc.seq != r.seq || opened.hash != r.hash || opened.doc.gate != config.gate {
                 return Err(GateError::Spool(SpoolError::Corrupt));
             }
@@ -242,7 +294,8 @@ impl<S: Spool> Gate<S> {
                 gate.spool.close_intent(r.seq)?;
                 gate.open_intents.remove(&r.seq);
             } else {
-                gate.write_outcome(intent, OutcomeStatus::Unknown, None, now)?;
+                // The gate has no lease yet when it opens: this is its machine's time.
+                gate.write_outcome(intent, OutcomeStatus::Unknown, None, When::here(now))?;
             }
         }
         Ok(gate)
@@ -310,8 +363,26 @@ impl<S: Spool> Gate<S> {
     /// Record that a call is about to pass through, before it does. Returns the intent's
     /// number, to give to [`Gate::finish`].
     pub fn begin(&mut self, call: &Observed<'_>, now: i64) -> Result<u64, GateError> {
-        let (at, at_clamped) = self.stamp(now);
+        let policy = self.config.policy_version.clone();
+        self.begin_under(call, When::here(now), policy)
+    }
+
+    /// As [`Gate::begin`], for a gate whose policy bundle can change while it runs: the
+    /// receipt carries the version of the bundle the call was read under, which the caller
+    /// took together with the map it read the call with. The outcome carries its intent's
+    /// (spec §7.6.3, point 7).
+    pub fn begin_under(
+        &mut self,
+        call: &Observed<'_>,
+        when: When,
+        policy_version: Option<Id>,
+    ) -> Result<u64, GateError> {
+        let (at, at_clamped) = self.stamp(when.at);
         let receipt = Receipt {
+            session: None,
+            cause: None,
+            rule: None,
+            labels: None,
             v: VERSION,
             tenant: self.config.scope.tenant.clone(),
             env: self.config.scope.env.clone(),
@@ -320,6 +391,7 @@ impl<S: Spool> Gate<S> {
             prev: None,
             at,
             at_clamped,
+            at_from_lease: when.from_lease,
             phase: Phase::Intent,
             mode: Mode::Observe,
             coverage: call.coverage,
@@ -329,7 +401,7 @@ impl<S: Spool> Gate<S> {
                 failure: call.who.failure,
             },
             mandate: call.who.mandates.clone(),
-            policy_version: None,
+            policy_version,
             action: ReceiptAction::from(call.action),
             reversal: call.reversal,
             before_digest: None,
@@ -354,6 +426,17 @@ impl<S: Spool> Gate<S> {
         upstream_ref: Option<Id>,
         now: i64,
     ) -> Result<u64, GateError> {
+        self.finish_at(intent, status, upstream_ref, When::here(now))
+    }
+
+    /// As [`Gate::finish`], with a time that says where it came from.
+    pub fn finish_at(
+        &mut self,
+        intent: u64,
+        status: OutcomeStatus,
+        upstream_ref: Option<Id>,
+        when: When,
+    ) -> Result<u64, GateError> {
         if !self.open_intents.contains(&intent) {
             return Err(GateError::NoSuchIntent(intent));
         }
@@ -361,9 +444,11 @@ impl<S: Spool> Gate<S> {
             .spool
             .get(intent)?
             .ok_or(GateError::NoSuchIntent(intent))?;
+        // Signed with the key in use: an intent an earlier key left open was closed when
+        // the gate opened.
         let keys = KeySet::new([self.key.public()]);
         let doc = open::<Receipt>(&held.envelope, &keys, &self.config.scope)?.doc;
-        self.write_outcome(&doc, status, upstream_ref, now)
+        self.write_outcome(&doc, status, upstream_ref, when)
     }
 
     fn write_outcome(
@@ -371,14 +456,19 @@ impl<S: Spool> Gate<S> {
         intent: &Receipt,
         status: OutcomeStatus,
         upstream_ref: Option<Id>,
-        now: i64,
+        when: When,
     ) -> Result<u64, GateError> {
-        let (at, at_clamped) = self.stamp(now);
+        let (at, at_clamped) = self.stamp(when.at);
         let receipt = Receipt {
+            session: None,
+            cause: None,
+            rule: None,
+            labels: None,
             seq: 0,
             prev: None,
             at,
             at_clamped,
+            at_from_lease: when.from_lease,
             phase: Phase::Outcome,
             outcome: Some(Outcome {
                 status,

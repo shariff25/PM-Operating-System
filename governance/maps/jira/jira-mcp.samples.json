@@ -1,0 +1,739 @@
+[
+ {
+  "tool": "jira_add_comment",
+  "arguments": {
+   "issue_key": "PAY-12",
+   "body": "x"
+  },
+  "expect": {
+   "operation": "comment.add",
+   "kind": "write",
+   "resource": "jira/project/pay/issue/pay-12"
+  }
+ },
+ {
+  "tool": "jira_add_issues_to_sprint",
+  "arguments": {
+   "sprint_id": "7",
+   "issue_keys": "x"
+  },
+  "expect": {
+   "operation": "sprint.issues.add",
+   "kind": "write",
+   "resource": "jira/sprint/7"
+  }
+ },
+ {
+  "tool": "jira_add_watcher",
+  "arguments": {
+   "issue_key": "PAY-12",
+   "user_identifier": "x"
+  },
+  "expect": {
+   "operation": "issue.watcher.add",
+   "kind": "write",
+   "resource": "jira/project/pay/issue/pay-12"
+  }
+ },
+ {
+  "tool": "jira_add_worklog",
+  "arguments": {
+   "issue_key": "PAY-12",
+   "time_spent": "x"
+  },
+  "expect": {
+   "operation": "worklog.add",
+   "kind": "write",
+   "resource": "jira/project/pay/issue/pay-12"
+  }
+ },
+ {
+  "tool": "jira_assign_issue",
+  "arguments": {
+   "issue_key": "PAY-12"
+  },
+  "expect": {
+   "operation": "issue.assign",
+   "kind": "write",
+   "resource": "jira/project/pay/issue/pay-12"
+  }
+ },
+ {
+  "tool": "jira_batch_create_issues",
+  "arguments": {
+   "issues": "x"
+  },
+  "expect": {
+   "operation": "issue.batch-create",
+   "kind": "write",
+   "resource": "jira/batch"
+  }
+ },
+ {
+  "tool": "jira_batch_create_versions",
+  "arguments": {
+   "project_key": "PAY",
+   "versions": "x"
+  },
+  "expect": {
+   "operation": "version.batch-create",
+   "kind": "write",
+   "resource": "jira/project/pay"
+  }
+ },
+ {
+  "tool": "jira_batch_get_changelogs",
+  "arguments": {
+   "issue_ids_or_keys": "x"
+  },
+  "expect": {
+   "operation": "issue.changelog.batch-read",
+   "kind": "read",
+   "resource": "jira/batch"
+  }
+ },
+ {
+  "tool": "jira_create_customer_request",
+  "arguments": {
+   "service_desk_id": "3",
+   "request_type_id": "x",
+   "request_field_values": "x"
+  },
+  "expect": {
+   "operation": "servicedesk.request.create",
+   "kind": "write",
+   "resource": "jira/servicedesk/3"
+  }
+ },
+ {
+  "tool": "jira_create_issue",
+  "arguments": {
+   "project_key": "PAY",
+   "summary": "x",
+   "issue_type": "x"
+  },
+  "expect": {
+   "operation": "issue.create",
+   "kind": "write",
+   "resource": "jira/project/pay"
+  }
+ },
+ {
+  "tool": "jira_create_issue_link",
+  "arguments": {
+   "link_type": "x",
+   "inward_issue_key": "PAY-12",
+   "outward_issue_key": "x"
+  },
+  "expect": {
+   "operation": "issuelink.create",
+   "kind": "write",
+   "resource": "jira/project/pay/issue/pay-12"
+  }
+ },
+ {
+  "tool": "jira_create_remote_issue_link",
+  "arguments": {
+   "issue_key": "PAY-12",
+   "url": "x",
+   "title": "x"
+  },
+  "expect": {
+   "operation": "remotelink.create",
+   "kind": "write",
+   "resource": "jira/project/pay/issue/pay-12"
+  }
+ },
+ {
+  "tool": "jira_create_sprint",
+  "arguments": {
+   "board_id": "42",
+   "name": "x",
+   "start_date": "x",
+   "end_date": "x"
+  },
+  "expect": {
+   "operation": "sprint.create",
+   "kind": "write",
+   "resource": "jira/board/42"
+  }
+ },
+ {
+  "tool": "jira_create_version",
+  "arguments": {
+   "project_key": "PAY",
+   "name": "x"
+  },
+  "expect": {
+   "operation": "version.create",
+   "kind": "write",
+   "resource": "jira/project/pay"
+  }
+ },
+ {
+  "tool": "jira_delete_issue",
+  "arguments": {
+   "issue_key": "PAY-12"
+  },
+  "expect": {
+   "operation": "issue.delete",
+   "kind": "destructive",
+   "resource": "jira/project/pay/issue/pay-12"
+  }
+ },
+ {
+  "tool": "jira_download_attachments",
+  "arguments": {
+   "issue_key": "PAY-12"
+  },
+  "expect": {
+   "operation": "issue.attachments.read",
+   "kind": "read",
+   "resource": "jira/project/pay/issue/pay-12"
+  }
+ },
+ {
+  "tool": "jira_edit_comment",
+  "arguments": {
+   "issue_key": "PAY-12",
+   "comment_id": "x",
+   "body": "x"
+  },
+  "expect": {
+   "operation": "comment.edit",
+   "kind": "write",
+   "resource": "jira/project/pay/issue/pay-12"
+  }
+ },
+ {
+  "tool": "jira_get_agile_boards",
+  "arguments": {},
+  "expect": {
+   "operation": "board.list",
+   "kind": "read",
+   "resource": "jira/board"
+  }
+ },
+ {
+  "tool": "jira_get_all_projects",
+  "arguments": {},
+  "expect": {
+   "operation": "project.list",
+   "kind": "read",
+   "resource": "jira/project"
+  }
+ },
+ {
+  "tool": "jira_get_board_issues",
+  "arguments": {
+   "board_id": "42",
+   "jql": "x"
+  },
+  "expect": {
+   "operation": "board.issues.read",
+   "kind": "read",
+   "resource": "jira/board/42"
+  }
+ },
+ {
+  "tool": "jira_get_create_fields",
+  "arguments": {
+   "project_key": "PAY",
+   "issue_type_id": "x"
+  },
+  "expect": {
+   "operation": "project.createfields.read",
+   "kind": "read",
+   "resource": "jira/project/pay"
+  }
+ },
+ {
+  "tool": "jira_get_cross_project_dependencies",
+  "arguments": {
+   "project_key": "PAY"
+  },
+  "expect": {
+   "operation": "project.dependencies.read",
+   "kind": "read",
+   "resource": "jira/dependencies"
+  }
+ },
+ {
+  "tool": "jira_get_field_options",
+  "arguments": {
+   "field_id": "customfield_10010"
+  },
+  "expect": {
+   "operation": "field.options.read",
+   "kind": "read",
+   "resource": "jira/field/customfield_10010"
+  }
+ },
+ {
+  "tool": "jira_get_issue",
+  "arguments": {
+   "issue_key": "PAY-12"
+  },
+  "expect": {
+   "operation": "issue.read",
+   "kind": "read",
+   "resource": "jira/project/pay/issue/pay-12"
+  }
+ },
+ {
+  "tool": "jira_get_issue_dates",
+  "arguments": {
+   "issue_key": "PAY-12"
+  },
+  "expect": {
+   "operation": "issue.dates.read",
+   "kind": "read",
+   "resource": "jira/project/pay/issue/pay-12"
+  }
+ },
+ {
+  "tool": "jira_get_issue_development_info",
+  "arguments": {
+   "issue_key": "PAY-12"
+  },
+  "expect": {
+   "operation": "issue.devinfo.read",
+   "kind": "read",
+   "resource": "jira/project/pay/issue/pay-12"
+  }
+ },
+ {
+  "tool": "jira_get_issue_images",
+  "arguments": {
+   "issue_key": "PAY-12"
+  },
+  "expect": {
+   "operation": "issue.images.read",
+   "kind": "read",
+   "resource": "jira/project/pay/issue/pay-12"
+  }
+ },
+ {
+  "tool": "jira_get_issue_proforma_forms",
+  "arguments": {
+   "issue_key": "PAY-12"
+  },
+  "expect": {
+   "operation": "issue.forms.read",
+   "kind": "read",
+   "resource": "jira/project/pay/issue/pay-12"
+  }
+ },
+ {
+  "tool": "jira_get_issue_sla",
+  "arguments": {
+   "issue_key": "PAY-12"
+  },
+  "expect": {
+   "operation": "issue.sla.read",
+   "kind": "read",
+   "resource": "jira/project/pay/issue/pay-12"
+  }
+ },
+ {
+  "tool": "jira_get_issue_watchers",
+  "arguments": {
+   "issue_key": "PAY-12"
+  },
+  "expect": {
+   "operation": "issue.watchers.read",
+   "kind": "read",
+   "resource": "jira/project/pay/issue/pay-12"
+  }
+ },
+ {
+  "tool": "jira_get_issues_development_info",
+  "arguments": {
+   "issue_keys": "x"
+  },
+  "expect": {
+   "operation": "issue.devinfo.batch-read",
+   "kind": "read",
+   "resource": "jira/batch"
+  }
+ },
+ {
+  "tool": "jira_get_link_types",
+  "arguments": {},
+  "expect": {
+   "operation": "linktype.list",
+   "kind": "read",
+   "resource": "jira/linktype"
+  }
+ },
+ {
+  "tool": "jira_get_proforma_form_details",
+  "arguments": {
+   "issue_key": "PAY-12",
+   "form_id": "x"
+  },
+  "expect": {
+   "operation": "issue.form.read",
+   "kind": "read",
+   "resource": "jira/project/pay/issue/pay-12"
+  }
+ },
+ {
+  "tool": "jira_get_project_components",
+  "arguments": {
+   "project_key": "PAY"
+  },
+  "expect": {
+   "operation": "project.components.read",
+   "kind": "read",
+   "resource": "jira/project/pay"
+  }
+ },
+ {
+  "tool": "jira_get_project_epic_hierarchy",
+  "arguments": {
+   "project_key": "PAY"
+  },
+  "expect": {
+   "operation": "project.epics.read",
+   "kind": "read",
+   "resource": "jira/project/pay"
+  }
+ },
+ {
+  "tool": "jira_get_project_fields",
+  "arguments": {
+   "project_key": "PAY"
+  },
+  "expect": {
+   "operation": "project.fields.read",
+   "kind": "read",
+   "resource": "jira/project/pay"
+  }
+ },
+ {
+  "tool": "jira_get_project_issue_types",
+  "arguments": {
+   "project_key": "PAY"
+  },
+  "expect": {
+   "operation": "project.issuetypes.read",
+   "kind": "read",
+   "resource": "jira/project/pay"
+  }
+ },
+ {
+  "tool": "jira_get_project_issues",
+  "arguments": {
+   "project_key": "PAY"
+  },
+  "expect": {
+   "operation": "issue.list",
+   "kind": "read",
+   "resource": "jira/project/pay"
+  }
+ },
+ {
+  "tool": "jira_get_project_versions",
+  "arguments": {
+   "project_key": "PAY"
+  },
+  "expect": {
+   "operation": "project.versions.read",
+   "kind": "read",
+   "resource": "jira/project/pay"
+  }
+ },
+ {
+  "tool": "jira_get_queue_issues",
+  "arguments": {
+   "service_desk_id": "3",
+   "queue_id": "x"
+  },
+  "expect": {
+   "operation": "servicedesk.queue.issues.read",
+   "kind": "read",
+   "resource": "jira/servicedesk/3"
+  }
+ },
+ {
+  "tool": "jira_get_request_type_fields",
+  "arguments": {
+   "service_desk_id": "3",
+   "request_type_id": "x"
+  },
+  "expect": {
+   "operation": "servicedesk.requesttype.fields.read",
+   "kind": "read",
+   "resource": "jira/servicedesk/3"
+  }
+ },
+ {
+  "tool": "jira_get_request_types",
+  "arguments": {
+   "service_desk_id": "3"
+  },
+  "expect": {
+   "operation": "servicedesk.requesttypes.read",
+   "kind": "read",
+   "resource": "jira/servicedesk/3"
+  }
+ },
+ {
+  "tool": "jira_get_service_desk_for_project",
+  "arguments": {
+   "project_key": "PAY"
+  },
+  "expect": {
+   "operation": "servicedesk.read",
+   "kind": "read",
+   "resource": "jira/project/pay"
+  }
+ },
+ {
+  "tool": "jira_get_service_desk_queues",
+  "arguments": {
+   "service_desk_id": "3"
+  },
+  "expect": {
+   "operation": "servicedesk.queues.read",
+   "kind": "read",
+   "resource": "jira/servicedesk/3"
+  }
+ },
+ {
+  "tool": "jira_get_sprint_issues",
+  "arguments": {
+   "sprint_id": "7"
+  },
+  "expect": {
+   "operation": "sprint.issues.read",
+   "kind": "read",
+   "resource": "jira/sprint/7"
+  }
+ },
+ {
+  "tool": "jira_get_sprints_from_board",
+  "arguments": {
+   "board_id": "42"
+  },
+  "expect": {
+   "operation": "board.sprints.read",
+   "kind": "read",
+   "resource": "jira/board/42"
+  }
+ },
+ {
+  "tool": "jira_get_transitions",
+  "arguments": {
+   "issue_key": "PAY-12"
+  },
+  "expect": {
+   "operation": "issue.transitions.read",
+   "kind": "read",
+   "resource": "jira/project/pay/issue/pay-12"
+  }
+ },
+ {
+  "tool": "jira_get_user_profile",
+  "arguments": {
+   "user_identifier": "x"
+  },
+  "expect": {
+   "operation": "user.read",
+   "kind": "read",
+   "resource": "jira/user"
+  }
+ },
+ {
+  "tool": "jira_get_worklog",
+  "arguments": {
+   "issue_key": "PAY-12"
+  },
+  "expect": {
+   "operation": "issue.worklog.read",
+   "kind": "read",
+   "resource": "jira/project/pay/issue/pay-12"
+  }
+ },
+ {
+  "tool": "jira_link_to_epic",
+  "arguments": {
+   "issue_key": "PAY-12",
+   "epic_key": "x"
+  },
+  "expect": {
+   "operation": "issue.epic.link",
+   "kind": "write",
+   "resource": "jira/project/pay/issue/pay-12"
+  }
+ },
+ {
+  "tool": "jira_move_issue",
+  "arguments": {
+   "issue_key": "PAY-12",
+   "target_project_key": "x"
+  },
+  "expect": {
+   "operation": "issue.move",
+   "kind": "destructive",
+   "resource": "jira/project/pay/issue/pay-12"
+  }
+ },
+ {
+  "tool": "jira_move_issues_to_backlog",
+  "arguments": {
+   "issue_keys": "x"
+  },
+  "expect": {
+   "operation": "backlog.issues.move",
+   "kind": "write",
+   "resource": "jira/batch"
+  }
+ },
+ {
+  "tool": "jira_remove_issue_link",
+  "arguments": {
+   "link_id": "20001"
+  },
+  "expect": {
+   "operation": "issuelink.remove",
+   "kind": "write",
+   "resource": "jira/issuelink/20001"
+  }
+ },
+ {
+  "tool": "jira_remove_watcher",
+  "arguments": {
+   "issue_key": "PAY-12"
+  },
+  "expect": {
+   "operation": "issue.watcher.remove",
+   "kind": "write",
+   "resource": "jira/project/pay/issue/pay-12"
+  }
+ },
+ {
+  "tool": "jira_search",
+  "arguments": {
+   "jql": "x"
+  },
+  "expect": {
+   "operation": "issue.search",
+   "kind": "read",
+   "resource": "jira/search"
+  }
+ },
+ {
+  "tool": "jira_search_assignable_users",
+  "arguments": {
+   "query": "x"
+  },
+  "expect": {
+   "operation": "user.search",
+   "kind": "read",
+   "resource": "jira/user"
+  }
+ },
+ {
+  "tool": "jira_search_fields",
+  "arguments": {},
+  "expect": {
+   "operation": "field.search",
+   "kind": "read",
+   "resource": "jira/field"
+  }
+ },
+ {
+  "tool": "jira_search_projects",
+  "arguments": {
+   "query": "x"
+  },
+  "expect": {
+   "operation": "project.search",
+   "kind": "read",
+   "resource": "jira/project"
+  }
+ },
+ {
+  "tool": "jira_transition_issue",
+  "arguments": {
+   "issue_key": "PAY-12",
+   "transition_id": "x"
+  },
+  "expect": {
+   "operation": "issue.transition",
+   "kind": "write",
+   "resource": "jira/project/pay/issue/pay-12"
+  }
+ },
+ {
+  "tool": "jira_update_issue",
+  "arguments": {
+   "issue_key": "PAY-12"
+  },
+  "expect": {
+   "operation": "issue.update",
+   "kind": "write",
+   "resource": "jira/project/pay/issue/pay-12"
+  }
+ },
+ {
+  "tool": "jira_update_proforma_form_answers",
+  "arguments": {
+   "issue_key": "PAY-12",
+   "form_id": "x",
+   "answers": "x"
+  },
+  "expect": {
+   "operation": "issue.form.update",
+   "kind": "write",
+   "resource": "jira/project/pay/issue/pay-12"
+  }
+ },
+ {
+  "tool": "jira_update_sprint",
+  "arguments": {
+   "sprint_id": "7"
+  },
+  "expect": {
+   "operation": "sprint.update",
+   "kind": "write",
+   "resource": "jira/sprint/7"
+  }
+ },
+ {
+  "tool": "jira_update_version",
+  "arguments": {
+   "version_id": "10100"
+  },
+  "expect": {
+   "operation": "version.update",
+   "kind": "write",
+   "resource": "jira/version/10100"
+  }
+ },
+ {
+  "tool": "jira_update_issue",
+  "arguments": {
+   "issue_key": "ops-7",
+   "fields": "{\"project\":\"PAY\"}"
+  },
+  "expect": {
+   "operation": "issue.update",
+   "kind": "write",
+   "resource": "jira/project/ops/issue/ops-7"
+  }
+ },
+ {
+  "tool": "jira_delete_issue",
+  "arguments": {
+   "issue_key": "PAY-99"
+  },
+  "expect": {
+   "operation": "issue.delete",
+   "kind": "destructive",
+   "resource": "jira/project/pay/issue/pay-99"
+  }
+ }
+]

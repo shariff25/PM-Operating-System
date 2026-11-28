@@ -66,6 +66,10 @@ async fn an_auditor_verifies_with_files_alone() {
         )
         .unwrap();
         let receipt = Receipt {
+            session: None,
+            cause: None,
+            rule: None,
+            labels: None,
             v: 1,
             tenant: id("acme"),
             env: id("prod"),
@@ -74,6 +78,7 @@ async fn an_auditor_verifies_with_files_alone() {
             prev: prev.clone(),
             at: T0,
             at_clamped: false,
+            at_from_lease: false,
             phase: Phase::Intent,
             mode: Mode::Enforce,
             coverage: Coverage::Custody,

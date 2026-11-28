@@ -60,10 +60,13 @@ async fn serve(router: Router) -> SocketAddr {
 
 fn map() -> ServerMap {
     ServerMap {
+        labels: Vec::new(),
+        clearances: Vec::new(),
         server: id("jira-mcp"),
         system: id("jira"),
         fold_case: true,
         tools: vec![ToolMap {
+            results: None,
             tool: id("jira_update_issue"),
             digest: tool_digest(&update_tool()).unwrap(),
             operation: id("issue.update"),
@@ -124,6 +127,7 @@ async fn the_shim_keeps_its_listing_when_only_the_session_ran_out() {
             ledger_keys: KeySet::new([key("ledger-1", 50).public()]),
             spool_limit: 1000,
             batch: 100,
+            policy_version: None,
         },
         gate_key,
         FileSpool::open(dir.path().join("spool")).unwrap(),
@@ -133,6 +137,7 @@ async fn the_shim_keeps_its_listing_when_only_the_session_ran_out() {
     let forwarder = Forwarder::new(
         gate,
         ForwarderConfig {
+            authority: None,
             upstream: format!("http://{upstream}/mcp"),
             map: map(),
             call_timeout: Duration::from_secs(5),
@@ -147,6 +152,7 @@ async fn the_shim_keeps_its_listing_when_only_the_session_ran_out() {
     let shim_addr = socket.local_addr().unwrap();
     let shim = Shim::new(
         ShimConfig {
+            follow: None,
             scope: scope(),
             gate: id("gate-1"),
             gate_url: format!("http://{gate_addr}"),

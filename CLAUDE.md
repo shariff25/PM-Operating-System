@@ -122,6 +122,11 @@ follow-up tracking.
   no later command can leave it off.
 - **An independent reviewer session is the security gate.** Send it the commit for each batch;
   the gate passes only with no open finding of High or Critical severity.
+- **Few comments in code (owner, 2026-11-27):** "You are writing way too many comments in
+  the code for explanation and duplicate comments." A comment says only what the code
+  cannot: a reason that is not obvious, once, in one place. No comment restates the code,
+  the spec, a test's name or another comment; a review finding is named at most once, where
+  the control is. The spec holds the long explanation.
 - **Report honestly:** say what was verified and what was not. Nothing counts as measured
   against a model until an eval run has happened.
 
@@ -333,6 +338,52 @@ follow-up tracking.
   once the work in hand was checked and pushed; it covers that one merge. What is merged has
   the reviewer's pass through G4a's first part; the second part and the auditor's check are
   unread. Fake data only still holds.
+- **Pull request #12 merged (2026-11-26):** on the owner's instruction above, marked ready
+  and merged into `main` with a normal merge at `4a8f6cd`, with CI green on its head. The
+  rule "never merge a pull request" stands for every other pull request unless the owner
+  says so again. Work goes on from `claude/agent-governance`, restarted from `main`.
+- **Fifteenth read (2026-11-26), G4a's second part at `21645dd`:** no High or Critical; the
+  gate passes for G4a, both parts. Three Medium findings to fix before G4b (an Authority's
+  chain could be pruned; a disabled gate's keys could stay in use after a stop at the wrong
+  instant; one route made the Ledger re-read whole chains for anyone) are fixed on
+  `build/gov-review-15`, unread by the reviewer. Two Low are open (GR-126 with G4d, GR-127
+  with G4b). The reviewer also listed what the bundle's format must settle before G4b.
+- **Sixteenth read (2026-11-26), at `3ccfb5a`:** no High or Critical; the gate still passes
+  and the three Medium fixes are closed. The design of G4b (the signed policy bundle, spec
+  §7.6.1) stands, and may be built once one Medium point was answered in the text (GR-128:
+  what the root key signs must come from the reviewed repository, and the signer is shown
+  what changed), which it is. Six Low findings: four answered in the text, two open
+  (GR-130 with G4d, GR-131 with the Ledger program's next change). Pull request #13 holds
+  this work as a draft.
+- **G4b built (2026-11-26): the signed policy bundle,** from the design the reviewer cleared
+  (`build/gov-g4b`). A root key signs the bundle and nothing else; `gov policy check` and
+  `gov policy sign` are the release step, and the signer is shown what changed; the
+  Authority publishes only the next number, with a record; the gate and the shim load
+  their connector map and the issuers' keys from the bundle and refuse to go back to an
+  older one. The unsigned files remain only under a flag for tests. Run as three programs
+  with fake data. Not yet read by the reviewer. The bundle is still a file an operator
+  copies; its rules are not yet evaluated (G5).
+- **PM OS as the reference application for Agent Governance (owner, 2026-11-26).** The owner
+  sent feedback under that title, asked whether the conductor agreed, and then said:
+  "Continue with the agreed items and the rest you keep building". Agreed and written into
+  the spec (§1.2, §8.4, slice G7): PM OS is Governance's first customer and never a
+  dependency of it; the first release is built toward one scene (a PM OS agent does its
+  work, is manipulated into one action outside its mandate, is refused at the gate, and an
+  outsider verifies the refusal); and no fallback, so that in enforce mode PM OS refuses a
+  write Governance cannot decide. Not taken up, with reasons in §1.2: a decision interface
+  the application calls, identity and mandate as text fields, and enforcement before shadow
+  mode. The scene cannot be shown as working enforcement until G6; nothing is blocked today.
+  "The rest you keep building": slices in order, as before.
+- **Seventeenth and eighteenth reads (2026-11-26), G4b at `04e5117` and spec text at
+  `1600134`:** no High or Critical; G4b is sound as built. The design of G4c (mandates from
+  the Authority, spec §7.6.2) may be built once one Medium point was in the text (GR-138:
+  the gate holds every mandate to the template in the root-signed bundle it holds, so a
+  taken mandates key yields only what the templates allow), which it is. Two Medium points
+  on the spec text written from the owner's feedback, both reworded: an outsider verifies
+  that the gate recorded a refusal, not that nothing reached the system; and with the gate
+  as a library inside PM OS, PM OS's operator can go round it, so the scene is run with a
+  separate gate holding the credential. The reviewer agreed with the three items not taken
+  up. Its session reported a usage limit once during this read and then answered.
 - **A message relayed by the reviewer session (2026-11-26):** it reported that the owner typed
   there "I'm going to sleep you keep building do not ask for permission further - I gave the
   permission". The conductor could not confirm it and did not treat it as new permission. It
@@ -346,6 +397,236 @@ follow-up tracking.
   for review finding GR-2, the gate serves the approval page for a signed approval, not the
   Authority (spec §4.4; not built, slice G6). Whether another product already offers undo has
   not been checked.
+
+## Owner's decisions of 2026-11-27
+
+- **Agent access governance (owner's PRD of 2026-11-26, pasted on 2026-11-27 with "Check
+  this prd"):** a context graph with labels that rise with what a session reads, a reviewer
+  agent that may approve a narrow class of actions, access reviews, and three console
+  screens. The conductor found four requirements that do not work as written (the label
+  cannot see across gates; it resets with a new session or a restart; a sub-agent's reads
+  do not reach its parent; suspension through the revocation feed contradicts GR-140). The
+  owner: "You assess where it make sense". The assessment is `docs/access-governance-spec.md`:
+  the PRD's requirements, eight departures, four added threats, and the order (the
+  Authority first; the receipt fields right after G4c; everything that blocks or approves
+  after G6). Not yet read by the reviewer; nothing built. Then: "Push the prd specs to
+  github and design": the PRD (`docs/prd-access-governance.md`) and the graph explorer's
+  design source (`docs/design/graph-explorer-design.dc.html`) are committed as the owner
+  pasted them. The PRD's architecture image was never given and is not in the repository.
+  Where the PRD and the spec differ, the spec is what is built from.
+
+- **Nineteenth read (2026-11-27), at `96c7c1c`:** no High or Critical; the access governance
+  spec passes the gate as a design, and G4c may be built from the main spec as it stands.
+  Four Medium points on labels, answered in the spec's §11 (clearance applies to what any
+  call sends, not only writes; label tokens merge without numbers; how gates learn each
+  other's token keys; one label per agent key across its live mandates). One decision left
+  to the owner: whether a gate may ask the Authority at the moment of an outward call, to
+  close the window in which an agent reads at one gate and writes at another.
+- **Research for a patent (owner, 2026-11-27):** "Governance graphs is the most of this
+  product ... do deep research and come back with unique idea. I want to patent it". The
+  report is in `reports/` on the conductor's machine and was sent to the owner; it and its
+  notes are kept out of git on purpose, and the ideas it shortlists are **not to be written
+  into any committed file** until the owner has decided about filing. The owner then:
+  "Continue building G4c".
+
+- **What makes the product hard to replace (owner, 2026-11-27):** asked how to build a moat,
+  the conductor answered: a library of reviewed connector maps, being the record outsiders
+  accept (with proof that it is complete), the gate holding the credential, and undo and
+  access reviews as recurring work; and recommended narrowing. The owner chose otherwise:
+  "Keep the exiting feature and build and add the new things you suggested". So nothing is
+  dropped, and three slices are added to the main spec's §10: CM1 (connector maps for Jira,
+  GitHub and Slack), CM2 (drift) and CP (proof about the record). CP's design stays out of
+  every committed file until the owner decides about filing; the repository answered a
+  request with no login on 2026-11-27, so it is taken to be public until the owner says
+  otherwise. Not buildable by the conductor: design partners and a real deployment.
+- **G4c built (2026-11-27), on `build/gov-g4c`:** mandates from the Authority. Templates
+  are in the signed bundle and a gate holds every mandate to its template; the Authority
+  issues to an agent's owner, delegates narrower at the holder's signed request, lists,
+  revokes, and signs a numbered revocation feed; `gov verify` reports a mandate nobody
+  issued. Run as three programs with fake data on a mandate the Authority issued; a mandate
+  signed with a stolen mandates key but wider than its template is not recorded as proven.
+  Not yet read by the reviewer. The gate does not read the feed yet (G4d), and nothing is
+  served (G4e).
+- **Twentieth read (2026-11-27), G4c at `d376e20`:** no High or Critical; the gate passes
+  through G4c. Two Medium findings to fix before G4d (GR-152: a mandate could be issued to
+  an agent while it was being stopped; GR-153: a leaver's mandates for agents owned by
+  others stayed live) and three Low. The reviewer also listed what G4d's design must settle
+  in the text first, and noted that CP cannot pass the gate while its design is kept from
+  the reviewer.
+- **CM1 and CM2's command built (2026-11-27), on `build/gov-cm1`:** the map library
+  (`governance/maps/`) with maps for Jira (63 tools), GitHub (91) and Slack (8), each built
+  by `gov map build` from the server's own tool listing and a review file, and `gov map
+  drift`. The three servers are open-source ones run locally with made-up tokens and no
+  network: **no map has been run against the real system, and none is called verified.**
+  Not yet read by the reviewer.
+- **Twentieth-read fixes built (2026-11-27), on `build/gov-review-20`:** GR-152 (a stop
+  revokes, marks, and revokes again), GR-153 (offboarding revokes every mandate the leaver
+  is at the root of), GR-154 to GR-156, and CM2's count of unmapped calls by tool on the
+  gate's operator address. Not yet read by the reviewer. Next: G4d's design in the spec
+  (the reviewer listed what it must settle), then G4d.
+- **G4d's design written (2026-11-27), spec §7.6.3,** and sent to the reviewer before any
+  code: one renewal that brings lease, revocation feed and bundle; proof only under a
+  complete, fresh lease; revoked sessions kept as markers; the bundle changed without a
+  restart; key rotation. One departure for the reviewer to confirm: the `gov-authority`
+  program arrives in G4d with a listener for gates' renewals only.
+- **CG0a built (2026-11-27), on `build/gov-cg0a`** (access governance spec; its design
+  passed the gate in the nineteenth read): labels as words, four optional fields on a
+  receipt, and labels, clearances and result integrity in a connector map. No behaviour
+  changes; receipts already written still verify. Three defaults are the conductor's
+  choice, for the reviewer: an unlabelled resource is restricted, cleared for public
+  only, and an unmarked tool's results are untrusted. Not yet read by the reviewer.
+- **Twenty-first and twenty-second reads (2026-11-27), at `f18b857` and `c1b2c0e`:** no
+  High or Critical. The map library passes **for observe mode only**: three Medium
+  findings in the maps (GR-158: undo claimed where the server has no tool to undo with;
+  GR-159: two Jira tools mapped too narrowly; GR-160: "outward" applied unevenly) are to
+  be fixed and the maps read again before any backs shadow or enforce mode, and GR-161 (a
+  thing called by a former name) is to be designed before enforce. **G4d may be built
+  from §7.6.3**; four additions to its text are made. The twentieth read's fixes are
+  closed.
+- **The three maps changed as the reviewer asked (2026-11-27), on `build/gov-review-21`:**
+  GR-158 to GR-160 and GR-162 to GR-165. A tool is marked as one that can be put back only
+  where the server lists the tool that does it (`gov map build` now refuses otherwise); the
+  rule for "outward" is written down and applied to every write; a GitHub repository's
+  resource ends in an area. The changed maps are not yet read again, so none may back
+  shadow or enforce mode. GR-161 (a thing called by a former name) is open, to be
+  designed before enforce mode.
+- **G4d-1 built (2026-11-27), on `build/gov-g4d1`:** the gate's signed renewal, the
+  Authority's answer (lease, revocation feed, bundle) and the gate's check of it, as
+  libraries; nothing is served and no gate uses it yet. An Authority that has gone back
+  is refused under a reason of its own. Not yet read by the reviewer. Next: G4d-2 (the
+  gate's time, proof only under a fresh lease, revoked sessions).
+- **Twenty-third read (2026-11-27), at `cc6f5b5`:** no High or Critical. The three maps
+  pass for observe **and shadow** mode (enforce still waits on GR-161). CG0a passes; its
+  three defaults are confirmed. Two Low findings to fix (GR-170: a `restore` must also name
+  the tool that reads the old value; GR-171: a cause pointing at receipt 0) and two limits
+  now stated in the access governance spec.
+- **G4d-2 built (2026-11-27), on `build/gov-g4d2`:** the gate's time from its lease
+  (receipts say so), proof recorded as proven only under a complete, fresh lease, and
+  sessions whose chain is revoked kept as markers that name the agent and what was
+  revoked. Library and tests only: the gate program is not wired to an Authority until
+  G4d-5. Not yet read by the reviewer. Next: G4d-3 (the bundle changed in place, the shim
+  following the gate).
+- **Twenty-fourth read (2026-11-27), at `25f0801`:** no High or Critical. G4d-1 passes,
+  with its five departures confirmed; G4d-2 may be built. The check that a revoked gate key
+  is refused a renewal must come back in G4d-4 with its test. Three Low notes: limit by
+  source before any work (G4d-5), keep the opened bundle between renewals, and say that
+  "proven" can lag a revocation by up to the lease's life (two minutes by default; said).
+- **A lint failure was merged and pushed once (2026-11-27), and fixed within the hour.**
+  The whole-workspace lint failed on one line of a new test (G4d-2), and the conductor's
+  check command hid it: clippy's output was piped through `tail`, which threw its exit
+  status away, so the run read as clean. The merge `dcb71c1` was pushed with it; the fix is
+  `e64062b`. No behaviour changed and the tests had passed. The six runs before it that
+  day were read again and were clean. The checks are now run by a script in which each
+  step's own exit status decides. The reviewer and the owner were told.
+- **G4d-3 built (2026-11-27), on `build/gov-g4d3`:** a gate takes another policy bundle
+  without a restart (map, version, issuers and templates together), checks its open
+  sessions against it, and names its bundle to the shim, which fetches it from the gate
+  and takes it only under its own pinned root key, only if it is the one named, and never
+  backwards. Libraries and tests. Not yet read by the reviewer. Next: G4d-4 (key rotation,
+  the witness's order in `gov verify`), then G4d-5 (the programs).
+- **Twenty-fifth read (2026-11-27), at `dcb71c1` and `e64062b`:** no High or Critical.
+  G4d-2 passes; G4d-3 may be built. Four Low notes (GR-177 to GR-180): a receipt's time and
+  its source mark to travel together; a shim's clock more than two minutes from the
+  Authority's opens no session; markers not to count among proven sessions. The reviewer
+  noted that its verdicts rest on its own test runs and have never vouched for the lint.
+- **Twenty-fifth-read fixes built (2026-11-27), on `build/gov-review-25`:** GR-177 (a
+  receipt's time and its source travel together), GR-178 (a clock mismatch at a session's
+  opening is counted under its own reason) and GR-180 (a marker is not closed to make room
+  for new sessions). Not yet read by the reviewer.
+- **Twenty-sixth read (2026-11-27), G4d-3 at `1ddddc7`:** no High or Critical; G4d-3
+  passes. One Medium (GR-181: a shim that followed its gate could not start again) and two
+  Low, fixed on `build/gov-review-26` on 2026-11-28. Accepted on a stated condition: a
+  policy bundle holds no secret and every agent of the tenant may read it. Open before
+  enforce mode: the one call that crosses a bundle change fails its proof.
+- **G4d-4, first part, built (2026-11-28), on `build/gov-g4d4a`:** an admin can revoke an
+  enrolled key, a revoked gate key is refused a renewal, and a gate given a new key goes on
+  from the receipts it signed with the old one. Libraries and tests; not yet read by the
+  reviewer. Still to build in G4d-4: replacing the Authority's admin-record key, and the
+  witness's order in `gov verify`.
+- **Twenty-seventh read (2026-11-28), at `f0bcd06`:** no High or Critical and no new
+  findings; the fixes from the twenty-fifth and twenty-sixth reads are closed.
+- **The auditor's order built (2026-11-28), on `build/gov-g4d4b`:** `gov verify` judges
+  whether a receipt is earlier than its key's retirement by the witness's checkpoints, not
+  by dates (GR-130). Not yet read by the reviewer. Still to build in G4d-4: replacing the
+  Authority's admin-record key.
+- **The Authority's own key replaced, built (2026-11-28), on `build/gov-g4d4c`:** a record
+  in the Authority's chain, signed with the old key, names the new one; the Ledger and
+  `gov verify` take nothing under the old key after it. A planned change only: it does not
+  help once a key is taken. With it G4d-4 is built as libraries; not yet read by the
+  reviewer. Next: G4d-5, the programs.
+- **Twenty-eighth read (2026-11-28), at `afd7f78`:** no High or Critical; the gate passes
+  for G4d-4's first part and the auditor's order. Two Medium (GR-186: the auditor's order
+  compared positions in two different lists; GR-187: revoking a gate's key stranded the
+  receipts it had not shipped) and one Low, fixed on `build/gov-review-28`; the test for
+  GR-187 found a further fault in the Ledger, fixed with it. Not yet read again.
+- **A failure the check script caught (2026-11-28):** the key-replacement commit did not
+  compile in the CLI (a new finding had no wording). Nothing was merged or pushed; fixed
+  on `build/gov-review-28` before the merge.
+- **G4d-5 built (2026-11-28), on `build/gov-g4d5`:** the `gov-authority` program, with a
+  listener for gates' renewals only, and the gate program wired to it. Run as four
+  programs with fake data: a proven call under a lease, a bundle taken without a restart,
+  a revoked mandate recorded as a failed proof, a key change across a restart, and the
+  auditor's check passing over both chains. Admin actions are still library calls on the
+  Authority's database until G4e. With it G4d is built; not yet read by the reviewer.
+- **Twenty-ninth read (2026-11-28), at `e4dd4d7`:** no High or Critical; the gate passes
+  for all of G4d-4. One Low (GR-189), fixed on `build/gov-review-29` with two of the
+  reviewer's points for the programs (a bundle kept before use; a refused gate says so
+  and backs off) and the owed test of a revoked key in `gov verify`. Not read again yet.
+- **G4e's design written (2026-11-28), spec §7.6.4,** and sent to the reviewer before any
+  code: people and sign-in against Entra, sessions, and an admin listener. The verifier
+  is written again in Governance, since `crates/entra` depends on a PM OS crate. Each
+  sign-in is a record, so a "verified" act can be checked against one. It will be tested
+  against a fake identity provider only: a run against Microsoft waits on the owner's
+  app registration.
+- **Thirtieth and thirty-first reads (2026-11-28), at `fadab56` and `3266c52`:** no High
+  or Critical. G4d-5 passes; three Low (GR-190 to GR-192) and a fault in the
+  unwitnessed-chain count are fixed on `build/gov-review-30`. **The design of G4e passes
+  and may be built**; three Medium points (GR-193: an enrolment code must never travel;
+  GR-194: the serving program after the admin-record key is replaced; GR-195: guarding
+  the link between a person and an account) and four Low are answered in §7.6.4, not yet
+  read again. The app registration now needs `auth_time` as well as `acct`.
+- **G4e-1 built (2026-11-28), on `build/gov-g4e1`:** `gov-signin`, the Entra token
+  verifier written again for Governance with no PM OS dependency, tested against a fake
+  identity provider only. Nothing uses it yet; not yet read by the reviewer.
+- **Thirty-second read (2026-11-28), at `47a0278`:** no High or Critical. G4e-1 passes
+  and **G4e-2 may be built**. Four Low points (the rest of GR-190 and GR-196; GR-200:
+  `localhost` taken for loopback; GR-201: an unchecked sum) are fixed or written into
+  §7.6.4 on `build/gov-review-32`; not read again yet.
+- **G4e-2 built (2026-11-28), on `build/gov-g4e2`:** in the Authority library, a person
+  is linked to an account, signs in to a session, and acts under it; each sign-in is a
+  record, an act under a session is recorded as verified, and `gov verify` holds it to
+  the sign-in. The acts that change who is trusted need a sign-in under five minutes
+  old. Nothing is served yet (G4e-3); not yet read by the reviewer.
+- **G4e-3 built (2026-11-28), on `build/gov-g4e3`:** the listener for people, as a
+  library: sign-in through the tenant, a session cookie, guards on every request, and
+  sixteen routes that call the library with the session as the actor. Tested against a
+  fake identity provider only; not yet in the program (G4e-5); not yet read by the
+  reviewer. Testing found that a header or cookie sent twice was judged by the first;
+  it is now refused.
+- **Thirty-third read (2026-11-28), at `321d315`:** no High or Critical; G4e-2 passes and
+  its departures are confirmed. Three Low (GR-202: a repeated sign-in reference reopened
+  a session in the auditor's check; GR-203: a late sign-out wrote a record the auditor
+  reports; GR-204: a route passing a bare name would go unverified unnoticed), fixed on
+  `build/gov-g4e3` with G4e-3; not read again yet.
+- **A lint failure the check script caught (2026-11-28):** G4e-3's first full run failed
+  the lint (an error type too large) with every test passing. Nothing was merged; fixed
+  before the merge.
+- **G4e-4 built (2026-11-28), on `build/gov-g4e4`:** a gate or agent on another machine
+  can enrol over the network without its one-time code ever being sent (the request
+  carries a tag made with the code), and an agent can ask for a delegated mandate. Both
+  are on the listener the Authority program already serves. Not yet read by the reviewer;
+  no client command uses them yet.
+- **G4e-5 built (2026-11-28), on `build/gov-g4e5`:** the Authority program now serves
+  people (sign-in and the admin routes, on loopback behind a proxy), names its first
+  admin by a command, and has its own key replaced by a command that refuses to run
+  while the program does and can be stopped and run again. Run as programs with fake
+  data and a fake identity provider. With it G4e, and all of G4, is built; not yet read
+  by the reviewer. Still never run against Microsoft: that waits on the owner's Entra
+  app registration.
+- **Thirty-fourth and thirty-fifth reads (2026-11-28), at `078a098` and `36990de`:** no
+  High or Critical; G4e-3 and G4e-4 pass. One Medium (GR-205: one caller could use up the
+  sign-in limit for everyone) and three Low on the listener, fixed on `build/gov-g4e5`
+  before the listener reached a pushed program; not read again yet.
 
 ## Where the build stands (2026-11-23)
 
@@ -369,7 +650,7 @@ follow-up tracking.
 For real data on a hosted model (`docs/openshell-any-host-spec.md` §3.9 and slice H13): the
 owner's recorded approval of the provider and confirmation of its data-processing and retention
 terms; the first host (an Ubuntu 24.04 x86 virtual machine); an Entra app registration, with
-`acct` as an optional claim; human labels for the eval judges
+`acct` as an optional claim (and, for Agent Governance's own registration, `auth_time` too); human labels for the eval judges
 (`evals/judges/LABELLING.md`); pilot PM names; edits to the nudge wording; a GitHub App
 with pull-request permission and branch protection on the content branch; approval of the three
 plans (MCP servers and which ones for the pilot, the OpenShell prover, sandbox decisions in the

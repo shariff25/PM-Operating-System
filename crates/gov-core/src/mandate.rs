@@ -1,5 +1,7 @@
 //! A mandate: what one agent may do, on which resources, until a set time (spec §4.2).
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 
 use crate::action::{self, Grant};
@@ -8,6 +10,78 @@ use crate::error::{Error, Result};
 use crate::ids::{Id, Scope};
 use crate::keys::{KeySet, PublicKey};
 use crate::revocation::{Revocable, Revocations};
+
+/// The longest a mandate may live, whatever a template says: eight hours (spec §4.2).
+pub const MAX_LIFE_SECS: u64 = 8 * 3600;
+
+/// A template: the most a mandate issued from it may carry (spec §7.6.2). Templates are
+/// policy: they are in the bundle the root key signs, and a gate holds every mandate to the
+/// template of that name in the bundle it holds (review finding GR-138), so that the online
+/// key mandates are signed with is worth no more than the reviewed templates allow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Template {
+    pub id: Id,
+    /// The grants a mandate from this template may carry at most.
+    pub grants: Vec<Grant>,
+    /// The longest life of a mandate from this template, in seconds.
+    pub max_life_secs: u64,
+    #[serde(default)]
+    pub limits: Limits,
+    /// Whether a mandate from this template may be delegated to another agent.
+    #[serde(default)]
+    pub delegable: bool,
+    /// People, beyond the agent's owner, who may ask for a mandate from this template.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub people: BTreeSet<Id>,
+    /// Owners, beyond the person at the root, whose agents may receive a delegation of a
+    /// mandate from this template (review finding GR-139).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub receivers: BTreeSet<Id>,
+}
+
+impl Template {
+    pub fn validate(&self) -> Result<()> {
+        if self.id.as_str().contains('@') {
+            return Err(Error::Malformed("a template's id holds no @"));
+        }
+        if self.grants.is_empty() {
+            return Err(Error::Malformed("a template grants nothing"));
+        }
+        for g in &self.grants {
+            g.validate()?;
+        }
+        if self.max_life_secs == 0 || self.max_life_secs > MAX_LIFE_SECS {
+            return Err(Error::Malformed("a template's life is 1 second to 8 hours"));
+        }
+        Ok(())
+    }
+
+    /// Is `mandate`, the root of a chain, inside this template?
+    fn holds(&self, mandate: &Mandate, delegated: bool) -> Result<()> {
+        if !action::within(&mandate.grants, &self.grants) {
+            return Err(Error::WiderThanTemplate("grants"));
+        }
+        let life = mandate.expires_at.saturating_sub(mandate.issued_at);
+        if u64::try_from(life).map_or(true, |l| l > self.max_life_secs) {
+            return Err(Error::WiderThanTemplate("time"));
+        }
+        if !mandate.limits.within(&self.limits) {
+            return Err(Error::WiderThanTemplate("limits"));
+        }
+        if delegated && !self.delegable {
+            return Err(Error::WiderThanTemplate("delegation"));
+        }
+        Ok(())
+    }
+}
+
+/// The template a mandate names: the part of `<id>@<bundle number>` before the `@`. The
+/// number records which bundle the Authority issued from; it does not choose which template
+/// governs.
+pub fn template_id(template: &Id) -> &str {
+    template.as_str().split('@').next().unwrap_or_default()
+}
 
 /// The longest chain a gate accepts: a root mandate and three delegations below it.
 pub const MAX_CHAIN: usize = 4;
@@ -49,7 +123,7 @@ pub struct Limits {
 }
 
 impl Limits {
-    fn within(&self, parent: &Limits) -> bool {
+    pub fn within(&self, parent: &Limits) -> bool {
         fn one(child: Option<u64>, parent: Option<u64>) -> bool {
             match (child, parent) {
                 (_, None) => true,
@@ -98,6 +172,33 @@ pub struct Mandate {
 
 document!(Mandate, "gov.mandate.v1");
 
+/// A parent agent's request that the Authority issue a narrower mandate to another agent
+/// (spec §7.6.2, point 4). Signed with the key the parent mandate is bound to. It names the
+/// Authority it is for, so it cannot be used at another; the mandate issued for it takes
+/// its id from the request, so the same request is never served twice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegateRequest {
+    pub v: u32,
+    pub tenant: Id,
+    pub env: Id,
+    pub authority: Id,
+    /// The id of the mandate being delegated from.
+    pub parent: Id,
+    /// The agent to receive it, and which of its enrolled keys the new mandate is bound to.
+    pub agent: Id,
+    pub key: Id,
+    pub grants: Vec<Grant>,
+    pub expires_at: i64,
+    #[serde(default)]
+    pub limits: Limits,
+    pub nonce: Id,
+    /// Seconds since the epoch, by the asking agent's clock.
+    pub at: i64,
+}
+
+document!(DelegateRequest, "gov.delegate.v1");
+
 /// What a gate checks a chain against.
 pub struct ChainCheck<'a> {
     pub scope: &'a Scope,
@@ -106,6 +207,10 @@ pub struct ChainCheck<'a> {
     /// Now, in seconds, from the lease's Authority time and the gate's monotonic clock.
     pub now: i64,
     pub revoked: &'a dyn Revocations,
+    /// The templates of the bundle held. Every chain's root mandate is held to the one it
+    /// names, and a chain naming none of them is refused. `None` only where no bundle was
+    /// loaded at all: tests, and the programs' unsigned path, whose receipts say so.
+    pub templates: Option<&'a [Template]>,
 }
 
 /// A chain every link of which has been checked. The first link is the one presented.
@@ -189,10 +294,25 @@ pub fn verify_chain(envelope: &Envelope, check: &ChainCheck<'_>) -> Result<Verif
         if !child.limits.within(&parent.limits) {
             return Err(Error::WiderThanParent("limits"));
         }
+        // A child is under its parent's template, not one of its own choosing.
+        if template_id(&child.template) != template_id(&parent.template) {
+            return Err(Error::WiderThanParent("template"));
+        }
     }
     let root = links.last().expect("the loop pushes at least one link");
     if root.issued_by.kind != IssuerKind::Person {
         return Err(Error::NotDelegatedByParent);
+    }
+    // The root against the template in the bundle held: the Authority checked this when it
+    // signed, and the gate checks again, so that whoever holds the mandates key can sign
+    // nothing the root-signed templates do not allow (review finding GR-138).
+    if let Some(templates) = check.templates {
+        let name = template_id(&root.template);
+        let template = templates
+            .iter()
+            .find(|t| t.id.as_str() == name)
+            .ok_or(Error::UnknownTemplate)?;
+        template.holds(root, links.len() > 1)?;
     }
     Ok(VerifiedChain { links })
 }

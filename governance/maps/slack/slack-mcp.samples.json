@@ -1,0 +1,104 @@
+[
+ {
+  "tool": "slack_add_reaction",
+  "arguments": {
+   "channel_id": "C0123ABCD",
+   "timestamp": "x",
+   "reaction": "x"
+  },
+  "expect": {
+   "operation": "reaction.add",
+   "kind": "write",
+   "resource": "slack/channel/c0123abcd"
+  }
+ },
+ {
+  "tool": "slack_get_channel_history",
+  "arguments": {
+   "channel_id": "C0123ABCD"
+  },
+  "expect": {
+   "operation": "channel.history.read",
+   "kind": "read",
+   "resource": "slack/channel/c0123abcd"
+  }
+ },
+ {
+  "tool": "slack_get_thread_replies",
+  "arguments": {
+   "channel_id": "C0123ABCD",
+   "thread_ts": "x"
+  },
+  "expect": {
+   "operation": "thread.read",
+   "kind": "read",
+   "resource": "slack/channel/c0123abcd"
+  }
+ },
+ {
+  "tool": "slack_get_user_profile",
+  "arguments": {
+   "user_id": "U0456EFGH"
+  },
+  "expect": {
+   "operation": "user.read",
+   "kind": "read",
+   "resource": "slack/user/u0456efgh"
+  }
+ },
+ {
+  "tool": "slack_get_users",
+  "arguments": {},
+  "expect": {
+   "operation": "user.list",
+   "kind": "read",
+   "resource": "slack/user"
+  }
+ },
+ {
+  "tool": "slack_list_channels",
+  "arguments": {},
+  "expect": {
+   "operation": "channel.list",
+   "kind": "read",
+   "resource": "slack/channel"
+  }
+ },
+ {
+  "tool": "slack_post_message",
+  "arguments": {
+   "channel_id": "C0123ABCD",
+   "text": "x"
+  },
+  "expect": {
+   "operation": "message.post",
+   "kind": "write",
+   "resource": "slack/channel/c0123abcd"
+  }
+ },
+ {
+  "tool": "slack_reply_to_thread",
+  "arguments": {
+   "channel_id": "C0123ABCD",
+   "thread_ts": "x",
+   "text": "x"
+  },
+  "expect": {
+   "operation": "thread.reply",
+   "kind": "write",
+   "resource": "slack/channel/c0123abcd"
+  }
+ },
+ {
+  "tool": "slack_post_message",
+  "arguments": {
+   "channel_id": "c0123abcd",
+   "text": "x"
+  },
+  "expect": {
+   "operation": "message.post",
+   "kind": "write",
+   "resource": "slack/channel/c0123abcd"
+  }
+ }
+]

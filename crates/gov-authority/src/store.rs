@@ -53,6 +53,34 @@ pub struct Person {
     pub role: Role,
     /// False once the person is offboarded.
     pub active: bool,
+    /// A digest of the account the person signs in with. Written once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<Digest>,
+}
+
+/// The admin-record key a replacement named, and the number of the record that did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamedKey {
+    pub digest: Digest,
+    pub seq: u64,
+}
+
+/// A signed-in session, as kept: never the value the person's browser holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionRow {
+    /// A digest of the session's value: what it is looked up by.
+    pub id: Digest,
+    pub person: Id,
+    /// What records carry: it names the session and cannot be used as one.
+    pub reference: Id,
+    /// When the person proved who they are to the identity provider.
+    pub started: i64,
+    pub until: i64,
+    pub last_used: i64,
+    /// A digest of the second value a changing request must carry.
+    pub csrf: Digest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +107,10 @@ pub struct PendingCode {
     pub kind: EnrolKind,
     pub name: Id,
     pub digest: Digest,
+    /// What a request sent over the network is authenticated with. Absent on a code made
+    /// before there was one: such a code enrols on the Authority's machine only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac_key: Option<Digest>,
     pub expires_at: i64,
     /// The admin who made it.
     pub by: Id,
@@ -95,6 +127,36 @@ pub struct EnrolledKey {
     pub key: PublicKey,
 }
 
+/// A policy bundle as published: signed by the root key, kept whole for the gates to fetch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Published {
+    pub number: u64,
+    /// The hash of the signed bundle, as the record of publishing carries it.
+    pub digest: Digest,
+    pub envelope: Envelope,
+}
+
+/// A mandate the Authority issued, as it keeps it: enough to list it and to revoke it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IssuedMandate {
+    pub id: Id,
+    pub agent: Id,
+    /// Who asked: a person, or for a delegated mandate the parent agent.
+    pub issued_by: Id,
+    /// The person at the root of its chain.
+    pub root_person: Id,
+    /// The mandate it was delegated from, if it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<Id>,
+    pub template: Id,
+    pub issued_at: i64,
+    pub expires_at: i64,
+    pub revoked: bool,
+    pub envelope: Envelope,
+}
+
 /// One change to the registry, applied with the record that stands for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
@@ -107,6 +169,20 @@ pub enum Effect {
     /// under any id, is enrolled already, the whole commit fails with
     /// [`StoreError::KeyTaken`] and nothing is written (review findings GR-114, GR-116).
     AddKey(EnrolledKey),
+    /// Keep a published bundle under its number.
+    PutBundle(Published),
+    PutMandate(IssuedMandate),
+    /// Add one numbered revocation. Its number must be the next one: if it is not, the
+    /// whole commit fails with [`StoreError::HeadMoved`] and nothing is written.
+    AddRevocation(gov_core::revocation::RevocationEntry),
+    /// Link an account to a person. Like a key, an account is linked once: if it is linked
+    /// already the whole commit fails with [`StoreError::KeyTaken`].
+    AddLink(Digest, Id),
+    PutSession(SessionRow),
+    /// Name the key admin records are signed with from the next record on.
+    NameAdminKey(NamedKey),
+    DropSession(Digest),
+    DropSessionsOf(Id),
 }
 
 /// One admin record as stored.
@@ -140,10 +216,31 @@ pub trait Store: Send + Sync {
 
     async fn any_person(&self, scope: &Scope) -> StoreResult<bool>;
     async fn person(&self, scope: &Scope, id: &Id) -> StoreResult<Option<Person>>;
+    /// The person an account's digest is linked to.
+    async fn linked(&self, scope: &Scope, link: &Digest) -> StoreResult<Option<Id>>;
+    /// The admin-record key the chain's last replacement named, if there was one.
+    async fn admin_key(&self, scope: &Scope) -> StoreResult<Option<NamedKey>>;
+    async fn session(&self, scope: &Scope, id: &Digest) -> StoreResult<Option<SessionRow>>;
+    /// Note that a session was used. Not an admin action: nothing is recorded.
+    async fn touch_session(&self, scope: &Scope, id: &Digest, now: i64) -> StoreResult<()>;
+    /// Forget a session that has run out. Not an admin action: nothing is recorded.
+    async fn forget_session(&self, scope: &Scope, id: &Digest) -> StoreResult<()>;
     async fn agent(&self, scope: &Scope, id: &Id) -> StoreResult<Option<Agent>>;
     async fn agents_of(&self, scope: &Scope, owner: &Id) -> StoreResult<Vec<Agent>>;
     async fn gate(&self, scope: &Scope, id: &Id) -> StoreResult<Option<Gate>>;
     async fn key(&self, scope: &Scope, kid: &Id) -> StoreResult<Option<EnrolledKey>>;
+    async fn mandate(&self, scope: &Scope, id: &Id) -> StoreResult<Option<IssuedMandate>>;
+    /// Every mandate issued, in order of id.
+    async fn mandates(&self, scope: &Scope) -> StoreResult<Vec<IssuedMandate>>;
+    /// Every revocation after number `after`, in order.
+    async fn revocations_after(
+        &self,
+        scope: &Scope,
+        after: u64,
+    ) -> StoreResult<Vec<gov_core::revocation::RevocationEntry>>;
+    /// The published bundle with the highest number.
+    async fn latest_bundle(&self, scope: &Scope) -> StoreResult<Option<Published>>;
+    async fn bundle(&self, scope: &Scope, number: u64) -> StoreResult<Option<Published>>;
     /// Every enrolled key, in order of key id.
     async fn keys(&self, scope: &Scope) -> StoreResult<Vec<EnrolledKey>>;
 
@@ -183,6 +280,12 @@ struct State {
     gates: BTreeMap<(Key, Id), Gate>,
     keys: BTreeMap<(Key, Id), EnrolledKey>,
     codes: BTreeMap<(Key, EnrolKind, Id), PendingCode>,
+    bundles: BTreeMap<(Key, u64), Published>,
+    mandates: BTreeMap<(Key, Id), IssuedMandate>,
+    revocations: BTreeMap<(Key, u64), gov_core::revocation::RevocationEntry>,
+    links: BTreeMap<(Key, Digest), Id>,
+    admin_keys: BTreeMap<Key, NamedKey>,
+    sessions: BTreeMap<(Key, Digest), SessionRow>,
 }
 
 /// A store in memory, for tests and for the library's own use where nothing must outlive
@@ -230,6 +333,25 @@ impl Store for MemoryStore {
                     return Err(StoreError::KeyTaken);
                 }
             }
+            if let Effect::AddLink(link, _) = effect {
+                if s.links.contains_key(&(key.clone(), link.clone())) {
+                    return Err(StoreError::KeyTaken);
+                }
+            }
+        }
+        // A revocation takes the next number, and no other.
+        let mut next = s
+            .revocations
+            .range((key.clone(), 0)..=(key.clone(), u64::MAX))
+            .next_back()
+            .map_or(1, |(_, e)| e.seq + 1);
+        for effect in effects {
+            if let Effect::AddRevocation(e) = effect {
+                if e.seq != next {
+                    return Err(StoreError::HeadMoved);
+                }
+                next += 1;
+            }
         }
         s.records
             .entry(key.clone())
@@ -254,6 +376,31 @@ impl Store for MemoryStore {
                 }
                 Effect::AddKey(e) => {
                     s.keys.insert((key.clone(), e.key.kid.clone()), e);
+                }
+                Effect::PutBundle(b) => {
+                    s.bundles.insert((key.clone(), b.number), b);
+                }
+                Effect::PutMandate(m) => {
+                    s.mandates.insert((key.clone(), m.id.clone()), m);
+                }
+                Effect::AddRevocation(e) => {
+                    s.revocations.insert((key.clone(), e.seq), e);
+                }
+                Effect::AddLink(link, person) => {
+                    s.links.insert((key.clone(), link), person);
+                }
+                Effect::NameAdminKey(named) => {
+                    s.admin_keys.insert(key.clone(), named);
+                }
+                Effect::PutSession(row) => {
+                    s.sessions.insert((key.clone(), row.id.clone()), row);
+                }
+                Effect::DropSession(id) => {
+                    s.sessions.remove(&(key.clone(), id));
+                }
+                Effect::DropSessionsOf(person) => {
+                    s.sessions
+                        .retain(|(scope_key, _), row| *scope_key != key || row.person != person);
                 }
             }
         }
@@ -292,6 +439,34 @@ impl Store for MemoryStore {
             .people
             .get(&(k(scope), id.clone()))
             .cloned())
+    }
+
+    async fn admin_key(&self, scope: &Scope) -> StoreResult<Option<NamedKey>> {
+        Ok(self.0.lock().unwrap().admin_keys.get(&k(scope)).cloned())
+    }
+
+    async fn linked(&self, scope: &Scope, link: &Digest) -> StoreResult<Option<Id>> {
+        let s = self.0.lock().unwrap();
+        Ok(s.links.get(&(k(scope), link.clone())).cloned())
+    }
+
+    async fn session(&self, scope: &Scope, id: &Digest) -> StoreResult<Option<SessionRow>> {
+        let s = self.0.lock().unwrap();
+        Ok(s.sessions.get(&(k(scope), id.clone())).cloned())
+    }
+
+    async fn forget_session(&self, scope: &Scope, id: &Digest) -> StoreResult<()> {
+        let mut s = self.0.lock().unwrap();
+        s.sessions.remove(&(k(scope), id.clone()));
+        Ok(())
+    }
+
+    async fn touch_session(&self, scope: &Scope, id: &Digest, now: i64) -> StoreResult<()> {
+        let mut s = self.0.lock().unwrap();
+        if let Some(row) = s.sessions.get_mut(&(k(scope), id.clone())) {
+            row.last_used = now;
+        }
+        Ok(())
     }
 
     async fn agent(&self, scope: &Scope, id: &Id) -> StoreResult<Option<Agent>> {
@@ -334,6 +509,58 @@ impl Store for MemoryStore {
             .unwrap()
             .keys
             .get(&(k(scope), kid.clone()))
+            .cloned())
+    }
+
+    async fn mandate(&self, scope: &Scope, id: &Id) -> StoreResult<Option<IssuedMandate>> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .mandates
+            .get(&(k(scope), id.clone()))
+            .cloned())
+    }
+
+    async fn mandates(&self, scope: &Scope) -> StoreResult<Vec<IssuedMandate>> {
+        let s = self.0.lock().unwrap();
+        Ok(s.mandates
+            .iter()
+            .filter(|((scope_key, _), _)| *scope_key == k(scope))
+            .map(|(_, m)| m.clone())
+            .collect())
+    }
+
+    async fn revocations_after(
+        &self,
+        scope: &Scope,
+        after: u64,
+    ) -> StoreResult<Vec<gov_core::revocation::RevocationEntry>> {
+        let s = self.0.lock().unwrap();
+        Ok(s.revocations
+            .iter()
+            .filter(|((scope_key, seq), _)| *scope_key == k(scope) && *seq > after)
+            .map(|(_, e)| e.clone())
+            .collect())
+    }
+
+    async fn latest_bundle(&self, scope: &Scope) -> StoreResult<Option<Published>> {
+        let s = self.0.lock().unwrap();
+        Ok(s.bundles
+            .iter()
+            .filter(|((scope_key, _), _)| *scope_key == k(scope))
+            .map(|(_, b)| b)
+            .next_back()
+            .cloned())
+    }
+
+    async fn bundle(&self, scope: &Scope, number: u64) -> StoreResult<Option<Published>> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .bundles
+            .get(&(k(scope), number))
             .cloned())
     }
 

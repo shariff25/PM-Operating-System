@@ -37,6 +37,7 @@ fn config(spool_limit: usize) -> GateConfig {
         ledger_keys: KeySet::new([ledger_key().public()]),
         spool_limit,
         batch: 100,
+        policy_version: None,
     }
 }
 fn gate_at(dir: &Path, limit: usize, now: i64) -> Gate<FileSpool> {
@@ -438,6 +439,150 @@ async fn a_clock_that_steps_back_does_not_reach_the_receipts() {
         .is_empty());
 }
 
+/// A receipt's time says where it came from, receipt by receipt: the mark is given with
+/// the time, so neither can be set without the other (review finding GR-177). A gate that
+/// gets its first lease between a call's intent and its outcome writes each as it was.
+#[tokio::test]
+async fn each_receipt_says_whether_its_own_time_is_the_authoritys() {
+    use gov_gate::When;
+    let dir = tempfile::tempdir().unwrap();
+    let agent = id("triage-bot");
+    let mut gate = gate_at(dir.path(), 100, T0);
+    let a = action(1);
+    let leased = |at: i64| When {
+        at,
+        from_lease: true,
+    };
+    // Begun on the machine's clock; the lease arrives; finished on the Authority's.
+    let first = gate
+        .begin_under(&observed(&agent, &a), When::here(T0 + 1), None)
+        .unwrap();
+    gate.finish_at(first, OutcomeStatus::Ok, None, leased(T0 + 60))
+        .unwrap();
+    // Both on the Authority's.
+    let second = gate
+        .begin_under(&observed(&agent, &a), leased(T0 + 61), None)
+        .unwrap();
+    gate.finish_at(second, OutcomeStatus::Ok, None, leased(T0 + 62))
+        .unwrap();
+    // The calls that take a bare time are the machine's clock, as before there were leases.
+    let third = gate.begin(&observed(&agent, &a), T0 + 63).unwrap();
+    gate.finish(third, OutcomeStatus::Ok, None, T0 + 64)
+        .unwrap();
+    let said: Vec<(i64, bool)> = docs(dir.path())
+        .iter()
+        .map(|r| (r.at, r.at_from_lease))
+        .collect();
+    assert_eq!(
+        said,
+        vec![
+            (T0 + 1, false),
+            (T0 + 60, true),
+            (T0 + 61, true),
+            (T0 + 62, true),
+            (T0 + 63, false),
+            (T0 + 64, false),
+        ]
+    );
+}
+
+/// A gate given a new key goes on from the receipts it signed with the old one, when it
+/// is told the old key was its own; with no word of it, or of another key, it does not
+/// start (review finding GR-59).
+#[tokio::test]
+async fn a_gate_with_a_new_key_goes_on_from_receipts_under_its_old_one() {
+    use gov_core::receipt::follow;
+    let dir = tempfile::tempdir().unwrap();
+    let agent = id("triage-bot");
+    let a = action(1);
+    {
+        let mut gate = gate_at(dir.path(), 100, T0);
+        call(&mut gate, 1, T0 + 1);
+        // Left open by a stop.
+        gate.begin(&observed(&agent, &a), T0 + 2).unwrap();
+    }
+    let new_key = || SigningKey::from_seed(id("gate-1-key-2"), &[21; 32]).unwrap();
+    let old = gate_key().public();
+    let open_with = |earlier: &[gov_core::PublicKey]| {
+        Gate::open_after(
+            config(100),
+            new_key(),
+            earlier,
+            FileSpool::open(dir.path()).unwrap(),
+            T0 + 10,
+        )
+    };
+    assert!(open_with(&[]).is_err());
+    let stranger = SigningKey::from_seed(id("gate-1-key"), &[99; 32]).unwrap();
+    assert!(open_with(&[stranger.public()]).is_err());
+
+    let mut gate = open_with(std::slice::from_ref(&old)).unwrap();
+    // The intent the old key signed was closed by the new one, and work goes on.
+    let third = gate.begin(&observed(&agent, &a), T0 + 11).unwrap();
+    gate.finish(third, OutcomeStatus::Ok, None, T0 + 12)
+        .unwrap();
+    let both = KeySet::new([old, new_key().public()]);
+    let held = FileSpool::open(dir.path()).unwrap().held().unwrap();
+    let signers: Vec<&str> = held.iter().map(|r| r.envelope.kid.as_str()).collect();
+    assert_eq!(
+        signers,
+        [
+            "gate-1-key",
+            "gate-1-key",
+            "gate-1-key",
+            "gate-1-key-2",
+            "gate-1-key-2",
+            "gate-1-key-2"
+        ]
+    );
+    // One chain across the change of key.
+    let mut head = None;
+    for r in &held {
+        let opened = open::<Receipt>(&r.envelope, &both, &scope()).unwrap();
+        head = Some(follow(head.as_ref(), &opened).unwrap());
+    }
+    let closed = open::<Receipt>(&held[3].envelope, &both, &scope())
+        .unwrap()
+        .doc;
+    assert_eq!((closed.phase, closed.intent), (Phase::Outcome, Some(3)));
+
+    // The old key is revoked before what it signed has been shipped: the Ledger still
+    // takes the whole chain, asked for under the new key (review finding GR-187).
+    let link = ledger().await;
+    link.ledger
+        .enrol_gate_key(&id("gate-1"), &new_key().public())
+        .await
+        .unwrap();
+    gov_ledger::Store::retire_keys(
+        link.ledger.store(),
+        &scope(),
+        &id("gate-1"),
+        Some(&gate_key().public().kid),
+    )
+    .await
+    .unwrap();
+    assert!(link.ledger.ingest(&held[0].envelope, T0).await.is_err());
+    gate.ship(&link).await.unwrap();
+    let at_ledger = gov_ledger::Store::head(link.ledger.store(), &scope(), &id("gate-1"))
+        .await
+        .unwrap();
+    assert_eq!(at_ledger.map(|h| h.seq), Some(6));
+    drop(gate);
+
+    // A key does not come back once a later one has signed (GR-188).
+    let backwards = Gate::open_after(
+        config(100),
+        gate_key(),
+        &[new_key().public()],
+        FileSpool::open(dir.path()).unwrap(),
+        T0 + 20,
+    );
+    assert!(matches!(
+        backwards,
+        Err(GateError::Spool(gov_gate::SpoolError::Corrupt))
+    ));
+}
+
 /// Review finding GR-10: an answer the Ledger did not sign, or one that names another hash,
 /// moves nothing.
 #[tokio::test]
@@ -565,6 +710,7 @@ async fn the_gate_notices_a_ledger_that_is_stuck_behind_or_ahead() {
     let mut small = Gate::open(
         GateConfig {
             batch: 2,
+            policy_version: None,
             ..config(100)
         },
         gate_key(),

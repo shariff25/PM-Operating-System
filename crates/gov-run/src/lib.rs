@@ -5,6 +5,9 @@
 //! must not cross a network in the clear because of a default. An operator who puts a TLS
 //! terminator in front says so with `--plain-http-on-network`.
 
+pub mod maps;
+pub mod policy_dir;
+pub mod policy_source;
 pub mod shim;
 
 use std::io::Write;
@@ -38,7 +41,16 @@ fn file_keys_allowed() -> anyhow::Result<()> {
 /// Read a private key from its file. The file must be a plain file that nobody but its owner
 /// can read or write: a key any other account on the machine can read is not this program's
 /// key alone (threat T13). Nothing from the file is ever printed, in an error or otherwise.
-pub fn read_key(path: &Path) -> anyhow::Result<SigningKey> {
+/// A secret kept in a file, under the same rule as a key: fake data only, a plain file,
+/// its owner's alone. For the client secret of the sign-in.
+pub fn read_secret(path: &Path) -> anyhow::Result<String> {
+    let text = owners_file(path)?;
+    let secret = text.trim();
+    anyhow::ensure!(!secret.is_empty(), "the file {} is empty", path.display());
+    Ok(secret.to_string())
+}
+
+fn owners_file(path: &Path) -> anyhow::Result<String> {
     file_keys_allowed()?;
     let meta = std::fs::symlink_metadata(path)
         .with_context(|| format!("the key file {} cannot be read", path.display()))?;
@@ -55,8 +67,12 @@ pub fn read_key(path: &Path) -> anyhow::Result<SigningKey> {
             );
         }
     }
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("the key file {} cannot be read", path.display()))?;
+    std::fs::read_to_string(path)
+        .with_context(|| format!("the key file {} cannot be read", path.display()))
+}
+
+pub fn read_key(path: &Path) -> anyhow::Result<SigningKey> {
+    let text = owners_file(path)?;
     SigningKey::from_file_text(&text)
         .map_err(|_| anyhow::anyhow!("the key file {} does not hold a key", path.display()))
 }
@@ -186,4 +202,67 @@ pub async fn bind(addr: SocketAddr) -> anyhow::Result<tokio::net::TcpListener> {
     println!("listening on {}", listener.local_addr()?);
     std::io::stdout().flush()?;
     Ok(listener)
+}
+
+/// Whether a chain's head has gone unwitnessed too long. It watches one head at a time:
+/// the first seen that the witness did not cover, until the witness reaches it. On a
+/// chain that keeps moving, a witness one interval behind is not an alarm.
+#[derive(Debug, Default)]
+pub struct Cover {
+    waiting: Option<(u64, i64)>,
+}
+
+impl Cover {
+    pub fn overdue(&mut self, head: u64, witnessed: u64, now: i64, within_secs: i64) -> bool {
+        if self.waiting.is_some_and(|(seen, _)| witnessed >= seen) {
+            self.waiting = None;
+        }
+        if witnessed >= head {
+            return false;
+        }
+        let (_, since) = *self.waiting.get_or_insert((head, now));
+        now.saturating_sub(since) > within_secs
+    }
+}
+
+/// Read a response's body, up to `max` bytes.
+pub async fn body_up_to(mut response: reqwest::Response, max: usize) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if bytes.len() + chunk.len() > max {
+            return None;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Some(bytes)
+}
+
+/// Milliseconds on a clock that goes on while the machine is suspended (spec §7.6.3,
+/// point 4). `None` where this program knows no such clock.
+#[cfg(target_os = "linux")]
+pub fn boot_millis() -> Option<u64> {
+    let t = rustix::time::clock_gettime(rustix::time::ClockId::Boottime);
+    let secs = u64::try_from(t.tv_sec).ok()?;
+    let nanos = u64::try_from(t.tv_nsec).ok()?;
+    secs.checked_mul(1000)?.checked_add(nanos / 1_000_000)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn boot_millis() -> Option<u64> {
+    None
+}
+
+/// The gate's count of time: the suspension-counting clock where there is one, and
+/// otherwise the time since the program started, which stops while the machine sleeps.
+pub fn mono_millis() -> u64 {
+    static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    boot_millis().unwrap_or_else(|| {
+        u64::try_from(
+            STARTED
+                .get_or_init(std::time::Instant::now)
+                .elapsed()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX)
+    })
 }

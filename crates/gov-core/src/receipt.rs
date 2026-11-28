@@ -87,6 +87,17 @@ pub enum ProofFailure {
     NoCanonicalForm,
     /// The session has made as many calls as one session may.
     SessionSpent,
+    /// The proof held, and the gate had no complete, fresh lease from its Authority: it
+    /// could not say whether the agent was revoked, and does not guess (spec §7.6.3,
+    /// point 5).
+    NoLease,
+    /// The proof held, and the key it was made with has been revoked. The caller did hold
+    /// the key: these three say so, where a failed signature would not (finding GR-110).
+    KeyRevoked,
+    /// The proof held, and the agent, or one further up its mandate chain, is revoked.
+    AgentRevoked,
+    /// The proof held, and a mandate in the chain, or the key that signed one, is revoked.
+    MandateRevoked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,6 +248,11 @@ pub struct Receipt {
     /// (review finding GR-53).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub at_clamped: bool,
+    /// The time is the Authority's: the gate's held lease plus its own count since. Left
+    /// out when false, as on every receipt written before a gate had a lease, which was
+    /// stamped from the gate machine's own clock (spec §7.6.3, point 4; finding GR-72).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub at_from_lease: bool,
     pub phase: Phase,
     pub mode: Mode,
     pub coverage: Coverage,
@@ -268,6 +284,21 @@ pub struct Receipt {
     /// identical actions in flight are told apart by it (review finding GR-40).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intent: Option<u64>,
+    /// The session the call presented (access governance spec, CG-1). A bare claim has
+    /// none. Written by no gate before slice CG1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<Id>,
+    /// What came before this receipt under the same root mandate. Computed by the gate from
+    /// its own record, never taken from the caller (CG-2). Only on a proven agent's receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<crate::label::Cause>,
+    /// The policy rule that decided; absent when none matched, or nothing decided.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<Id>,
+    /// The label of what the call touched and the mandate's label after it. Only on a
+    /// proven agent's receipt: a stock client has no mandate, so no label (GR-151).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<crate::label::ReceiptLabels>,
 }
 
 document!(Receipt, "gov.receipt.v1");
@@ -311,6 +342,36 @@ impl Receipt {
         }
         if self.mode == Mode::Enforce && self.agent.proof != Proof::Proven {
             return Err(Error::Malformed("enforce mode needs a proven agent"));
+        }
+        // A session is something a caller presented: a bare claim presented none.
+        if self.session.is_some() && self.agent.proof == Proof::Claimed {
+            return Err(Error::Malformed("a bare claim has no session"));
+        }
+        // Labels and cause are about a mandate, and count only what its agent provably
+        // did: a failed proof is nobody's act, and a bare claim has no mandate (GR-151).
+        if (self.labels.is_some() || self.cause.is_some()) && self.agent.proof != Proof::Proven {
+            return Err(Error::Malformed(
+                "labels and cause belong to a proven agent's receipt",
+            ));
+        }
+        if let Some(labels) = &self.labels {
+            labels.validate()?;
+        }
+        if let Some(cause) = &self.cause {
+            // A cause that says nothing is left out, so one receipt has one form.
+            if cause.prev.is_none() && cause.token.is_none() {
+                return Err(Error::Malformed("an empty cause is left out"));
+            }
+            // The receipt before is an earlier one of this gate's own chain.
+            if cause
+                .prev
+                .as_ref()
+                .is_some_and(|p| p.gate != self.gate || p.seq == 0 || p.seq >= self.seq)
+            {
+                return Err(Error::Malformed(
+                    "a cause is an earlier receipt of the same gate",
+                ));
+            }
         }
         if self.before_digest.is_some()
             && (self.phase != Phase::Intent

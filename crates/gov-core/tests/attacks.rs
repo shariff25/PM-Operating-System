@@ -15,7 +15,10 @@ use gov_core::lease::{
 use gov_core::mandate::{
     verify_chain, AgentRef, ChainCheck, IssuedBy, IssuerKind, Limits, Mandate, Requires, MAX_CHAIN,
 };
-use gov_core::policy::{Effect, Match, Needed, PolicyBundle, Rule, Subject, Verdict};
+use gov_core::policy::{
+    changes, may_replace, open_bundle, Effect, HeldBundle, KeyRole, Match, Needed, OnlineKeys,
+    PolicyBundle, Rule, Subject, Verdict,
+};
 use gov_core::receipt::{
     follow, ChainHead, Coverage, Decision, DecisionKind, Mode, Outcome, OutcomeStatus, Phase,
     Proof, Reason, Receipt, ReceiptAction, ReceiptAgent,
@@ -139,6 +142,7 @@ fn check<'a>(scope: &'a Scope, keys: &'a KeySet, revoked: &'a RevocationSet) -> 
         authority: keys,
         now: NOW,
         revoked,
+        templates: None,
     }
 }
 
@@ -850,6 +854,10 @@ fn args_only_digest() -> Digest {
 
 fn receipt(seq: u64, prev: Option<Digest>, phase: Phase) -> Receipt {
     Receipt {
+        session: None,
+        cause: None,
+        rule: None,
+        labels: None,
         v: 1,
         tenant: id("acme"),
         env: id("prod"),
@@ -858,6 +866,7 @@ fn receipt(seq: u64, prev: Option<Digest>, phase: Phase) -> Receipt {
         prev,
         at: NOW,
         at_clamped: false,
+        at_from_lease: false,
         phase,
         mode: Mode::Enforce,
         coverage: Coverage::Custody,
@@ -1087,7 +1096,7 @@ fn a_replayed_or_older_lease_is_refused() {
     back_in_time.nonce = id("n-3");
     assert_eq!(
         HeldLease::accept(Some(&held), back_in_time, third()).unwrap_err(),
-        Error::LeaseReplayed
+        Error::AuthorityBehind
     );
     let mut fewer_revocations = newer.clone();
     fewer_revocations.nonce = id("n-3");
@@ -1095,7 +1104,7 @@ fn a_replayed_or_older_lease_is_refused() {
     fewer_revocations.revocation_seq = 41;
     assert_eq!(
         HeldLease::accept(Some(&held), fewer_revocations, third()).unwrap_err(),
-        Error::LeaseReplayed
+        Error::AuthorityBehind
     );
     // Each check alone: a lease that is newer in every way but answers another request...
     let mut wrong_nonce = newer.clone();
@@ -1113,7 +1122,7 @@ fn a_replayed_or_older_lease_is_refused() {
     older_clock.revocation_seq = 60;
     assert_eq!(
         HeldLease::accept(Some(&held), older_clock, third()).unwrap_err(),
-        Error::LeaseReplayed
+        Error::AuthorityBehind
     );
     // Another gate's lease.
     let mut other_gate = newer.clone();
@@ -1258,10 +1267,16 @@ fn bundle(rules: Vec<Rule>) -> PolicyBundle {
         env: id("prod"),
         issuer: id("authority"),
         version: id("7"),
+        number: 1,
         issued_at: NOW,
+        keys: OnlineKeys {
+            mandates: vec![key("authority:mandates-1", 71).public()],
+            leases: vec![key("authority:leases-1", 72).public()],
+        },
         freshness: FreshnessLimits::default(),
         rules,
         connectors: Vec::new(),
+        templates: Vec::new(),
     }
 }
 
@@ -1834,10 +1849,13 @@ fn listed(description: &str) -> Value {
 fn jira_map() -> gov_core::connector::ServerMap {
     use gov_core::connector::{tool_digest, ResourceTemplate, ServerMap, ToolMap};
     ServerMap {
+        labels: Vec::new(),
+        clearances: Vec::new(),
         server: id("jira-mcp"),
         system: id("jira"),
         fold_case: true,
         tools: vec![ToolMap {
+            results: None,
             tool: id("jira_update_issue"),
             digest: tool_digest(&listed("Update an issue")).unwrap(),
             operation: id("issue.update"),
@@ -2033,6 +2051,26 @@ fn a_rule_that_could_never_match_a_folded_system_is_refused() {
     bundle(vec![refuse("jira/project/PAY/*")])
         .validate()
         .unwrap();
+    // A mandate template's grants are held to it too (review finding GR-156): one written
+    // otherwise would grant nothing, and its author would not know why.
+    let with_template = |pattern: &str, connectors| {
+        let mut t = triage_template();
+        t.grants = vec![grant(&["issue.read"], &[pattern])];
+        PolicyBundle {
+            connectors,
+            templates: vec![t],
+            ..bundle(Vec::new())
+        }
+    };
+    with_template("jira/project/pay/*", vec![jira_map()])
+        .validate()
+        .unwrap();
+    assert!(with_template("jira/project/PAY/*", vec![jira_map()])
+        .validate()
+        .is_err());
+    with_template("jira/project/PAY/*", Vec::new())
+        .validate()
+        .unwrap();
     // And the map's own template is held to it.
     let mut map = jira_map();
     map.tools[0].resource = ResourceTemplate::new("jira/Project/{key}").unwrap();
@@ -2201,12 +2239,15 @@ fn admin(
         at: NOW,
         actor: Actor {
             id: id("ana"),
+            kind: Default::default(),
             verified: false,
+            session: None,
         },
         action,
         subject: what,
         about,
         value,
+        until: None,
     }
 }
 
@@ -2240,6 +2281,40 @@ fn an_admin_record_keeps_its_rules_and_is_never_a_receipt() {
     let mut wrong = admin(1, None, A::PersonAdded);
     wrong.value = Some(Digest::of(&[b"x"]));
     assert!(wrong.validate().is_err());
+    // A record is verified exactly when it names a session; only a sign-in carries an
+    // end; and a session is opened and closed by the person whose it is.
+    let signed_in = |action| {
+        let mut r = admin(1, None, action);
+        r.actor.verified = true;
+        r.actor.session = Some(id("s-1"));
+        r.until = (action == A::SignedIn).then_some(NOW + 60);
+        r
+    };
+    for action in [A::SignedIn, A::SignedOut, A::PersonAdded] {
+        signed_in(action).validate().unwrap();
+    }
+    let mut wrong = signed_in(A::PersonAdded);
+    wrong.actor.session = None;
+    assert!(wrong.validate().is_err());
+    let mut wrong = signed_in(A::PersonAdded);
+    wrong.actor.verified = false;
+    assert!(wrong.validate().is_err());
+    let mut wrong = signed_in(A::PersonAdded);
+    wrong.until = Some(NOW);
+    assert!(wrong.validate().is_err());
+    let mut wrong = signed_in(A::SignedIn);
+    wrong.until = None;
+    assert!(wrong.validate().is_err());
+    for action in [A::SignedIn, A::SignedOut] {
+        let mut wrong = signed_in(action);
+        wrong.subject.id = id("ben");
+        assert!(wrong.validate().is_err());
+        assert!(admin(1, None, action).validate().is_err());
+    }
+    let mut linked = admin(1, None, A::PersonLinked);
+    assert!(linked.validate().is_err());
+    linked.value = Some(Digest::of(&[b"an account"]));
+    linked.validate().unwrap();
     let mut wrong = admin(1, None, A::MandateIssued);
     wrong.about = Some(Subject {
         kind: K::Gate,
@@ -2347,4 +2422,794 @@ fn an_enrolment_code_names_the_root_key_to_pin() {
     let stranger = key("stranger", 10);
     let forged = seal(&request, &stranger).unwrap();
     assert!(open::<EnrolRequest>(&forged, &own, &scope()).is_err());
+}
+
+// ----- G4b: the signed policy bundle (spec §7.6.1) ----------------------------------------
+
+fn root_key() -> SigningKey {
+    key("root-1", 70)
+}
+
+/// The root key signs the bundle and nothing else, and a bundle opens under nothing else
+/// (GR-109).
+#[test]
+fn a_bundle_opens_under_the_root_key_and_no_other() {
+    let policy = bundle(vec![rule(
+        "read",
+        jira(&["issue.read"], &[]),
+        Effect::Allow,
+    )]);
+    let signed = seal(&policy, &root_key()).unwrap();
+    let opened = open_bundle(&signed, &root_key().public(), &scope()).unwrap();
+    assert_eq!(opened.bundle, policy);
+    // What a receipt carries: the number and the start of the digest (GR-129).
+    let version = opened.policy_version();
+    assert_eq!(
+        version.as_str(),
+        format!("1-{}", &opened.digest.as_str()[..16])
+    );
+
+    // Signed by an online key the bundle itself names, or by any other key: not a bundle.
+    for signer in [
+        key("authority:mandates-1", 71),
+        key("authority:leases-1", 72),
+    ] {
+        let forged = seal(&policy, &signer).unwrap();
+        assert!(open_bundle(&forged, &root_key().public(), &scope()).is_err());
+        // Nor does it open for someone who takes that online key as the root: a bundle
+        // may not list its own signer.
+        assert!(open_bundle(&forged, &signer.public(), &scope()).is_err());
+    }
+    // The root key under another id among the online keys is still the root key.
+    let mut names_root = policy.clone();
+    names_root
+        .keys
+        .leases
+        .push(key("authority:leases-2", 70).public());
+    let signed = seal(&names_root, &root_key()).unwrap();
+    assert!(open_bundle(&signed, &root_key().public(), &scope()).is_err());
+    // So is a key listed under the root's id, whatever key it is.
+    let mut names_root_id = policy.clone();
+    names_root_id.keys.leases.push(key("root-1", 74).public());
+    let signed = seal(&names_root_id, &root_key()).unwrap();
+    assert!(open_bundle(&signed, &root_key().public(), &scope()).is_err());
+    // A bundle that breaks its own rules is refused however well it is signed.
+    let mut unnumbered = policy.clone();
+    unnumbered.number = 0;
+    let signed = seal(&unnumbered, &root_key()).unwrap();
+    assert!(open_bundle(&signed, &root_key().public(), &scope()).is_err());
+    // Another tenant's bundle is not this one's.
+    let other = Scope::new("other", "prod").unwrap();
+    assert!(open_bundle(
+        &seal(&policy, &root_key()).unwrap(),
+        &root_key().public(),
+        &other
+    )
+    .is_err());
+
+    // The root's signature over another kind of document opens nowhere as a bundle, and a
+    // bundle opens nowhere as another kind of document: the type tag is signed.
+    let receipt_like = seal(&mandate_for_tag_test(), &root_key()).unwrap();
+    assert!(open_bundle(&receipt_like, &root_key().public(), &scope()).is_err());
+    let root_keys = KeySet::new([root_key().public()]);
+    let signed = seal(&policy, &root_key()).unwrap();
+    assert!(open::<Mandate>(&signed, &root_keys, &scope()).is_err());
+}
+
+fn mandate_for_tag_test() -> Mandate {
+    root(&key("agent-1", 5), "agent-1")
+}
+
+/// What a bundle must say of its keys and its number before it is a bundle.
+#[test]
+fn a_bundle_keeps_its_key_roles_apart() {
+    let good = bundle(Vec::new());
+    good.validate().unwrap();
+    let with = |change: &dyn Fn(&mut PolicyBundle)| {
+        let mut b = good.clone();
+        change(&mut b);
+        b.validate()
+    };
+    // The number starts at 1.
+    assert!(with(&|b| b.number = 0).is_err());
+    // Each role has a key.
+    assert!(with(&|b| b.keys.mandates.clear()).is_err());
+    assert!(with(&|b| b.keys.leases.clear()).is_err());
+    // One key under two roles, by id or by the key itself.
+    assert!(with(&|b| b.keys.leases.push(b.keys.mandates[0].clone())).is_err());
+    assert!(with(&|b| b.keys.leases.push(key("authority:leases-9", 71).public())).is_err());
+    assert!(with(&|b| b.keys.leases.push(key("authority:mandates-1", 99).public())).is_err());
+    // A second key for a role is fine.
+    with(&|b| b.keys.leases.push(key("authority:leases-2", 73).public())).unwrap();
+    // A bundle without the new fields is not read as one.
+    for gone in ["number", "keys"] {
+        let mut v = serde_json::to_value(&good).unwrap();
+        v.as_object_mut().unwrap().remove(gone);
+        assert!(serde_json::from_value::<PolicyBundle>(v).is_err(), "{gone}");
+    }
+}
+
+/// A gate does not go back to an older bundle, and two bundles under one number is an
+/// alarm, not a choice (spec §7.6.1, point 3).
+#[test]
+fn a_bundle_does_not_go_back() {
+    let held = |number, seed: u8| HeldBundle {
+        number,
+        digest: gov_core::Digest::of(&[&[seed]]),
+    };
+    // Nothing held: anything validly signed is taken (a stated limit, GR-132).
+    may_replace(None, &held(3, 1)).unwrap();
+    // The same bundle again, the next, and one several releases on.
+    may_replace(Some(&held(3, 1)), &held(3, 1)).unwrap();
+    may_replace(Some(&held(3, 1)), &held(4, 2)).unwrap();
+    may_replace(Some(&held(3, 1)), &held(9, 2)).unwrap();
+    // An older one, even the very one held before.
+    assert_eq!(
+        may_replace(Some(&held(3, 1)), &held(2, 7)),
+        Err(gov_core::Error::BundleOlder)
+    );
+    // Another bundle under the number held.
+    assert_eq!(
+        may_replace(Some(&held(3, 1)), &held(3, 2)),
+        Err(gov_core::Error::BundleForked)
+    );
+    // The state a gate keeps survives a trip through JSON, and nothing extra rides in it.
+    let text = serde_json::to_string(&held(3, 1)).unwrap();
+    assert_eq!(
+        serde_json::from_str::<HeldBundle>(&text).unwrap(),
+        held(3, 1)
+    );
+    assert!(serde_json::from_str::<HeldBundle>(&text.replace('}', ",\"x\":1}")).is_err());
+}
+
+/// What the signer is shown before signing (GR-128): every key, rule and map that was
+/// added, removed or changed since the bundle before.
+#[test]
+fn the_signer_is_shown_what_changed() {
+    let read = || rule("read", jira(&["issue.read"], &[]), Effect::Allow);
+    let before = PolicyBundle {
+        connectors: vec![jira_map()],
+        ..bundle(vec![
+            read(),
+            rule("no-pay", jira(&[], &["jira/project/pay/*"]), Effect::Refuse),
+        ])
+    };
+    // Nothing before: everything is new.
+    let first = changes(None, &before);
+    assert_eq!(first.rules_added, vec![id("read"), id("no-pay")]);
+    assert_eq!(first.maps_added, vec![before.connectors[0].server.clone()]);
+    assert_eq!(
+        first.keys_added,
+        vec![
+            (KeyRole::Mandates, id("authority:mandates-1")),
+            (KeyRole::Leases, id("authority:leases-1"))
+        ]
+    );
+    assert!(first.keys_removed.is_empty() && !first.freshness_changed);
+    // The same bundle with a new number: nothing to show.
+    let mut same = before.clone();
+    same.number = 2;
+    assert!(changes(Some(&before), &same).is_empty());
+
+    // An attacker's key slipped in under `mandates`, a refusal dropped, a rule loosened, a
+    // map altered, a key swapped under its old id: each is shown.
+    let mut after = same.clone();
+    after
+        .keys
+        .mandates
+        .push(key("authority:mandates-2", 66).public());
+    after.keys.leases = vec![key("authority:leases-1", 67).public()];
+    after.rules.retain(|r| r.id != id("no-pay"));
+    after.rules[0] = rule(
+        "read",
+        jira(&["issue.read", "issue.update"], &[]),
+        Effect::Allow,
+    );
+    after
+        .rules
+        .push(rule("new", jira(&["issue.read"], &[]), Effect::Refuse));
+    after.connectors[0].fold_case = !after.connectors[0].fold_case;
+    after.freshness.strict_secs += 1;
+    let shown = changes(Some(&before), &after);
+    assert_eq!(
+        shown.keys_added,
+        vec![
+            (KeyRole::Mandates, id("authority:mandates-2")),
+            (KeyRole::Leases, id("authority:leases-1"))
+        ]
+    );
+    assert_eq!(
+        shown.keys_removed,
+        vec![(KeyRole::Leases, id("authority:leases-1"))]
+    );
+    assert_eq!(shown.rules_removed, vec![id("no-pay")]);
+    assert_eq!(shown.rules_changed, vec![id("read")]);
+    assert_eq!(shown.rules_added, vec![id("new")]);
+    assert_eq!(
+        shown.maps_changed,
+        vec![before.connectors[0].server.clone()]
+    );
+    assert!(shown.freshness_changed && !shown.is_empty());
+    // Something the list does not name: here, whom the bundle is from. It is not passed
+    // over in silence (GR-135).
+    assert!(!shown.other);
+    let mut renamed = same.clone();
+    renamed.issuer = id("another-authority");
+    let shown_other = changes(Some(&before), &renamed);
+    assert!(shown_other.other && !shown_other.is_empty());
+    assert!(!changes(None, &renamed).other);
+    // A map removed, and a key moved from one role to the other.
+    let mut moved = same.clone();
+    moved.connectors.clear();
+    std::mem::swap(&mut moved.keys.mandates, &mut moved.keys.leases);
+    let shown = changes(Some(&before), &moved);
+    assert_eq!(
+        shown.maps_removed,
+        vec![before.connectors[0].server.clone()]
+    );
+    assert_eq!((shown.keys_added.len(), shown.keys_removed.len()), (2, 2));
+}
+
+// ----- G4c: the gate holds a mandate to its template (spec §7.6.2, point 10) --------------
+
+fn triage_template() -> gov_core::mandate::Template {
+    gov_core::mandate::Template {
+        id: id("triage"),
+        grants: vec![grant(
+            &["issue.read", "issue.update"],
+            &["jira/project/PAY/*"],
+        )],
+        max_life_secs: 2 * 3600,
+        limits: Limits {
+            max_actions: Some(100),
+            max_writes: Some(10),
+        },
+        delegable: true,
+        people: BTreeSet::new(),
+        receivers: BTreeSet::new(),
+    }
+}
+
+/// Check `env` as a gate holding `templates` would.
+fn verify_under(
+    env: &Envelope,
+    templates: &[gov_core::mandate::Template],
+) -> Result<gov_core::mandate::VerifiedChain, Error> {
+    verify_chain(
+        env,
+        &ChainCheck {
+            templates: Some(templates),
+            ..check(&scope(), &authority_keys(), &RevocationSet::default())
+        },
+    )
+}
+
+/// GR-138: the key mandates are signed with is online, so its signature alone is worth no
+/// more than the templates the root signed. A mandate wider than its template in any way,
+/// or naming a template the gate does not hold, is refused though validly signed.
+#[test]
+fn a_validly_signed_mandate_wider_than_its_template_is_refused() {
+    let agent = key("agent-0-key", 10);
+    let good = root(&agent, "agent-0");
+    let signed = |m: &Mandate| seal(m, &authority()).unwrap();
+    let held = [triage_template()];
+    verify_under(&signed(&good), &held).unwrap();
+    // With no bundle loaded nothing is held to a template: tests and the unsigned path only.
+    verify(&signed(&good)).unwrap();
+
+    // What someone holding the mandates key could sign, and a gate refuses.
+    let wider = |change: &dyn Fn(&mut Mandate)| {
+        let mut m = good.clone();
+        change(&mut m);
+        verify_under(&signed(&m), &held).unwrap_err()
+    };
+    assert_eq!(
+        wider(&|m| m.grants = vec![grant(&["issue.delete"], &["jira/project/PAY/*"])]),
+        Error::WiderThanTemplate("grants")
+    );
+    assert_eq!(
+        wider(&|m| m.grants = vec![grant(&["issue.read"], &["jira/project/OPS/*"])]),
+        Error::WiderThanTemplate("grants")
+    );
+    assert_eq!(
+        wider(&|m| m.expires_at = m.issued_at + 2 * 3600 + 1),
+        Error::WiderThanTemplate("time")
+    );
+    assert_eq!(
+        wider(&|m| m.limits.max_writes = Some(11)),
+        Error::WiderThanTemplate("limits")
+    );
+    assert_eq!(
+        wider(&|m| m.limits.max_actions = None),
+        Error::WiderThanTemplate("limits")
+    );
+    // A template the gate does not hold, whatever number follows the name.
+    assert_eq!(
+        wider(&|m| m.template = id("admin@7")),
+        Error::UnknownTemplate
+    );
+    assert_eq!(
+        verify_under(&signed(&good), &[]).unwrap_err(),
+        Error::UnknownTemplate
+    );
+
+    // The number after the @ does not choose the template: the one held governs. A mandate
+    // issued from bundle 7 is held to the template as it stands now, so narrowing a
+    // template tightens the mandates already out, and removing it ends them.
+    let mut narrowed = triage_template();
+    narrowed.grants = vec![grant(&["issue.read"], &["jira/project/PAY/*"])];
+    assert_eq!(
+        verify_under(&signed(&good), &[narrowed]).unwrap_err(),
+        Error::WiderThanTemplate("grants")
+    );
+    let mut later = good.clone();
+    later.template = id("triage@99");
+    verify_under(&signed(&later), &held).unwrap();
+}
+
+/// A chain is delegated only where its template allows it, and a child cannot name a
+/// template of its own choosing.
+#[test]
+fn delegation_is_the_templates_to_allow() {
+    let (leaf, _, _) = chain();
+    let held = [triage_template()];
+    verify_under(&leaf, &held).unwrap();
+    let mut alone = triage_template();
+    alone.delegable = false;
+    assert_eq!(
+        verify_under(&leaf, &[alone.clone()]).unwrap_err(),
+        Error::WiderThanTemplate("delegation")
+    );
+    // The same template still serves a mandate that is not delegated.
+    let agent = key("agent-0-key", 10);
+    verify_under(
+        &seal(&root(&agent, "agent-0"), &authority()).unwrap(),
+        &[alone],
+    )
+    .unwrap();
+
+    // A child that names another template, one that would allow more, is not believed.
+    let a0 = key("agent-0-key", 10);
+    let a1 = key("agent-1-key", 11);
+    let r = root(&a0, "agent-0");
+    let r_env = seal(&r, &authority()).unwrap();
+    let mut c = child(&r, &r_env, &a1, 1);
+    c.template = id("wide@7");
+    let mut wide = triage_template();
+    wide.id = id("wide");
+    assert_eq!(
+        verify_under(&seal(&c, &authority()).unwrap(), &[triage_template(), wide]).unwrap_err(),
+        Error::WiderThanParent("template")
+    );
+}
+
+/// What a template must be before a bundle carrying it is a bundle, and the signer is shown
+/// a template that was added, removed or changed.
+#[test]
+fn templates_are_policy() {
+    let with = |templates: Vec<gov_core::mandate::Template>| PolicyBundle {
+        templates,
+        ..bundle(Vec::new())
+    };
+    with(vec![triage_template()]).validate().unwrap();
+    let bad = |change: &dyn Fn(&mut gov_core::mandate::Template)| {
+        let mut t = triage_template();
+        change(&mut t);
+        with(vec![t]).validate()
+    };
+    assert!(bad(&|t| t.grants.clear()).is_err());
+    assert!(bad(&|t| t.max_life_secs = 0).is_err());
+    assert!(bad(&|t| t.max_life_secs = 8 * 3600 + 1).is_err());
+    bad(&|t| t.max_life_secs = 8 * 3600).unwrap();
+    assert!(bad(&|t| t.id = id("triage@7")).is_err());
+    assert!(with(vec![triage_template(), triage_template()])
+        .validate()
+        .is_err());
+
+    let before = with(vec![triage_template()]);
+    let mut loosened = triage_template();
+    loosened.grants = vec![grant(
+        &["issue.read", "issue.update", "issue.delete"],
+        &["jira/*"],
+    )];
+    let mut extra = triage_template();
+    extra.id = id("admin");
+    let shown = changes(Some(&before), &with(vec![loosened, extra]));
+    assert_eq!(shown.templates_changed, vec![id("triage")]);
+    assert_eq!(shown.templates_added, vec![id("admin")]);
+    assert!(!shown.other);
+    let shown = changes(Some(&before), &with(Vec::new()));
+    assert_eq!(shown.templates_removed, vec![id("triage")]);
+    assert!(!shown.other && !shown.is_empty());
+}
+
+// ----- labels: the words and where they are written (access governance spec, CG0a) -------
+
+mod labels {
+    use super::*;
+    use gov_core::connector::{ResourceClearance, ResourceLabel};
+    use gov_core::label::{Cause, Confidentiality, Integrity, Label, ReceiptLabels};
+    use gov_core::receipt::ReceiptRef;
+
+    const C: [Confidentiality; 4] = [
+        Confidentiality::Public,
+        Confidentiality::Internal,
+        Confidentiality::Confidential,
+        Confidentiality::Restricted,
+    ];
+    const I: [Integrity; 2] = [Integrity::Trusted, Integrity::Untrusted];
+
+    fn all() -> Vec<Label> {
+        C.iter()
+            .flat_map(|c| {
+                I.iter().map(|i| Label {
+                    confidentiality: *c,
+                    integrity: *i,
+                })
+            })
+            .collect()
+    }
+
+    fn label(c: Confidentiality, i: Integrity) -> Label {
+        Label {
+            confidentiality: c,
+            integrity: i,
+        }
+    }
+
+    /// Gates learn of the same reads in different orders, and more than once. A label that
+    /// depended on either would differ from gate to gate (review finding GR-145). Checked
+    /// for every label there is.
+    #[test]
+    fn a_label_only_rises_and_the_order_of_reads_does_not_matter() {
+        for a in all() {
+            assert_eq!(a.join(a), a);
+            assert_eq!(a.join(Label::CLEAN), a);
+            assert_eq!(a.join(Label::WORST), Label::WORST);
+            assert!(Label::WORST.covers(&a) && a.covers(&Label::CLEAN));
+            for b in all() {
+                let joined = a.join(b);
+                assert_eq!(joined, b.join(a));
+                // Never below either: nothing read lowers a label.
+                assert!(joined.covers(&a) && joined.covers(&b));
+                // And no higher than it must be.
+                assert!(joined.confidentiality == a.confidentiality.max(b.confidentiality));
+                assert_eq!(a.covers(&b), a.join(b) == a);
+                for c in all() {
+                    assert_eq!(a.join(b).join(c), a.join(b.join(c)));
+                }
+            }
+        }
+        // One part higher and one lower: neither covers the other.
+        let secret = label(Confidentiality::Restricted, Integrity::Trusted);
+        let dirty = label(Confidentiality::Public, Integrity::Untrusted);
+        assert!(!secret.covers(&dirty) && !dirty.covers(&secret));
+        assert_eq!(secret.join(dirty), Label::WORST);
+    }
+
+    fn labelled() -> Receipt {
+        let mut r = receipt(5, Some(Digest::of(&[b"prev"])), Phase::Intent);
+        r.session = Some(id("sess-1"));
+        r.rule = Some(id("allow-triage"));
+        r.cause = Some(Cause {
+            prev: Some(ReceiptRef {
+                gate: id("gate-1"),
+                seq: 3,
+                hash: Digest::of(&[b"earlier"]),
+            }),
+            token: Some(Digest::of(&[b"token"])),
+        });
+        r.labels = Some(ReceiptLabels {
+            data: label(Confidentiality::Confidential, Integrity::Trusted),
+            after: label(Confidentiality::Confidential, Integrity::Untrusted),
+        });
+        r
+    }
+
+    fn text(e: &Envelope) -> String {
+        String::from_utf8(URL_SAFE_NO_PAD.decode(&e.payload).unwrap()).unwrap()
+    }
+
+    /// The new fields are signed like the rest, and a receipt without them is byte for byte
+    /// what it was before they existed: every receipt already written still verifies.
+    #[test]
+    fn a_receipt_carries_its_session_cause_rule_and_labels_or_none_of_them() {
+        let gate = key("gate-1-key", 20);
+        let keys = KeySet::new([gate.public()]);
+        let r = labelled();
+        r.validate().unwrap();
+        let sealed = seal(&r, &gate).unwrap();
+        assert_eq!(open::<Receipt>(&sealed, &keys, &scope()).unwrap().doc, r);
+        let signed = text(&sealed);
+        for part in [
+            r#""session":"sess-1""#,
+            r#""rule":"allow-triage""#,
+            r#""data":{"confidentiality":"confidential","integrity":"trusted"}"#,
+            r#""after":{"confidentiality":"confidential","integrity":"untrusted"}"#,
+            r#""cause":{"prev":{"gate":"gate-1""#,
+        ] {
+            assert!(signed.contains(part), "{part} is not in {signed}");
+        }
+
+        let plain = receipt(5, Some(Digest::of(&[b"prev"])), Phase::Intent);
+        let signed = text(&seal(&plain, &gate).unwrap());
+        for word in ["session", "cause", "rule", "labels"] {
+            assert!(!signed.contains(&format!("\"{word}\"")), "{word}");
+        }
+
+        // A word outside the closed lists, or a field nobody defined, is refused.
+        let tampered = |from: &str, to: &str| {
+            let mut value: Value = serde_json::to_value(labelled()).unwrap();
+            let s = serde_json::to_string(&value).unwrap().replace(from, to);
+            value = serde_json::from_str(&s).unwrap();
+            serde_json::from_value::<Receipt>(value)
+        };
+        tampered("sess-1", "sess-2").unwrap();
+        assert!(tampered(r#""confidential""#, r#""secret""#).is_err());
+        assert!(tampered(r#""untrusted""#, r#""tainted""#).is_err());
+        assert!(tampered(
+            r#""integrity":"trusted""#,
+            r#""integrity":"trusted","note":"x""#
+        )
+        .is_err());
+        assert!(tampered(r#""token":"#, r#""tokens":"#).is_err());
+    }
+
+    /// What a receipt may not say about labels, whoever signs it.
+    #[test]
+    fn a_receipt_that_misstates_its_labels_or_cause_is_refused() {
+        let bad = |change: &dyn Fn(&mut Receipt)| {
+            let mut r = labelled();
+            change(&mut r);
+            r.validate()
+        };
+        bad(&|_| {}).unwrap();
+        // The mandate's label after a call is never below what the call touched.
+        assert!(bad(&|r| {
+            r.labels.as_mut().unwrap().after =
+                label(Confidentiality::Internal, Integrity::Untrusted)
+        })
+        .is_err());
+        assert!(bad(&|r| {
+            r.labels.as_mut().unwrap().data = label(Confidentiality::Public, Integrity::Untrusted);
+            r.labels.as_mut().unwrap().after =
+                label(Confidentiality::Restricted, Integrity::Trusted);
+        })
+        .is_err());
+        // A cause is an earlier receipt of this gate's chain, and says something.
+        // Receipts are numbered from 1: there is no receipt 0 to point at (GR-171).
+        assert!(bad(&|r| r.cause.as_mut().unwrap().prev.as_mut().unwrap().seq = 0).is_err());
+        bad(&|r| r.cause.as_mut().unwrap().prev.as_mut().unwrap().seq = 1).unwrap();
+        assert!(bad(&|r| r.cause.as_mut().unwrap().prev.as_mut().unwrap().seq = 5).is_err());
+        assert!(bad(&|r| r.cause.as_mut().unwrap().prev.as_mut().unwrap().seq = 6).is_err());
+        assert!(
+            bad(&|r| r.cause.as_mut().unwrap().prev.as_mut().unwrap().gate = id("gate-2")).is_err()
+        );
+        assert!(bad(&|r| {
+            r.cause = Some(Cause {
+                prev: None,
+                token: None,
+            })
+        })
+        .is_err());
+        bad(&|r| r.cause.as_mut().unwrap().prev = None).unwrap();
+        bad(&|r| r.cause.as_mut().unwrap().token = None).unwrap();
+
+        // A stock client's call has no mandate: no session, no label, no cause (GR-151).
+        let claimed = |change: &dyn Fn(&mut Receipt)| {
+            let mut r = receipt(5, Some(Digest::of(&[b"prev"])), Phase::Intent);
+            r.mode = Mode::Observe;
+            r.coverage = Coverage::InLine;
+            r.agent.proof = Proof::Claimed;
+            r.mandate = Vec::new();
+            change(&mut r);
+            r.validate()
+        };
+        claimed(&|_| {}).unwrap();
+        claimed(&|r| r.rule = Some(id("allow-triage"))).unwrap();
+        assert!(claimed(&|r| r.session = labelled().session).is_err());
+        assert!(claimed(&|r| r.labels = labelled().labels).is_err());
+        assert!(claimed(&|r| r.cause = labelled().cause).is_err());
+        // A failed proof presented a session, and is nobody's act: it moves no label.
+        let failed = |change: &dyn Fn(&mut Receipt)| {
+            claimed(&|r| {
+                r.agent.proof = Proof::Failed;
+                r.agent.failure = Some(gov_core::receipt::ProofFailure::BadSignature);
+                r.mandate = vec![id("m-root")];
+                change(r);
+            })
+        };
+        failed(&|r| r.session = labelled().session).unwrap();
+        assert!(failed(&|r| r.labels = labelled().labels).is_err());
+        assert!(failed(&|r| r.cause = labelled().cause).is_err());
+    }
+
+    fn pattern(p: &str) -> ResourcePattern {
+        ResourcePattern::new(p).unwrap()
+    }
+    fn path(p: &str) -> ResourcePath {
+        ResourcePath::new(p).unwrap()
+    }
+    fn labelled_map() -> gov_core::connector::ServerMap {
+        let mut map = jira_map();
+        map.labels = vec![
+            ResourceLabel {
+                resources: pattern("jira/*"),
+                confidentiality: Confidentiality::Internal,
+            },
+            ResourceLabel {
+                resources: pattern("jira/project/pay/*"),
+                confidentiality: Confidentiality::Restricted,
+            },
+            ResourceLabel {
+                resources: pattern("jira/project/docs/*"),
+                confidentiality: Confidentiality::Public,
+            },
+        ];
+        map.clearances = vec![
+            ResourceClearance {
+                resources: pattern("jira/project/*"),
+                clearance: Confidentiality::Confidential,
+            },
+            ResourceClearance {
+                resources: pattern("jira/project/docs/*"),
+                clearance: Confidentiality::Public,
+            },
+        ];
+        map
+    }
+
+    /// What nobody labelled is taken for the worst, and where two entries cover one
+    /// resource the stricter wins: a mistake in a map can only make it stricter.
+    #[test]
+    fn an_unlabelled_resource_is_the_most_closely_held_and_cleared_for_nothing() {
+        let bare = jira_map();
+        bare.validate().unwrap();
+        let anywhere = path("jira/project/pay/issue/pay-1");
+        assert_eq!(
+            bare.confidentiality_of(&anywhere),
+            Confidentiality::Restricted
+        );
+        assert_eq!(bare.clearance_of(&anywhere), Confidentiality::Public);
+        assert!(bare
+            .tools
+            .iter()
+            .all(|t| t.results() == Integrity::Untrusted));
+
+        let map = labelled_map();
+        map.validate().unwrap();
+        for (resource, held, cleared) in [
+            // Two labels cover it: the more closely held.
+            (
+                "jira/project/pay/issue/pay-1",
+                Confidentiality::Restricted,
+                Confidentiality::Confidential,
+            ),
+            // A wider entry says internal, a narrower says public: still internal.
+            (
+                "jira/project/docs/issue/docs-1",
+                Confidentiality::Internal,
+                Confidentiality::Public,
+            ),
+            (
+                "jira/project/ops/issue/ops-1",
+                Confidentiality::Internal,
+                Confidentiality::Confidential,
+            ),
+            // Labelled, and no clearance covers it: cleared for nothing above public.
+            (
+                "jira/search",
+                Confidentiality::Internal,
+                Confidentiality::Public,
+            ),
+        ] {
+            let r = path(resource);
+            assert_eq!(map.confidentiality_of(&r), held, "{resource}");
+            assert_eq!(map.clearance_of(&r), cleared, "{resource}");
+        }
+        let mut trusted = map.clone();
+        trusted.tools[0].results = Some(Integrity::Trusted);
+        assert_eq!(trusted.tools[0].results(), Integrity::Trusted);
+    }
+
+    /// Labels in a map are held to what a rule's patterns are, and are part of what the
+    /// root key signs: a change to one shows to the signer as a changed map.
+    #[test]
+    fn a_maps_labels_are_linted_and_signed_with_it() {
+        let bad = |change: &dyn Fn(&mut gov_core::connector::ServerMap)| {
+            let mut map = labelled_map();
+            change(&mut map);
+            map.validate()
+        };
+        // Another system's resource.
+        assert!(bad(&|m| m.labels[0].resources = pattern("github/*")).is_err());
+        assert!(bad(&|m| m.clearances[0].resources = pattern("github/*")).is_err());
+        // Upper case in a system that folds: it would cover nothing, and so label nothing.
+        assert!(bad(&|m| m.labels[1].resources = pattern("jira/project/PAY/*")).is_err());
+        assert!(bad(&|m| m.clearances[1].resources = pattern("jira/project/DOCS/*")).is_err());
+        bad(&|m| {
+            m.fold_case = false;
+            m.labels[1].resources = pattern("jira/project/PAY/*");
+        })
+        .unwrap();
+        // The same pattern twice in one list, which could say two things.
+        assert!(bad(&|m| m.labels[2].resources = pattern("jira/*")).is_err());
+        assert!(bad(&|m| m.clearances[1].resources = pattern("jira/project/*")).is_err());
+        // The same pattern in both lists says one thing each.
+        bad(&|m| m.clearances[1].resources = pattern("jira/*")).unwrap();
+
+        // A map without labels is written exactly as it was before there were any.
+        let bare = serde_json::to_string(&jira_map()).unwrap();
+        for word in ["labels", "clearances", "results"] {
+            assert!(!bare.contains(word), "{word}");
+        }
+        // Loosening one label is a changed map to whoever signs the next bundle.
+        let with = |map| PolicyBundle {
+            connectors: vec![map],
+            ..bundle(Vec::new())
+        };
+        let before = with(labelled_map());
+        let mut loosened = labelled_map();
+        loosened.labels[1].confidentiality = Confidentiality::Public;
+        let after = PolicyBundle {
+            number: 2,
+            ..with(loosened)
+        };
+        after.validate().unwrap();
+        assert_eq!(
+            changes(Some(&before), &after).maps_changed,
+            [id("jira-mcp")]
+        );
+        let mut trusting = labelled_map();
+        trusting.tools[0].results = Some(Integrity::Trusted);
+        let after = PolicyBundle {
+            number: 2,
+            ..with(trusting)
+        };
+        assert_eq!(
+            changes(Some(&before), &after).maps_changed,
+            [id("jira-mcp")]
+        );
+    }
+}
+
+// ----- the gate's time and the reasons a held key is not proven (spec §7.6.3; G4d-2) -----
+
+/// A receipt stamped with the Authority's time says so; one that does not is byte for byte
+/// what it was before gates had leases. The four new reasons are words of the closed list.
+#[test]
+fn a_receipt_says_when_its_time_is_the_authoritys() {
+    let gate = key("gate-1-key", 20);
+    let text = |r: &Receipt| {
+        let sealed = seal(r, &gate).unwrap();
+        String::from_utf8(URL_SAFE_NO_PAD.decode(&sealed.payload).unwrap()).unwrap()
+    };
+    let mut r = receipt(1, None, Phase::Intent);
+    assert!(!text(&r).contains("at_from_lease"));
+    r.at_from_lease = true;
+    r.validate().unwrap();
+    assert!(text(&r).contains(r#""at_from_lease":true"#));
+    let keys = KeySet::new([gate.public()]);
+    let back = open::<Receipt>(&seal(&r, &gate).unwrap(), &keys, &scope()).unwrap();
+    assert!(back.doc.at_from_lease);
+
+    use gov_core::receipt::ProofFailure;
+    for (why, word) in [
+        (ProofFailure::NoLease, "no_lease"),
+        (ProofFailure::KeyRevoked, "key_revoked"),
+        (ProofFailure::AgentRevoked, "agent_revoked"),
+        (ProofFailure::MandateRevoked, "mandate_revoked"),
+    ] {
+        assert_eq!(serde_json::to_value(why).unwrap(), json!(word));
+        // Each is a failed proof's reason, and only that.
+        let mut failed = receipt(1, None, Phase::Intent);
+        failed.mode = Mode::Observe;
+        failed.coverage = Coverage::InLine;
+        failed.agent.proof = Proof::Failed;
+        failed.agent.failure = Some(why);
+        failed.validate().unwrap();
+        failed.agent.proof = Proof::Proven;
+        assert!(failed.validate().is_err(), "{word} on a proven receipt");
+    }
+    assert!(serde_json::from_value::<ProofFailure>(json!("revoked")).is_err());
 }

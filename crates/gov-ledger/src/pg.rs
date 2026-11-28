@@ -9,7 +9,7 @@ use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::types::Json;
 use sqlx::Row;
 
-use crate::store::{ChainKind, Refusal, Store, StoreError, StoreResult, StoredReceipt};
+use crate::store::{ChainKind, Enrolment, Refusal, Store, StoreError, StoreResult, StoredReceipt};
 
 fn kind_text(kind: ChainKind) -> &'static str {
     match kind {
@@ -128,6 +128,75 @@ impl Store for PgStore {
         .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    async fn note_enrolment(&self, scope: &Scope, kid: &Id, e: &Enrolment) -> StoreResult<()> {
+        sqlx::query(
+            "INSERT INTO key_enrolments (tenant, env, kid, authority, gate, digest, ended) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING",
+        )
+        .bind(scope.tenant.as_str())
+        .bind(scope.env.as_str())
+        .bind(kid.as_str())
+        .bind(e.authority.as_str())
+        .bind(e.gate.as_str())
+        .bind(e.digest.as_str())
+        .bind(e.ended)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn end_enrolments(
+        &self,
+        scope: &Scope,
+        authority: &Id,
+        gate: Option<&Id>,
+        kid: Option<&Id>,
+    ) -> StoreResult<()> {
+        sqlx::query(
+            "UPDATE key_enrolments SET ended = TRUE \
+             WHERE tenant = $1 AND env = $2 AND authority = $3 \
+               AND ($4::text IS NULL OR gate = $4) AND ($5::text IS NULL OR kid = $5)",
+        )
+        .bind(scope.tenant.as_str())
+        .bind(scope.env.as_str())
+        .bind(authority.as_str())
+        .bind(gate.map(|g| g.as_str()))
+        .bind(kid.map(|k| k.as_str()))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn clear_enrolments(&self, scope: &Scope) -> StoreResult<()> {
+        sqlx::query("DELETE FROM key_enrolments WHERE tenant = $1 AND env = $2")
+            .bind(scope.tenant.as_str())
+            .bind(scope.env.as_str())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn enrolment(&self, scope: &Scope, kid: &Id) -> StoreResult<Option<Enrolment>> {
+        let row = sqlx::query(
+            "SELECT authority, gate, digest, ended FROM key_enrolments \
+             WHERE tenant = $1 AND env = $2 AND kid = $3",
+        )
+        .bind(scope.tenant.as_str())
+        .bind(scope.env.as_str())
+        .bind(kid.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| {
+            Ok(Enrolment {
+                authority: id(r.try_get("authority")?)?,
+                gate: id(r.try_get("gate")?)?,
+                digest: digest(r.try_get("digest")?)?,
+                ended: r.try_get("ended")?,
+            })
+        })
+        .transpose()
     }
 
     async fn retire_keys(&self, scope: &Scope, chain: &Id, kid: Option<&Id>) -> StoreResult<()> {

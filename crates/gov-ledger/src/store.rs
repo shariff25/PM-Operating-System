@@ -85,6 +85,20 @@ pub trait Store: Send + Sync {
     async fn add_gate_key(&self, scope: &Scope, gate: &Id, key: &PublicKey) -> StoreResult<()> {
         self.add_key(scope, gate, ChainKind::Receipt, key).await
     }
+    /// Note what an Authority's record says of a gate key id. Written once: a second
+    /// enrolment under the same id changes nothing, and an ended one stays ended.
+    async fn note_enrolment(&self, scope: &Scope, kid: &Id, e: &Enrolment) -> StoreResult<()>;
+    /// End the enrolments an Authority recorded for a gate, or the one of a key id.
+    async fn end_enrolments(
+        &self,
+        scope: &Scope,
+        authority: &Id,
+        gate: Option<&Id>,
+        kid: Option<&Id>,
+    ) -> StoreResult<()>;
+    async fn enrolment(&self, scope: &Scope, kid: &Id) -> StoreResult<Option<Enrolment>>;
+    /// Forget every note of an enrolment, to write them again from the chains.
+    async fn clear_enrolments(&self, scope: &Scope) -> StoreResult<()>;
     /// Retire a chain's keys: one of them, or all. Nothing more is taken under a retired
     /// key; what was taken stays, and so does the key, for checking it.
     async fn retire_keys(&self, scope: &Scope, chain: &Id, kid: Option<&Id>) -> StoreResult<()>;
@@ -153,8 +167,20 @@ pub trait Store: Send + Sync {
 
 type Key = (Id, Id);
 
+/// What an Authority's chain says of one gate key id (review finding GR-124).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Enrolment {
+    pub authority: Id,
+    pub gate: Id,
+    /// The digest of the key that was enrolled.
+    pub digest: gov_core::Digest,
+    /// The gate was disabled or the key revoked since.
+    pub ended: bool,
+}
+
 #[derive(Default)]
 struct Inner {
+    enrolments: BTreeMap<(Key, Id), Enrolment>,
     gate_keys: BTreeMap<(Key, Id), (Id, PublicKey)>,
     kinds: BTreeMap<(Key, Id), ChainKind>,
     retired: std::collections::BTreeSet<(Key, Id)>,
@@ -207,6 +233,51 @@ impl Store for MemoryStore {
         s.gate_keys.insert(slot, (gate.clone(), key.clone()));
         s.kinds.insert((k(scope), gate.clone()), kind);
         Ok(())
+    }
+
+    async fn note_enrolment(&self, scope: &Scope, kid: &Id, e: &Enrolment) -> StoreResult<()> {
+        let mut s = self.0.lock().unwrap();
+        s.enrolments
+            .entry((k(scope), kid.clone()))
+            .or_insert_with(|| e.clone());
+        Ok(())
+    }
+
+    async fn end_enrolments(
+        &self,
+        scope: &Scope,
+        authority: &Id,
+        gate: Option<&Id>,
+        kid: Option<&Id>,
+    ) -> StoreResult<()> {
+        let mut s = self.0.lock().unwrap();
+        for ((scope_key, held), e) in s.enrolments.iter_mut() {
+            if *scope_key == k(scope)
+                && &e.authority == authority
+                && gate.is_none_or(|g| g == &e.gate)
+                && kid.is_none_or(|one| one == held)
+            {
+                e.ended = true;
+            }
+        }
+        Ok(())
+    }
+
+    async fn clear_enrolments(&self, scope: &Scope) -> StoreResult<()> {
+        let mut s = self.0.lock().unwrap();
+        s.enrolments
+            .retain(|(scope_key, _), _| *scope_key != k(scope));
+        Ok(())
+    }
+
+    async fn enrolment(&self, scope: &Scope, kid: &Id) -> StoreResult<Option<Enrolment>> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .enrolments
+            .get(&(k(scope), kid.clone()))
+            .cloned())
     }
 
     async fn retire_keys(&self, scope: &Scope, chain: &Id, kid: Option<&Id>) -> StoreResult<()> {

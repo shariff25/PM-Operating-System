@@ -9,14 +9,20 @@ rust-version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+axum.workspace = true
 base64.workspace = true
+chrono.workspace = true
 gov-core = { path = "../gov-core" }
+gov-signin = { path = "../gov-signin" }
+reqwest = { workspace = true, features = ["stream"] }
+sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+gov-signin = { path = "../gov-signin", features = ["test-support"] }
 gov-ledger = { path = "../gov-ledger" }
 tempfile.workspace = true
 tokio.workspace = true

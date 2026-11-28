@@ -116,9 +116,23 @@ pub enum Problem {
     /// Authority's chain (finding GR-84): the keys file says more than the Authority did.
     /// Reported only when the auditor names an Authority.
     KeyNotEnrolled,
-    /// A receipt is signed by a key and dated after the Authority's record that disabled its
-    /// gate or revoked the key, by more than the clocks may differ.
+    /// A receipt marked proven names a mandate that no witnessed record of this
+    /// installation's Authority says was issued (spec §7.6.2, point 8): a forged mandate,
+    /// or one from an issuer that is not the Authority. Reported only when the auditor
+    /// names an Authority.
+    MandateNotIssued,
+    /// A receipt is signed by a key that the Authority retired (its gate disabled, or the
+    /// key revoked), and is not shown to be earlier than that: no checkpoint covered it
+    /// before the first one that covered the retirement. A receipt written honestly before
+    /// and shipped late is reported too.
     ReceiptAfterRetirement,
+    /// An Authority's record is signed with a key other than the one its chain's last
+    /// replacement names: the key was replaced, and went on signing (finding GR-166).
+    RecordUnderReplacedKey,
+    /// A record says its actor was signed in, and no earlier record of that person's
+    /// sign-in in the same chain bears the session out: there is none, it is another
+    /// person's, it was ended by a sign-out or an offboarding, or its time had run out.
+    SessionNotBorneOut,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,7 +198,8 @@ struct Enrolment {
     seq: u64,
     gate: Id,
     digest: Digest,
-    retired_at: Option<i64>,
+    /// The number, in that Authority's chain, of the record that retired the key.
+    retired_by: Option<u64>,
 }
 
 struct Chain {
@@ -215,7 +230,12 @@ pub fn verify(check: &Check<'_>) -> Report {
     // By key id: what the Authorities recorded, and the latest receipt each key signed
     // (gate, time, number).
     let mut enrolments: BTreeMap<Id, Enrolment> = BTreeMap::new();
-    let mut signed_last: BTreeMap<Id, (Id, i64, u64)> = BTreeMap::new();
+    // For each key, the last receipt it signed: its gate and its number.
+    let mut signed_last: BTreeMap<Id, (Id, u64)> = BTreeMap::new();
+    // Mandates the Authorities recorded issuing (by id: the Authority and the record's
+    // number), and those that proven receipts name (by gate and id: the first receipt).
+    let mut issued: BTreeMap<Id, (Id, u64)> = BTreeMap::new();
+    let mut named: BTreeMap<(Id, Id), u64> = BTreeMap::new();
 
     if check.export.v != gov_core::VERSION {
         find(Problem::BadExport("unknown_version"), None, None);
@@ -260,6 +280,9 @@ pub fn verify(check: &Check<'_>) -> Report {
             prune_tied: false,
         };
         let mut head: Option<ChainHead> = None;
+        let mut successor: Option<Digest> = None;
+        // Each session a sign-in opened: whose, until when, and whether it was ended.
+        let mut sessions: BTreeMap<Id, (Id, i64, bool)> = BTreeMap::new();
         if let Some(record) = &gate.pruned {
             match open::<Pruned>(record, &ledger_keys, check.scope) {
                 Ok(p) if p.doc.gate == gate.gate && p.doc.through_seq >= 1 => {
@@ -337,16 +360,86 @@ pub fn verify(check: &Check<'_>) -> Report {
                     }
                     match &link {
                         Link::Receipt(opened) => {
-                            let last = signed_last.get(&opened.kid).map(|(_, at, _)| *at);
-                            if last.is_none_or(|at| opened.doc.at >= at) {
-                                signed_last.insert(
-                                    opened.kid.clone(),
-                                    (gate.gate.clone(), opened.doc.at, h.seq),
-                                );
+                            let last = signed_last.get(&opened.kid).map(|(_, seq)| *seq);
+                            if last.is_none_or(|seq| h.seq >= seq) {
+                                signed_last.insert(opened.kid.clone(), (gate.gate.clone(), h.seq));
+                            }
+                            if opened.doc.agent.proof == gov_core::receipt::Proof::Proven {
+                                for mandate in &opened.doc.mandate {
+                                    named
+                                        .entry((gate.gate.clone(), mandate.clone()))
+                                        .or_insert(h.seq);
+                                }
                             }
                         }
                         Link::Admin(opened) => {
                             let record = &opened.doc;
+                            if let Some(named) = &successor {
+                                let signer = gate_keys
+                                    .iter()
+                                    .find(|k| k.kid == envelope.kid)
+                                    .and_then(|k| key_digest(k).ok());
+                                if signer.as_ref() != Some(named) {
+                                    find(
+                                        Problem::RecordUnderReplacedKey,
+                                        Some(&gate.gate),
+                                        Some(h.seq),
+                                    );
+                                }
+                            }
+                            if let (AdminAction::AdminKeyReplaced, Some(next)) =
+                                (&record.action, &record.value)
+                            {
+                                successor = Some(next.clone());
+                            }
+                            if let Some(reference) = &record.actor.session {
+                                // A reference is opened once: a second sign-in under it
+                                // would reopen a session that was ended (GR-202).
+                                let borne_out = match (&record.action, record.until) {
+                                    (AdminAction::SignedIn, Some(until)) => {
+                                        let fresh = !sessions.contains_key(reference);
+                                        if fresh {
+                                            sessions.insert(
+                                                reference.clone(),
+                                                (record.actor.id.clone(), until, false),
+                                            );
+                                        }
+                                        fresh
+                                    }
+                                    _ => sessions.get(reference).is_some_and(
+                                        |(person, until, ended)| {
+                                            person == &record.actor.id
+                                                && !ended
+                                                && record.at < *until
+                                        },
+                                    ),
+                                };
+                                if !borne_out {
+                                    find(
+                                        Problem::SessionNotBorneOut,
+                                        Some(&gate.gate),
+                                        Some(h.seq),
+                                    );
+                                }
+                                if record.action == AdminAction::SignedOut {
+                                    if let Some(session) = sessions.get_mut(reference) {
+                                        session.2 = true;
+                                    }
+                                }
+                            }
+                            if record.action == AdminAction::PersonOffboarded {
+                                for session in sessions
+                                    .values_mut()
+                                    .filter(|(person, _, _)| person == &record.subject.id)
+                                {
+                                    session.2 = true;
+                                }
+                            }
+                            if record.action == AdminAction::MandateIssued {
+                                issued
+                                    .entry(record.subject.id.clone())
+                                    .or_insert((gate.gate.clone(), h.seq));
+                            }
                             match (&record.action, &record.about, &record.value) {
                                 (AdminAction::KeyEnrolled, Some(about), Some(digest))
                                     if about.kind == SubjectKind::Gate =>
@@ -358,7 +451,7 @@ pub fn verify(check: &Check<'_>) -> Report {
                                             seq: h.seq,
                                             gate: about.id.clone(),
                                             digest: digest.clone(),
-                                            retired_at: None,
+                                            retired_by: None,
                                         },
                                     );
                                 }
@@ -366,7 +459,7 @@ pub fn verify(check: &Check<'_>) -> Report {
                                     for e in enrolments.values_mut().filter(|e| {
                                         e.authority == gate.gate && e.gate == record.subject.id
                                     }) {
-                                        e.retired_at.get_or_insert(record.at);
+                                        e.retired_by.get_or_insert(h.seq);
                                     }
                                 }
                                 (AdminAction::Revoked, _, _)
@@ -376,7 +469,7 @@ pub fn verify(check: &Check<'_>) -> Report {
                                         .get_mut(&record.subject.id)
                                         .filter(|e| e.authority == gate.gate)
                                     {
-                                        e.retired_at.get_or_insert(record.at);
+                                        e.retired_by.get_or_insert(h.seq);
                                     }
                                 }
                                 _ => {}
@@ -412,6 +505,9 @@ pub fn verify(check: &Check<'_>) -> Report {
     let mut last_moved: BTreeMap<Id, i64> = BTreeMap::new();
     // For each gate, every (head number, hash, checkpoint time) the witness holds.
     let mut witnessed: BTreeMap<Id, Vec<(u64, Digest, i64)>> = BTreeMap::new();
+    // For each chain, (head number, the checkpoint's own number): positions in `witnessed`
+    // are per chain and cannot be compared across chains (review finding GR-186).
+    let mut covered_in: BTreeMap<Id, Vec<(u64, u64)>> = BTreeMap::new();
     let mut checkpoints_verified = 0;
     let silence = i64::from(check.interval_secs) * 2;
     if check.checkpoints.is_empty() {
@@ -464,6 +560,10 @@ pub fn verify(check: &Check<'_>) -> Report {
         let mut seen: BTreeMap<Id, u64> = BTreeMap::new();
         for h in &cp.heads {
             seen.insert(h.gate.clone(), h.seq);
+            covered_in
+                .entry(h.gate.clone())
+                .or_default()
+                .push((h.seq, cp.seq));
             witnessed
                 .entry(h.gate.clone())
                 .or_default()
@@ -633,9 +733,36 @@ pub fn verify(check: &Check<'_>) -> Report {
                 }
             }
         }
-        for (kid, (gate, at, seq)) in &signed_last {
-            let retired = enrolments.get(kid).and_then(|e| e.retired_at);
-            if retired.is_some_and(|t| at.saturating_sub(t) > i64::from(check.clock_skew_secs)) {
+        for ((gate, mandate), seq) in &named {
+            let borne_out = issued.get(mandate).is_some_and(|(authority, record)| {
+                last_heads.get(authority).is_some_and(|w| record <= w)
+            });
+            if !borne_out {
+                find(Problem::MandateNotIssued, Some(gate), Some(*seq));
+            }
+        }
+        // The witness's order decides, not the dates either side wrote (finding GR-130):
+        // a receipt counts as earlier than a retirement only if a checkpoint before the
+        // first one covering the retirement already covered the receipt.
+        let first_cover = |chain: &Id, seq: u64| {
+            covered_in.get(chain).and_then(|heads| {
+                heads
+                    .iter()
+                    .find(|(head, _)| *head >= seq)
+                    .map(|(_, checkpoint)| *checkpoint)
+            })
+        };
+        for (kid, (gate, seq)) in &signed_last {
+            let Some((authority, record)) = enrolments
+                .get(kid)
+                .and_then(|e| Some((&e.authority, e.retired_by?)))
+            else {
+                continue;
+            };
+            let Some(retired) = first_cover(authority, record) else {
+                continue;
+            };
+            if first_cover(gate, *seq).is_none_or(|covered| covered >= retired) {
                 find(Problem::ReceiptAfterRetirement, Some(gate), Some(*seq));
             }
         }

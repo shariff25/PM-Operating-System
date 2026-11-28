@@ -8,7 +8,7 @@ use gov_core::request::{RequestProof, SessionOpen};
 use gov_core::{
     seal, Digest, Envelope, Id, KeySet, ResourcePath, ResourcePattern, Scope, SigningKey,
 };
-use gov_gate::sessions::{OpenRefused, Proved, Sessions, SessionsConfig};
+use gov_gate::sessions::{why, OpenRefused, Proved, Sessions, SessionsConfig};
 use serde_json::json;
 
 const NOW: i64 = 1_800_000_000;
@@ -30,11 +30,15 @@ fn agent() -> SigningKey {
 }
 
 fn mandate(agent: &SigningKey, expires_at: i64) -> Envelope {
+    mandate_named("m-1", agent, expires_at)
+}
+
+fn mandate_named(name: &str, agent: &SigningKey, expires_at: i64) -> Envelope {
     let m = Mandate {
         v: 1,
         tenant: id("acme"),
         env: id("prod"),
-        id: id("m-1"),
+        id: id(name),
         issuer: id("authority"),
         issued_at: NOW - 60,
         expires_at,
@@ -172,12 +176,26 @@ fn only_the_keys_holder_opens_a_session() {
         Err(OpenRefused::Invalid)
     );
     assert!(s.is_empty());
+    // The asker is told nothing of why; the operator's count says (finding GR-155).
+    let count = |s: &Sessions, why: &str| s.refusals().get(why).copied().unwrap_or(0);
+    // Two were not the mandate's agent or were for another gate; two were properly signed
+    // and too far from this gate's time, which has a reason of its own (finding GR-178).
+    assert_eq!(
+        (
+            count(&s, why::REQUEST),
+            count(&s, why::CLOCK),
+            count(&s, why::MANDATE)
+        ),
+        (2, 2, 2)
+    );
 
     // The real one opens; the same signed request played again does not.
     let request = ask(&agent(), "gate-1", "n-7", NOW);
     s.open(&m, &request, NOW).unwrap();
     assert_eq!(s.open(&m, &request, NOW + 1), Err(OpenRefused::Invalid));
     assert_eq!(s.len(), 1);
+    assert_eq!(count(&s, why::REPLAY), 1);
+    assert_eq!(s.refusals().values().sum::<u64>(), 7);
 
     // A time at either end of the range is refused like any other; it does not stop the
     // gate (review finding GR-102).
@@ -185,6 +203,19 @@ fn only_the_keys_holder_opens_a_session() {
         let extreme = ask(&agent(), "gate-1", &format!("x-{n}"), at);
         assert_eq!(s.open(&m, &extreme, NOW), Err(OpenRefused::Invalid));
     }
+    assert_eq!(count(&s, why::CLOCK), 5);
+    // Just inside what an opening allows, and just outside it.
+    let mut s = sessions();
+    s.open(&m, &ask(&agent(), "gate-1", "e-1", NOW - 120), NOW)
+        .unwrap();
+    s.open(&m, &ask(&agent(), "gate-1", "e-2", NOW + 120), NOW)
+        .unwrap();
+    for (n, at) in [NOW - 121, NOW + 121].into_iter().enumerate() {
+        let off = ask(&agent(), "gate-1", &format!("o-{n}"), at);
+        assert_eq!(s.open(&m, &off, NOW), Err(OpenRefused::Invalid));
+    }
+    assert_eq!(s.refusals().get(why::CLOCK), Some(&2));
+    assert_eq!(s.refusals().len(), 1);
 }
 
 /// Proven is said only for a proof that holds for the action the gate computed, and each
@@ -401,6 +432,7 @@ fn unproven_sessions_never_push_out_a_proven_one() {
         }
     }
     assert_eq!(opened, 2);
+    assert_eq!(s.refusals().get(why::BUSY), Some(&8));
     let d = action(2, 2);
     assert!(matches!(
         s.prove(
@@ -468,4 +500,541 @@ fn unproven_sessions_never_push_out_a_proven_one() {
         ),
         Proved::Proven(_)
     ));
+}
+
+/// A mandate that a trusted key signed and that names no template of the bundle held, or
+/// goes wider than the one it names, is refused, and counted apart from every other
+/// refusal: signed with the real key, it is what a taken mandates key looks like (review
+/// findings GR-138 and GR-155).
+#[test]
+fn a_mandate_outside_its_template_is_counted_as_that() {
+    use gov_core::mandate::Template;
+    let template = |resource: &str| Template {
+        id: id("triage"),
+        grants: vec![Grant {
+            system: id("jira"),
+            operations: [id("issue.update")].into(),
+            resources: vec![ResourcePattern::new(resource).unwrap()],
+        }],
+        max_life_secs: 3600,
+        limits: Limits::default(),
+        delegable: false,
+        people: Default::default(),
+        receivers: Default::default(),
+    };
+    let with = |templates: Vec<Template>| {
+        let mut config =
+            SessionsConfig::new(scope(), id("gate-1"), KeySet::new([issuer().public()]));
+        config.templates = Some(templates);
+        Sessions::new(config)
+    };
+    let m = mandate(&agent(), NOW + 600);
+
+    // Within its template: opened, and nothing counted.
+    let mut s = with(vec![template("jira/project/pay/*")]);
+    s.open(&m, &ask(&agent(), "gate-1", "n-1", NOW), NOW)
+        .unwrap();
+    assert!(s.refusals().is_empty());
+
+    // Wider than its template, and a template the bundle does not hold.
+    for held in [vec![template("jira/project/pay/issue/pay-1")], Vec::new()] {
+        let mut s = with(held);
+        assert_eq!(
+            s.open(&m, &ask(&agent(), "gate-1", "n-2", NOW), NOW),
+            Err(OpenRefused::Invalid)
+        );
+        assert_eq!(s.refusals().get(why::TEMPLATE), Some(&1));
+        assert_eq!(s.refusals().len(), 1);
+        assert!(s.is_empty());
+    }
+}
+
+// ----- a gate with an Authority: the lease and revocation (spec §7.6.3, points 5 and 6) --
+
+mod with_an_authority {
+    use super::*;
+    use gov_core::revocation::{Revocable, RevocationSet};
+    use gov_gate::sessions::{Call, Trust};
+
+    fn revoked(what: &[(Revocable, &str)]) -> RevocationSet {
+        let mut set = RevocationSet::default();
+        for (kind, name) in what {
+            set.revoke(*kind, id(name));
+        }
+        set
+    }
+
+    /// One call under `sid`, with a proof that holds, numbered `n`.
+    fn call(
+        s: &mut Sessions,
+        sid: &Id,
+        chal: &Id,
+        n: u64,
+        fresh: bool,
+        revoked: &RevocationSet,
+    ) -> Proved {
+        let d = action(n, u8::try_from(n).unwrap());
+        let salt = [u8::try_from(n).unwrap(); 32];
+        s.prove_with(
+            sid,
+            &Call {
+                proof: Some(&proof(&agent(), sid, chal, n, &d)),
+                salt: Some(&salt),
+                digest: &d,
+                canonical: true,
+            },
+            NOW,
+            Some(&Trust { fresh, revoked }),
+        )
+    }
+
+    fn who(p: &Proved) -> Option<Id> {
+        match p {
+            Proved::Failed { who, .. } => who.as_ref().map(|w| w.agent.clone()),
+            Proved::Proven(call) => Some(call.who().agent.clone()),
+        }
+    }
+
+    /// Without a complete, fresh lease the gate cannot say that nothing is revoked, so it
+    /// opens no session; and it opens none for a chain any part of which is revoked.
+    #[test]
+    fn no_session_is_opened_without_a_fresh_lease_or_for_anything_revoked() {
+        let m = mandate(&agent(), NOW + 3600);
+        let none = RevocationSet::default();
+        let open = |s: &mut Sessions, n: &str, fresh: bool, revoked: &RevocationSet| {
+            let request = ask(&agent(), "gate-1", n, NOW);
+            s.open_with(&m, &request, NOW, Some(&Trust { fresh, revoked }))
+        };
+        let mut s = sessions();
+        assert_eq!(open(&mut s, "n-1", false, &none), Err(OpenRefused::Invalid));
+        assert_eq!(s.refusals().get(why::NO_LEASE), Some(&1));
+        assert!(s.is_empty());
+        // The mandate, its agent, the agent's key, the key the mandate was signed with.
+        for (n, what) in [
+            (Revocable::Mandate, "m-1"),
+            (Revocable::Agent, "triage-bot"),
+            (Revocable::Key, "agent-key-1"),
+            (Revocable::Key, "issuer-1"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let set = revoked(&[*what]);
+            assert_eq!(
+                open(&mut s, &format!("r-{n}"), true, &set),
+                Err(OpenRefused::Invalid),
+                "{what:?}"
+            );
+        }
+        assert_eq!(s.refusals().get(why::REVOKED), Some(&4));
+        // Something else revoked is no reason to refuse this one.
+        let other = revoked(&[(Revocable::Mandate, "m-2"), (Revocable::Agent, "other-bot")]);
+        open(&mut s, "n-2", true, &other).unwrap();
+        assert_eq!(s.len(), 1);
+        // A gate with no Authority asks none of this.
+        let mut bare = sessions();
+        bare.open(&m, &ask(&agent(), "gate-1", "n-3", NOW), NOW)
+            .unwrap();
+    }
+
+    /// A proof that holds is recorded as proven only under a fresh lease. Without one it is
+    /// a failed proof with a reason of its own, the agent is still named, and the session
+    /// is not counted as proven.
+    #[test]
+    fn a_proof_that_holds_is_proven_only_under_a_fresh_lease() {
+        let none = RevocationSet::default();
+        let mut s = sessions();
+        let m = mandate(&agent(), NOW + 3600);
+        let request = ask(&agent(), "gate-1", "n-1", NOW);
+        let trust = Trust {
+            fresh: true,
+            revoked: &none,
+        };
+        let (sid, chal) = s.open_with(&m, &request, NOW, Some(&trust)).unwrap();
+
+        // The lease has run out by the first call.
+        let stale = call(&mut s, &sid, &chal, 1, false, &none);
+        assert_eq!(who(&stale), Some(id("triage-bot")));
+        assert_eq!(why(stale), ProofFailure::NoLease);
+        // A proof that does not hold keeps its own reason, lease or no lease.
+        let d = action(2, 2);
+        let forged = s.prove_with(
+            &sid,
+            &Call {
+                proof: Some(&proof(&key("agent-key-1", 99), &sid, &chal, 2, &d)),
+                salt: Some(&[2; 32]),
+                digest: &d,
+                canonical: true,
+            },
+            NOW,
+            Some(&Trust {
+                fresh: false,
+                revoked: &none,
+            }),
+        );
+        assert_eq!(why(forged), ProofFailure::BadSignature);
+        // The proof under no lease was used up all the same: it is not played again later.
+        let d1 = action(1, 1);
+        let replayed = s.prove_with(
+            &sid,
+            &Call {
+                proof: Some(&proof(&agent(), &sid, &chal, 1, &d1)),
+                salt: Some(&[9; 32]),
+                digest: &d1,
+                canonical: true,
+            },
+            NOW,
+            Some(&trust),
+        );
+        assert_eq!(why(replayed), ProofFailure::Replay);
+
+        // The lease is renewed: the next call is proven.
+        assert!(matches!(
+            call(&mut s, &sid, &chal, 3, true, &none),
+            Proved::Proven(_)
+        ));
+        // And stale again: failed again. Proven is never remembered from one call to the next.
+        assert_eq!(
+            why(call(&mut s, &sid, &chal, 4, false, &none)),
+            ProofFailure::NoLease
+        );
+    }
+
+    /// A session whose chain is revoked is closed to proof and kept: a call that still
+    /// proves the key is recorded as that agent's, failed, with what was revoked.
+    #[test]
+    fn a_revoked_session_is_kept_as_a_marker_and_says_what_was_revoked() {
+        let none = RevocationSet::default();
+        for (what, expected) in [
+            (
+                vec![(Revocable::Mandate, "m-1")],
+                ProofFailure::MandateRevoked,
+            ),
+            (
+                vec![(Revocable::Key, "issuer-1")],
+                ProofFailure::MandateRevoked,
+            ),
+            (
+                vec![(Revocable::Agent, "triage-bot")],
+                ProofFailure::AgentRevoked,
+            ),
+            (
+                vec![(Revocable::Key, "agent-key-1")],
+                ProofFailure::KeyRevoked,
+            ),
+            // The nearest thing revoked is the one named: the key, then the agent.
+            (
+                vec![
+                    (Revocable::Mandate, "m-1"),
+                    (Revocable::Agent, "triage-bot"),
+                ],
+                ProofFailure::AgentRevoked,
+            ),
+            (
+                vec![
+                    (Revocable::Agent, "triage-bot"),
+                    (Revocable::Key, "agent-key-1"),
+                ],
+                ProofFailure::KeyRevoked,
+            ),
+        ] {
+            let mut s = sessions();
+            let m = mandate(&agent(), NOW + 3600);
+            let (sid, chal) = s
+                .open(&m, &ask(&agent(), "gate-1", "n-1", NOW), NOW)
+                .unwrap();
+            assert!(matches!(
+                call(&mut s, &sid, &chal, 1, true, &none),
+                Proved::Proven(_)
+            ));
+            // Something else is revoked: this session is untouched.
+            let other = revoked(&[(Revocable::Mandate, "m-2")]);
+            assert_eq!(s.revoke(&other, NOW), 0);
+            assert!(matches!(
+                call(&mut s, &sid, &chal, 2, true, &other),
+                Proved::Proven(_)
+            ));
+
+            let set = revoked(&what);
+            assert_eq!(s.revoke(&set, NOW), 1, "{what:?}");
+            // Marked once: telling it again closes nothing more.
+            assert_eq!(s.revoke(&set, NOW), 0);
+            assert_eq!(s.len(), 1, "the session is kept");
+            let after = call(&mut s, &sid, &chal, 3, true, &set);
+            assert_eq!(who(&after), Some(id("triage-bot")), "{what:?}");
+            assert_eq!(why(after), expected, "{what:?}");
+            // A proof that does not hold keeps its own reason.
+            let d = action(4, 4);
+            let forged = s.prove_with(
+                &sid,
+                &Call {
+                    proof: Some(&proof(&key("agent-key-1", 99), &sid, &chal, 4, &d)),
+                    salt: Some(&[4; 32]),
+                    digest: &d,
+                    canonical: true,
+                },
+                NOW,
+                Some(&Trust {
+                    fresh: true,
+                    revoked: &set,
+                }),
+            );
+            assert_eq!(why(forged), ProofFailure::BadSignature);
+            // Revoked beats a stale lease: the reason that will not go away is the one said.
+            assert_eq!(why(call(&mut s, &sid, &chal, 5, false, &set)), expected);
+            // No new session is opened for it.
+            let again = ask(&agent(), "gate-1", "n-2", NOW);
+            let trust = Trust {
+                fresh: true,
+                revoked: &set,
+            };
+            assert_eq!(
+                s.open_with(&m, &again, NOW, Some(&trust)),
+                Err(OpenRefused::Invalid)
+            );
+            assert_eq!(s.refusals().get(why::REVOKED), Some(&1));
+        }
+    }
+
+    /// A marker lives only as long as its session would have, and takes no proven
+    /// session's place.
+    #[test]
+    fn a_marker_does_not_outlive_its_session_or_push_one_out() {
+        let none = RevocationSet::default();
+        let set = revoked(&[(Revocable::Mandate, "m-1")]);
+        // Never proven before it was revoked: gone when an unproven session would be.
+        let mut s = sessions();
+        let m = mandate(&agent(), NOW + 3600);
+        let (sid, chal) = s
+            .open(&m, &ask(&agent(), "gate-1", "n-1", NOW), NOW)
+            .unwrap();
+        assert_eq!(s.revoke(&set, NOW), 1);
+        assert_eq!(
+            why(call(&mut s, &sid, &chal, 1, true, &set)),
+            ProofFailure::MandateRevoked
+        );
+        // Its call did not make it a proven session.
+        assert_eq!(s.revoke(&none, NOW + 31), 0);
+        assert!(
+            s.is_empty(),
+            "an unproven marker is swept with the unproven"
+        );
+
+        // Proven sessions of the same key are not closed to make room for a marker's calls.
+        let mut s = sessions();
+        let mut proven = Vec::new();
+        for n in 1..=4u64 {
+            let request = ask(&agent(), "gate-1", &format!("p-{n}"), NOW);
+            let (sid, chal) = s.open(&m, &request, NOW).unwrap();
+            assert!(matches!(
+                call(&mut s, &sid, &chal, n, true, &none),
+                Proved::Proven(_)
+            ));
+            proven.push((sid, chal));
+        }
+        assert_eq!(s.len(), 4);
+        let request = ask(&agent(), "gate-1", "late", NOW);
+        let (late, chal) = s.open(&m, &request, NOW).unwrap();
+        assert_eq!(s.revoke(&set, NOW), 5);
+        for n in 10..=14u64 {
+            assert_eq!(
+                why(call(&mut s, &late, &chal, n, true, &set)),
+                ProofFailure::MandateRevoked
+            );
+        }
+        assert_eq!(s.len(), 5, "nothing was pushed out");
+        // Each of the four still answers as the agent's, revoked.
+        for (n, (sid, chal)) in proven.iter().enumerate() {
+            let n = 20 + u64::try_from(n).unwrap();
+            assert_eq!(
+                why(call(&mut s, sid, chal, n, true, &set)),
+                ProofFailure::MandateRevoked
+            );
+        }
+    }
+
+    /// The gate takes another bundle: a session whose chain still holds under it goes on,
+    /// one that no longer does is dropped, and a marker stays whatever the bundle says.
+    #[test]
+    fn a_new_bundle_drops_the_sessions_it_no_longer_covers_and_keeps_markers() {
+        use gov_core::mandate::Template;
+        let none = RevocationSet::default();
+        let template = |name: &str, resource: &str| Template {
+            id: id(name),
+            grants: vec![Grant {
+                system: id("jira"),
+                operations: [id("issue.update")].into(),
+                resources: vec![ResourcePattern::new(resource).unwrap()],
+            }],
+            max_life_secs: 8 * 3600,
+            limits: Limits::default(),
+            delegable: false,
+            people: Default::default(),
+            receivers: Default::default(),
+        };
+        let issuers = || KeySet::new([issuer().public()]);
+        let m = mandate(&agent(), NOW + 3600);
+        let opened = |s: &mut Sessions, n: &str| {
+            let (sid, chal) = s.open(&m, &ask(&agent(), "gate-1", n, NOW), NOW).unwrap();
+            assert!(matches!(
+                call(s, &sid, &chal, 1, true, &none),
+                Proved::Proven(_)
+            ));
+            (sid, chal)
+        };
+
+        // The same issuers and a template that still covers the mandate: nothing changes.
+        let mut s = sessions();
+        let (sid, chal) = opened(&mut s, "n-1");
+        let same = Some(vec![template("triage", "jira/project/pay/*")]);
+        assert_eq!(s.rebundle(issuers(), same, &none, NOW), 0);
+        assert!(matches!(
+            call(&mut s, &sid, &chal, 2, true, &none),
+            Proved::Proven(_)
+        ));
+
+        // The template is gone, is narrower, or the issuer's key is no longer listed: the
+        // session is dropped, and its next call is an unknown session.
+        for (what, keys, templates) in [
+            ("no template", issuers(), Some(Vec::new())),
+            (
+                "a narrower template",
+                issuers(),
+                Some(vec![template("triage", "jira/project/pay/issue/pay-1")]),
+            ),
+            (
+                "another issuer",
+                KeySet::new([key("issuer-2", 2).public()]),
+                Some(vec![template("triage", "jira/project/pay/*")]),
+            ),
+        ] {
+            let mut s = sessions();
+            let (sid, chal) = opened(&mut s, "n-1");
+            assert_eq!(s.rebundle(keys, templates, &none, NOW), 1, "{what}");
+            assert!(!s.holds(&sid) && s.is_empty(), "{what}");
+            let after = call(&mut s, &sid, &chal, 2, true, &none);
+            assert_eq!(who(&after), None, "{what}");
+            assert_eq!(why(after), ProofFailure::UnknownSession, "{what}");
+            // And a new one is held to the new bundle.
+            let again = ask(&agent(), "gate-1", "n-2", NOW);
+            assert_eq!(s.open(&m, &again, NOW), Err(OpenRefused::Invalid), "{what}");
+        }
+
+        // A marker is kept: it still says whose call it was and what was revoked, even
+        // under a bundle that would no longer open a session for its mandate.
+        let mut s = sessions();
+        let (sid, chal) = opened(&mut s, "n-1");
+        let set = revoked(&[(Revocable::Mandate, "m-1")]);
+        assert_eq!(s.revoke(&set, NOW), 1);
+        assert_eq!(s.rebundle(issuers(), Some(Vec::new()), &set, NOW), 0);
+        assert!(s.holds(&sid));
+        assert_eq!(
+            why(call(&mut s, &sid, &chal, 2, true, &set)),
+            ProofFailure::MandateRevoked
+        );
+        // Revoked, and its issuer's key retired in the same bundle, as after a key is
+        // taken: still a marker with its reason, not an unknown session (finding GR-182).
+        let mut s = sessions();
+        let (sid, chal) = opened(&mut s, "n-1");
+        let other = KeySet::new([key("issuer-2", 2).public()]);
+        let same = Some(vec![template("triage", "jira/project/pay/*")]);
+        assert_eq!(s.rebundle(other, same, &set, NOW), 0);
+        assert!(s.holds(&sid));
+        assert_eq!(
+            why(call(&mut s, &sid, &chal, 2, true, &set)),
+            ProofFailure::MandateRevoked
+        );
+        // What a new bundle's arrival also revokes is marked in the same step.
+        let mut s = sessions();
+        let (sid, chal) = opened(&mut s, "n-1");
+        let same = Some(vec![template("triage", "jira/project/pay/*")]);
+        assert_eq!(s.rebundle(issuers(), same, &set, NOW), 0);
+        assert_eq!(
+            why(call(&mut s, &sid, &chal, 2, true, &set)),
+            ProofFailure::MandateRevoked
+        );
+    }
+
+    /// A marker is not among the proven sessions that are closed to make room for a new
+    /// one: its calls would then lose the agent's name (review finding GR-180). The agent
+    /// goes on working under another mandate, and the old session still says what it is.
+    #[test]
+    fn a_marker_is_not_closed_to_make_room_for_new_sessions() {
+        let none = RevocationSet::default();
+        let set = revoked(&[(Revocable::Mandate, "m-1")]);
+        let mut s = sessions();
+        // A session under the first mandate proves a call, and the mandate is revoked.
+        let old = mandate(&agent(), NOW + 3600);
+        let (marker, marker_chal) = s
+            .open(&old, &ask(&agent(), "gate-1", "n-1", NOW), NOW)
+            .unwrap();
+        assert!(matches!(
+            call(&mut s, &marker, &marker_chal, 1, true, &none),
+            Proved::Proven(_)
+        ));
+        assert_eq!(s.revoke(&set, NOW), 1);
+
+        // The same key opens and proves as many sessions as a key may hold, and one more,
+        // under a second mandate. Each proof is for that mandate and that session.
+        let new = mandate_named("m-2", &agent(), NOW + 3600);
+        let mut sessions_of_new = Vec::new();
+        for n in 0..5u64 {
+            let request = seal(
+                &SessionOpen {
+                    v: 1,
+                    tenant: id("acme"),
+                    env: id("prod"),
+                    gate: id("gate-1"),
+                    mandate: id("m-2"),
+                    nonce: id(&format!("m2-{n}")),
+                    at: NOW,
+                },
+                &agent(),
+            )
+            .unwrap();
+            let trust = Trust {
+                fresh: true,
+                revoked: &set,
+            };
+            let (sid, chal) = s.open_with(&new, &request, NOW, Some(&trust)).unwrap();
+            let d = action(100 + n, 50);
+            let good = seal(
+                &RequestProof {
+                    v: 1,
+                    tenant: id("acme"),
+                    env: id("prod"),
+                    gate: id("gate-1"),
+                    session: sid.clone(),
+                    challenge: chal.clone(),
+                    counter: 1,
+                    mandate: id("m-2"),
+                    action_digest: d.clone(),
+                },
+                &agent(),
+            )
+            .unwrap();
+            let proved = s.prove_with(
+                &sid,
+                &Call {
+                    proof: Some(&good),
+                    salt: Some(&[50; 32]),
+                    digest: &d,
+                    canonical: true,
+                },
+                // Each a second after the last, so that "unused longest" has an order.
+                NOW + i64::try_from(n).unwrap(),
+                Some(&trust),
+            );
+            assert!(matches!(proved, Proved::Proven(_)), "session {n}");
+            sessions_of_new.push(sid);
+        }
+        // Four proven sessions are kept for the key, and the oldest of the five made room.
+        assert!(!s.holds(&sessions_of_new[0]));
+        assert!(sessions_of_new[1..].iter().all(|sid| s.holds(sid)));
+        // The marker was older than all of them, and is still there, saying what it is.
+        assert!(s.holds(&marker));
+        let after = call(&mut s, &marker, &marker_chal, 2, true, &set);
+        assert_eq!(who(&after), Some(id("triage-bot")));
+        assert_eq!(why(after), ProofFailure::MandateRevoked);
+    }
 }

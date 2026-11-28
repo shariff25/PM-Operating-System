@@ -12,8 +12,9 @@ use serde_json::Value;
 
 use crate::action::{CanonicalAction, Kind, Reversal, Salt};
 use crate::error::{Error, Result};
-use crate::ids::{Digest, Id, ResourcePath};
+use crate::ids::{Digest, Id, ResourcePath, ResourcePattern};
 use crate::jcs;
+use crate::label::{Confidentiality, Integrity};
 
 /// The digest that pins a tool: SHA-256 over the canonical form of its whole definition, as
 /// the server lists it. Every field is covered, so text added anywhere in a definition makes
@@ -157,6 +158,36 @@ pub struct ToolMap {
     /// (spec §4.7; review finding GR-35).
     pub outward: bool,
     pub resource: ResourceTemplate,
+    /// Whether what the tool returns can be trusted to steer an agent (access governance
+    /// spec, CG-4). Left out, it cannot: see [`ToolMap::results`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub results: Option<Integrity>,
+}
+
+impl ToolMap {
+    /// The integrity of what the tool returns. A tool nobody marked returns text that may
+    /// have been written by anyone.
+    pub fn results(&self) -> Integrity {
+        self.results.unwrap_or(Integrity::Untrusted)
+    }
+}
+
+/// How confidential the resources under a pattern are.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceLabel {
+    pub resources: ResourcePattern,
+    pub confidentiality: Confidentiality,
+}
+
+/// Who can see what is sent to the resources under a pattern: the most confidential thing
+/// that may go there. It covers every kind of call, a read as much as a write, since a
+/// read sends its arguments somewhere too (review finding GR-144).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceClearance {
+    pub resources: ResourcePattern,
+    pub clearance: Confidentiality,
 }
 
 /// One upstream server and the system it fronts.
@@ -171,6 +202,13 @@ pub struct ServerMap {
     #[serde(default)]
     pub fold_case: bool,
     pub tools: Vec<ToolMap>,
+    /// How confidential the system's resources are (CG-4). See
+    /// [`ServerMap::confidentiality_of`] for one that no entry covers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<ResourceLabel>,
+    /// What may be sent where (CG-4). See [`ServerMap::clearance_of`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clearances: Vec<ResourceClearance>,
 }
 
 /// A call, mapped.
@@ -182,6 +220,14 @@ pub struct Mapped {
     /// False when the map does not know the tool, or the tool has changed since it was
     /// mapped. The action then has a kind of `unknown`, which nothing may enforce on.
     pub known: bool,
+}
+
+/// The operation a call is recorded under when the map cannot read it: a digest of the
+/// tool's name, never the name. Whoever holds a server's listing can work out which tool
+/// a recorded operation stands for; nobody else can read a name out of a receipt.
+pub fn unmapped_operation(tool: &str) -> Id {
+    let name = Digest::of(&[b"gov.toolname.v1\0", tool.as_bytes()]);
+    Id::new(&format!("unmapped-{}", &name.as_str()[..16])).expect("hex digits are an identifier")
 }
 
 impl ServerMap {
@@ -213,7 +259,62 @@ impl ServerMap {
                 return Err(Error::Malformed("a read is neither reversible nor outward"));
             }
         }
+        // Labels and clearances are held to what a rule's patterns are: inside this system,
+        // in lower case where the system folds, and said once.
+        let patterns = self
+            .labels
+            .iter()
+            .map(|l| &l.resources)
+            .chain(self.clearances.iter().map(|c| &c.resources));
+        for pattern in patterns {
+            if pattern.system() != self.system.as_str() {
+                return Err(Error::Malformed("a label's resource is not in its system"));
+            }
+            let text = String::from(pattern.clone());
+            if self.fold_case && text != text.to_ascii_lowercase() {
+                return Err(Error::Malformed(
+                    "a folded system's patterns are lower case",
+                ));
+            }
+        }
+        let mut labelled = BTreeSet::new();
+        let mut cleared = BTreeSet::new();
+        if !self
+            .labels
+            .iter()
+            .all(|l| labelled.insert(String::from(l.resources.clone())))
+            || !self
+                .clearances
+                .iter()
+                .all(|c| cleared.insert(String::from(c.resources.clone())))
+        {
+            return Err(Error::Malformed("a pattern is labelled twice"));
+        }
         Ok(())
+    }
+
+    /// How confidential `resource` is: the most closely held of every entry that covers it.
+    /// One that no entry covers is taken for the most closely held there is, so a resource
+    /// nobody labelled raises a label as far as it goes and never slips through as public.
+    pub fn confidentiality_of(&self, resource: &ResourcePath) -> Confidentiality {
+        self.labels
+            .iter()
+            .filter(|l| l.resources.covers(resource))
+            .map(|l| l.confidentiality)
+            .max()
+            .unwrap_or(Confidentiality::Restricted)
+    }
+
+    /// The most confidential thing that may be sent to `resource`: the lowest of every
+    /// entry that covers it. One that no entry covers is cleared for nothing but what is
+    /// public.
+    pub fn clearance_of(&self, resource: &ResourcePath) -> Confidentiality {
+        self.clearances
+            .iter()
+            .filter(|c| c.resources.covers(resource))
+            .map(|c| c.clearance)
+            .min()
+            .unwrap_or(Confidentiality::Public)
     }
 
     /// Map one call. `listed` is the digest of the tool's definition as the server listed it
@@ -258,9 +359,7 @@ impl ServerMap {
         // the caller or the server, and a receipt holds no text either could choose (T17,
         // review finding GR-71). The resource says only that it was not mapped. The worst is
         // assumed of it.
-        let name = Digest::of(&[b"gov.toolname.v1\0", tool.as_bytes()]);
-        let operation = Id::new(&format!("unmapped-{}", &name.as_str()[..16]))
-            .expect("hex digits are an identifier");
+        let operation = unmapped_operation(tool);
         let resource = ResourcePath::new(&format!("{}/unmapped", self.system))
             .expect("a system and a word are a resource");
         Mapped {

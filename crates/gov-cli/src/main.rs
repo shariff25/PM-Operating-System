@@ -1,6 +1,8 @@
-//! `gov`: Agent Governance's command line. For now one command, `gov verify`, which an
-//! auditor runs with nothing but files: the public keys, the witness's checkpoints and an
-//! export of receipts. It opens no database and no network connection.
+//! `gov`: Agent Governance's command line. `gov verify` is what an auditor runs with nothing
+//! but files: the public keys, the witness's checkpoints and an export of receipts.
+//! `gov policy check` and `gov policy sign` are the release step for policy (spec §7.6.1):
+//! the first needs no key, the second runs wherever the root key is kept. No command here
+//! opens a database or a network connection.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -54,6 +56,90 @@ enum Command {
         #[arg(long)]
         gate_quiet: Option<u32>,
     },
+    /// Check and sign the policy bundle.
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommand,
+    },
+    /// Build a connector map from a server's tool listing and its review, and see what a
+    /// server has changed since.
+    Map {
+        #[command(subcommand)]
+        command: MapCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum MapCommand {
+    /// Join a server's tool listing and the review of it into a connector map. Refuses
+    /// unless every listed tool is reviewed or set aside by name with a reason.
+    Build {
+        /// The server's answer to `tools/list`, as it gave it.
+        #[arg(long)]
+        listing: PathBuf,
+        /// The review: what each tool is, and which are left out and why.
+        #[arg(long)]
+        review: PathBuf,
+        /// Where the map is written.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Report tools a server has added, removed or changed since a map was reviewed. Exits
+    /// with failure when anything has.
+    Drift {
+        /// The server's answer to `tools/list` now.
+        #[arg(long)]
+        listing: PathBuf,
+        #[arg(long)]
+        map: PathBuf,
+        /// The review the map was built from, so tools it set aside are not reported as new.
+        #[arg(long)]
+        review: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum PolicyCommand {
+    /// Build the bundle from a policy directory and run every check a gate would, and each
+    /// connector map's sample calls. Needs no key.
+    Check {
+        /// The policy directory, as checked out from the reviewed repository.
+        #[arg(long)]
+        dir: PathBuf,
+        /// The time the bundle would carry, in seconds since the epoch. Defaults to now.
+        #[arg(long)]
+        issued_at: Option<i64>,
+    },
+    /// Check a policy directory, show what changed since the bundle before, and sign it
+    /// with the root key. The directory must come from the reviewed repository, never from
+    /// the Authority's machine.
+    Sign {
+        /// The policy directory, as checked out from the reviewed repository.
+        #[arg(long)]
+        dir: PathBuf,
+        /// The root key's file. It signs bundles and nothing else.
+        #[arg(long)]
+        root_key: PathBuf,
+        /// The bundle's number: 1 for the first, then one more each time.
+        #[arg(long)]
+        number: u64,
+        /// The signed bundle before this one. Required for every number but 1.
+        #[arg(long)]
+        previous: Option<PathBuf>,
+        /// The time the bundle carries, in seconds since the epoch. Given, not read from
+        /// this machine's clock, so that a second person who builds the bundle from the same
+        /// commit with the same number and time gets the same digest (for example the
+        /// commit's own time).
+        #[arg(long)]
+        issued_at: i64,
+        /// Where the signed bundle is written. It must not exist yet.
+        #[arg(long)]
+        out: PathBuf,
+        /// Sign without asking. The changes are still printed. Only for a release step in
+        /// which a person has already been shown these changes elsewhere and agreed to them.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 fn describe(problem: &Problem) -> String {
@@ -103,8 +189,17 @@ fn describe(problem: &Problem) -> String {
         Problem::KeyNotEnrolled => {
             "a trusted key of this gate matches no witnessed record of its enrolment".into()
         }
+        Problem::MandateNotIssued => {
+            "a proven receipt names a mandate no witnessed record says was issued".into()
+        }
         Problem::ReceiptAfterRetirement => {
-            "a receipt is dated after its gate was disabled or its key revoked".into()
+            "a receipt under a disabled gate's or revoked key is not shown to be earlier than that: no checkpoint covered it before one covered the retirement".into()
+        }
+        Problem::SessionNotBorneOut => {
+            "a record says its actor was signed in, and no earlier sign-in of that person still in force bears it out".into()
+        }
+        Problem::RecordUnderReplacedKey => {
+            "an Authority's record is signed with a key its chain says was replaced".into()
         }
     }
 }
@@ -148,6 +243,138 @@ fn print(report: &Report) {
     }
 }
 
+fn map(command: MapCommand) -> anyhow::Result<bool> {
+    use gov_run::maps;
+    match command {
+        MapCommand::Build {
+            listing,
+            review,
+            out,
+        } => {
+            let listing = maps::read_listing(&listing)?;
+            let review = maps::read_review(&review)?;
+            let built = maps::build(&listing, &review)?;
+            std::fs::write(&out, serde_json::to_vec_pretty(&built)?)
+                .with_context(|| format!("{} cannot be written", out.display()))?;
+            println!(
+                "{}: {} tools mapped, {} set aside, of {} the server lists.",
+                built.server,
+                built.tools.len(),
+                review.unmapped.len(),
+                listing.len()
+            );
+            Ok(true)
+        }
+        MapCommand::Drift {
+            listing,
+            map,
+            review,
+        } => {
+            let listing = maps::read_listing(&listing)?;
+            let map = maps::read_map(&map)?;
+            let set_aside = match review {
+                Some(path) => maps::read_review(&path)?.unmapped.into_keys().collect(),
+                None => Default::default(),
+            };
+            let drift = maps::drift(&listing, &map, &set_aside)?;
+            for (what, tools) in [
+                ("added", &drift.added),
+                ("removed", &drift.removed),
+                ("changed", &drift.changed),
+            ] {
+                for tool in tools {
+                    // What a gate records a call to it as, and counts it under for its
+                    // operator, until the map is reviewed again.
+                    let recorded = gov_core::connector::unmapped_operation(tool);
+                    println!("{what}: {tool} (a call is recorded as {recorded})");
+                }
+            }
+            if drift.none() {
+                println!("No drift: {} tools as reviewed.", drift.unchanged);
+            } else {
+                println!(
+                    "Drift: {} added, {} removed, {} changed, {} as reviewed. A changed or new tool is recorded as unknown until the map is reviewed again.",
+                    drift.added.len(),
+                    drift.removed.len(),
+                    drift.changed.len(),
+                    drift.unchanged
+                );
+            }
+            Ok(drift.none())
+        }
+    }
+}
+
+fn policy(command: PolicyCommand) -> anyhow::Result<bool> {
+    use gov_run::policy_dir;
+    match command {
+        PolicyCommand::Check { dir, issued_at } => {
+            let checked = policy_dir::check(&dir, 1, issued_at.unwrap_or_else(gov_run::now))?;
+            println!(
+                "The policy passes its checks: {} rules, {} connector maps, {} sample calls.",
+                checked.bundle.rules.len(),
+                checked.bundle.connectors.len(),
+                checked.samples
+            );
+            Ok(true)
+        }
+        PolicyCommand::Sign {
+            dir,
+            root_key,
+            number,
+            previous,
+            issued_at,
+            out,
+            yes,
+        } => {
+            anyhow::ensure!(issued_at > 0, "--issued-at is seconds since the epoch");
+            anyhow::ensure!(
+                !out.exists(),
+                "{} exists already; a signed bundle is never written over",
+                out.display()
+            );
+            let root = gov_run::read_key(&root_key)?;
+            let previous: Option<gov_core::Envelope> = previous
+                .map(|path| {
+                    let bytes = std::fs::read(&path).context("reading --previous")?;
+                    serde_json::from_slice(&bytes).context("--previous is not a signed bundle")
+                })
+                .transpose()?;
+            let prepared =
+                policy_dir::prepare(&dir, &root.public(), number, previous.as_ref(), issued_at)?;
+            println!(
+                "Bundle {number} for {}/{}, checked ({} sample calls). Since the bundle before:",
+                prepared.bundle.tenant, prepared.bundle.env, prepared.samples
+            );
+            for line in policy_dir::describe(&prepared.changes) {
+                println!("  {line}");
+            }
+            if !yes {
+                println!("Type yes to sign this with the root key:");
+                let mut answer = String::new();
+                std::io::stdin().read_line(&mut answer)?;
+                if answer.trim() != "yes" {
+                    println!("Not signed.");
+                    return Ok(false);
+                }
+            }
+            let (envelope, opened) = policy_dir::sign(&prepared, &root)?;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&out)
+                .with_context(|| format!("{} cannot be created", out.display()))?;
+            std::io::Write::write_all(&mut file, &serde_json::to_vec(&envelope)?)?;
+            file.sync_all()?;
+            println!(
+                "Signed. Digest: {}\nCompare it with the digest the Authority reports when this is published.",
+                opened.digest.as_str()
+            );
+            Ok(true)
+        }
+    }
+}
+
 fn run(cli: Cli) -> anyhow::Result<bool> {
     let Command::Verify {
         tenant,
@@ -160,7 +387,14 @@ fn run(cli: Cli) -> anyhow::Result<bool> {
         retention_days,
         clock_skew,
         gate_quiet,
-    } = cli.command;
+    } = cli.command
+    else {
+        return match cli.command {
+            Command::Policy { command } => policy(command),
+            Command::Map { command } => map(command),
+            Command::Verify { .. } => unreachable!("matched above"),
+        };
+    };
     let now = now.or_else(|| {
         let since = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

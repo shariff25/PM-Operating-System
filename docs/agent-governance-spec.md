@@ -365,8 +365,384 @@ reviewer.
   the check is not made, as before; if the Authority's chain were pruned past an enrolment,
   the key would be reported, so that chain is not to be pruned; the comparison of dates is
   between two clocks and is only as fine as `--clock-skew`.
+- **G4b built (2026-11-26), from §7.6.1 after the sixteenth read; not yet read by the
+  reviewer.** The signed policy bundle, in four steps on `build/gov-g4b`:
+  - *the format* (`gov-core`): a number that rises, the online keys by role, a bundle that
+    opens under the root key alone and may not list its own signer, the rule that a gate
+    does not go back, and the list of what changed between two bundles;
+  - *the release step* (`gov policy check`, `gov policy sign`; `gov-run`'s `policy_dir`): a
+    policy directory of JSON files with sample calls for every connector map; the signer
+    runs the check itself, is shown what changed since the bundle before, and the digest
+    signed is printed;
+  - *publishing* (`gov-authority`): only the next number, only under the root key, kept
+    with a `PolicyPublished` record of its digest; and an agent and a gate may not share a
+    name (GR-127);
+  - *the programs*: `gov-gate` and `gov-shim` take `--bundle`, `--root-key`,
+    `--bundle-state` and `--server`; the unsigned files work only with
+    `--unsigned-policy-for-tests` and fake data; every receipt carries the bundle's number
+    and the start of its digest, or `unsigned`.
+  Run as three programs on a signed bundle with fake data, an agent's call through the shim
+  is recorded as proven and the auditor's check passes; a gate started on an older bundle,
+  or on another under the same number, does not start. Sixty controls removed one at a
+  time; each removal fails a test, but one of two overlapping guards against writing over
+  a signed bundle.
+  **Limits, and what is not built:** the bundle reaches a gate as a file an operator
+  copies, read at start (fetching it, and changing it without a restart, come with the
+  lease in G4d); two bundles under one number stops a program from starting and is not yet
+  counted anywhere an operator's dashboard reads; with no state file any validly signed
+  bundle is taken (GR-132); the bundle's rules are still not evaluated against a call
+  (G5); the `mandates` keys are a test issuer's until G4c; nothing checks that a bundle a
+  gate ran on was published by the Authority (`gov verify` reporting a policy version with
+  no `PolicyPublished` record is not written); the `gov` command now links the programs'
+  library to read a key file, though no command of it opens a network connection.
+- **G4c built (2026-11-27), from §7.6.2 after the eighteenth read; not yet read by the
+  reviewer.** Mandates from the Authority, on `build/gov-g4c`:
+  - *templates* are in the root-signed bundle, shown to the signer like rules, and a gate
+    holds every chain's root mandate to the template of that name in the bundle it holds
+    (GR-138); a child stays under its parent's template;
+  - *issuing*: to the agent's owner or a person the template names, from the latest
+    published bundle, signed with a key that bundle lists for mandates, checked as a gate
+    would check it, and written with its `MandateIssued` record in one step. The mandate
+    carries no session, since nobody is signed in before G4e;
+  - *delegating*: at the signed request (`gov.delegate.v1`) of the agent holding the
+    parent, narrower, to an agent whose owner is the person at the root or one the template
+    names, once;
+  - *listing* by ownership, *revoking* by the issuer, the owner or an admin, and the
+    numbered *revocation feed* (`gov.revocations.v1`) signed with the leases key;
+  - `gov verify`, with an Authority named, reports a proven receipt whose mandate no
+    witnessed record says was issued.
+  Run as three programs with fake data, the agent's mandate is now the Authority's and not
+  a test issuer's: its call is recorded as proven, and a mandate signed with the same
+  mandates key but wider than its template is not. About fifty controls removed one at a
+  time; each removal fails a test, after two that only repeated the chain check were taken
+  out.
+  **Departures from §7.6.2, and limits:**
+  - "The same request is never served twice" is kept by taking the child mandate's id from
+    the request's own hash, not by remembering nonces: a second copy asks for an id that
+    exists.
+  - Stopping an agent revokes its mandates as separate records, not in one step with
+    the record that stops it: once **before** that record, so a stop halfway leaves an
+    agent with less authority than it should have, and once **after** it, for a mandate
+    issued while the first round ran (GR-152, fixed after the twentieth read). Asking
+    again for a stop that was interrupted finishes it.
+  - The Authority is still a library. The gate does not read the revocation feed, so a
+    revoked mandate still opens a session until G4d; nothing is served until G4e.
+  - A call under a mandate the gate will not open a session for is forwarded, as
+    everything is in observe mode, and recorded as a client's bare claim, not as a failed
+    proof. The marker for such calls is G4d's (§7.6, choice 5).
+  - Limits are carried and compared, not yet charged (G6). A mandate's grants are not
+    yet checked against a call (G5).
 - One more test on both of the Ledger's stores (a chain holds one kind of document), and
   two with an Authority and a Ledger together.
+- **CM1, first map, and CM2's command built (2026-11-27), on `build/gov-cm1`; not yet read
+  by the reviewer.** The library is `governance/maps/` (its `README.md` says what a map
+  claims). A map is built, never written by hand: `gov map build` joins the server's own
+  `tools/list` answer with a review file, and refuses unless every listed tool is reviewed
+  or set aside by name with a reason. `gov map drift` names tools a later listing added,
+  removed or changed in any field, and exits non-zero.
+  - **Jira:** `mcp-atlassian` 0.24.8, 63 Jira tools, all mapped. The listing was got by
+    starting the server with made-up settings; **no Jira was contacted and no tool has
+    been run against one, so the map is not verified**, only reviewed against the listing.
+  - Choices a reader should know: an issue is placed in the project its own key names;
+    `jira_update_issue` is mapped as not undoable and reaching outside, because one call
+    can also comment, move the issue through its workflow and attach files;
+    `jira_move_issue` and `jira_delete_issue` are destructive; a search, and every tool
+    that takes a list of issues, has a resource of its own outside any project, so a grant
+    on one project never reaches it.
+  - **Limits:** `jira_move_issue` names its target project in an argument the resource
+    does not carry, and `jira_create_issue_link` and `jira_add_issues_to_sprint` can name
+    issues of other projects: a grant on the source is enough for each. A resource holds
+    one place; a rule on a second argument waits for G5.
+  - Eleven controls of the builder and the drift check removed one at a time; each
+    removal fails a test.
+  - **GitHub:** `github-mcp-server` v1.14.0 with every toolset, 91 tools, all mapped.
+    **Slack:** `@modelcontextprotocol/server-slack` 2025.4.25, 8 tools, all mapped. Both
+    listings were got with a made-up token and no network: **neither map is verified.**
+  - GitHub choices: a call is held to the repository its `owner` and `repo` name, and no
+    finer, because an issue's or a pull request's number is not a string a resource can
+    be built from; a tool with several methods is mapped as the widest (so
+    `pull_request_review_write`, which can approve, and `actions_run_trigger`, which runs
+    whatever a workflow holds, are destructive and reach outside); searches, projects,
+    rulesets, gists and notifications have resources outside any repository. The review
+    and the server's own read-only hint agree on all 91 tools, and a test holds them to it.
+  - Slack choices: every tool that posts reaches people; a channel is its id, and a
+    channel given by name is recorded as unknown.
+  - **CM2's count:** the gate's operator address shows `unmapped_by_tool`: calls the map
+    could not read, by the operation each was recorded under (`unmapped-` and a digest of
+    the tool's name). `gov map drift` prints the same name beside each tool it reports,
+    so an operator can tell which tool a count is for. The count holds 256 names and
+    adds the rest together; it is lost at a restart (the receipts are not).
+- **G4d-1 built (2026-11-27), from §7.6.3 points 1 to 3 after the twenty-second read; not
+  yet read by the reviewer.** Libraries only, on `build/gov-g4d1`: nothing is served and
+  no gate uses it yet.
+  - *The renewal* (`gov-core/src/renew.rs`): `gov.renew.v1`, signed with the gate's key,
+    with its name, the Authority's name, a fresh nonce, the bundle held and the
+    revocation number read through. It carries no time.
+  - *The Authority's answer* (`Authority::renew`): a lease with the request's nonce, the
+    Authority's time, the latest bundle's version and the newest revocation number, good
+    for the bundle's own `standard` limit; the feed from the number the gate named; the
+    bundle unless the gate says it holds that very one. Only a key enrolled for a gate,
+    asking in that gate's own name, for this Authority, while the gate is not disabled,
+    is answered; anyone else gets a bare refusal. One answer a second for each gate. It
+    writes nothing and makes no record.
+  - *What a gate holds and checks* (`Standing`, `Standing::take`): the checks of point 2,
+    in that order, with a closed list of reasons for the operator (`bundle`,
+    `bundle_older`, `bundle_forked`, `wrong_bundle`, `lease`, `not_this_request`,
+    `authority_behind`, `feed`). An answer that fails any check changes nothing. The
+    gate's time is the lease's plus its own count since the request left; a lease is
+    fresh for as long as it says.
+  - Run together on both of the Authority's stores: a first renewal brings the bundle; a
+    revoked mandate and a disabled agent reach the gate's revoked set; a new bundle
+    arrives with its lease; a gate started again is told everything from nothing; a
+    disabled gate is not answered. An Authority put back from an older copy, or with its
+    clock set back, is refused as `authority_behind` and taken again once it has caught
+    up. 23 controls removed one at a time; each removal fails a test.
+  - **Departures and limits.** (1) "At most once a second" compares for the same second
+    only: an Authority whose clock was set back still answers, so that the gate can say
+    it is behind. (2) A gate that names a higher revocation number than the Authority
+    has is answered from where the Authority stands, not refused, for the same reason.
+    (3) The lease names the bundle by `<number>-<first 16 hex of its digest>`, the
+    version a receipt carries, not by the whole digest; the bundle itself is opened
+    under the root key before it is compared. (4) A gate's revoked key is not yet
+    refused a renewal: no key can be revoked before G4d-4. (5) The limit of one answer a
+    second is kept in memory and is each Authority process's own.
+  - **How long "proven" lags a revocation** (GR-176). A lease is good for the bundle's
+    `standard` limit, 120 seconds unless the bundle says otherwise. Until the gate's next
+    renewal brings the feed, or the lease runs out, a revoked agent's calls are still
+    recorded as proven: for at most that limit after the revocation, and in practice for
+    the time between two renewals. A proven receipt is to be read with that delay in mind.
+- **G4d-2 built (2026-11-27), from §7.6.3 points 4 to 6; not yet read by the reviewer.**
+  On `build/gov-g4d2`. The gate program is not wired to an Authority yet (G4d-5): this is
+  the gate's library, run in tests with answers made by hand.
+  - *The gate's time.* With a lease held, "now" for sessions and receipts is the lease's
+    time counted on by the gate's own clock, and every receipt from the first lease on
+    carries `at_from_lease`. Before the first lease, and with no Authority, nothing
+    changes: the machine's clock, and no mark. The clock that counts suspension is given
+    to the forwarder as a function; the real one comes with the program (G4d-5).
+  - *Proof under a lease.* With an Authority, a session is opened only under a complete,
+    fresh lease and for a chain nothing in which is revoked (refusals counted as
+    `no_lease` and `revoked`). A proof that holds is recorded as proven only under such a
+    lease; otherwise as the agent's failed proof with the reason `no_lease`. Complete, at
+    the forwarder, also means the lease names the bundle the forwarder's map came from.
+  - *Revoked sessions.* When an answer is taken that revokes something, every open
+    session's chain is checked again as a new one would be. One that no longer holds is
+    kept as a marker: a later call whose proof holds is recorded as that agent's, failed,
+    with `key_revoked`, `agent_revoked` or `mandate_revoked` (the nearest thing revoked:
+    the session's key, then an agent of the chain, then a mandate or the key that signed
+    one). A proof that does not hold keeps its own reason. A marker is never counted as
+    proven, pushes out no proven session, and is swept when its session would have been.
+  - Run with a gate and a shim in one process: a bare claim before the first lease; proven
+    under it, at the Authority's time; `no_lease` once it is two minutes old; proven again
+    after a renewal; `mandate_revoked`, twice, after the mandate is revoked, with the shim
+    keeping its session. 18 controls removed one at a time; each removal fails a test.
+  - **Limits.** (1) A bundle that changes while the gate runs is not put in use until
+    G4d-3: the lease then names a bundle the forwarder does not decide from, so the gate
+    has no complete lease and proves nothing until it is restarted on the new bundle.
+    (2) The shim's clock and the Authority's must agree to within the time a session's
+    opening allows (two minutes), since the gate's time is now the Authority's. (3) During
+    a long loss of the Authority a session runs out; the shim's next opening is refused
+    and its calls are then recorded as a client's bare claim, not as `no_lease`. (4) The
+    new reasons are new words in the receipt's closed list: a `gov verify` built before
+    this slice refuses a receipt that carries one.
+- **G4d-3 built (2026-11-27), from §7.6.3 point 7; not yet read by the reviewer.** On
+  `build/gov-g4d3`. Libraries and tests; the gate program is wired to an Authority in
+  G4d-5.
+  - *The gate changes bundle in place.* When an answer brings another bundle, the
+    forwarder swaps its connector map and the version its receipts carry together, and
+    the sessions take the new issuers' keys and templates. A call takes the map and the
+    version as one thing when it starts, so no receipt names one bundle for a call read
+    by another's map, and an outcome carries its intent's. A bundle with no map for the
+    gate's server leaves every tool unknown.
+  - *Sessions under the new bundle.* Each open session's chain is checked again as a new
+    one would be. One that no longer holds (its template gone or narrower, its issuer's
+    key no longer listed) is dropped, and its next call is an unknown session. A marker
+    for something revoked is kept whatever the new bundle says.
+  - *The shim follows* (GR-133). The gate names the bundle it decides from when a
+    session opens and with every answer to the shim. A shim on another asks the gate for
+    it (`POST /v1/bundle`, given only to a caller that names a session open at that
+    gate), opens it under the root key the shim pinned itself, takes it only if it is the
+    one the gate named and would not take the shim back or sideways, notes it in its
+    state file, and uses it from its next call.
+  - *A gate's standing keeps the bundle as signed* (to hand on), and starts only on a
+    bundle the root signed for its own Authority.
+  - *GR-175:* the Authority keeps the bundle it last opened and opens another only when
+    the store's latest has another digest.
+  - Run with a gate and a shim in one process: proven under the first bundle; the second
+    arrives, the next call is read by the new map and its proof fails (`wrong_digest`)
+    once; the shim follows and the call after is proven under the same session; a third
+    bundle without the mandate's template drops the session. A shim that pinned another
+    root, holds a later bundle, or holds another under the same number takes nothing. A
+    stand-in for the gate that names one bundle and hands over another moves the shim
+    nowhere. 18 controls removed one at a time; each removal fails a test.
+  - **Departures and limits.** (1) The call that crosses a change is recorded as a failed
+    proof with `wrong_digest`, as §7.6.3 says, but it is **not counted apart** on the
+    operator's address: it is in the count of failed proofs, and the receipt has the
+    reason. (2) A shim with no session is handed no bundle, so it cannot follow; its
+    calls are bare claims then, and no map of its own matters to them. (3) The gate
+    library does not write the bundle it took to its state file; the program does that
+    in G4d-5, and until then a gate started again begins from the bundle file it is given
+    and is brought forward by its first renewal. (4) The bundle is policy, and any agent
+    with a mandate that opens a session can read it.
+- **G4d-4, first part, built (2026-11-28), from §7.6.3 point 8; not yet read by the
+  reviewer.** On `build/gov-g4d4a`, libraries and tests.
+  - `Authority::revoke_key`: an admin revokes an enrolled key, an agent's or a gate's,
+    once, with a record and an entry in the feed that never runs out. A revoked gate key
+    is refused a renewal (the check the twenty-fourth read asked to come back, with its
+    test). Nothing is issued to a revoked agent key: the chain check the Authority makes
+    before it signs already refuses it.
+  - `Gate::open_after`: a gate given a new key opens its spool under the keys it is told
+    were its own before, closes what the old key left open, and goes on in one chain. A
+    receipt under any other key still stops it (GR-59).
+  - Six controls removed one at a time; each removal fails a test. Two checks added at
+    first were taken out again, since another check already did their work.
+  - **Not built here:** keeping the earlier keys as files and deleting the old private
+    half once the Ledger has acknowledged its last receipt (the program, G4d-5); the
+    Authority's own admin-record key (point 9) and the witness's order in `gov verify`
+    (point 10), which are the second part.
+- **G4d-4, the auditor's order, built (2026-11-28), from §7.6.3 point 10; not yet read by
+  the reviewer.** On `build/gov-g4d4b`. `gov verify` no longer compares the gate's date on
+  a receipt with the Authority's date on the record that retired its key. A receipt under
+  a retired key counts as earlier only if a checkpoint before the first one covering the
+  retirement already covered it; otherwise it is reported, as "not shown to be earlier"
+  (GR-130). Tested for a disabled gate, with and without the earlier checkpoint; the same
+  code serves a revoked key, which has no test of its own yet. `clock_skew_secs` no longer
+  bears on this finding. Not built: replacing the Authority's admin-record key (point 9).
+- **G4d-4, the Authority's own key, built (2026-11-28), from §7.6.3 point 9; not yet read
+  by the reviewer.** On `build/gov-g4d4c`. An admin replaces the key admin records are
+  signed with: a new record, `admin_key_replaced`, is the last the old key signs and
+  carries the digest of the new key. The Ledger takes the new key only when it matches
+  that digest, answers the old key nothing afterwards, and refuses any later record under
+  it; `gov verify` reports a record signed by any key but the one the chain's last
+  replacement names (GR-166). The shipment that carries the replacement is asked for
+  under the old key, since the Ledger does not know the new one yet. A key enrolled for a
+  gate that bears the Authority's name is never taken as the Authority's. Nine controls
+  broken on purpose, each caught. Limits: this is a planned change, and whoever holds a
+  taken key can write the same record; the Authority keeps the replaced key in memory
+  until the Ledger has the new one, so a restart between the two leaves the replacement
+  unshipped and the old key is needed once more (the program in G4d-5 does the three
+  steps as one); the Authority must be given its earlier public keys to read its own
+  chain. Not built, and moved to G4d-5: the Authority checking that the witness covers
+  its own chain. With this G4d-4 is built as libraries.
+- **G4d-5 built (2026-11-28), from §7.6.3 point 11; not yet read by the reviewer.** On
+  `build/gov-g4d5`. A fourth program, `gov-authority`, with one listener, for gates only
+  (`POST /v1/renew`): a request of at most 64 KiB, a limit for each source address applied
+  before anything is parsed or looked up (GR-169, GR-174), and a bare refusal whatever is
+  wrong. It ships its own records to the Ledger and counts, for its operator, a head no
+  witnessed checkpoint covers in time. The gate program, given `--authority`, renews on a
+  timer, counts time on the clock that goes on through suspension (`CLOCK_BOOTTIME`;
+  elsewhere it starts only with fake data), keeps a bundle it takes (file, then note),
+  opens its spool under its earlier keys (`--earlier-key`), and offers its key to the
+  Ledger, which takes it on the Authority's record. `gov-ledger enrol-authority` gives the
+  Ledger the Authority's key at installation. **Run as four programs with fake data:** a
+  call proven under a lease; the next bundle published and taken without a restart, by
+  gate and shim; the mandate revoked and the next call recorded as a failed proof with
+  that reason; the gate started again under a new key; the auditor's check passing over
+  both chains. Limits and what is not tested: admin actions are still library calls on
+  the Authority's database (G4e), so the run's set-up is a library beside the program;
+  the count of an unwitnessed chain is only seen at zero; the refusal to start without a
+  suspension-counting clock cannot be run here; the old private key is not deleted by
+  the program; nothing speaks TLS; the Authority's acknowledged position is not kept
+  across a restart, so it sends its chain again from the start (the Ledger holds it
+  already). With this G4d is built.
+- **G4e-1 built (2026-11-28), from §7.6.4 point 1; not yet read by the reviewer.** On
+  `build/gov-g4e1`. A new crate, `gov-signin`: PM OS's Entra verifier written again with
+  nothing of PM OS in it. Changed from the original: no name or email is read at all;
+  `auth_time` is required beside `acct`, and may not be ahead of the clock; a response is
+  read in pieces up to the size limit. Every test of validation in `crates/entra` is
+  ported (bad signature, algorithm, audience, issuer, tenant, times, nonce, object id,
+  guest, another identity provider, key rotation, a slow or failed key fetch), with three
+  added: the keys are not fetched from an address off the authority that the discovery
+  document names, a redirect is not followed, and an oversized answer is refused. Five
+  rules removed on purpose, each caught. Not ported: the one-use key for PM OS's first
+  link, which Governance has no use for. Limits: tested against a fake identity provider
+  only, never Microsoft; the size limit on a response sent without a length is not
+  tested on its own; asking for `openid` only and discarding the tokens belong to the
+  flow, in G4e-3. Nothing uses the crate yet.
+- **G4e-2 built (2026-11-28), from §7.6.4 points 3 and 4; not yet read by the reviewer.**
+  On `build/gov-g4e2`. In the Authority library, on both stores: an admin links a person
+  to an account (once; one to one; the record carries a digest); a sign-in for a linked,
+  active person opens a session and writes its record together; a session is good within
+  its idle and latest times and while its person is active, and the person is read again
+  each time; sign-out and offboarding end it. Every action takes either a name (someone
+  on the Authority's machine: recorded as unverified, as before) or a session (recorded
+  as verified, with the session's reference); a mandate issued under a session carries
+  it. Adding or offboarding an admin, linking, publishing a bundle, revoking a key,
+  disabling a gate and offering a gate's enrolment code refuse a session whose sign-in
+  is more than five minutes old. Three new records (`person_linked`, `signed_in`,
+  `signed_out`), a session on a record's actor, and an end time on a sign-in; records
+  written before still verify. `gov verify` reports a verified record that no earlier
+  sign-in of the same person, still in force, bears out. Eighteen controls removed on
+  purpose, each caught. Departures and limits, for the reviewer: a session's reference
+  is a random id of its own, not a digest of the session's value; a role cannot be
+  changed yet, so that rule has nothing to guard; the recent-sign-in rule binds
+  sessions only, since an act without one is already someone on the machine; a session
+  that ran out stays stored until sign-out or offboarding; the auditor's check reads the
+  Authority's records, not the mandate inside a receipt. Nothing is served: the listener
+  is G4e-3.
+- **G4e-3 built (2026-11-28), from §7.6.4 points 2 and 5 to 8; not yet read by the
+  reviewer.** On `build/gov-g4e3`. The listener for people, as a library
+  (`gov_authority::admin_http`): sign-in by code with PKCE (only `openid` asked for; a
+  fresh sign-in on request; the flow kept under a digest of a `Lax` pre-sign-in cookie,
+  used once, ten minutes at most; the code redeemed with the client's secret; the token
+  checked by `gov-signin` and then discarded); a session cookie (`HttpOnly`, `Strict`,
+  `__Host-` and `Secure` on an https origin); the page after sign-in served by the
+  callback itself with `Referrer-Policy: no-referrer`; `Cache-Control: no-store` on every
+  answer. Every request must be for this host, and any that is not a read must carry this
+  origin, a JSON body and the session's second value. Sixteen routes, each the library
+  call with the session as the actor. A refused sign-in answers 403 with nothing, and the
+  reason is counted for the operator. It starts only on an https origin, or a literal
+  loopback address with fake data; a plain-HTTP identity provider is for fake data; and
+  beyond loopback the proxy's header must be named (GR-196). Sign-ins are limited
+  overall and for each client address in that header. Eighteen controls removed on
+  purpose, each caught. **Found while testing:** a request with two `Origin` headers, or
+  two session cookies, was judged by the first; a header or cookie sent twice is now
+  refused. Limits: a library only, not yet in the `gov-authority` program (G4e-5); fake
+  identity provider only; no listing of people, agents, gates or keys (the stores have
+  no such reads yet), only of mandates; no limit for each pre-sign-in cookie beyond a
+  flow being used once; the count of flows in progress is capped at 10,000, so a flood
+  of starts can hold up new sign-ins for up to ten minutes within the overall limit.
+  Every changing route is walked by a test that holds its record to "verified" and the
+  session (GR-204).
+- **G4e-4 built (2026-11-28), from §7.6.4 point 6; not yet read by the reviewer.** On
+  `build/gov-g4e4`. Two more routes on the machines' listener, each a signed document and
+  no session, behind the limit for each source. `POST /v1/enrol`: a gate or agent on
+  another machine sends its signed request and a tag over it (HMAC-SHA-256 under a key
+  derived from the one-time code under a label of its own); **the code is never sent**
+  (GR-193), and a body that carries one is refused. The tag is checked before the code is
+  touched, so someone on the path can neither enrol their own key nor use the code up;
+  a code is still used once; wrong attempts from afar do not cancel it (GR-199). A code is
+  16 random bytes, checked by a test. `POST /v1/delegate`: a parent agent's signed
+  request, answered with the narrower mandate; every refusal is a bare 403. Seven
+  controls removed on purpose, each caught. Limits: a code offered before this change
+  has no such key and enrols on the Authority's machine only (not tested); no client
+  command sends these requests yet (the shim and gate programs still enrol by library in
+  the tests); the routes are in the `gov-authority` program through the listener it
+  already serves.
+- **G4e-5 built (2026-11-28), from §7.6.4 points 3, 6 and 9; not yet read by the
+  reviewer.** On `build/gov-g4e5`. In the library: an Authority refuses to sign with a key
+  its chain says was replaced (GR-194), and one started with the new key can still ask
+  for the shipment that carries the replacement under the old one. A lock in the
+  Authority's database, held on a session of its own so that a crash frees it. In the
+  `gov-authority` program: it holds that lock while it runs, so a second instance does
+  not start; it serves the listener for people when told its origin, the tenant and
+  client ids and the client secret's file (owner-only, fake data only), on a literal
+  loopback address only; `first-admin` names the first admin and links their account,
+  once; `replace-admin-key` writes the record, ships it under the old key, has the
+  Ledger take the new key, and only then deletes the old private key, keeping its public
+  half. It refuses to run while the program holds the lock, and run again after a stop
+  it goes on from where it was. **Run as programs with fake data and a fake identity
+  provider:** the first admin named; a sign-in through the tenant and a gate registered
+  under the session; a second instance and the key command both refused while the
+  program runs; the key command stopped after the record, then after the shipment, then
+  finished, then run once more with nothing left to do; a program started with the
+  replaced key signing nobody in; the program started with the new key serving again;
+  and the auditor's check passing over the chain across the change of key. Limits and
+  what is not tested: the stops are made with a hidden test flag (fake data only), not
+  by killing the process or taking the Ledger away; the old private key is removed by
+  the file system's delete, not overwritten; a Ledger that never takes the record
+  leaves the command failing with "run this again"; no command enrols a gate or agent
+  over the network yet; the admin listener's limits are not exercised through the
+  program; nothing has run against Microsoft. With this G4e is built, and G4 with it.
 
 ## Security review of 2026-11-26 (first read; the gate did not pass)
 
@@ -678,6 +1054,352 @@ disabling the gate retires the key; `gov verify` applies an admin record's own r
 refuses a document of the wrong kind in either chain. Still to do, with G4c: `gov verify`
 reporting a mandate id that appears in a receipt and in no record of its issue.
 
+### Fifteenth read, 2026-11-26, G4a's second part at `21645dd`
+
+**Verdict: no High or Critical. The gate passes for G4a, both parts.** GR-114 to GR-119 are
+closed; GR-120 and GR-121 are accepted as stated. The reviewer corrected one framing: G4a is
+no longer "a library nothing serves", because the Ledger's listener routes `/v1/keys` to
+anyone who can reach it. The reviewer ran the tests of four crates without Postgres; the
+Postgres stores and migrations were read, not run. It also read the CI failure on `36ded25`
+and agreed it was the test looking too early, with no way for a real open intent to result.
+The auditor's check of gate keys (GR-84) was built after this read and is unread.
+
+| Id | Severity | What | Done |
+|---|---|---|---|
+| GR-122 | Medium, before G4b | An Authority's chain could be pruned like a gate's, losing the records that say which keys are trusted | The Ledger does not prune a chain of admin records; a signed snapshot of the registry would have to be designed first |
+| GR-123 | Medium, before G4b | A record disabling a gate was kept first and acted on second: a stop between the two left the keys in use, since the record sent again was "already held" | What a record ends is done before the record is kept, and again when it comes again; what it grants is done after it is kept, and again when it comes again |
+| GR-124 | Medium, before G4b | `/v1/keys` made the Ledger read and verify every Authority chain for each request, from anyone | The Ledger notes each enrolment, and its end, as records are taken in (migration 0005); a key offered is one lookup. Limits per source wait with GR-77 |
+| GR-125 | Low | "Witnessed" overstated it: the record a key is taken on is held, and covered by the next checkpoint, not necessarily by one already | The wording below and in the code says "held"; the auditor's check asks for a checkpoint's cover |
+| GR-126 | Low | The Authority's admin key at the Ledger cannot be retired or replaced, and the Authority does not check that the witness covers its own chain | Open; with key rotation in G4d |
+| GR-127 | Low | An agent and a gate of the same name share the `<name>:` prefix of a key id | Open; to be settled with the bundle's key ids in G4b |
+
+Fixed on `build/gov-review-15`; nine controls removed one at a time, each caught by a test.
+Not yet read by the reviewer. Limit: the note of an enrolment is written when its record is
+kept or comes again; a Ledger restored from a copy older than its chain would need its
+notes rebuilt from the chain, and nothing does that yet.
+
+**To be settled in the bundle's format before G4b is built** (the reviewer's list): the root
+key signs the bundle and nothing else; the bundle names the online keys by role, each with an
+id, and a gate takes an online key only from a bundle it verified under the root; the bundle
+carries a number that only rises, and a gate refuses one older than it holds; once the gate
+and shim load the connector map and issuers' keys from the bundle, the unsigned files work
+only under an explicit test flag; `gov policy sign` is usable off the Authority's machine,
+and publishing a bundle is a `PolicyPublished` record carrying its digest. Still the
+owner's: how the root key is replaced if lost or stolen (§11, decision 9).
+
+### Sixteenth read, 2026-11-26, at `3ccfb5a`
+
+**Verdict: no High or Critical; the gate still passes.** GR-122 to GR-124 are closed (the
+reviewer walked the stops on each side of keeping a record and found none that leaves a
+disabled gate's key in use). The auditor's check of gate keys is sound for what it checks.
+The G4b design stands in all eight points; JSON for now, and the bundle read from a file at
+start, are confirmed. **G4b may be built once GR-128 is answered in the text**, which it is.
+Postgres was again read, not run, by the reviewer.
+
+| Id | Severity | What | Done |
+|---|---|---|---|
+| GR-128 | Medium, before G4b | Keeping the root key off the Authority's machine only helps if what it signs does not come from that machine, and the text did not say where the signer's input comes from or what the signer sees | §7.6.1, point 4: the input is the reviewed repository; `sign` runs the check itself, shows what changed since the previous signed bundle, and prints the digest it signed |
+| GR-129 | Low | A receipt carried the bundle's number only, so two bundles under one number could not be told apart | §7.6.1, point 5: the policy version is the number and the digest |
+| GR-130 | Low | "A receipt after its gate was disabled" compares the gate's own date with the Authority's, so it catches only a gate that dates honestly | Fixed on `build/gov-g4d4b` (2026-11-28): the witness's order decides |
+| GR-131 | Low | On a Ledger restored from an older copy, the notes of enrolments can disagree with the chain | Fixed on `build/gov-review-16`: the Ledger writes its notes again from the Authorities' chains before it serves, and a chain it cannot open stops the start. Tested as a library call; that the program makes the call is read, not tested |
+| GR-132 | Low | A gate or shim with no saved state accepts any validly signed bundle, an old one included | Stated in §7.6.1, point 3, as a limit until the lease names the bundle (G4d) |
+| GR-133 | Low | A gate and its shim started on different bundles fail proofs for every tool whose map differs | Stated in §7.6.1, point 7 |
+| GR-134 | Low | The Ledger's public keys stay an unsigned file the gate trusts | §7.6.1, point 9: they stay local configuration, and why |
+
+### Seventeenth and eighteenth reads, 2026-11-26: G4b at `04e5117`, the G4c design and §1.2, §8.4 at `1600134`
+
+**Verdict: no High or Critical; the gate still passes. G4b is sound as built**, GR-128 is
+closed in the text and the code, and GR-129 to GR-134 are answered. **G4c may be built from
+§7.6.2 once GR-138 is in the text**, which it is. §1.2 and §8.4 weaken no control; each
+claimed more than the design gives in one place, now reworded. The three items of the
+owner's feedback that were not taken up are, in the reviewer's words, rightly refused.
+Postgres was read, not run, by the reviewer.
+
+| Id | Severity | What | Done |
+|---|---|---|---|
+| GR-135 | Low | The signer's list of changes is written field by field, so a field added later would show nothing | Fixed on `build/gov-review-17`: anything that differs and is not named is shown as "other changes" |
+| GR-136 | Low | The bundle's time was the signer's clock, so nobody else could rebuild the same digest from the repository | Fixed: `sign` takes the time from `--issued-at`, which a second person repeats |
+| GR-137 | Low | `--yes` skips the question | Kept; it still prints the changes, and its help says they must have been shown to a person elsewhere |
+| GR-138 | Medium, before G4c | The template was checked only by the Authority at issue, so whoever takes the online mandates key could sign any grants | §7.6.2, point 10: the gate holds every chain's root mandate to the template in the bundle it holds |
+| GR-139 | Low | A parent agent could hand authority to any enrolled agent, whose owner never asked | §7.6.2, point 4: the child has the root person as owner, or the template names who may receive; the request names the Authority |
+| GR-140 | Low | A feed that only adds cannot undo a suspension | §7.6.2, point 6: suspending revokes mandates and never adds the agent's id; only disabling does |
+| GR-141 | Medium, before the scene is shown | "Verifies the refusal" claimed more than an export shows, and with the library seam PM OS is the gate's operator | §1.2 reworded; the scene runs with a separate gate holding the credential, or says whose word the refusal is |
+| GR-142 | Medium, before the scene is shown | Turning the seam off is PM OS's own setting, so it is not always a recorded act | §8.4 reworded: with the library seam the cover is in line, not custody, and PM OS's operator can go round it |
+| GR-143 | Low | "Names both" does not fit a record with one `about` field | §7.6.2, point 4: the record is about the child agent; the parent is in the mandate, which the record's digest covers |
+
+### Twentieth read, 2026-11-27: G4c at `d376e20`
+
+**Verdict: no High or Critical; the gate passes for the main spec, G1, G2, G3a, G3b, G4a,
+G4b and G4c.** The template check at the gate (GR-138), issuing, delegation, the feed and
+the auditor's check were read and found sound. Of the three departures, the child's id
+from the request's hash stands, recording a refused mandate's call as claimed is
+acceptable until G4d, and the order of stopping an agent does not stand (GR-152). The
+reviewer ran the tests of `gov-core`, `gov-authority` and `gov-ledger` without Postgres;
+the Authority's Postgres store was read, not run, and `gov-gate`, `gov-run` and `gov-cli`
+were not re-run. **GR-152 and GR-153 are to be fixed before G4d.**
+
+| Id | Severity | What | Done |
+|---|---|---|---|
+| GR-152 | Medium, before G4d | An agent's mandates were revoked before the agent was marked stopped, so a mandate issued in between stayed live under a suspended agent | Fixed on `build/gov-review-20`: revoke, mark, revoke again. Once the agent is marked nothing is issued to it, so the second round leaves none. Stopping an agent already stopped makes the round again and still answers that it is in that state, which finishes a stop that was interrupted |
+| GR-153 | Medium, before G4d | A leaver's mandates for agents owned by others stayed live | Fixed: offboarding revokes every live mandate the leaver is at the root of, and suspends their agents, before the person is marked and again after. The other owner's agent and its other mandates are left alone |
+| GR-154 | Low | A delegation's record names an agent in the field that elsewhere holds a person: the two cannot be told apart | Fixed: the actor has a kind, `agent` for a delegation. It is left out for a person, so earlier records read as they did. `verified` stays false for both until G4e |
+| GR-155 | Low | A refused attempt to open a session leaves no trace | Fixed: the gate counts refusals by why (`mandate`, `template`, `request`, `replay`, `busy`) and shows them on the operator's address as `sessions_refused`. The asker is still told nothing more. A count only: it is lost at a restart, and the record of such attempts is G4d's |
+| GR-156 | Low | A template's grants for a system that folds case are not required to be lower case | Fixed: the bundle's lint refuses it, as it does a rule |
+| GR-157 | Info | CP's design is not in the repository, so nothing of CP can count as through the gate until the reviewer is given it some other way | Noted; CP is not built |
+
+What the reviewer asked to be settled in the text before G4d is built: what a gate does
+before its first lease (GR-72); how the lease and the feed are checked together; that the
+lease names the bundle (closing GR-132 and GR-133) and how a gate changes bundle without a
+restart; separate reasons for closing a session (GR-110); key rotation (GR-59, GR-126); and
+that `gov verify` orders receipts after a retirement by the witness, not by the gate's own
+time (GR-130). CM1 and CM2 were called sound as slices; each map is read when it is sent.
+
+### Twenty-first read, 2026-11-27: the connector-map library at `f18b857`
+
+**Verdict: no High or Critical; CM1 and CM2's command pass, for observe mode. The three
+maps may not back shadow or enforce mode until GR-158, GR-159 and GR-160 are fixed and the
+fixed maps are read; GR-161 is to be designed before enforce mode.** The reviewer tabulated
+all 162 tools against the listings and their arguments. Like the maps, its read is against
+the listings, not a live system. The builder and the drift command were found sound.
+
+| Id | Severity | What | Done |
+|---|---|---|---|
+| GR-158 | Medium, before shadow or enforce | A tool was marked as undoable (`inverse`) where the server has no tool to undo it with: six in Jira, four in GitHub, all three Slack writes | Fixed on `build/gov-review-21`: each is now `none`, and so are six more found the same way (a link whose comment stays, an epic that cannot be unlinked, sprints, a version). `gov map build` refuses a tool marked as one that can be put back unless its review names the tool that does it, which must be in the map and not a read. Jira keeps 8 such tools, GitHub 10, Slack none |
+| GR-159 | Medium, before shadow or enforce | `jira_transition_issue` can set fields and post a comment and was not marked outward; `jira_create_issue_link` posts a comment too | Fixed: both are outward |
+| GR-160 | Medium, before shadow or enforce | "Outward" had no tight rule and was applied unevenly | Fixed: the rule is in `governance/maps/README.md` (text people see, a person told, access widened, something started). Every write was checked against it: 13 more Jira tools and 3 GitHub tools are now outward. A test holds every write that takes free text to it |
+| GR-161 | Medium, before enforce | A moved Jira issue answers to its old key and a renamed GitHub repository to its old name, so a call by a former name is placed where the thing no longer is | Stated as a limit in the README. **Open: to be designed before enforce mode** (G6): the gate compares the name it was given with the one the system answers under |
+| GR-162 | Low | `jira_get_cross_project_dependencies` returns other projects' issues under one project's resource | Fixed: a resource of its own, `jira/dependencies` |
+| GR-163 | Low | GitHub's secret-scanning alerts and job logs sit under the bare repository, so any read grant on it reaches them | Fixed: a repository's resource ends in `code`, `issues`, `pulls`, `actions`, `security`, `discussions` or `settings`; no tool is left on the bare repository |
+| GR-164 | Low | `fork_repository` writes into an account named in a second argument | Added, in the README and the tool's note |
+| GR-165 | Low | The listings were taken with made-up settings; if a listing depends on settings, every tool reads as unknown in a real deployment | Each `source` now says so, and the README |
+
+### Twenty-second read, 2026-11-27: the G4d design and the twentieth-read fixes at `c1b2c0e`
+
+**Verdict: no High or Critical; the gate still passes. G4d may be built from §7.6.3**, with
+four additions to its text (GR-166 to GR-169), which are made. The reviewer confirmed the
+one departure (point 11: the `gov-authority` program in G4d, with one listener for gates'
+renewals). GR-152 to GR-156 are closed, and the unmapped-tool count was found sound. The
+reviewer ran the tests of `gov-core`, `gov-authority` and `gov-gate` without Postgres.
+
+| Id | Severity | What | Done |
+|---|---|---|---|
+| GR-166 | Low | After the record naming a new admin-record key, the old key must be refused for later records | §7.6.3, point 9 |
+| GR-167 | Low | What happens to a disabled gate was not said | §7.6.3, point 1: no answer, so no fresh lease |
+| GR-168 | Low | An Authority whose clock or database goes back has its leases refused by every gate; right, but unsaid and unshown | §7.6.3, point 2: stated, with a reason of its own on the operator's address |
+| GR-169 | Low | The renewal listener needs the Ledger listener's hardening, and the text should say what is not on it | §7.6.3, point 11 |
+
+### Twenty-third read, 2026-11-27: the revised maps and CG0a at `cc6f5b5`
+
+**Verdict: no High or Critical; the gate still passes. GR-158, GR-159 and GR-160 are
+closed, so the three maps may back shadow mode as well as observe mode. Enforce mode
+still waits on GR-161.** CG0a passes, and the reviewer confirmed its three defaults and
+the rule that the stricter of two entries wins. It compared every tool with the maps it
+read before and checked each of the eighteen remaining undo claims against the listings;
+as before, against the listings and not live systems. GR-162 to GR-165 are closed or
+stated.
+
+| Id | Severity | What | Done |
+|---|---|---|---|
+| GR-170 | Low | A `restore` needs the earlier value, and the build checks only that a tool exists to write it back. GitHub's two subscription tools are marked `restore` and the listing has no tool that reads a subscription | Fixed on `build/gov-review-23`: a `restore` also names, in `read_with`, a tool of the map that reads the old value, and `gov map build` refuses one that does not. The two subscription tools are `none`, and so are two more that can only be named by an id nothing reads (`update_issue_comment`, `jira_remove_issue_link`). What still claims an undo: Jira 7 tools, GitHub 7, Slack none |
+| GR-171 | Low | A receipt's cause may point at receipt number 0; receipts are numbered from 1 | Fixed: refused |
+| GR-172 | Low | A call whose proof failed is still forwarded in observe and shadow modes, so the agent may have read the data, yet its receipt raises no label: the shadow flow check under-counts such reads | Stated in the access governance spec's status note |
+| GR-173 | Info | The library's maps carry no labels, so every read raises a mandate to restricted and untrusted until a deployment labels its resources: the shadow flow check will flag nearly everything at first | Noted in the access governance spec |
+
+### Twenty-fourth read, 2026-11-27: G4d-1 and the fixes for GR-170 and GR-171 at `25f0801`
+
+**Verdict: no High or Critical; the gate still passes. G4d-1 passes as built, and G4d-2
+may be built.** The reviewer confirmed all five departures and limits of G4d-1's status
+note: the limit that compares for the same second only; a gate naming a higher revocation
+number being answered from where the Authority stands; the lease naming the bundle by
+number and the first 16 hex digits of its digest ("enough, since only the root's holder
+could make two"); a revoked gate key not yet refused a renewal, **which must return with
+key rotation in G4d-4, with its test**; and the limit being each process's own. GR-170 and
+GR-171 are closed. It ran the Authority's tests without Postgres.
+
+| Id | Severity | What | Done |
+|---|---|---|---|
+| GR-174 | Low, with G4d-5 | The limit for each gate is applied after the key is looked up and the signature checked, so a caller with no valid key still costs a database read each time | Open: the listener limits by source before any of that work (G4d-5, with GR-169) |
+| GR-175 | Low | Every renewal opens the latest bundle again and checks each online key again: the Authority's main cost once several gates renew every few seconds | Fixed on `build/gov-g4d3`: the bundle last opened is kept and used again while the store's latest has the same digest |
+| GR-176 | Low | A lease is good for the bundle's `standard` limit, two minutes by default, so a revoked agent's calls can be recorded as proven for up to that long after the revocation, plus the time between renewals | Stated in G4d-1's status note |
+
+### Twenty-fifth read, 2026-11-27: G4d-2 at `dcb71c1`, confirmed at `e64062b`
+
+**Verdict: no High or Critical; the gate still passes. G4d-2 passes as built, and G4d-3
+may be built.** The reviewer confirmed the two choices it was asked about: the order of
+reasons for a marker, with "revoked" said ahead of "no lease" ("a revocation is a fact the
+gate learned from an accepted feed; no lease is the gate not knowing"); and that a proof
+that holds under no lease is still used up. It ran the gate's forwarder and session tests
+and the two end-to-end tests, and nothing else. Told that the lint had failed unseen at
+`dcb71c1`, it confirmed from the diff that `e64062b` changes one line of a test and no
+behaviour, and noted that no verdict of its has ever vouched for the lint or the format:
+its verdicts rest on its own test runs.
+
+| Id | Severity | What | Done |
+|---|---|---|---|
+| GR-177 | Low | A receipt's time and the mark saying where it came from are set in two steps, so around the first lease a receipt can carry the lease's time without the mark, or the machine's time with it | Fixed on `build/gov-review-25`: a receipt's time is given to the gate together with where it came from (`When`), for the intent and for the outcome each; the separate switch is gone |
+| GR-178 | Low | With a lease held, a shim's request to open is compared with the Authority's time while the shim stamps it from its own machine: a shim more than two minutes off opens no session | Stated in G4d-2's limits. Fixed: a request that is properly signed and too far from the gate's time is counted under `clock`, apart from `request` |
+| GR-179 | Low | After a renewal brings a newer bundle and before it is swapped in, every proof is `no_lease`; to be said, so that it is not read as the Authority being down | No longer so since G4d-3: the bundle is swapped in the same step as the lease is taken |
+| GR-180 | Low | A marker that had proven a call still counts among its key's proven sessions and can be the one closed to make room, after which its calls lose the agent's name | Fixed: a marker is not among the proven sessions closed to make room |
+
+### Twenty-sixth read, 2026-11-27: G4d-3 at `1ddddc7`
+
+**Verdict: no High or Critical; G4d-3 passes.** GR-133 and GR-175 are closed. The reviewer
+ran the tests of `gov-core`, `gov-gate`, `gov-run` and `gov-authority` without Postgres;
+its findings are from reading. **GR-181 and GR-182 are to be fixed before G4d-5.**
+
+| Id | Severity | What | Done |
+|---|---|---|---|
+| GR-181 | Medium, before G4d-5 | A shim that followed its gate noted the new bundle but did not keep it, so on its next start its old bundle file was refused as older | Fixed on `build/gov-review-26`: the bundle taken is written over the shim's bundle file before it is noted |
+| GR-182 | Low | Under a bundle that both revokes a chain and drops its issuer's key, the session was dropped and lost its reason | Fixed: revocation is checked under the old bundle before the new keys and templates replace it |
+| GR-183 | Low | Two overlapping calls could put an older bundle back in the shim's state | Fixed: one follow at a time, each reading what is held after it has the lock. No test removes this one: it needs two bundle changes inside one call |
+| GR-184 | Low | The bundle is handed to anyone who knows an open session's id, which is on every receipt | Accepted for this release on a condition now stated here: **a bundle never holds a secret, and every agent of the tenant may read all of it.** With more than one tenant, or a rule an agent should not learn, the request must carry a proof under the session's key |
+| GR-185 | Info | The call that crosses a bundle change fails its proof; an operator cannot tell a publish from an attack without reading receipts | Open: before enforce mode the shim retries once after it follows, or the call gets a reason of its own |
+
+### Twenty-seventh read, 2026-11-28: the fixes at `f0bcd06`
+
+**Verdict: no High or Critical, and no new findings.** GR-177, GR-178, GR-180, GR-181 and
+GR-182 are closed; GR-183 is closed from reading only; GR-184 is accepted on its stated
+condition; GR-185 stays open before enforce mode. The reviewer ran the tests of four crates
+without Postgres, and did not run the lint or the format check. Two notes for G4d-5: a
+shim needs write access to its bundle file, or it follows nothing; and the bundle file and
+the state file must not share a name stem in one directory, since both write through a
+temporary file named from it.
+
+### Twenty-eighth read, 2026-11-28: G4d-4 (first part and the auditor's order) at `afd7f78`
+
+**Verdict: no High or Critical; the gate passes for both parts.** The reviewer ran the
+tests of the six `gov-*` crates without Postgres (213 passed), not the lint or format
+check. GR-130 is not closed until GR-186 is fixed. Fixed on `build/gov-review-28`; the
+re-read is owed.
+
+| Finding | Severity | What was wrong | What was done |
+|---|---|---|---|
+| GR-186 | Medium, confirmed by a probe | The auditor's order compared a checkpoint's position in one chain's list with a position in another's; the Authority's chain starts earlier, so a receipt first covered after the retirement could pass | Fixed: the checkpoints' own numbers are compared. Tested with the Authority's chain witnessed first, alone |
+| GR-187 | Medium | Revoking a gate's key made the Ledger refuse the receipts it had not yet shipped, and so every receipt after them | Fixed, rule in §7.6.3 point 8: taken only in a shipment asked for under a key of that gate still in use; the auditor reports them. Tested by shipping a rotated chain after the revocation. The test found a second fault: the Ledger read an intent only under the key of the outcome that answers it; it now reads it under its own signer |
+| GR-188 | Low | An earlier key was accepted anywhere in a gate's spool | Fixed: refused once a later key has signed |
+
+Not done: refusing `revoke_key` until the Ledger has acknowledged that key's last receipt
+(the Authority does not see those answers); a test of a revoked key, as distinct from a
+disabled gate, in `gov verify`; the reviewer did not verify that issuing to a revoked
+agent key is refused by the chain check.
+
+### Twenty-ninth read, 2026-11-28: G4d-4's last part and the fixes, at `e4dd4d7`
+
+**Verdict: no High or Critical; the gate passes for all of G4d-4.** GR-126, GR-130, GR-166
+and GR-186 to GR-188 are closed. The reviewer ran the tests of the six `gov-*` crates
+without Postgres (214 passed), not the lint or format check, and did not repeat the
+control removals. Vouching (GR-187) is accepted for a gate disabled and later given a new
+key; the sentence it asked for is in §7.6.3 point 8. Fixed on `build/gov-review-29`,
+not yet read again.
+
+| Finding | Severity | What was wrong | What was done |
+|---|---|---|---|
+| GR-189 | Low | A replacement admin key whose id was already enrolled for a gate was not noted at the Ledger, yet the old key was retired: the Authority's chain would stop there | Fixed on both sides: the Authority refuses a new key whose id or bytes are enrolled; the Ledger retires the signer only when the successor's note holds the digest the record names |
+
+Also done from this read: the `gov verify` test of a revoked key, as distinct from a
+disabled gate; and, of the reviewer's seven points for the programs, the two that apply
+to what G4d-5 serves: the gate keeps a bundle it takes before any call is read under it
+(counted when it cannot), and a gate refused outright by its Authority says so on its
+operator's address and waits longer each time, up to a minute. Not applicable until
+G4e, since the program takes no admin action: the Authority's own key across a crash
+and a lost acknowledgement (points 1 and 2). A gate's change of key is an operator's
+order of steps (point 3: enrol the new key, ship everything under the old one, revoke
+it, delete its private half), and `--earlier-key` must be given oldest first; the
+program does not enforce the order or delete the key.
+
+### Thirtieth read, 2026-11-28: G4d-5 and the fixes, at `fadab56`
+
+**Verdict: no High or Critical; the gate passes for G4d-5.** GR-169, GR-174 and GR-189
+are closed. The reviewer ran the tests of the six `gov-*` crates with a Postgres of its
+own (217 passed, the four-program run among them), not the lint or format check. Fixed
+on `build/gov-review-30`, not yet read again.
+
+| Finding | Severity | What was wrong | What was done |
+|---|---|---|---|
+| GR-190 | Low | The table of sources could be filled each second (one IPv6 /64 is enough), and every gate not yet in it was then refused a renewal | Fixed: an IPv6 source is its /64, and once the table is full late sources share one source's allowance instead of being refused |
+| GR-191 | Low | `gov-ledger enrol-authority` could give an Authority a second admin key beside the first | Fixed: refused when the chain holds an admin key; a later one comes only by a replacement record |
+| GR-192 | Low | The Authority read the Ledger's answer to a shipment without a size limit | Fixed: read in pieces, 64 KiB at most. No test of its own |
+| (note) | | The count of an unwitnessed chain kept the time of the first uncovered head, so a chain that keeps moving would alarm with the witness one interval behind | Fixed: it watches one head until the witness reaches it; tested |
+
+Accepted as stated, with conditions now in §7.6.4: admin actions as library calls until
+G4e; a gate's change of key as an operator's order of steps, for fake data; the chain
+sent again after a restart, while nothing can re-enable a gate; no TLS, for fake data on
+loopback. Still open: GR-77.
+
+### Thirty-first read, 2026-11-28: the design of G4e (§7.6.4) at `3266c52`
+
+**Verdict: no High or Critical; the design passes and may be built,** with three Medium
+points to be in the text before the step that builds them. All seven findings are
+answered in §7.6.4 on `build/gov-review-30`; the reviewer has not read the changed text.
+
+| Finding | Severity | What was wrong | Where it is answered |
+|---|---|---|---|
+| GR-193 | Medium, before G4e-4 | An enrolment code would travel beside the request, and on a plain link someone on the path could enrol their own key with it | Point 6: the code never travels; the request carries a MAC under a key derived from it |
+| GR-194 | Medium, before G4e-5 | After the admin-record key is replaced, a serving program still holding the old one would write records the Ledger refuses | Point 9: the library signs only with the key the last replacement names; the command runs only with the program stopped, under a lock |
+| GR-195 | Medium, before G4e-2 | Whoever can link an account to a person can act as that person, and nothing guarded the link | Points 3 and 4: written once, one to one, and a recent sign-in for linking, a change of role, and a gate's enrolment code |
+| GR-196 | Low | Behind the proxy every caller has one address, so one stranger uses up the sign-in limit | Point 8 |
+| GR-197 | Low | A `Strict` cookie does not come back from Microsoft | Points 2 and 4 |
+| GR-198 | Low | A session reference had no end in the auditor's check | Point 4 |
+| GR-199 | Low | Five wrong codes would cancel an enrolment from anywhere | Point 6 |
+
+The reviewer's conditions on the new verifier, and its notes on what a sign-in record
+does and does not show, are in points 1 and 4.
+
+### Thirty-second read, 2026-11-28: the fixes, the changed G4e text and G4e-1, at `47a0278`
+
+**Verdict: no High or Critical; G4e-1 passes, and G4e-2 may be built** on the changed
+text for GR-195 and GR-198. GR-191, GR-192, GR-193 to GR-195 and GR-197 to GR-199 are
+closed or answered. The reviewer ran the tests of the six `gov-*` crates (220 passed)
+and of `gov-signin` (7 passed) without Postgres, not the lint or format check. Fixed on
+`build/gov-review-32`, not yet read again.
+
+| Finding | Severity | What was wrong | What was done |
+|---|---|---|---|
+| GR-190, the rest | Low | Late sources shared one source's allowance (20 a second), so filling the table and 20 more requests still shut gates out; a /48 is enough | Fixed: late sources have an allowance of their own, 1,000 a second by default |
+| GR-196, the rest | Low, before G4e-3 | Without the proxy's header a stranger meets only the overall sign-in limit and can use it up | In the text, point 8: the header must be named whenever the origin is not loopback |
+| GR-200 | Low, before the verifier is wired to a listener | `localhost` counted as loopback for a plain-HTTP authority, and nothing tied a plain authority to fake data | Fixed: a literal loopback address only; `Tenant::plain_http` for the caller, which refuses it unless the data is fake (G4e-3) |
+| GR-201 | Low | Unchecked addition on a token's times | Fixed: saturating; a token whose `exp` is the largest number is checked without overflow |
+
+Also done: `Referrer-Policy: no-referrer` on the page the callback serves, and a lock a
+crash releases, are in the text (points 4 and 9); the verifier's comments no longer
+speak of PM OS's services; the verifier's reason for a failure is not to reach the
+caller (point 8).
+
+### Thirty-third read, 2026-11-28: the fixes and G4e-2, at `321d315`
+
+**Verdict: no High or Critical; G4e-2 passes.** GR-190, GR-200 (in the crate) and GR-201
+are closed. The reviewer ran the tests of the seven `gov-*` crates with a Postgres of its
+own (229 passed), not the lint or format check, and did not repeat the control removals.
+The departures stated for G4e-2 are confirmed; a sweep of run-out sessions is needed
+before real use. Fixed on `build/gov-g4e3`, not yet read again.
+
+| Finding | Severity | What was wrong | What was done |
+|---|---|---|---|
+| GR-202 | Low | In the auditor's check a second sign-in record under a used reference replaced the first, reopening a session that was ended | Fixed: a reference is opened once; a second sign-in under it is reported |
+| GR-203 | Low | Signing out of a session that had run out wrote a verified record dated after its end, which the auditor then reported | Fixed: past either limit the session is forgotten and nothing is recorded |
+| GR-204 | Low, with G4e-3 | A route passing a bare name where the session is meant would compile, record the act as unverified and skip the recent-sign-in rule | A test walks every changing route of the listener and holds its record to "verified" and the session. Not done: a type only a session can produce |
+
+### Thirty-fourth and thirty-fifth reads, 2026-11-28: G4e-3 at `078a098`, G4e-4 at `36990de`
+
+**Verdict: no High or Critical; G4e-3 and G4e-4 pass.** GR-193, GR-199, GR-200 (the
+caller's side) and GR-202 to GR-204 are closed. The reviewer ran the governance crates'
+tests without Postgres (234, then 122 for two crates), not the lint or format check, and
+did not repeat the control removals. G4e-4 has no finding. Fixed on `build/gov-g4e5`,
+before the listener went into a pushed program; not yet read again.
+
+| Finding | Severity | What was wrong | What was done |
+|---|---|---|---|
+| GR-205 | Medium, before G4e-5 | A refused request still counted toward the overall sign-in limit, so one address could use it up for everyone | Fixed: a client is held to its own limit first; only what passes counts overall |
+| GR-206 | Low, before G4e-5 | The client's address was the whole first header value, so a caller behind an appending proxy could vary it | Fixed: the last entry of the last line, parsed as an address (IPv6 by its /64); a request with the header named and no address in it is refused |
+| GR-207 | Low | The pre-sign-in cookie could be planted from a sibling host | Fixed: `__Host-gov_pre` with `Path=/` on https |
+| GR-208 | Low | An ordinary sign-in asked the tenant for no bounded age, and a too-old one was counted as an unlinked account | Fixed: `max_age` is always sent (the absolute limit; 0 when a recent sign-in is asked); a too-old sign-in has its own reason |
+
+Also done: a refused delegation's reason is counted for the operator. Notes kept for
+later: a client command for enrolment must treat a refusal after sending as "possibly
+enrolled"; a sweep of run-out sessions is needed before real use (through the listener
+such a session is removed only by offboarding); the auditor's listings of people,
+agents, gates and keys are still owed.
+
 ## 1. What is being built
 
 Agent Governance is a second product, separate from PM OS. It has three parts.
@@ -723,6 +1445,73 @@ slice, so hosting many tenants later changes no format.
 
 Everything runs on fake data until the security gate passes (no open High or Critical) and the
 owner says otherwise. Nothing in this spec enforces against a real system.
+
+### 1.2 PM OS is the reference application (owner, 2026-11-26)
+
+The owner's feedback of 2026-11-26, "PM-OS as the reference application for Agent
+Governance", and the conductor's reading of it. The owner's word: "Continue with the agreed
+items". What follows is what was agreed, what that changes here, and what was not taken up.
+
+**Agreed, and now part of this spec.**
+
+- **PM OS is the first customer of Agent Governance, not a part of it.** PM OS creates and
+  runs product work; Governance decides what its agents may do, on whose authority, and
+  keeps the evidence. Governance must work as well for an agent that is not PM OS's. This
+  was already the rule (§9: no `gov-*` crate depends on a `pmos-*` crate); it is now also
+  the reason PM OS is the first thing wired to it (slice G7).
+- **The demonstration the first release is built toward** is one scene, not a dashboard:
+  a PM OS agent completes a piece of work, attempts one action outside its mandate because
+  a document it read told it to, is refused at the gate before the action reaches the
+  system, and a person outside verifies, from the Ledger's export with public keys alone,
+  **that the gate recorded a refusal and that the record has not been altered or removed**,
+  trusting neither PM OS's database nor the Ledger's operator. §10 lists it as what G7 is
+  done against.
+- **What that person cannot verify, said in the scene itself** (review finding GR-141). A
+  receipt proves what the gate said, not what reached the system (T9). And where the gate
+  is a library inside PM OS's tool server (§8.1), PM OS holds the credential and is the
+  gate's operator: the refusal is then PM OS's own word, signed. So the scene is run with
+  a **separate gate process holding the only credential**, where the party believed is the
+  gate and not the application; run with the library seam, it is described as "in line",
+  and the words "PM OS could not have done it" are not used.
+- **No fallback.** For a system a deployment has put in enforce mode, PM OS has no
+  authorization path of its own to fall back on when Governance cannot decide (§8.4).
+- **Three ways to install** stay as §1 has them: PM OS alone, Governance alone, both.
+
+**What the demonstration needs that is not built**, so that nothing is claimed early: an
+Authority that issues the agent's mandate to a named person's account (G4c, G4e); the
+gate's time and revocation (G4d); shadow mode (G5); enforce mode with the gate holding the
+credential (G6); the seam (G7). Until G6 the gate blocks nothing, and the scene may not be
+shown or described as working enforcement. In shadow mode it can be shown honestly as
+"would have been refused".
+
+**How the scene is written, so that the refusal is real.** The gate refuses by operation
+and resource, as the connector map reads a call. An agent permitted to read feedback that
+reads all of it, one call at a time, has done nothing its mandate forbids: "bulk export"
+is not an operation unless a tool makes it one, and limits on volume are not designed
+(budgets, G6, count calls; they do not know what a record is). So the scene's unauthorized
+action is a different operation or resource from the permitted ones: sending to an outside
+address, or reading a resource the mandate does not cover, such as another project's
+issues. That is also the more honest picture of what a mandate stops.
+
+**Not taken up, and why** (the owner asked for the agreed items only; these stay open for
+the owner to press):
+
+- *A decision interface* (`GovernanceRequest` in, `ALLOW`, `DENY` or `REQUIRE_APPROVAL`
+  out). An application that asks and then acts with its own credential is governed only
+  while it chooses to ask. The proposal's own first line, that an agent never holds a key,
+  needs the gate in the path of the call, holding the credential, which is what is built.
+- *Identity, mandate and delegation chain as text fields in a request.* Those are claims.
+  Here the agent proves its key on every call and the mandate is a signed document the
+  gate verifies; a receipt says `proven` or `claimed` for this reason.
+- *Enforcement first.* Observe, then shadow, then enforce stays the order: the reviewer
+  has made closing named findings a condition of enforcing, and a customer should see what
+  would be refused before anything is.
+
+**In the feedback's list and already here under another name:** signed receipts and the
+check an outsider can run (built); agent identity as an enrolled key (built); human
+approval as the countersignature (G6); revocation (G4d); the console (G8); undo (G9),
+which the feedback does not mention and which answers a question it leaves open, what
+happens after an agent was allowed to do the wrong thing.
 
 ## 2. Where this spec departs from the proposal
 
@@ -1503,9 +2292,548 @@ issuer; nothing is revoked and the gate's time is its own machine's. G4 ends eac
    depended on without PM OS's roles (§7.2) is checked first in G4e; if it cannot, the
    verifier is written again in Governance, as the tool digest was.
 
+#### 7.6.1 G4b, the policy bundle (design of 2026-11-26; not built; for the reviewer)
+
+Written to settle the reviewer's list from the fifteenth read before any code.
+
+1. **The bundle's format.** `gov.policy.v1` gains three things; a bundle without them is
+   refused.
+   - `number`: a whole number that rises by exactly one with each published bundle, from 1.
+     `version` stays as the label a person reads; order is decided by `number` alone.
+   - `keys`: the Authority's online keys by role, `mandates` and `leases` (the lease key
+     also signs the revocation feed), each a list of public keys with ids. A key appears
+     under one role only, and the root key under none: a bundle that lists its own signer,
+     or one key under two roles, is refused.
+   - `connectors`: as now, the connector map, which the gate and the shim both take from
+     the bundle.
+2. **The root key signs the bundle and nothing else** (GR-109). A gate, a shim and the
+   Authority are each configured with the root's public key, and use it only to open a
+   bundle: it is never placed in a key set that opens a mandate, a lease, a receipt or an
+   admin record, and those documents' type tags differ from the bundle's, so a signature by
+   the root over anything else opens nowhere. An online key is taken only from a bundle
+   that opened under the root.
+3. **No going back.** A gate and a shim each keep, beside their other state on disk, the
+   number and digest of the newest bundle they have accepted, written before the bundle is
+   used. A bundle with a lower number is refused. The same number with another digest is
+   refused and counted: two bundles under one number means the root key signed twice or
+   was copied. A gate or shim with no saved state accepts any validly signed bundle, an old
+   one included, so wiping that state undoes the removal of an online key until the lease
+   names the bundle a gate must hold (G4d): a stated limit of G4b (GR-132). A higher number
+   is accepted whatever the gap (a gate may have been off for
+   several releases); the Authority, which publishes, accepts only the next number.
+4. **Three commands, and where each runs.**
+   - `gov policy check <dir>`: reads the policy files, builds the bundle, and runs every
+     check a gate would (rules, key roles, each connector map), needing no key. Each
+     connector map in the directory must come with a file of sample calls and the action
+     each is to be read as; the check runs them and fails without them (the standing
+     condition of GR-65).
+   - `gov policy sign --root-key <file> --number <n> --previous <signed bundle>` (GR-128).
+     Its input is the policy directory **as checked out from the reviewed repository**
+     (threat T18), never a directory or a built file carried from the Authority's machine:
+     were it otherwise, whoever took that machine would add a key of their own under
+     `mandates` and the root would sign it. So `sign` takes the directory, not a built
+     bundle, and runs `check` itself. It reads the previous signed bundle (required for
+     every number but 1), verifies it under the same root, requires the next number, and
+     prints what changed before it signs: online keys added and removed, by role; rules
+     added, removed and changed; connector maps added, removed and changed. It asks for a
+     typed yes unless told `--yes`, and prints the digest it signed, which the person
+     publishing compares with the digest the Authority reports. It opens no database and
+     no network connection.
+   - Publishing, on the Authority: a library function for now (no listener until G4e). It
+     opens the signed bundle under the root key, takes only the next number, and writes the
+     bundle and a `PolicyPublished` admin record carrying its number and digest in one
+     step. A bundle a gate holds whose digest has no such record is then something
+     `gov verify` can report, as with mandates.
+5. **The unsigned files go.** `gov-gate` and `gov-shim` take `--bundle` and `--root-key`
+   in place of `--map` and `--mandate-issuers`. The old options remain only with
+   `--unsigned-policy-for-tests`, refused unless the data class is fake, and a gate started
+   that way says so in every receipt's policy version (`unsigned`), so no record made
+   without a bundle reads as made with one. A receipt otherwise carries the bundle's number
+   and the start of its digest (`<number>-<16 hex digits>`), so that two bundles under one
+   number, the case point 3 counts as an alarm, can be told apart in the record (GR-129).
+6. **Policy source is JSON for now**, not the YAML §4.6 names: the strict reader the gate
+   already uses for everything it parses refuses a repeated key and an unknown field, and a
+   YAML reader would be a new dependency on the path that decides what is trusted. YAML,
+   if wanted, is converted before `check` and is not what is signed.
+7. **Delivery.** In G4b the gate and shim read the bundle from a file at start. Fetching
+   it from the Authority, and changing it without a restart, come with the lease (G4d),
+   which names the bundle a gate must hold. Until then a gate and its shim can be started
+   on different bundles; every tool whose map differs then fails its proof, with a reason
+   that says so, until both run the same one (GR-133).
+8. **An agent and a gate may not share a name** (GR-127). A key's id is under the name it
+   is for, so two things of one name could take each other's key ids. The registry refuses
+   to register an agent under a gate's name, or a gate under an agent's, and the
+   Authority's own name is refused for both.
+
+9. **The Ledger's keys stay local configuration** (GR-134). The gate checks the Ledger's
+   acknowledgements and checkpoints against public keys from a file. They are not put in
+   the bundle: the Ledger is the party that checks on the Authority's records, and an
+   auditor is meant to hold the Ledger's key from outside the installation (§7.6, choice
+   7); a bundle naming the Ledger's key would let whoever signs policy choose who witnesses
+   it. A wrong file there cannot make a receipt: it can only make a gate believe, or
+   refuse to believe, that its receipts were taken.
+
+**Not built in G4b:** rules are still not evaluated against a call (G5); the lease and
+revocation (G4d); mandates from the Authority (G4c), so the `mandates` keys in a bundle are
+a test issuer's until then.
+
+#### 7.6.2 G4c, mandates from the Authority (design of 2026-11-26; not built; for the reviewer)
+
+Ends the test issuer. Written before any code; nothing here is served until G4e, so every
+function below is a library call, usable only by someone on the Authority's machine.
+
+1. **Templates are policy.** The bundle gains `templates`, a list. A template has an id,
+   the grants a mandate from it may carry at most, the longest life (never more than the
+   bundle's own cap, default 8 hours), limits, whether a mandate from it may be delegated,
+   and who may ask for it: the agent's owner always, and beyond that only the people or
+   roles the template names. A mandate says `template: "<id>@<bundle number>"`, and the
+   signer is shown templates added, removed and changed like rules (§7.6.1, point 4).
+2. **Issuing to a person's request.** The Authority issues a mandate when all of these hold,
+   checked on the chain's head it then commits on:
+   - the person is active, and is the agent's owner or one the template names. Being an
+     admin is not enough: an admin manages the registry, and does not thereby hold every
+     agent's authority;
+   - the agent is usable (§7.1) and the mandate is bound to one of its enrolled keys, named
+     in the request;
+   - the template is in the **latest published bundle**; the grants asked for are inside
+     the template's, by the same containment check a gate applies to a chain; the life
+     asked for is within the template's;
+   - the key the Authority signs with is listed under `mandates` in that same bundle. An
+     Authority whose mandates key the root has not named issues nothing.
+   The mandate's id is 128 random bits from the Authority and is never reused. The mandate
+   and a `MandateIssued` record (the mandate's id, the agent, the digest of the signed
+   mandate) are written in one step.
+3. **Nobody is signed in until G4e**, and the mandate says so. `issued_by.session` is
+   absent on every mandate issued before then, as the admin record's actor is unverified.
+   A condition on G6, stated now: a gate in enforce mode refuses a mandate whose root has
+   no session. So no mandate issued by whoever could run a command can ever back an
+   enforced action.
+4. **Delegation.** A parent agent asks, in a document of its own (`gov.delegate.v1`: the
+   parent mandate's id, the child agent and its key id, the narrowed grants, the life, a
+   nonce, the time), signed with the key the parent mandate is bound to. The Authority
+   issues the child only if: the parent mandate verifies now and is not revoked; its
+   template allows delegating; the child is another enrolled, usable agent; the child's
+   grants and life are inside the parent's; the chain would be no deeper than 3; the nonce
+   has not been seen and the time is within the clock allowance; and the request names
+   this Authority, so it cannot be used at another. **The receiving side agrees** (review
+   finding GR-139): the child agent's owner is the person at the root of the chain, unless
+   the template names other owners or agents who may receive from it. The child embeds the
+   parent's signed mandate, so a gate checks the chain without asking the Authority. A
+   delegated mandate's `issued_by` is the parent agent; the person at the root is found by
+   walking the chain. The `MandateIssued` record is about the child agent, as for any
+   mandate; the parent is inside the mandate whose digest the record carries (GR-143).
+5. **Listing.** A person sees the mandates of agents they own; an admin and an auditor see
+   every mandate's id, agent, template, issuer, times and state, and never its grants'
+   resources beyond what the template already says. (Listing is what the admin interface
+   serves in G4e; here it is a library call with the same rule.)
+6. **Revoking.** The person who issued a mandate, the agent's owner, or an admin may revoke
+   it. One entry is enough for its descendants: a gate checks every link of a chain against
+   the revocations it holds. Offboarding a person, or suspending or disabling an agent,
+   revokes that agent's live mandates, each with its own `Revoked` record, in the same step
+   as the change that caused it (§7.6, choice 4). The feed only ever adds, so it carries
+   nothing that must later be undone (review finding GR-140): suspending an agent revokes
+   its mandates and never puts the agent's id in the feed, and an agent resumed is issued
+   new mandates; only disabling an agent puts its id there, for good.
+7. **The revocation feed.** Every revocation takes the next number, from 1, with no gaps,
+   and carries the kind, the id and the time after which the thing would have expired
+   anyway. The feed a gate fetches is "everything after number N": a signed document
+   (`gov.revocations.v1`: from, through, the entries, and the newest number there is),
+   signed with the **leases key**, which the bundle names, and never the admin-record key.
+   An entry is left out of the feed only once its expiry has passed by more than the clock
+   allowance, and the numbers of dropped entries are never reused, so a gate that asks from
+   an old number is told the range it missed was dropped rather than shown a shorter feed.
+   The gate's use of the feed, and the lease that says how far a gate must have read, are
+   G4d.
+8. **`gov verify` reports a mandate nobody issued.** A receipt marked `proven` names its
+   mandate ids. With an Authority named, an id with no witnessed `MandateIssued` record is
+   reported, as a gate key with no enrolment record is (GR-84). This makes a forged or
+   test-issued mandate visible to an auditor even in observe mode.
+9. **Three keys at the Authority, three uses.** The admin-record key signs admin records;
+   the mandates key signs mandates; the leases key signs the revocation feed (and leases,
+   G4d). Each is refused for the others' documents by type tag and by key set, as the root
+   is for anything but a bundle. All are files, for fake data only, until a key service
+   exists.
+
+10. **The gate holds a mandate to its template** (review finding GR-138). The mandates
+    key is online, so a mandate's signature alone must not be worth more than the root
+    allowed. When a gate verifies a chain it also checks the chain's root mandate against
+    the template of that id **in the bundle the gate holds**: the grants inside the
+    template's, the life within the template's, the limits no looser, and, if the chain
+    has a child, that the template allows delegating. Taking the Authority's machine then
+    yields only what the reviewed, root-signed templates already allow. The number in
+    `template: "<id>@<number>"` records which bundle the Authority issued from; it does not
+    choose which template governs. **The template in the held bundle governs**: narrowing a
+    template tightens every live mandate from it at once, and removing a template ends
+    them. In G4c this check is built into the chain check in `gov-core` and used by the
+    gate's sessions; with no grants yet checked against a call (G5), what it changes today
+    is which mandates a session is opened for.
+
+**Not built in G4c:** anything served over HTTP (G4e); the gate reading the feed, closing
+sessions, and its clock (G4d); grants checked against a call (G5); limits charged (G6); a
+limit on how many mandates may be issued in a time, which belongs with the listener.
+
 **Not in G4:** countersignatures and approvals (G6), shadow decisions (G5), the console's
 screens (G8). A mandate's grants are still not checked against an action until G5, so a
 proven receipt is still not an authorised one.
+
+#### 7.6.3 G4d, the lease at the gate (design of 2026-11-27; read by the reviewer, who cleared it to be built; not built)
+
+Makes revocation take effect and ends the gate's own clock. It settles what the reviewer's
+twentieth read asked to be in the text first. The lease, the held lease and the freshness
+check exist in `gov-core` since G1 (§4.6); nothing has used them yet.
+
+1. **One request, one answer.** A gate renews with one signed document, `gov.renew.v1`:
+   its name, the Authority's name, a fresh random nonce, the bundle it holds (number and
+   digest, or none) and the revocation number it has read through. It is signed with a key
+   enrolled for that gate. It carries no time: a gate may not have one yet.
+   The Authority answers a gate that is not disabled, for a key that is its own and not
+   revoked. **A disabled gate gets no answer** (GR-167): it then has no fresh lease, so
+   its calls are recorded as `no_lease` in observe mode (point 5) and refused in enforce
+   mode. The answer is three things made from one reading of its store:
+   - a **lease** (§4.6), signed with a leases key of the latest published bundle, carrying
+     the request's nonce, the Authority's time, that bundle's version (number and digest)
+     and the newest revocation number;
+   - the **revocation feed** after the number the gate named, always, even when empty;
+   - the **bundle**, when the gate does not hold the one the lease names.
+   A renewal changes nothing at the Authority and writes no record. A copy of a request
+   played by someone else gets an answer bound to that nonce, which no gate is waiting for.
+   The Authority answers one gate at most once a second.
+2. **The gate takes the whole answer or none of it**, checking in this order:
+   - the bundle, if one came: it opens under the pinned root key and may replace the one
+     held (§7.6.1, point 3): never a lower number, never another bundle under the same
+     number;
+   - the lease: it opens under a leases key **of the bundle it names**, which must now be
+     the bundle in hand; it is for this gate and carries the nonce of the request the gate
+     sent and has not yet used; its time and its revocation number are not lower than the
+     held lease's (GR-1, as built);
+   - the feed: it opens under a leases key of the same bundle; its issuer is the lease's;
+     its `after` is the number the gate asked for; its `through` is not lower than the
+     lease's revocation number; its entries are numbered in order, and entries and the
+     count of those left out account for every number between `after` and `through`.
+   Then the bundle is put in use (point 7), the entries are added to the gate's revoked
+   set, and the lease is held. If any check fails nothing is changed, the gate keeps what
+   it had, and the operator's address says which check failed.
+   **An Authority that has gone back** (GR-168). If the Authority's clock is set back, or
+   its database is put back from an older copy, its leases carry a time or a revocation
+   number below what gates hold, and every gate refuses them until the Authority has
+   caught up. That is meant: nothing may turn a gate's clock or its revocations back. The
+   operator's address shows it under a reason of its own, `authority_behind`, so that it
+   is not read as the Authority being down.
+3. **Entries left out.** The Authority leaves out an entry once what it names expired more
+   than five minutes ago by its own clock. The gate's clock is the Authority's (point 4),
+   so the gate already refuses that mandate as expired: nothing is missing. Entries for an
+   agent and for a key name things that do not expire, and are never left out. A gate does
+   not keep its revoked set across a restart: it has no lease then either, and asks from
+   number 0.
+4. **The gate's time** (GR-72). "Now" is the held lease's Authority time plus the gate's
+   own count of time since that lease's request left (as built in `HeldLease`).
+   - The count must go on while the machine is suspended. On Linux that is the
+     `CLOCK_BOOTTIME` clock, read through a library with a safe interface; the standard
+     library's `Instant` does not count suspension there. On any other system the gate
+     program refuses to start with an Authority configured, except with fake data.
+   - A receipt stamped this way says so: a new field, `at_from_lease`, true. It is left
+     out when false, so every receipt written before G4d reads as what it was: stamped
+     from the gate's own clock. A receipt's time still never goes back along the chain
+     (`at_clamped`, as built).
+   - **Before its first lease**, and with no Authority configured (tests, fake data), a
+     gate in observe mode forwards and records as now, stamps from its own clock, and the
+     receipt does not carry `at_from_lease`. In enforce mode (G6) it refuses everything.
+   - Once a gate has held a lease in this run it keeps stamping from it, however old the
+     lease is: an old lease still gives a better clock than the machine's.
+5. **Proof needs a complete, fresh lease.** A lease is *complete* when the gate holds the
+   bundle it names and has read the feed through its revocation number (`permits`, as
+   built), and *fresh* while it is no older than its `valid_for_secs`. With an Authority
+   configured:
+   - a session is opened only under a complete, fresh lease, and only for a chain that
+     holds against the revoked set. A refusal is counted by why, as since GR-155, with two
+     more reasons: `no_lease` and `revoked`;
+   - a call under an open session, with a proof that holds, is recorded as **proven** only
+     under a complete, fresh lease. Otherwise it is forwarded, as everything is in observe
+     mode, and recorded as a failed proof with a new reason, `no_lease`: the gate could not
+     say whether the agent was revoked, and does not guess;
+   - enforce mode (G6) refuses an action whose freshness class the lease's age exceeds
+     (§4.6); nothing in G4d blocks.
+6. **A revoked agent, mandate or key** (GR-110; §7.6, choice 5). When an accepted feed
+   revokes any link of a session's chain, the agent a link names, or the session's key,
+   the session is **closed to proof and kept as a marker**. A later call that presents
+   it, with a proof that holds, is recorded as that agent's with a failed proof and one of
+   three new reasons: `key_revoked`, `agent_revoked`, `mandate_revoked`. The caller did
+   hold the key, and the reason says so; the receipt is not `claimed` and not an
+   unknown session. A proof that does not hold keeps its own reason.
+   - A marker lives as long as the session would have (its mandate's expiry, the idle
+     limit), under the same limits for each key, and pushes out nothing proven.
+   - No new session is opened for a revoked mandate, agent or key. The shim, refused, goes
+     on presenting the session it has, so its calls stay named. Once the marker is gone
+     they are recorded as an unknown session, with the agent as claimed: a stated limit.
+   - Enforce mode (G6) refuses these calls.
+7. **Changing bundle without a restart** (GR-132, GR-133). The connector map, the
+   issuers' keys, the templates and the version are swapped together between calls. A
+   call whose intent is already written finishes under the bundle its intent names.
+   - Each open session's chain is checked again against the new issuers and templates;
+     one that no longer holds is dropped, and its next call is an unknown session.
+   - **A gate with no saved state** (GR-132) may be started with a bundle file, to have a
+     map at once, but its lease is not complete until a lease names that very bundle. If
+     the lease names a newer one, the answer carries it. If the lease names an older one
+     than the gate holds, the gate keeps its own, has no complete lease, and says so on
+     the operator's address: something handed it a newer bundle than its Authority
+     publishes, or the Authority was put back.
+   - **The shim follows the gate** (GR-133). The gate's answer to opening a session, and
+     to every call the shim sends, names the version the gate holds, in a header the shim
+     removes before the agent sees it. A shim holding another version asks the gate for
+     the bundle, checks it under the root key it pinned itself, by the same rule against
+     going back, and uses it from its next call. The call that crossed the change may be
+     recorded as a failed proof (`wrong_digest`), once for each shim at each change: a
+     stated limit, counted on the operator's address.
+8. **Rotating a gate's key** (GR-59). A gate enrols a further key as it enrolled its first:
+   a one-time code from an admin, a key id under its own name that was never used, a
+   record. Both keys then open its receipts at the Ledger.
+   - The chain goes on across the change: receipt *n* is signed with the old key, *n+1*
+     with the new, linked as any two are.
+   - The gate keeps the public half of every key it has signed with, a file each beside
+     the spool, and opens its spool under that set. A receipt in its spool under any
+     other key still stops it from starting. The old private half is deleted once the
+     Ledger has acknowledged the last receipt signed with it.
+   - An admin then revokes the old key (`Revoked`, of a key): the Ledger retires it, and
+     the feed carries it, so no gate opens a session for an agent key revoked the same
+     way.
+   - **Receipts under a revoked key that were not yet shipped** (GR-187). A chain cannot
+     skip, so refusing them would stop the gate's record at the Ledger from the
+     revocation on. The Ledger takes a receipt under a revoked key of a gate only inside
+     a shipment asked for under a key of that gate still in use; sent any other way it
+     is refused as before. `gov verify` reports each such receipt that no checkpoint
+     shows to be earlier than the revocation (point 10): the record is kept, and marked.
+     A disabled gate has no key in use, so nothing more of its is taken. If such a gate
+     is later given a new key, a shipment under it says only "these are my chain's
+     receipts"; it cannot settle when the old key's receipts were written, and the
+     auditor reports any the witness does not show to be earlier than the disabling. In a planned
+     change the gate ships what the old key signed before the admin revokes it; the
+     Authority cannot check that, since it does not see the Ledger's answers to a gate.
+   - In a spool, a key does not come back once a later one has signed (GR-188).
+9. **Replacing the Authority's admin-record key** (GR-126). A planned change is a record
+   in the Authority's own chain, signed with the old key, that names the new one; records
+   after it are signed with the new key, and the Ledger and `gov verify` follow the chain
+   across it. **From that record on, the old key is refused for every later record**
+   (GR-166), by the Ledger and by `gov verify`: otherwise whoever still holds it could
+   continue the chain beside the new one. A **taken** admin-record key cannot be repaired this way, since whoever
+   holds it can write the same record: that is repaired by the operator at the Ledger and
+   by giving auditors the new key out of band, like the first installation, and is stated
+   as a limit beside the loss of the root key (owner's decision 9).
+   The Authority also checks, when it ships, that a witnessed checkpoint covers its own
+   chain's head within a set time, and counts it for its operator when none does.
+10. **After a retirement, the witness's order decides** (GR-130). `gov verify` no longer
+    compares the gate's date on a receipt with the Authority's date on the record. A
+    receipt under a retired key, or of a disabled gate, counts as written before the
+    retirement only if a witnessed checkpoint earlier than the first one covering the
+    retirement record already covered that receipt. Any other is reported. A receipt
+    written honestly before and shipped late is reported too; the report says "not shown
+    to be earlier", not "written after".
+11. **What is served** (a departure from §7.6's table, for the reviewer to confirm or
+    refuse). The table put the `gov-authority` program in G4e. G4d cannot be run as
+    programs without one, so its last step adds the program with **one listener, for
+    gates only**: the renewal of point 1 and nothing else. Every request on it is a
+    document signed with an enrolled gate key; it takes no admin action and no sign-in,
+    which stay with G4e (choice 8). It follows the programs' connection rule (HTTPS, or a
+    literal loopback address) and their key-file rule (fake data only).
+    It is hardened as the Ledger's listener is (GR-169, with GR-77): a sender it does not
+    know gets a bare refusal and nothing is written; the request and the answer have a
+    size cap; and a limit for each source address applies before any signature is
+    checked. **Enrolment, issuing and delegation are not on this listener**: they stay
+    library calls on the Authority's machine, so a gate on another machine cannot enrol
+    until G4e.
+
+**Steps.** G4d-1: the renewal document, the Authority's answer and the gate's check of it
+(points 1 to 3), as libraries. G4d-2: the gate's time, proof under a lease, and revoked
+sessions (points 4 to 6). G4d-3: the bundle changed in place and the shim following
+(point 7). G4d-4: key rotation and the auditor's order (points 8 to 10). G4d-5: the
+program and the gate's renewal loop (point 11), run as four programs with fake data.
+
+**Not in G4d:** people and sign-in (G4e); anything blocked (G6); whether a gate may ask
+the Authority at the moment of an outward call (access governance spec §11; the owner's
+decision).
+
+#### 7.6.4 G4e, people and sign-in (design of 2026-11-28; read by the reviewer, who cleared it to be built; not built)
+
+Ends the last stand-in of G4: admin actions made by whoever can run a command. Written
+before any code. Fake data only, as everywhere before the gate passes for a pilot; the
+Entra app registration is the owner's to make, so the tests run against a fake identity
+provider and **nothing here will have been run against Microsoft** when it is first built.
+
+1. **The verifier is written again in Governance** (§7.6, choice 8). `crates/entra`
+   depends on `pmos-contract`, which carries PM OS's roles, and Governance never depends
+   on PM OS (§1.2). A new crate, `gov-signin`, holds the same claim rules and nothing of
+   PM OS: one configured tenant; discovery and keys fetched over HTTPS only (a literal
+   loopback address for tests), with a size cap, a time limit, and a limit on how often
+   an unknown key id causes a fetch; RS256 only; `iss`, `aud` (exactly one, this client),
+   `exp`, `nbf`, `iat`, `nonce` and `tid` all checked; `oid` a GUID; guests refused
+   (`acct` must say member, so the registration needs that optional claim). A person is
+   `(tid, oid)` and nothing else: `email` and `preferred_username` never decide who
+   someone is. Conditions from the reviewer: every attack test of `crates/entra` is
+   ported; the endpoints the discovery document names must be HTTPS on the configured
+   authority's host, and no redirect is followed; only `openid` is asked for, and the
+   tokens are discarded once checked.
+2. **The flow.** Authorization code with PKCE, as a confidential client of one tenant;
+   the ID token comes from the code exchange, never the front channel. `state`, `nonce`
+   and the PKCE verifier are random, kept at the Authority under a digest of a
+   pre-sign-in cookie, used once, and gone after ten minutes. The return address after
+   sign-in is fixed, not taken from the request. The code comes back in the query, not a
+   form post, and the pre-sign-in cookie is `SameSite=Lax`, since a `Strict` cookie is
+   not sent on the navigation back from Microsoft; `SameSite=None` is never used
+   (GR-197). The client secret is read from a file
+   under the key-file rule (owner only; fake data only until a key service exists) and
+   is never logged or put in an error.
+3. **Who a person is in Governance.** Governance's own people table, as built: a name and
+   a role (admin, owner, approver, auditor). An admin links a person to an Entra account
+   by giving the account's object id; the link is an admin record (`PersonLinked`, naming
+   the person and a digest of `(tid, oid)`; the object id itself is not in the chain).
+   There is no linking by name or email at first sign-in. **The link is the grant, and
+   is guarded as one** (GR-195): it is written once, and changing it means offboarding
+   the person and adding a new one; one account links to one person and one person to
+   one account; and linking, like any change of role, needs a recent sign-in (point 4).
+   The digest hides the object id from outsiders, not from anyone in the tenant, who can
+   list object ids and test them. A person with no link cannot
+   sign in; an account linked to nobody is refused with the same bare answer as any other
+   failure. The first admin is made on the Authority's machine by a command, with their
+   object id, and that record says its actor is unverified, as now.
+4. **Sessions.** An opaque 256-bit random value in a cookie named with the `__Host-`
+   prefix (`HttpOnly`, `Secure`, `SameSite=Strict`, host-only, path `/`). The first page
+   after sign-in is served directly by the callback, not by a redirect that would need
+   the new cookie (GR-197); its address holds the spent code, so it is sent with
+   `Referrer-Policy: no-referrer`. The Authority stores only the value's digest, with
+   the person, the time of sign-in and the time last used. Idle limit 15 minutes,
+   absolute limit 8 hours; both set by the operator, neither unlimited. Every request
+   re-reads the person: offboarded or with a changed role, the session ends or acts with
+   the new role at once. Signing out deletes it. A person removed in Entra keeps a
+   Governance session until its limits run out: a stated limit, bounded by the absolute
+   limit, and ended at once by offboarding them here.
+   - **Each sign-in is a record** (`SignedIn`: the person, a session reference, the
+     time). The reference is a random id of its own, tied to nothing in the cookie, so it
+     names the session without being usable as one. The witness then covers the fact that a
+     session existed before any act made under it.
+   - **Acts under a session say so.** An admin record's actor is `verified` and carries
+     the session reference; a mandate's `issued_by.session` carries it. `gov verify`
+     reports a verified record, or a mandate with a session, whose reference no earlier
+     `SignedIn` record of the same person in the same chain bears out. This is what the
+     condition on G6 (§7.6.2, point 3) rests on: the auditor checks the record of a
+     mandate's issue, which carries the session, not the mandate inside a receipt.
+   - **A session reference has an end** (GR-198). The record carries the absolute limit
+     then in force; sign-out and offboarding are records too. `gov verify` also reports
+     an act later than its session's limit, or after that person's sign-out of it or
+     offboarding. The session's start is the token's `auth_time`, not the moment the
+     code came back; signing in again makes a new session and a new record; and the
+     record and the session row are written in one transaction.
+   - The chain then holds when each person signed in, for as long as it is kept. It does
+     not show that a second factor was used: that is the tenant's policy and is not in
+     the token.
+   - **What "verified" proves.** That the Authority, holding its admin-record key, says
+     this person was signed in. Whoever takes that key or the Authority's database can
+     write the same records. It is evidence of who acted while the Authority is honest,
+     and no more; said in the product wherever "verified" is shown.
+   - **Recent sign-in for the acts that change who is trusted:** adding or offboarding
+     an admin, linking a person or changing a role, publishing a bundle, revoking a key,
+     disabling a gate, and offering an enrolment code for a gate (it makes a new trusted
+     signer). These need a sign-in no older than five minutes (`max_age` asked for,
+     `auth_time` checked); otherwise the answer says to sign in again. A token without
+     `auth_time`, like one without `acct`, is refused, so the app registration needs
+     both optional claims.
+5. **Requests that change something.** `SameSite=Strict` is not relied on alone: every
+   request that is not a read must carry an `Origin` equal to the configured admin
+   origin, a JSON content type, and a header whose value is a second random value given
+   to the page at sign-in and kept with the session. A read changes nothing. Every
+   request's `Host` must be the configured origin's, and every answer says
+   `Cache-Control: no-store`.
+6. **Two listeners, two purposes.**
+   - **The admin listener** (new): sign-in, sign-out, and people's calls. It is told its
+     own public origin (`https://…`) and refuses to start with any other scheme unless
+     the address is a literal loopback one and the data is fake. The program still does
+     not speak TLS: it listens on loopback behind a proxy that does, which is the only
+     supported way to serve it. `--plain-http-on-network` does not apply to it.
+   - **The machines' listener** (as built for renewals) gains two routes, each a signed
+     document and no session: `POST /v1/enrol` (so a gate or agent on another machine
+     can enrol) and `POST /v1/delegate` (a parent agent's signed request). The
+     per-source limit applies before any work.
+   - **An enrolment code never travels** (GR-193). When a code is offered, the Authority
+     keeps, beside the digest it keeps now, a key derived from the code under another
+     label. A request over the network carries a MAC under that key over the signed
+     request, and no code; someone on the path who reads it has nothing to enrol their
+     own key with. A code is at least 128 random bits, so neither value can be guessed
+     from what travels (to be checked against `new_code` when this is built). The
+     library call that takes the code itself stays, for the Authority's own machine.
+   - **Wrong attempts over the network do not cancel a code** (GR-199): with a code
+     that long, guessing is not the risk, and a stranger who knows a name could
+     otherwise cancel its enrolment from anywhere. The limits answer a flood. The
+     count that cancels stays on the library call.
+7. **Routes on the admin listener, first cut.** JSON only; the console's screens are a
+   later slice and will use these.
+
+   | Who | Calls |
+   |---|---|
+   | Anyone signed in | who am I; sign out |
+   | Admin | add, link and offboard a person; register, suspend, resume and disable an agent; register and disable a gate; offer an enrolment code; publish a signed bundle; revoke a key; revoke any mandate |
+   | Owner | issue a mandate to an agent they own; list and revoke their own |
+   | Auditor, admin | list people, agents, gates, keys and mandates, under the rule of §7.6.2 point 5 |
+
+   Each call is the library function that exists, with the session's person as the
+   actor; the library's own checks (role, ownership, last admin) stay the authority, and
+   the listener adds none of its own that the library lacks.
+8. **Bare answers and limits.** Sign-in failures all answer alike and say nothing of
+   why; the reason is counted for the operator. Behind the proxy every caller is
+   loopback, so the limit on the sign-in routes is not by address (GR-196): there is
+   one overall limit, one for each pre-sign-in cookie, and one for each client address
+   in the header the operator's proxy sets. A stranger drops the cookie each time and
+   would meet only the overall limit, using it up for everyone, so **the header must be
+   named whenever the origin is not loopback**: without it the listener does not start.
+   That header is read on the admin listener only, and only its last entry: the proxy
+   must set or append it itself, and must pass the browser's `Host` through unchanged.
+   A client is held to its own limit first, and only what that lets through counts
+   toward the overall one (GR-205). The verifier's own reason for a
+   failure (a guest, a missing claim, a bad token) goes to the operator's count and
+   never to the caller. No token, code, secret, cookie or object id is
+   logged.
+9. **The Authority's own key, in the program** (the reviewer's points from the
+   twenty-ninth read). Replacing the admin-record key stays an operator's command on
+   the Authority's machine, never a route. The command keeps both private key files
+   until the Ledger has taken the new key: it writes the record; ships under the old key
+   until the Ledger accepts the new one; then moves the old file aside and deletes it.
+   Stopped at any point and run again, it goes on from where it was: if the Ledger
+   already holds the new key (a lost acknowledgement), it asks under the new key. There
+   is a test for a stop between each two steps.
+   - **The serving program must not go on signing with the old key** (GR-194), which it
+     would, all day, once sign-ins are records. Two rules. The library refuses to sign
+     a record with any key but the one its chain's last replacement names, so an
+     instance left holding the old key stops writing instead of writing records the
+     Ledger refuses. And the command runs only with the program stopped: the program
+     holds a lock in the Authority's database while it serves, the command refuses
+     while that lock is held, and the program is then started with the new key's file.
+     The lock is one a crash releases (a database session lock), not a row that outlives
+     the process.
+
+**Threats this adds, and the answer to each.** A stolen session cookie: short limits,
+`HttpOnly`, recent sign-in for the acts that matter, and offboarding ends it. A forged
+request from another site: point 5. Sign-in started by an attacker and finished by the
+victim: `state` is tied to the victim's own pre-sign-in cookie. A token from another
+tenant or client, or replayed: `tid`, `aud` and a one-use `nonce`. A redirect to
+somewhere else after sign-in: the return address is fixed. A flood of unknown key ids
+making the Authority fetch keys: the fetch limit. An admin who removes every admin: the
+library already refuses.
+
+**Steps.** G4e-1: `gov-signin`, the verifier, against a fake identity provider. G4e-2:
+the link, sessions and their records in the Authority library and both stores, and the
+auditor's check of session references. G4e-3: the admin listener and its routes.
+G4e-4: enrolment and delegation on the machines' listener. G4e-5: the commands (the
+first admin; replacing the admin-record key), and the run as programs, with fake data
+and a fake identity provider.
+
+**Conditions carried into G4e from earlier reads.** A gate's change of key (enrol the new
+key, ship everything under the old one, revoke it, delete its private half) is written
+into the run notes now and is enforced or checked before real data. The Authority's
+acknowledged position at the Ledger must be kept across a restart before anything can
+re-enable a disabled gate: until then a record sent again is harmless. TLS is required
+before real data or any use beyond loopback, and GR-77 (limits on connections and slow
+requests on every listener) before any network exposure.
+
+**Not in G4e:** the console's screens; groups from the token; approvals and the page
+the gate serves for them (G6); any sign-in other than Entra; a run against Microsoft,
+which waits on the owner's app registration.
 
 ## 8. The seam in PM OS
 
@@ -1545,6 +2873,26 @@ One setting. PM OS enrols its bots in bulk and starts in observe, then shadow, c
 decision with Governance's for every write, the way `PMOS_MCP_COMPARE` compares connectors with
 MCP servers. Fake data only until the gate passes review.
 
+**No fallback (owner, 2026-11-26; to be built in G7).** Once a system is in enforce mode,
+a write to it that Governance cannot decide is refused: no lease or a stale one, no bundle,
+a mandate that cannot be checked, a receipt that cannot be written. PM OS's own grant check
+still runs first and can refuse; it can never be what allows a write that Governance did
+not. The tool server does not notice Governance is unwell and carry on without it. Taking
+a system out of enforce mode is an admin action at the Authority, recorded (`ModeSet`), and
+never something the running service does for itself.
+
+**What this does not cover** (review finding GR-142). The seam's own switch is PM OS's
+setting. With the library seam PM OS still holds the system's credential, so whoever
+operates PM OS can unset the switch and write directly, with no record at the Authority:
+the cover is **in line, not custody** (§5.2), and receipts say so. "No fallback" is a rule
+about what the running service does, not a control on its operator. The stronger claim
+holds only where a separate gate holds the only credential. What the Ledger can show
+afterwards is the trace of going round: a gate in enforce mode that goes quiet while the
+system's own log shows writes, which is reconciliation (§7.5), not built.
+
+ In observe and shadow modes nothing is refused by
+Governance, by definition; what cannot be recorded is counted and shown.
+
 ### 8.5 Not connected
 
 The model gateway, evals, content, the daily brief, the Slack app's own messages, OpenShell
@@ -1582,10 +2930,26 @@ Each slice ends with its attack tests (§3.3) passing and its commit sent to the
 | G4 | `gov-authority`: registry, enrolment, Entra sign-in, policy check and signing, mandates, lease and revocation feed, admin interface, `gov` commands | A revoked agent is refused within its class; a gate that misses a revocation treats its lease as invalid; a wrong clock does not extend an expiry |
 | G5 | Shadow mode; policy replay; a drafted first policy from observed receipts | Replay reports exactly the decisions a changed rule alters on a fixed history |
 | G6 | Enforce: the sealed store, the twelve checks, countersignatures of both classes, the approval screen's interface, budgets, crash recovery | Every row T1 to T7, T11, T15 and T22 has a failing-without, passing-with test; a kill between intent and outcome yields `unknown` and no second write |
-| G7 | The PM OS seam, off by default; bulk enrolment; the session mandate; attested approvals; the receipt reference in the audit log; side-by-side comparison | With the switch off, the tool server's output is identical; with it on, on the test stack, every write has an intent and an outcome receipt |
+| G7 | The PM OS seam, off by default; bulk enrolment; the session mandate; attested approvals; the receipt reference in the audit log; side-by-side comparison; no fallback in enforce mode (§8.4) | With the switch off, the tool server's output is identical; with it on, on the test stack, every write has an intent and an outcome receipt; in enforce mode a write is refused when Governance cannot decide; and the scene of §1.2 runs end to end on fake data: a PM OS bot finishes a task, a planted instruction makes it attempt an operation outside its mandate, the gate refuses it before the fake system is called, and `gov verify` passes on an export holding the refusal |
 | G8 | Console screens; Governance's own stack file and the overlay for both; health and metrics (decision time, refusals, lease age, revocation delay) | CI's deploy job starts both stacks on a real Docker host |
 
 | G9 | Undo (§4.7), after G6: before-values sealed at intent; the undo action and its receipts; refusal on a changed target; undo of a whole mandate; the undo cover page | On the fake Jira: forty issues changed by one mandate are put back by one undo with a receipt each; an issue someone edited in between is left alone and reported; a `none` operation cannot be undone and needed a person to run |
+
+**Added by the owner on 2026-11-27** ("Keep the existing feature and build and add the new
+things you suggested"). Nothing above is dropped or reordered: G4c to G9 and the access
+governance slices stand as they are. Three things are added, from the conductor's answer
+on what would make the product hard to replace.
+
+| Slice | Built | Done when |
+|---|---|---|
+| CM1 | **A library of connector maps** for the three systems to start with: Jira, GitHub and Slack. Each map is a directory in `governance/maps/<system>/` holding the map for one named MCP server at one named version, its sample calls (as `gov policy check` requires), and a note of what it was checked against. A map says, for every tool, the operation, its kind, whether and how it can be put back, whether it reaches outside, and the resource it acts on | `gov policy check` passes on each; every tool of the server is mapped or listed as deliberately unmapped with a reason; the reviewer has read each map (the standing condition of GR-65). A map made from a server's published tool definitions, and not yet run against that server, says so, and is not called verified |
+| CM2 | **Drift**: a command, `gov map drift`, that takes a server's current tool listing and a map and reports tools added, removed and changed (by the digest of the definition) since the map was reviewed; and the gate's count of calls to tools the map does not know, by tool digest, on the operator's address | A changed description, a new tool and a removed tool are each reported; a tool whose definition is unchanged is not |
+| CP | **Proof about the record**, beyond what `gov verify` shows today. Its design is **not written in this repository**: the owner is deciding whether to file for a patent first, and what is written here is published. It is built after that decision | Not stated here, for the same reason |
+
+Where they sit: CM1 and CM2 need nothing that is not built, so they are built beside G4c
+to G4e, one system at a time, Jira first. CP waits for the owner. Custody (G6), undo (G9)
+and access reviews (the access governance spec) were in the conductor's answer too and
+are already slices.
 
 After the first release, in no fixed order: reconciliation (§7.5); GitHub with tokens minted
 per repository; a key-service driver; object-storage witness with lock; SCIM; passkey approval

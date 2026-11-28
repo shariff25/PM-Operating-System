@@ -24,6 +24,7 @@ use sqlx::{ConnectOptions, Connection};
 const LEDGER: &str = env!("CARGO_BIN_EXE_gov-ledger");
 const GATE: &str = env!("CARGO_BIN_EXE_gov-gate");
 const SHIM: &str = env!("CARGO_BIN_EXE_gov-shim");
+const AUTHORITY: &str = env!("CARGO_BIN_EXE_gov-authority");
 
 /// How many requests the fake server has been sent.
 static UPSTREAM_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -193,14 +194,17 @@ impl Site {
         .args(["--operator-listen", "127.0.0.1:0"])
         .arg("--operator-secret-file")
         .arg(self.path("operator.secret"))
-        .arg("--mandate-issuers")
-        .arg(self.path("issuers.json"))
+        .arg("--bundle")
+        .arg(self.path("bundle.json"))
+        .arg("--root-key")
+        .arg(self.path("root.pub.json"))
+        .arg("--bundle-state")
+        .arg(self.path("gate.bundle-state"))
+        .args(["--server", "jira-mcp"])
         .arg("--key-file")
         .arg(self.path("gate.key"))
         .arg("--spool")
         .arg(self.path("spool"))
-        .arg("--map")
-        .arg(self.path("map.json"))
         .arg("--ledger-keys")
         .arg(self.path("ledger-keys.json"))
         .arg("--witness")
@@ -283,6 +287,781 @@ async fn call(gate: &str, n: u64, key: &str) -> u16 {
         .as_u16()
 }
 
+/// The fake server again, without the count the test above keeps.
+async fn quiet_jira(body: Bytes) -> Json<Value> {
+    let msg: Value = serde_json::from_slice(&body).unwrap();
+    let result = match msg["method"].as_str().unwrap_or_default() {
+        "tools/list" => json!({"tools": [update_tool()]}),
+        _ => json!({"content": [{"type": "text", "text": "done"}]}),
+    };
+    Json(json!({"jsonrpc": "2.0", "id": msg["id"], "result": result}))
+}
+
+async fn health_of(operator: &str, secret_file: &Path) -> Value {
+    reqwest::Client::new()
+        .get(format!("http://{operator}/healthz"))
+        .header(
+            "x-gov-operator-key",
+            std::fs::read_to_string(secret_file).unwrap(),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+/// Ask `what` twice a second until it holds, for twenty seconds at most.
+async fn until<F: std::future::Future<Output = bool>>(why: &str, mut what: impl FnMut() -> F) {
+    for _ in 0..40 {
+        if what().await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    panic!("never happened: {why}");
+}
+
+/// Slice G4d-5: four programs with fake data. The gate takes its lease, its revocations
+/// and its next bundle from the Authority's listener, and the Ledger takes the gate's key
+/// on the Authority's record. Admin actions are library calls on the Authority's database,
+/// as they are until G4e.
+#[tokio::test]
+async fn four_programs_a_gate_renews_from_its_authority() {
+    use gov_core::enrol::{code_digest, EnrolKind, EnrolRequest};
+    use gov_core::SigningKey;
+    let (Some(db), Some(authority_db)) = (Database::new().await, Database::new().await) else {
+        return;
+    };
+    let site = Site {
+        dir: tempfile::tempdir().unwrap(),
+        db,
+        upstream: serve(Router::new().route("/mcp", post(quiet_jira))).await,
+    };
+    let now = gov_run::now();
+    let keygen = |program_path: &str, kid: &str, file: &str| -> PublicKey {
+        let (ok, public, err) = run(program(program_path)
+            .args(["keygen", "--kid", kid, "--out"])
+            .arg(site.path(file)));
+        assert!(ok, "{err}");
+        std::fs::write(site.path(&format!("{file}.pub")), &public).unwrap();
+        serde_json::from_str(&public).unwrap()
+    };
+    let private = |file: &str| {
+        SigningKey::from_file_text(&std::fs::read_to_string(site.path(file)).unwrap()).unwrap()
+    };
+    let ledger_public = keygen(LEDGER, "ledger-k1", "ledger.key");
+    let gate_public = keygen(GATE, "gate-1:k1", "gate.key");
+    let agent_public = keygen(GATE, "refund-bot:k1", "agent.key");
+    keygen(AUTHORITY, "authority-admin-1", "admin.key");
+    let mandates_public = keygen(AUTHORITY, "authority:mandates-1", "mandates.key");
+    let leases_public = keygen(AUTHORITY, "authority:leases-1", "leases.key");
+    let root = SigningKey::from_seed(id("root-1"), &[70; 32]).unwrap();
+    std::fs::write(
+        site.path("root.pub.json"),
+        serde_json::to_vec(&root.public()).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        site.path("ledger-keys.json"),
+        serde_json::to_vec(&[ledger_public]).unwrap(),
+    )
+    .unwrap();
+
+    let grants = vec![gov_core::action::Grant {
+        system: id("jira"),
+        operations: [id("issue.update")].into(),
+        resources: vec![gov_core::ResourcePattern::new("jira/project/pay/*").unwrap()],
+    }];
+    let bundle = |number: u64, version: &str| {
+        let bundle = gov_core::policy::PolicyBundle {
+            v: 1,
+            tenant: id("acme"),
+            env: id("prod"),
+            issuer: id("authority"),
+            version: id(version),
+            number,
+            issued_at: now,
+            keys: gov_core::policy::OnlineKeys {
+                mandates: vec![mandates_public.clone()],
+                leases: vec![leases_public.clone()],
+            },
+            freshness: Default::default(),
+            rules: Vec::new(),
+            connectors: vec![ServerMap {
+                labels: Vec::new(),
+                clearances: Vec::new(),
+                server: id("jira-mcp"),
+                system: id("jira"),
+                fold_case: true,
+                tools: vec![ToolMap {
+                    results: None,
+                    tool: id("jira_update_issue"),
+                    digest: tool_digest(&update_tool()).unwrap(),
+                    operation: id("issue.update"),
+                    kind: Kind::Write,
+                    reversal: Reversal::Restore,
+                    outward: false,
+                    resource: ResourceTemplate::new("jira/project/{key:before(-)}/issue/{key}")
+                        .unwrap(),
+                }],
+            }],
+            templates: vec![gov_core::mandate::Template {
+                id: id("triage"),
+                grants: grants.clone(),
+                max_life_secs: 3600,
+                limits: Default::default(),
+                delegable: false,
+                people: Default::default(),
+                receivers: Default::default(),
+            }],
+        };
+        gov_core::seal(&bundle, &root).unwrap()
+    };
+    for file in ["bundle.json", "shim-bundle.json"] {
+        std::fs::write(
+            site.path(file),
+            serde_json::to_vec(&bundle(1, "v1")).unwrap(),
+        )
+        .unwrap();
+    }
+
+    // The admin's side, on the Authority's own database.
+    let store = gov_authority::pg::PgStore::connect(&authority_db.url)
+        .await
+        .unwrap();
+    store.migrate().await.unwrap();
+    let admin = gov_authority::Authority::new(
+        store,
+        Scope::new("acme", "prod").unwrap(),
+        id("authority"),
+        private("admin.key"),
+        root.public(),
+    )
+    .with_online_keys(private("mandates.key"), private("leases.key"));
+    let (ana, ben) = (id("ana"), id("ben"));
+    admin.bootstrap(&ana, now).await.unwrap();
+    admin
+        .add_person(&ana, &ben, gov_authority::Role::Owner, now)
+        .await
+        .unwrap();
+    admin
+        .register_agent(&ana, &id("refund-bot"), &ben, Default::default(), now)
+        .await
+        .unwrap();
+    admin.register_gate(&ana, &id("gate-1"), now).await.unwrap();
+    admin
+        .publish_bundle(&ana, &bundle(1, "v1"), now)
+        .await
+        .unwrap();
+    for (kind, name, public, file) in [
+        (EnrolKind::Gate, "gate-1", &gate_public, "gate.key"),
+        (EnrolKind::Agent, "refund-bot", &agent_public, "agent.key"),
+    ] {
+        let code = admin
+            .offer_enrolment(&ana, kind, &id(name), now)
+            .await
+            .unwrap();
+        let asked = gov_core::seal(
+            &EnrolRequest {
+                v: 1,
+                tenant: id("acme"),
+                env: id("prod"),
+                authority: id("authority"),
+                kind,
+                name: id(name),
+                key: public.clone(),
+                code: code_digest(&code),
+            },
+            &private(file),
+        )
+        .unwrap();
+        admin.enrol(&code, &asked, now).await.unwrap();
+    }
+    let issued = admin
+        .issue_mandate(
+            &ben,
+            &gov_authority::MandateAsk {
+                agent: id("refund-bot"),
+                key: id("refund-bot:k1"),
+                template: id("triage"),
+                grants: grants.clone(),
+                life_secs: 3600,
+                limits: Default::default(),
+            },
+            now,
+        )
+        .await
+        .unwrap();
+    let mandate_id = admin.list_mandates(&ben).await.unwrap()[0].id.clone();
+    std::fs::write(
+        site.path("mandate.json"),
+        serde_json::to_vec(&issued).unwrap(),
+    )
+    .unwrap();
+
+    // The Ledger is given the Authority's admin-record key, and no gate's key.
+    let (ok, _, err) = run(site
+        .ledger()
+        .args(["enrol-authority", "--tenant", "acme", "--env", "prod"])
+        .args(["--authority", "authority", "--public-key"])
+        .arg(site.path("admin.key.pub")));
+    assert!(ok, "{err}");
+    let ledger = start({
+        let mut c = site.ledger();
+        c.args(["serve", "--tenant", "acme", "--env", "prod"])
+            .args(["--listen", "127.0.0.1:0", "--checkpoint-interval", "1"])
+            .arg("--key-file")
+            .arg(site.path("ledger.key"))
+            .arg("--witness")
+            .arg(site.path("witness"));
+        c
+    });
+    let ledger_url = format!("http://{}", ledger.addr);
+    let mut authority = start({
+        let mut c = program(AUTHORITY);
+        c.env("GOV_AUTHORITY_DATABASE_URL", &authority_db.url)
+            .args(["serve", "--tenant", "acme", "--env", "prod"])
+            .args(["--name", "authority", "--listen", "127.0.0.1:0"])
+            .args(["--operator-listen", "127.0.0.1:0", "--ship-interval", "1"])
+            .arg("--operator-secret-file")
+            .arg(site.path("authority.secret"))
+            .arg("--admin-key-file")
+            .arg(site.path("admin.key"))
+            .arg("--mandates-key-file")
+            .arg(site.path("mandates.key"))
+            .arg("--leases-key-file")
+            .arg(site.path("leases.key"))
+            .arg("--root-key")
+            .arg(site.path("root.pub.json"))
+            .arg("--ledger-keys")
+            .arg(site.path("ledger-keys.json"))
+            .arg("--witness")
+            .arg(site.path("witness"))
+            .args(["--ledger", &ledger_url]);
+        c
+    });
+    let authority_operator = authority.said("operator on ");
+    let authority_url = format!("http://{}", authority.addr);
+
+    // Whoever is not an enrolled gate learns only that it was refused; too large a
+    // request is not read.
+    let stranger = reqwest::Client::new()
+        .post(format!("{authority_url}/v1/renew"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stranger.status().as_u16(), 403);
+    assert!(stranger.text().await.unwrap().is_empty());
+    let large = reqwest::Client::new()
+        .post(format!("{authority_url}/v1/renew"))
+        .body(vec![b' '; 70 * 1024])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(large.status().as_u16(), 413);
+    // One source is answered so many times a second, before any signature is read.
+    let mut limited = 0;
+    for _ in 0..45 {
+        let answer = reqwest::Client::new()
+            .post(format!("{authority_url}/v1/renew"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        limited += u32::from(answer.status().as_u16() == 429);
+    }
+    assert!(limited >= 1);
+    // Nothing for people is on this listener: no sign-in, no admin action.
+    for path in ["/healthz", "/v1/mandates", "/v1/people", "/v1/signin/start"] {
+        let other = reqwest::get(format!("{authority_url}{path}"))
+            .await
+            .unwrap();
+        assert_eq!(other.status().as_u16(), 404);
+    }
+    // Enrolment is: a signed request and a tag, and anything else is refused bare.
+    let stranger = reqwest::Client::new()
+        .post(format!("{authority_url}/v1/enrol"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert!(matches!(stranger.status().as_u16(), 403 | 429));
+    assert!(stranger.text().await.unwrap().is_empty());
+
+    let with_authority = |listen: &str| {
+        let mut c = site.gate_on(&ledger_url, listen);
+        c.args(["--authority", &authority_url]).args([
+            "--authority-name",
+            "authority",
+            "--renew-interval",
+            "1",
+        ]);
+        c
+    };
+    let mut gate = start(with_authority("127.0.0.1:0"));
+    let operator = gate.said("operator on ");
+    let gate_health = |operator: String| {
+        let secret = site.path("operator.secret");
+        async move { health_of(&operator, &secret).await }
+    };
+    until("the gate renewed", || async {
+        health_of(&authority_operator, &site.path("authority.secret")).await["renewed"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    })
+    .await;
+
+    let shim = start({
+        let mut c = program(SHIM);
+        c.args(["--tenant", "acme", "--env", "prod", "--gate", "gate-1"])
+            .args(["--gate-url", &format!("http://{}", gate.addr)])
+            .arg("--key-file")
+            .arg(site.path("agent.key"))
+            .arg("--mandate")
+            .arg(site.path("mandate.json"))
+            .arg("--bundle")
+            .arg(site.path("shim-bundle.json"))
+            .arg("--root-key")
+            .arg(site.path("root.pub.json"))
+            .arg("--bundle-state")
+            .arg(site.path("shim.bundle-state"))
+            .args(["--server", "jira-mcp"])
+            .arg("--secret-file")
+            .arg(site.path("shim.secret"));
+        c
+    });
+    let secret = std::fs::read_to_string(site.path("shim.secret")).unwrap();
+    let through_shim = |body: Value| {
+        reqwest::Client::new()
+            .post(format!("http://{}/mcp", shim.addr))
+            .header("content-type", "application/json")
+            .header("x-gov-shim-key", &secret)
+            .body(body.to_string())
+            .send()
+    };
+    let tool_call = |n: u64| json!({"jsonrpc": "2.0", "id": n, "method": "tools/call", "params": {"name": "jira_update_issue", "arguments": {"key": format!("PAY-{n}"), "summary": "Refund flow"}}});
+    let listed = through_shim(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}));
+    assert_eq!(listed.await.unwrap().status().as_u16(), 200);
+    assert_eq!(through_shim(tool_call(2)).await.unwrap().status(), 200);
+    let health = gate_health(operator.clone()).await;
+    assert_eq!(
+        (&health["proven"], &health["proof_failed"]),
+        (&json!(1), &json!(0)),
+        "{health}"
+    );
+    let first_version = health["policy_version"].clone();
+
+    // The next bundle is published at the Authority: the gate takes it with a renewal,
+    // without a restart, and keeps it; the shim follows.
+    admin
+        .publish_bundle(&ana, &bundle(2, "v2"), now)
+        .await
+        .unwrap();
+    until("the gate took the next bundle", || async {
+        gate_health(operator.clone()).await["policy_version"] != first_version
+    })
+    .await;
+    let kept: gov_core::Envelope =
+        serde_json::from_slice(&std::fs::read(site.path("bundle.json")).unwrap()).unwrap();
+    assert_eq!(kept, bundle(2, "v2"));
+    let mut n = 10;
+    until("a call is proven under the next bundle", || {
+        n += 1;
+        let (call, operator) = (through_shim(tool_call(n)), operator.clone());
+        async move {
+            assert_eq!(call.await.unwrap().status(), 200);
+            gate_health(operator).await["proven"].as_u64().unwrap() >= 2
+        }
+    })
+    .await;
+
+    // The mandate is revoked at the Authority. Within a renewal the gate records the
+    // agent's calls as failed proofs, with the reason; nothing is blocked.
+    admin.revoke_mandate(&ana, &mandate_id, now).await.unwrap();
+    let failed_before = gate_health(operator.clone()).await["proof_failed"]
+        .as_u64()
+        .unwrap();
+    let proven_before = gate_health(operator.clone()).await["proven"].clone();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(through_shim(tool_call(40)).await.unwrap().status(), 200);
+    let health = gate_health(operator.clone()).await;
+    assert_eq!(health["proven"], proven_before, "{health}");
+    assert_eq!(health["proof_failed"], json!(failed_before + 1), "{health}");
+
+    // Started again with a new key, enrolled at the Authority, the gate begins from the
+    // bundle it kept, goes on from the receipts its old key signed, and the Ledger takes
+    // the new key on the Authority's record.
+    let gate_addr = gate.addr.clone();
+    drop(gate);
+    let next_public = keygen(GATE, "gate-1:k2", "gate-next.key");
+    let code = admin
+        .offer_enrolment(&ana, EnrolKind::Gate, &id("gate-1"), now)
+        .await
+        .unwrap();
+    let asked = gov_core::seal(
+        &EnrolRequest {
+            v: 1,
+            tenant: id("acme"),
+            env: id("prod"),
+            authority: id("authority"),
+            kind: EnrolKind::Gate,
+            name: id("gate-1"),
+            key: next_public,
+            code: code_digest(&code),
+        },
+        &private("gate-next.key"),
+    )
+    .unwrap();
+    admin.enrol(&code, &asked, now).await.unwrap();
+    std::fs::rename(site.path("gate.key"), site.path("gate-first.key")).unwrap();
+    std::fs::rename(site.path("gate-next.key"), site.path("gate.key")).unwrap();
+    let mut gate = start({
+        let mut c = with_authority(&gate_addr);
+        c.arg("--earlier-key").arg(site.path("gate.key.pub"));
+        c
+    });
+    let operator = gate.said("operator on ");
+    assert_ne!(
+        gate_health(operator.clone()).await["policy_version"],
+        first_version
+    );
+    assert_eq!(through_shim(tool_call(50)).await.unwrap().status(), 200);
+
+    // An auditor's check passes over both chains: the gate's receipts, under a key the
+    // Ledger took on the Authority's record, and the Authority's own records.
+    let signers = || -> std::collections::BTreeSet<String> {
+        std::fs::read_to_string(site.path("export.json"))
+            .unwrap()
+            .split(r#""kid":""#)
+            .skip(1)
+            .map(|rest| rest.split('"').next().unwrap().to_string())
+            .filter(|kid| kid.starts_with("gate-1:"))
+            .collect()
+    };
+    until(
+        "both of the gate's keys are in a witnessed export",
+        || async {
+            let report = site.audit();
+            report.gates.len() == 2
+                && report.gates.iter().all(|g| g.unwitnessed == 0)
+                && signers().len() == 2
+        },
+    )
+    .await;
+    let report = site.audit();
+    assert!(report.ok(), "{:?}", report.findings);
+    let export = laid_bare(&std::fs::read(site.path("export.json")).unwrap());
+    assert!(export.contains("mandate_revoked"));
+    assert!(export.contains(r#""at_from_lease":true"#));
+    let health = health_of(&authority_operator, &site.path("authority.secret")).await;
+    assert_eq!(health["chain_not_witnessed"], json!(0), "{health}");
+    assert!(health["shipped_through"].as_u64().unwrap() >= 9, "{health}");
+
+    // Its key revoked, the gate is refused outright; it says so to its operator.
+    admin.revoke_key(&ana, &id("gate-1:k2"), now).await.unwrap();
+    until("the gate reports that it is refused", || async {
+        gate_health(operator.clone()).await["renew_refused_by_authority"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    })
+    .await;
+
+    drop((gate, shim, authority, ledger));
+    authority_db.drop_schema().await;
+    site.db.drop_schema().await;
+}
+
+/// Slice G4e-5: the Authority program serves people, and its own key is replaced by a
+/// command that can be stopped and run again. Fake data and a fake identity provider.
+#[tokio::test]
+async fn people_sign_in_to_the_program_and_its_key_is_replaced_by_a_command() {
+    use gov_core::admin::AdminAction;
+    use gov_core::SigningKey;
+    use gov_signin::testing::FakeIdp;
+    use std::os::unix::fs::PermissionsExt;
+    const TENANT: &str = "72f988bf-0000-4000-8000-0000000000aa";
+    const CLIENT: &str = "0b7f0c6e-1111-4222-8333-444455556666";
+    const ANA: &str = "00000000-0000-0000-0000-00000000a0a0";
+    let (Some(db), Some(authority_db)) = (Database::new().await, Database::new().await) else {
+        return;
+    };
+    let site = Site {
+        dir: tempfile::tempdir().unwrap(),
+        db,
+        upstream: serve(Router::new().route("/mcp", post(quiet_jira))).await,
+    };
+    let idp = FakeIdp::start(TENANT).await;
+    idp.set_client(CLIENT, "the-client-secret");
+    idp.set_claim("oid", json!(ANA));
+    let keygen = |program_path: &str, kid: &str, file: &str| -> PublicKey {
+        let (ok, public, err) = run(program(program_path)
+            .args(["keygen", "--kid", kid, "--out"])
+            .arg(site.path(file)));
+        assert!(ok, "{err}");
+        std::fs::write(site.path(&format!("{file}.pub")), &public).unwrap();
+        serde_json::from_str(&public).unwrap()
+    };
+    let ledger_public = keygen(LEDGER, "ledger-k1", "ledger.key");
+    keygen(AUTHORITY, "authority-admin-1", "admin.key");
+    keygen(AUTHORITY, "authority-admin-2", "admin-next.key");
+    keygen(AUTHORITY, "authority:mandates-1", "mandates.key");
+    keygen(AUTHORITY, "authority:leases-1", "leases.key");
+    let root = SigningKey::from_seed(id("root-1"), &[70; 32]).unwrap();
+    std::fs::write(
+        site.path("root.pub.json"),
+        serde_json::to_vec(&root.public()).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        site.path("ledger-keys.json"),
+        serde_json::to_vec(&[ledger_public]).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(site.path("client.secret"), "the-client-secret\n").unwrap();
+    std::fs::set_permissions(
+        site.path("client.secret"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+
+    let command = |name: &str, key_file: &str| {
+        let mut c = program(AUTHORITY);
+        c.env("GOV_AUTHORITY_DATABASE_URL", &authority_db.url)
+            .args([name, "--tenant", "acme", "--env", "prod"])
+            .args(["--name", "authority"])
+            .arg("--admin-key-file")
+            .arg(site.path(key_file))
+            .arg("--root-key")
+            .arg(site.path("root.pub.json"));
+        c
+    };
+    // The first admin, named once on the Authority's machine.
+    let first = |oid: &str| {
+        run(command("first-admin", "admin.key").args([
+            "--person",
+            "ana",
+            "--entra-tenant-id",
+            TENANT,
+            "--oid",
+            oid,
+        ]))
+    };
+    assert!(!first("not-an-object-id").0);
+    let (ok, said, err) = first(ANA);
+    assert!(
+        ok && said.contains("ana is the first admin"),
+        "{said} {err}"
+    );
+    assert!(!first(ANA).0);
+
+    let (ok, _, err) = run(site
+        .ledger()
+        .args(["enrol-authority", "--tenant", "acme", "--env", "prod"])
+        .args(["--authority", "authority", "--public-key"])
+        .arg(site.path("admin.key.pub")));
+    assert!(ok, "{err}");
+    let ledger = start({
+        let mut c = site.ledger();
+        c.args(["serve", "--tenant", "acme", "--env", "prod"])
+            .args(["--listen", "127.0.0.1:0", "--checkpoint-interval", "1"])
+            .arg("--key-file")
+            .arg(site.path("ledger.key"))
+            .arg("--witness")
+            .arg(site.path("witness"));
+        c
+    });
+    let ledger_url = format!("http://{}", ledger.addr);
+
+    // A port for the admin listener, so that its origin can be told to it.
+    let port = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        probe.local_addr().unwrap().port()
+    };
+    let origin = format!("http://127.0.0.1:{port}");
+    let serving_at = |key_file: &str, earlier: Option<&str>, admin_listen: &str| {
+        let mut c = command("serve", key_file);
+        c.args([
+            "--listen",
+            "127.0.0.1:0",
+            "--operator-listen",
+            "127.0.0.1:0",
+        ])
+        .args(["--ship-interval", "1"])
+        .arg("--operator-secret-file")
+        .arg(site.path("authority.secret"))
+        .arg("--mandates-key-file")
+        .arg(site.path("mandates.key"))
+        .arg("--leases-key-file")
+        .arg(site.path("leases.key"))
+        .arg("--ledger-keys")
+        .arg(site.path("ledger-keys.json"))
+        .args(["--ledger", &ledger_url])
+        .args(["--admin-listen", admin_listen])
+        .args(["--admin-origin", &origin])
+        .args(["--entra-tenant-id", TENANT, "--entra-client-id", CLIENT])
+        .args(["--entra-authority", &idp.base])
+        .arg("--entra-client-secret-file")
+        .arg(site.path("client.secret"));
+        if let Some(earlier) = earlier {
+            c.arg("--earlier-admin-key").arg(site.path(earlier));
+        }
+        c
+    };
+    let serving = |key_file: &str, earlier: Option<&str>| {
+        serving_at(key_file, earlier, &format!("127.0.0.1:{port}"))
+    };
+    // Sign in through the tenant and register a gate: the answer's status.
+    let sign_in_and_act = |gate: &'static str| {
+        let origin = origin.clone();
+        async move {
+            // A client of its own each time: the program is stopped and started between.
+            let http = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap();
+            let begun = http
+                .get(format!("{origin}/v1/signin/start"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(begun.status(), 302);
+            let cookie = |answer: &reqwest::Response, name: &str| {
+                answer
+                    .headers()
+                    .get_all("set-cookie")
+                    .iter()
+                    .filter_map(|v| v.to_str().ok())
+                    .find(|v| v.starts_with(name))
+                    .map(|v| v.split(';').next().unwrap().to_string())
+            };
+            let pre = cookie(&begun, "gov_pre=").unwrap();
+            let to = begun.headers()["location"].to_str().unwrap().to_string();
+            let back = http.get(to).send().await.unwrap();
+            let back = back.headers()["location"].to_str().unwrap().to_string();
+            let landed = http.get(back).header("cookie", pre).send().await.unwrap();
+            if landed.status() != 200 {
+                return landed.status().as_u16();
+            }
+            let session = cookie(&landed, "gov_session=").unwrap();
+            let body: Value = landed.json().await.unwrap();
+            http.post(format!("{origin}/v1/gates"))
+                .header("cookie", session)
+                .header("origin", &origin)
+                .header("x-gov-csrf", body["csrf"].as_str().unwrap())
+                .json(&json!({"id": gate}))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }
+    };
+
+    // The listener for people is on loopback, behind a proxy; nowhere else.
+    let (ok, _, err) = run(&mut serving_at("admin.key", None, "0.0.0.0:0"));
+    assert!(!ok && err.contains("loopback"), "{err}");
+    let mut authority = start(serving("admin.key", None));
+    assert_eq!(authority.said("admin on "), format!("127.0.0.1:{port}"));
+    assert_eq!(sign_in_and_act("gate-1").await, 200);
+    // While it runs: no second instance, and no change of its key.
+    let (ok, _, err) = run(&mut serving("admin.key", None));
+    assert!(!ok && err.contains("another instance"), "{err}");
+    let replace = |stop: Option<&str>| {
+        let mut c = command("replace-admin-key", "admin.key");
+        c.arg("--new-key-file")
+            .arg(site.path("admin-next.key"))
+            .args(["--as", "ana", "--ledger", &ledger_url])
+            .arg("--ledger-keys")
+            .arg(site.path("ledger-keys.json"));
+        if let Some(step) = stop {
+            c.args(["--stop-after", step]);
+        }
+        run(&mut c)
+    };
+    let (ok, _, err) = replace(None);
+    assert!(!ok && err.contains("stop it first"), "{err}");
+    drop(authority);
+
+    // Stopped after the record, then after the shipment, then run to the end; and once
+    // more, with nothing left to do. The old private key is gone only at the end.
+    let (ok, said, err) = replace(Some("record"));
+    assert!(ok && said.contains("recorded"), "{said} {err}");
+    // An instance started with the old key writes nothing: nobody can sign in.
+    let mut stale = start(serving("admin.key", None));
+    stale.said("admin on ");
+    assert_eq!(sign_in_and_act("gate-2").await, 403);
+    drop(stale);
+    let (ok, said, err) = replace(Some("shipped"));
+    assert!(ok && !said.contains("recorded"), "{said} {err}");
+    assert!(site.path("admin.key").exists());
+    let (ok, said, err) = replace(None);
+    assert!(ok && said.contains("done"), "{said} {err}");
+    assert!(!site.path("admin.key").exists() && site.path("admin.pub.json").exists());
+    let (ok, said, err) = replace(None);
+    assert!(ok && said.contains("done"), "{said} {err}");
+
+    // Started with the new key, and told the old one's public half, it serves again.
+    let mut authority = start(serving("admin-next.key", Some("admin.pub.json")));
+    authority.said("admin on ");
+    assert_eq!(sign_in_and_act("gate-3").await, 200);
+
+    // The chain as kept: one admin key replaced, and the acts under a session verified.
+    let store = gov_authority::pg::PgStore::connect(&authority_db.url)
+        .await
+        .unwrap();
+    let reader = gov_authority::Authority::new(
+        store,
+        Scope::new("acme", "prod").unwrap(),
+        id("authority"),
+        SigningKey::from_file_text(&std::fs::read_to_string(site.path("admin-next.key")).unwrap())
+            .unwrap(),
+        root.public(),
+    )
+    .with_earlier_admin_keys(vec![serde_json::from_slice(
+        &std::fs::read(site.path("admin.pub.json")).unwrap(),
+    )
+    .unwrap()]);
+    let records = reader.records().await.unwrap();
+    let said: Vec<(AdminAction, bool)> = records
+        .iter()
+        .map(|r| (r.action, r.actor.verified))
+        .collect();
+    use AdminAction as A;
+    assert_eq!(
+        said,
+        vec![
+            (A::PersonAdded, false),
+            (A::PersonLinked, false),
+            (A::SignedIn, true),
+            (A::GateRegistered, true),
+            (A::AdminKeyReplaced, false),
+            (A::SignedIn, true),
+            (A::GateRegistered, true),
+        ]
+    );
+    // An auditor's check passes over the Authority's chain across the change of key.
+    let mut report = site.audit();
+    for _ in 0..40 {
+        let covered = report.gates.iter().all(|g| g.unwitnessed == 0);
+        if report.ok() && report.receipts_verified == records.len() as u64 && covered {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        report = site.audit();
+    }
+    assert!(report.ok(), "{:?}", report.findings);
+    assert_eq!(report.receipts_verified, records.len() as u64);
+
+    drop((authority, ledger));
+    authority_db.drop_schema().await;
+    site.db.drop_schema().await;
+}
+
 /// A file's text, and with it the text of everything in it that is base64: a receipt's body
 /// is carried encoded, so a search of the raw file alone would miss what is inside it.
 fn laid_bare(bytes: &[u8]) -> String {
@@ -351,52 +1130,14 @@ async fn a_gate_and_a_ledger_run_as_programs_leave_a_record_an_auditor_can_check
         .arg(site.path("gate.key")));
     assert!(!ok && err.contains("must not exist"), "{err}");
 
-    // An agent's key, and a mandate for it from a test issuer: there is no Authority yet to
-    // issue one. The gate is given the issuer's public key.
+    // An agent's key. Its mandate comes from the Authority, further down, once there is a
+    // published bundle to issue it from.
     let (ok, agent_public, _) = run(program(GATE)
-        .args(["keygen", "--kid", "refund-bot-k1", "--out"])
+        .args(["keygen", "--kid", "refund-bot:k1", "--out"])
         .arg(site.path("agent.key")));
     assert!(ok);
     let agent_public: PublicKey = serde_json::from_str(&agent_public).unwrap();
-    let issuer = gov_core::SigningKey::from_seed(id("issuer-k1"), &[41; 32]).unwrap();
     let now = gov_run::now();
-    let mandate = gov_core::mandate::Mandate {
-        v: 1,
-        tenant: id("acme"),
-        env: id("prod"),
-        id: id("m-1"),
-        issuer: id("test-issuer"),
-        issued_at: now - 60,
-        expires_at: now + 3600,
-        agent: gov_core::mandate::AgentRef {
-            id: id("refund-bot"),
-            key: agent_public,
-        },
-        issued_by: gov_core::mandate::IssuedBy {
-            kind: gov_core::mandate::IssuerKind::Person,
-            id: id("ana"),
-            session: Some(id("ses-1")),
-        },
-        template: id("triage@7"),
-        grants: vec![gov_core::action::Grant {
-            system: id("jira"),
-            operations: [id("issue.update")].into(),
-            resources: vec![gov_core::ResourcePattern::new("jira/project/pay/*").unwrap()],
-        }],
-        limits: Default::default(),
-        requires: Default::default(),
-        parent: None,
-    };
-    std::fs::write(
-        site.path("mandate.json"),
-        serde_json::to_vec(&gov_core::seal(&mandate, &issuer).unwrap()).unwrap(),
-    )
-    .unwrap();
-    std::fs::write(
-        site.path("issuers.json"),
-        serde_json::to_vec(&[issuer.public()]).unwrap(),
-    )
-    .unwrap();
 
     std::fs::write(site.path("gate.pub"), &gate_public).unwrap();
     std::fs::write(
@@ -405,10 +1146,13 @@ async fn a_gate_and_a_ledger_run_as_programs_leave_a_record_an_auditor_can_check
     )
     .unwrap();
     let map = ServerMap {
+        labels: Vec::new(),
+        clearances: Vec::new(),
         server: id("jira-mcp"),
         system: id("jira"),
         fold_case: true,
         tools: vec![ToolMap {
+            results: None,
             tool: id("jira_update_issue"),
             digest: tool_digest(&update_tool()).unwrap(),
             operation: id("issue.update"),
@@ -418,7 +1162,133 @@ async fn a_gate_and_a_ledger_run_as_programs_leave_a_record_an_auditor_can_check
             resource: ResourceTemplate::new("jira/project/{key:before(-)}/issue/{key}").unwrap(),
         }],
     };
-    std::fs::write(site.path("map.json"), serde_json::to_vec(&map).unwrap()).unwrap();
+    // The policy bundle, signed by the root key: it carries the connector map and the key
+    // mandates are issued under. The gate and the shim are given the root's public key.
+    let root = gov_core::SigningKey::from_seed(id("root-1"), &[70; 32]).unwrap();
+    let lease_key = gov_core::SigningKey::from_seed(id("authority:leases-1"), &[72; 32]).unwrap();
+    let mandates_key =
+        gov_core::SigningKey::from_seed(id("authority:mandates-1"), &[71; 32]).unwrap();
+    let grants = vec![gov_core::action::Grant {
+        system: id("jira"),
+        operations: [id("issue.update")].into(),
+        resources: vec![gov_core::ResourcePattern::new("jira/project/pay/*").unwrap()],
+    }];
+    let triage = gov_core::mandate::Template {
+        id: id("triage"),
+        grants: grants.clone(),
+        max_life_secs: 3600,
+        limits: Default::default(),
+        delegable: false,
+        people: Default::default(),
+        receivers: Default::default(),
+    };
+    let bundle = |number: u64, version: &str| {
+        let bundle = gov_core::policy::PolicyBundle {
+            v: 1,
+            tenant: id("acme"),
+            env: id("prod"),
+            issuer: id("authority"),
+            version: id(version),
+            number,
+            issued_at: now,
+            keys: gov_core::policy::OnlineKeys {
+                mandates: vec![mandates_key.public()],
+                leases: vec![lease_key.public()],
+            },
+            freshness: Default::default(),
+            rules: Vec::new(),
+            connectors: vec![map.clone()],
+            templates: vec![triage.clone()],
+        };
+        serde_json::to_vec(&gov_core::seal(&bundle, &root).unwrap()).unwrap()
+    };
+    std::fs::write(site.path("bundle.json"), bundle(2, "v2")).unwrap();
+    std::fs::write(site.path("bundle-older.json"), bundle(1, "v1")).unwrap();
+    std::fs::write(site.path("bundle-forked.json"), bundle(2, "v2-other")).unwrap();
+    std::fs::write(
+        site.path("root.pub.json"),
+        serde_json::to_vec(&root.public()).unwrap(),
+    )
+    .unwrap();
+
+    // The Authority, as a library (no program serves it yet): the bundles are published to
+    // it in order, the agent is registered to its owner and enrols its own key, and the
+    // owner is issued a mandate from the template. That mandate, not a test issuer's, is
+    // what the shim presents and the gate holds to the bundle it loaded.
+    let authority = gov_authority::Authority::new(
+        gov_authority::MemoryStore::default(),
+        gov_core::Scope::new("acme", "prod").unwrap(),
+        id("authority"),
+        gov_core::SigningKey::from_seed(id("authority-admin-1"), &[60; 32]).unwrap(),
+        root.public(),
+    )
+    .with_online_keys(
+        gov_core::SigningKey::from_seed(id("authority:mandates-1"), &[71; 32]).unwrap(),
+        gov_core::SigningKey::from_seed(id("authority:leases-1"), &[72; 32]).unwrap(),
+    );
+    let (ana, ben) = (id("ana"), id("ben"));
+    authority.bootstrap(&ana, now).await.unwrap();
+    authority
+        .add_person(&ana, &ben, gov_authority::Role::Owner, now)
+        .await
+        .unwrap();
+    authority
+        .register_agent(&ana, &id("refund-bot"), &ben, Default::default(), now)
+        .await
+        .unwrap();
+    for (number, version) in [(1, "v1"), (2, "v2")] {
+        let signed: gov_core::Envelope = serde_json::from_slice(&bundle(number, version)).unwrap();
+        authority.publish_bundle(&ana, &signed, now).await.unwrap();
+    }
+    let agent_key = gov_core::SigningKey::from_file_text(
+        &std::fs::read_to_string(site.path("agent.key")).unwrap(),
+    )
+    .unwrap();
+    let code = authority
+        .offer_enrolment(
+            &ana,
+            gov_core::enrol::EnrolKind::Agent,
+            &id("refund-bot"),
+            now,
+        )
+        .await
+        .unwrap();
+    let asked = gov_core::seal(
+        &gov_core::enrol::EnrolRequest {
+            v: 1,
+            tenant: id("acme"),
+            env: id("prod"),
+            authority: id("authority"),
+            kind: gov_core::enrol::EnrolKind::Agent,
+            name: id("refund-bot"),
+            key: agent_public.clone(),
+            code: gov_core::enrol::code_digest(&code),
+        },
+        &agent_key,
+    )
+    .unwrap();
+    authority.enrol(&code, &asked, now).await.unwrap();
+    let issued = authority
+        .issue_mandate(
+            &ben,
+            &gov_authority::MandateAsk {
+                agent: id("refund-bot"),
+                key: id("refund-bot:k1"),
+                template: id("triage"),
+                grants,
+                life_secs: 3600,
+                limits: Default::default(),
+            },
+            now,
+        )
+        .await
+        .unwrap();
+    let mandate_id = authority.list_mandates(&ben).await.unwrap()[0].id.clone();
+    std::fs::write(
+        site.path("mandate.json"),
+        serde_json::to_vec(&issued).unwrap(),
+    )
+    .unwrap();
 
     // The gate is enrolled once; a second time is refused.
     let enrol = |site: &Site| {
@@ -500,8 +1370,13 @@ async fn a_gate_and_a_ledger_run_as_programs_leave_a_record_an_auditor_can_check
             .arg(site.path("agent.key"))
             .arg("--mandate")
             .arg(site.path("mandate.json"))
-            .arg("--map")
-            .arg(site.path("map.json"))
+            .arg("--bundle")
+            .arg(site.path("bundle.json"))
+            .arg("--root-key")
+            .arg(site.path("root.pub.json"))
+            .arg("--bundle-state")
+            .arg(site.path("shim.bundle-state"))
+            .args(["--server", "jira-mcp"])
             .arg("--secret-file")
             .arg(site.path("shim.secret"));
         c
@@ -617,12 +1492,31 @@ async fn a_gate_and_a_ledger_run_as_programs_leave_a_record_an_auditor_can_check
     // mandate, the call under a lost session as a failed proof, never as a mere claim.
     for held in [
         r#""agent":{"id":"refund-bot","proof":"proven"}"#,
-        r#""mandate":["m-1"]"#,
+        &format!(r#""mandate":["{mandate_id}"]"#),
         r#""proof":"failed","failure":"unknown_session""#,
         r#""agent":{"id":"triage-bot","proof":"claimed"}"#,
     ] {
         assert!(written.contains(held), "no receipt holds {held}");
     }
+    // Every receipt names the bundle the gate ran on: its number and the start of its
+    // digest (review finding GR-129).
+    let held: gov_core::policy::HeldBundle =
+        serde_json::from_slice(&std::fs::read(site.path("gate.bundle-state")).unwrap()).unwrap();
+    assert_eq!(held.number, 2);
+    let version = format!(r#""policy_version":"2-{}""#, &held.digest.as_str()[..16]);
+    // The export and the spool both hold the receipts, so each is found more than once;
+    // none carries any other policy version, or none.
+    let with_version = written.matches(&version).count();
+    assert!(with_version >= 12, "{with_version} of {version}");
+    assert_eq!(
+        written.matches(r#""policy_version":"#).count(),
+        with_version
+    );
+    assert_eq!(written.matches(r#""phase":"#).count(), with_version);
+    assert_eq!(
+        std::fs::read(site.path("shim.bundle-state")).unwrap(),
+        std::fs::read(site.path("gate.bundle-state")).unwrap()
+    );
     for secret in ["agent-jira-token", "Refund flow", "customer 4411"] {
         assert!(
             !written.contains(secret),
@@ -634,8 +1528,104 @@ async fn a_gate_and_a_ledger_run_as_programs_leave_a_record_an_auditor_can_check
     // stop at the gate: the server was never sent one of them.
     assert!(!GOV_HEADER_SEEN.load(std::sync::atomic::Ordering::SeqCst));
 
+    // The key mandates are signed with is taken, and used to sign a mandate for the same
+    // agent that is wider than the template allows: every project, not one. The signature
+    // is good. The gate holds it to the template in the bundle it loaded and opens no
+    // session for it, so the call it carries is never recorded as proven (review finding
+    // GR-138).
+    let issuers = gov_core::KeySet::new([gov_core::SigningKey::from_seed(
+        id("authority:mandates-1"),
+        &[71; 32],
+    )
+    .unwrap()
+    .public()]);
+    let honest = gov_core::open::<gov_core::mandate::Mandate>(
+        &issued,
+        &issuers,
+        &gov_core::Scope::new("acme", "prod").unwrap(),
+    )
+    .unwrap()
+    .doc;
+    let mut wider = honest.clone();
+    wider.id = id("m-wider");
+    wider.grants[0].resources = vec![gov_core::ResourcePattern::new("jira/*").unwrap()];
+    let stolen = gov_core::SigningKey::from_seed(id("authority:mandates-1"), &[71; 32]).unwrap();
+    std::fs::write(
+        site.path("mandate-wider.json"),
+        serde_json::to_vec(&gov_core::seal(&wider, &stolen).unwrap()).unwrap(),
+    )
+    .unwrap();
+    let second = start({
+        let mut c = program(SHIM);
+        c.args(["--tenant", "acme", "--env", "prod", "--gate", "gate-1"])
+            .args(["--gate-url", &format!("http://{}", gate.addr)])
+            .arg("--key-file")
+            .arg(site.path("agent.key"))
+            .arg("--mandate")
+            .arg(site.path("mandate-wider.json"))
+            .arg("--bundle")
+            .arg(site.path("bundle.json"))
+            .arg("--root-key")
+            .arg(site.path("root.pub.json"))
+            .arg("--bundle-state")
+            .arg(site.path("shim2.bundle-state"))
+            .args(["--server", "jira-mcp"])
+            .arg("--secret-file")
+            .arg(site.path("shim2.secret"));
+        c
+    });
+    let second_secret = std::fs::read_to_string(site.path("shim2.secret")).unwrap();
+    let before = site.health(&operator).await;
+    let sent = reqwest::Client::new()
+        .post(format!("http://{}/mcp", second.addr))
+        .header("authorization", SECRET)
+        .header("content-type", "application/json")
+        .header("x-gov-shim-key", &second_secret)
+        .body(tool_call(30, "OPS-30").to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sent.status().as_u16(), 200);
+    let after = site.health(&operator).await;
+    assert_eq!(
+        after["proven"], before["proven"],
+        "a wider mandate was proven"
+    );
+    // The call still went through, since nothing is blocked in observe mode, and was still
+    // recorded: as a client's bare claim, with no session behind it.
+    assert_eq!(
+        after["recorded"].as_u64().unwrap(),
+        before["recorded"].as_u64().unwrap() + 1
+    );
+    // Until refused attempts are recorded (G4d), the operator's count is where a mandate
+    // signed with the real key and wider than its template shows (review finding GR-155).
+    let refused =
+        |health: &serde_json::Value| health["sessions_refused"]["template"].as_u64().unwrap_or(0);
+    assert!(
+        refused(&after) > refused(&before),
+        "the refused mandate left no trace: {}",
+        after["sessions_refused"]
+    );
+    drop(second);
+
     drop(shim);
     drop(gate);
+
+    // The gate does not go back: started again on an older bundle, or on another bundle
+    // under the number it holds, it refuses to start, and what it holds is unchanged.
+    let state = std::fs::read(site.path("gate.bundle-state")).unwrap();
+    for (file, says) in [
+        ("bundle-older.json", "older than number 2"),
+        ("bundle-forked.json", "ALARM"),
+    ] {
+        std::fs::copy(site.path(file), site.path("bundle.json")).unwrap();
+        let (ok, _, err) = run(&mut site.gate_on(&ledger_url, "127.0.0.1:0"));
+        assert!(!ok && err.contains(says), "{file}: {err}");
+        assert_eq!(
+            std::fs::read(site.path("gate.bundle-state")).unwrap(),
+            state
+        );
+    }
     drop(ledger);
     site.db.drop_schema().await;
 }
@@ -674,6 +1664,7 @@ fn a_program_does_not_start_in_a_way_that_would_expose_a_key_or_a_credential() {
         .arg(path("gate.key"))
         .arg("--spool")
         .arg(path("spool"))
+        .arg("--unsigned-policy-for-tests")
         .arg("--map")
         .arg(path("map.json"))
         .arg("--ledger-keys")

@@ -6,6 +6,7 @@
 use async_trait::async_trait;
 use gov_core::enrol::EnrolKind;
 use gov_core::receipt::ChainHead;
+use gov_core::revocation::RevocationEntry;
 use gov_core::{Digest, Envelope, Id, Scope};
 use serde::de::DeserializeOwned;
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
@@ -13,8 +14,8 @@ use sqlx::types::Json;
 use sqlx::Row;
 
 use crate::store::{
-    Agent, Effect, EnrolledKey, Gate, PendingCode, Person, Store, StoreError, StoreResult,
-    StoredRecord,
+    Agent, Effect, EnrolledKey, Gate, IssuedMandate, NamedKey, PendingCode, Person, Published,
+    SessionRow, Store, StoreError, StoreResult, StoredRecord,
 };
 
 impl From<sqlx::Error> for StoreError {
@@ -46,6 +47,18 @@ fn stored(r: &PgRow) -> StoreResult<StoredRecord> {
     })
 }
 
+/// Held while its holder lives. Its session is its own, not the pool's, so dropping it
+/// closes the session and frees the lock.
+pub struct ServingLock(sqlx::PgConnection);
+
+impl ServingLock {
+    pub async fn release(self) {
+        use sqlx::Connection;
+        let _ = self.0.close().await;
+    }
+}
+
+#[derive(Clone)]
 pub struct PgStore {
     pool: PgPool,
 }
@@ -54,6 +67,20 @@ impl PgStore {
     pub async fn connect(url: &str) -> StoreResult<Self> {
         let pool = PgPoolOptions::new().max_connections(8).connect(url).await?;
         Ok(PgStore { pool })
+    }
+
+    /// The lock the serving program holds for as long as it runs, and the command that
+    /// replaces the admin-record key must get: `None` when another holds it. It is the
+    /// database session's, so a crash releases it (review finding GR-194).
+    pub async fn serving_lock(&self, scope: &Scope) -> StoreResult<Option<ServingLock>> {
+        let mut session = self.pool.acquire().await?;
+        let got: bool = sqlx::query_scalar(
+            "SELECT pg_try_advisory_lock(hashtext('gov-authority:' || current_schema() || ':' || $1))",
+        )
+        .bind(format!("{}:{}", scope.tenant, scope.env))
+        .fetch_one(&mut *session)
+        .await?;
+        Ok(got.then(|| ServingLock(session.detach())))
     }
 
     pub fn from_pool(pool: PgPool) -> Self {
@@ -107,6 +134,14 @@ fn row(effect: &Effect) -> (String, String, Option<String>, Option<serde_json::V
         ),
         Effect::PutGate(g) => ("gate".into(), g.id.to_string(), None, Some(json(g))),
         Effect::AddKey(e) => ("key".into(), e.key.kid.to_string(), None, Some(json(e))),
+        Effect::PutBundle(b) => ("bundle".into(), b.number.to_string(), None, Some(json(b))),
+        Effect::PutMandate(m) => (
+            "mandate".into(),
+            m.id.to_string(),
+            Some(m.agent.to_string()),
+            Some(json(m)),
+        ),
+        Effect::AddRevocation(e) => ("revocation".into(), e.seq.to_string(), None, Some(json(e))),
         Effect::PutCode(c) => (
             format!("code-{}", kind_text(c.kind)),
             c.name.to_string(),
@@ -117,6 +152,32 @@ fn row(effect: &Effect) -> (String, String, Option<String>, Option<serde_json::V
             format!("code-{}", kind_text(*kind)),
             name.to_string(),
             None,
+            None,
+        ),
+        Effect::AddLink(link, person) => (
+            "link".into(),
+            link.as_str().to_string(),
+            Some(person.to_string()),
+            Some(json(person)),
+        ),
+        Effect::NameAdminKey(named) => (
+            "admin-key".into(),
+            "current".into(),
+            None,
+            Some(json(named)),
+        ),
+        Effect::PutSession(row) => (
+            "session".into(),
+            row.id.as_str().to_string(),
+            Some(row.person.to_string()),
+            Some(json(row)),
+        ),
+        Effect::DropSession(id) => ("session".into(), id.as_str().to_string(), None, None),
+        // Handled by its own statement: it removes by owner, not by name.
+        Effect::DropSessionsOf(person) => (
+            "session".into(),
+            String::new(),
+            Some(person.to_string()),
             None,
         ),
     }
@@ -192,12 +253,44 @@ impl Store for PgStore {
         if inserted.rows_affected() != 1 {
             return Err(StoreError::HeadMoved);
         }
+        // A revocation takes the next number, and no other. The record's own primary key
+        // already lets only one of two writers in, so the number read here is the one kept.
+        let newest: Option<i64> = sqlx::query_scalar(
+            "SELECT MAX((doc ->> 'seq')::bigint) FROM authority_registry \
+             WHERE tenant = $1 AND env = $2 AND kind = 'revocation'",
+        )
+        .bind(scope.tenant.as_str())
+        .bind(scope.env.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+        let mut next =
+            u64::try_from(newest.unwrap_or(0)).map_err(|_| bad("revocation number"))? + 1;
+        for effect in effects {
+            if let Effect::AddRevocation(e) = effect {
+                if e.seq != next {
+                    return Err(StoreError::HeadMoved);
+                }
+                next += 1;
+            }
+        }
         for effect in effects {
             let (kind, name, owner, doc) = row(effect);
             // A key is enrolled once: no replacing. The key id is the row's name and the
             // public key has a unique index of its own, so either being taken fails the
             // insert, and with it the whole transaction.
-            if let (Effect::AddKey(_), Some(doc)) = (effect, &doc) {
+            if let Effect::DropSessionsOf(_) = effect {
+                sqlx::query(
+                    "DELETE FROM authority_registry \
+                     WHERE tenant = $1 AND env = $2 AND kind = 'session' AND owner = $3",
+                )
+                .bind(scope.tenant.as_str())
+                .bind(scope.env.as_str())
+                .bind(&owner)
+                .execute(&mut *tx)
+                .await?;
+                continue;
+            }
+            if let (Effect::AddKey(_) | Effect::AddLink(..), Some(doc)) = (effect, &doc) {
                 let added = sqlx::query(
                     "INSERT INTO authority_registry (tenant, env, kind, name, owner, doc) \
                      VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
@@ -285,6 +378,45 @@ impl Store for PgStore {
         self.entry(scope, "person", id.as_str()).await
     }
 
+    async fn admin_key(&self, scope: &Scope) -> StoreResult<Option<NamedKey>> {
+        self.entry(scope, "admin-key", "current").await
+    }
+
+    async fn linked(&self, scope: &Scope, link: &Digest) -> StoreResult<Option<Id>> {
+        self.entry(scope, "link", link.as_str()).await
+    }
+
+    async fn session(&self, scope: &Scope, id: &Digest) -> StoreResult<Option<SessionRow>> {
+        self.entry(scope, "session", id.as_str()).await
+    }
+
+    async fn forget_session(&self, scope: &Scope, id: &Digest) -> StoreResult<()> {
+        sqlx::query(
+            "DELETE FROM authority_registry \
+             WHERE tenant = $1 AND env = $2 AND kind = 'session' AND name = $3",
+        )
+        .bind(scope.tenant.as_str())
+        .bind(scope.env.as_str())
+        .bind(id.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn touch_session(&self, scope: &Scope, id: &Digest, now: i64) -> StoreResult<()> {
+        sqlx::query(
+            "UPDATE authority_registry SET doc = jsonb_set(doc, '{last_used}', to_jsonb($4::bigint)) \
+             WHERE tenant = $1 AND env = $2 AND kind = 'session' AND name = $3",
+        )
+        .bind(scope.tenant.as_str())
+        .bind(scope.env.as_str())
+        .bind(id.as_str())
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn agent(&self, scope: &Scope, id: &Id) -> StoreResult<Option<Agent>> {
         self.entry(scope, "agent", id.as_str()).await
     }
@@ -310,6 +442,63 @@ impl Store for PgStore {
 
     async fn key(&self, scope: &Scope, kid: &Id) -> StoreResult<Option<EnrolledKey>> {
         self.entry(scope, "key", kid.as_str()).await
+    }
+
+    async fn mandate(&self, scope: &Scope, id: &Id) -> StoreResult<Option<IssuedMandate>> {
+        self.entry(scope, "mandate", id.as_str()).await
+    }
+
+    async fn mandates(&self, scope: &Scope) -> StoreResult<Vec<IssuedMandate>> {
+        let rows = sqlx::query(
+            "SELECT doc FROM authority_registry \
+             WHERE tenant = $1 AND env = $2 AND kind = 'mandate' ORDER BY name",
+        )
+        .bind(scope.tenant.as_str())
+        .bind(scope.env.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| Ok(r.try_get::<Json<IssuedMandate>, _>("doc")?.0))
+            .collect()
+    }
+
+    async fn revocations_after(
+        &self,
+        scope: &Scope,
+        after: u64,
+    ) -> StoreResult<Vec<RevocationEntry>> {
+        let after = i64::try_from(after).map_err(|_| bad("revocation number"))?;
+        let rows = sqlx::query(
+            "SELECT doc FROM authority_registry \
+             WHERE tenant = $1 AND env = $2 AND kind = 'revocation' \
+               AND (doc ->> 'seq')::bigint > $3 ORDER BY (doc ->> 'seq')::bigint",
+        )
+        .bind(scope.tenant.as_str())
+        .bind(scope.env.as_str())
+        .bind(after)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| Ok(r.try_get::<Json<RevocationEntry>, _>("doc")?.0))
+            .collect()
+    }
+
+    async fn latest_bundle(&self, scope: &Scope) -> StoreResult<Option<Published>> {
+        let row = sqlx::query(
+            "SELECT doc FROM authority_registry \
+             WHERE tenant = $1 AND env = $2 AND kind = 'bundle' \
+             ORDER BY (doc ->> 'number')::bigint DESC LIMIT 1",
+        )
+        .bind(scope.tenant.as_str())
+        .bind(scope.env.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|r| Ok(r.try_get::<Json<Published>, _>("doc")?.0))
+            .transpose()
+    }
+
+    async fn bundle(&self, scope: &Scope, number: u64) -> StoreResult<Option<Published>> {
+        self.entry(scope, "bundle", &number.to_string()).await
     }
 
     async fn keys(&self, scope: &Scope) -> StoreResult<Vec<EnrolledKey>> {

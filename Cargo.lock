@@ -1022,11 +1022,16 @@ name = "gov-authority"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
  "base64 0.22.1",
+ "chrono",
  "gov-core",
  "gov-ledger",
+ "gov-signin",
+ "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sqlx",
  "tempfile",
  "thiserror",
@@ -1042,6 +1047,7 @@ dependencies = [
  "clap",
  "gov-core",
  "gov-ledger",
+ "gov-run",
  "serde_json",
  "tempfile",
  "tokio",
@@ -1100,15 +1106,35 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "clap",
+ "gov-authority",
  "gov-core",
  "gov-gate",
  "gov-ledger",
+ "gov-signin",
  "reqwest",
+ "rustix",
+ "serde",
  "serde_json",
  "sqlx",
  "tempfile",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "gov-signin"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "chrono",
+ "jsonwebtoken",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "subtle",
+ "tokio",
 ]
 
 [[package]]

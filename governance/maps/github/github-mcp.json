@@ -1,0 +1,826 @@
+{
+  "server": "github-mcp",
+  "system": "github",
+  "fold_case": true,
+  "tools": [
+    {
+      "tool": "actions_get",
+      "digest": "e364354359b22e51ebc42c3fb950bec9ae8b5bbda39734a635bbc318643de74a",
+      "operation": "actions.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/repo/{owner}/{repo}/actions"
+    },
+    {
+      "tool": "actions_list",
+      "digest": "14b77f5277a28968a091beb87dfa41b1857bdb4c4c40e8f687ddc8f09cf02af6",
+      "operation": "actions.list",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/repo/{owner}/{repo}/actions"
+    },
+    {
+      "tool": "actions_run_trigger",
+      "digest": "a0f2d43e842f3298cb2c57f12d304329d11367d060454dd2ed8863b9f2cc580f",
+      "operation": "actions.run",
+      "kind": "destructive",
+      "reversal": "none",
+      "outward": true,
+      "resource": "github/repo/{owner}/{repo}/actions"
+    },
+    {
+      "tool": "add_comment_to_pending_review",
+      "digest": "cd067a2a7516318a512143ec9975a9b5a1f0ce910398abd245497178c75c6acd",
+      "operation": "pull.review.comment.add",
+      "kind": "write",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/repo/{owner}/{repo}/pulls"
+    },
+    {
+      "tool": "add_issue_comment",
+      "digest": "62e2fbd50d245f691347c97d92db06d54ee18572d369f0c41fd7838ff3922484",
+      "operation": "issue.comment.add",
+      "kind": "write",
+      "reversal": "none",
+      "outward": true,
+      "resource": "github/repo/{owner}/{repo}/issues"
+    },
+    {
+      "tool": "add_reply_to_pull_request_comment",
+      "digest": "930a691e7922840b1f04490fb915d402bad5e321556196f020f86bb964cca698",
+      "operation": "pull.comment.reply",
+      "kind": "write",
+      "reversal": "none",
+      "outward": true,
+      "resource": "github/repo/{owner}/{repo}/pulls"
+    },
+    {
+      "tool": "assign_copilot_to_issue",
+      "digest": "176fae35502f1ca857104f223f1cfdd3c79551fa9d1b230f8da8401a37b412ad",
+      "operation": "issue.assign-agent",
+      "kind": "write",
+      "reversal": "none",
+      "outward": true,
+      "resource": "github/repo/{owner}/{repo}/issues"
+    },
+    {
+      "tool": "assign_copilot_to_issue_with_intent",
+      "digest": "c4901abdc919f5a8018fcbaf221df4e75c7f832dc3e543fd5667c1f8d568557b",
+      "operation": "issue.assign-agent.with-intent",
+      "kind": "write",
+      "reversal": "none",
+      "outward": true,
+      "resource": "github/repo/{owner}/{repo}/issues"
+    },
+    {
+      "tool": "create_branch",
+      "digest": "33620f958eae382f30dfa9f5b7d06955c9b125814b39423fa8e9cce5385afbe8",
+      "operation": "branch.create",
+      "kind": "write",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/repo/{owner}/{repo}/code"
+    },
+    {
+      "tool": "create_gist",
+      "digest": "e26ea7afec140dccf1b3bcfc83acdb1dd5f3fb5a3eb3105bc9b6a650858f9000",
+      "operation": "gist.create",
+      "kind": "write",
+      "reversal": "none",
+      "outward": true,
+      "resource": "github/gist"
+    },
+    {
+      "tool": "create_or_update_file",
+      "digest": "92dd6b56f593d0ab23325e5bc1ef884a107625a5eadccc224c0f9c29fa7f4634",
+      "operation": "file.write",
+      "kind": "write",
+      "reversal": "restore",
+      "outward": true,
+      "resource": "github/repo/{owner}/{repo}/code"
+    },
+    {
+      "tool": "create_pull_request",
+      "digest": "f9c16c32c0213839c113cba53cdb1a7415fb89a5600ee74392c7a358b5b92079",
+      "operation": "pull.create",
+      "kind": "write",
+      "reversal": "inverse",
+      "outward": true,
+      "resource": "github/repo/{owner}/{repo}/pulls"
+    },
+    {
+      "tool": "create_repository",
+      "digest": "ddbb5f7ccb984ba8641912801cd3cc4fe80aeb556e85bf32055d5db72b2d48f0",
+      "operation": "repo.create",
+      "kind": "write",
+      "reversal": "none",
+      "outward": true,
+      "resource": "github/account"
+    },
+    {
+      "tool": "create_repository_ruleset",
+      "digest": "fc43c8246ec6a9fda2714c4e01fc34c1dc0559f4dfc8bc71a1457cc80b6c06c4",
+      "operation": "ruleset.create",
+      "kind": "write",
+      "reversal": "none",
+      "outward": true,
+      "resource": "github/admin"
+    },
+    {
+      "tool": "custom_properties_read",
+      "digest": "800ffdd789741336d030973bfd2f2720ad90efd1e836007c141ac5c89b576873",
+      "operation": "custom-properties.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/admin"
+    },
+    {
+      "tool": "custom_properties_write",
+      "digest": "42cddbededaf62f127e23f1ab0777d0b976db1fdc5878d3873a8239f8c4c603b",
+      "operation": "custom-properties.write",
+      "kind": "write",
+      "reversal": "none",
+      "outward": true,
+      "resource": "github/admin"
+    },
+    {
+      "tool": "delete_file",
+      "digest": "8c1be3e3f7ed8b687ffa1f3d40838ba287053b88d11f2e3647902b4e9b610572",
+      "operation": "file.delete",
+      "kind": "write",
+      "reversal": "restore",
+      "outward": true,
+      "resource": "github/repo/{owner}/{repo}/code"
+    },
+    {
+      "tool": "discussion_comment_write",
+      "digest": "e20dc658ec92d85da4604a71f62e8608876dcefb9dbe0381c8a978612207a88c",
+      "operation": "discussion.comment.write",
+      "kind": "destructive",
+      "reversal": "none",
+      "outward": true,
+      "resource": "github/discussion"
+    },
+    {
+      "tool": "dismiss_notification",
+      "digest": "7957d55e9f57d100471b056438775f1b186d275e5f929c950ebd7602c95b852f",
+      "operation": "notification.dismiss",
+      "kind": "write",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/notification"
+    },
+    {
+      "tool": "fork_repository",
+      "digest": "8409cb3549e1070a05feec899291a916e0ad490dfe19d5f90da0752b41f03a0c",
+      "operation": "repo.fork",
+      "kind": "write",
+      "reversal": "none",
+      "outward": true,
+      "resource": "github/repo/{owner}/{repo}/code"
+    },
+    {
+      "tool": "get_code_quality_finding",
+      "digest": "a6723e7b3b592aba9d3867e6d5cc02193e9fc889bc1f297fb27cdea81a83443c",
+      "operation": "code-quality.finding.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/repo/{owner}/{repo}/security"
+    },
+    {
+      "tool": "get_code_scanning_alert",
+      "digest": "71bf7c1d3e6b4df2c3ae009005d12d6caae7d351768bc4c79d76653d37794143",
+      "operation": "code-scanning.alert.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/repo/{owner}/{repo}/security"
+    },
+    {
+      "tool": "get_commit",
+      "digest": "549bcd838f119d967a0f6ebd0755e477c53db124913e9443982f34019ad18e60",
+      "operation": "commit.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/repo/{owner}/{repo}/code"
+    },
+    {
+      "tool": "get_dependabot_alert",
+      "digest": "3f37f445418cbef3188609e14b56b711fb0c275d1615329d2ccbd661c4d89720",
+      "operation": "dependabot.alert.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/repo/{owner}/{repo}/security"
+    },
+    {
+      "tool": "get_discussion",
+      "digest": "67aa27f7517d19141f99650b472dc4a25013df67c223763b52df76abc39bf6ea",
+      "operation": "discussion.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/repo/{owner}/{repo}/discussions"
+    },
+    {
+      "tool": "get_discussion_comments",
+      "digest": "5e262d7f635163fc9a610943170e2743f6c099ceec2a23a559b6da505a0b3687",
+      "operation": "discussion.comments.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/repo/{owner}/{repo}/discussions"
+    },
+    {
+      "tool": "get_file_contents",
+      "digest": "076a259a47e210695a35409c83bc4ac2bc9ae88a464d2b056d01d1c7d028d851",
+      "operation": "file.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/repo/{owner}/{repo}/code"
+    },
+    {
+      "tool": "get_gist",
+      "digest": "2668b3a848fc6096012349d1b4855fc9136d0d63738f79fd1cb876758a41b2ce",
+      "operation": "gist.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/gist/{gist_id}"
+    },
+    {
+      "tool": "get_global_security_advisory",
+      "digest": "3fcebdbcbdc35678244489a823d2aeb80655796e09d9b8a23b991a008d4512f6",
+      "operation": "advisory.global.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/advisory"
+    },
+    {
+      "tool": "get_job_logs",
+      "digest": "e43da3c8d394ce8ff61224b72ae1b456e0685b0ec82413ebc709dc312e09e5ce",
+      "operation": "actions.job.logs.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/repo/{owner}/{repo}/actions"
+    },
+    {
+      "tool": "get_label",
+      "digest": "bb3b45ffd350c450baec80e968b9086228839e7b032e4ad19116a20d27414535",
+      "operation": "label.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/repo/{owner}/{repo}/issues"
+    },
+    {
+      "tool": "get_latest_release",
+      "digest": "8a3d72cd9b84125677f562b508d0fd4d344986fa227c883d02281f65d696634d",
+      "operation": "release.latest.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/repo/{owner}/{repo}/code"
+    },
+    {
+      "tool": "get_me",
+      "digest": "38dfd14a53bcb31044d61521094ee637ca3a8bd9d30fbf2e6f3dbee7a8b35c7b",
+      "operation": "user.self.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/user"
+    },
+    {
+      "tool": "get_notification_details",
+      "digest": "18a7bdaec6056041b20671c9d38e95613a8be05674018b21cc35c82709080992",
+      "operation": "notification.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/notification"
+    },
+    {
+      "tool": "get_release_by_tag",
+      "digest": "0164ee2533836b4c9d87e7aefe9c78b46603069b8f0df03aeed73150de50b0d6",
+      "operation": "release.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/repo/{owner}/{repo}/code"
+    },
+    {
+      "tool": "get_repository_tree",
+      "digest": "91b6450fa36e05b0a94c7ece064a4d67d6ad7c2eb01cd2a4fdbd680c93d15365",
+      "operation": "tree.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/repo/{owner}/{repo}/code"
+    },
+    {
+      "tool": "get_secret_scanning_alert",
+      "digest": "b4a32ebba342dcb39867c1d257e70158cea06f50570dcb202a8b7ca63ce64312",
+      "operation": "secret-scanning.alert.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/repo/{owner}/{repo}/security"
+    },
+    {
+      "tool": "get_tag",
+      "digest": "b9ca091cdd78b3b89b57aae9bf0d5ccbc27c343808d5b0f66796aa8d93c4cfc9",
+      "operation": "tag.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/repo/{owner}/{repo}/code"
+    },
+    {
+      "tool": "get_team_members",
+      "digest": "9c1b39c0e5706e3f3c729fb0775419692be5893ad32463ecb1adc42f7f92947d",
+      "operation": "team.members.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/org/{org}"
+    },
+    {
+      "tool": "get_teams",
+      "digest": "4af4878807fcfe18dd53eba93a60ad088e8d8e48d89e1084b35a036eeab484e5",
+      "operation": "team.list",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/user"
+    },
+    {
+      "tool": "issue_read",
+      "digest": "8c78cb1e08571b86ce5a3c3539fbc04cbef521d7ff6787eb81fe0b53c13475e0",
+      "operation": "issue.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/repo/{owner}/{repo}/issues"
+    },
+    {
+      "tool": "issue_write",
+      "digest": "9c2684eb7ab76951752cd1e3910657f495a500538d839535796f7788e730f73e",
+      "operation": "issue.write",
+      "kind": "write",
+      "reversal": "none",
+      "outward": true,
+      "resource": "github/repo/{owner}/{repo}/issues"
+    },
+    {
+      "tool": "label_write",
+      "digest": "f83a74e98bc1e7a12d90306739d6fffd3d20e52404e847a291cc6c1c50fc5912",
+      "operation": "label.write",
+      "kind": "destructive",
+      "reversal": "none",
+      "outward": true,
+      "resource": "github/repo/{owner}/{repo}/issues"
+    },
+    {
+      "tool": "list_branches",
+      "digest": "1efd9393039e7b476edd83c26796c93b3f9ea378f2df9cc1425c177ed2e503fb",
+      "operation": "branch.list",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/repo/{owner}/{repo}/code"
+    },
+    {
+      "tool": "list_code_scanning_alerts",
+      "digest": "e711b0d4b3e8c651f317a1509f4ef61e9cef5b65d88b47993058ea5a7493fc10",
+      "operation": "code-scanning.alert.list",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/repo/{owner}/{repo}/security"
+    },
+    {
+      "tool": "list_commits",
+      "digest": "24d891c3485c68085e391be8ee58f401fa84fbab6e076924113deca8c751d13b",
+      "operation": "commit.list",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/repo/{owner}/{repo}/code"
+    },
+    {
+      "tool": "list_dependabot_alerts",
+      "digest": "ae5984e7ce64860b83abb38c772a848f155d6480e651a65ac55a8967d7ff1114",
+      "operation": "dependabot.alert.list",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/repo/{owner}/{repo}/security"
+    },
+    {
+      "tool": "list_discussion_categories",
+      "digest": "f8d4b8f418e298d8de38474aaeebe9e2138dd0d27a8866e7905b20c5dcaacc0c",
+      "operation": "discussion.category.list",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/owner/{owner}"
+    },
+    {
+      "tool": "list_discussions",
+      "digest": "46531fff5076b7beb9a38bfeec85221e22640469586396a3affc519b7834d757",
+      "operation": "discussion.list",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/owner/{owner}"
+    },
+    {
+      "tool": "list_gists",
+      "digest": "208f1d9cce9642ba3172256c4d1ccd398f0e7534d67b581a549c250a05195972",
+      "operation": "gist.list",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/gist"
+    },
+    {
+      "tool": "list_global_security_advisories",
+      "digest": "10448f900e31eb439e3c1c9976e22ed68bfd8d34475e1844bf14a8d1fc666afd",
+      "operation": "advisory.global.list",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/advisory"
+    },
+    {
+      "tool": "list_issue_fields",
+      "digest": "8b227c525bfd8bf350ea39b467701868e98d950c6f7fe5e5769489cc7d4e0f56",
+      "operation": "issue.field.list",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/owner/{owner}"
+    },
+    {
+      "tool": "list_issue_types",
+      "digest": "e705bf9955df1da2fba5d8fc4fc8f35d23d72874e6d0bbed81f1a5e912ceded1",
+      "operation": "issue.type.list",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/owner/{owner}"
+    },
+    {
+      "tool": "list_issues",
+      "digest": "929fd7fe128a549a1df2afed231547026bd5f9dd157b25609eeaa419eb74e445",
+      "operation": "issue.list",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/repo/{owner}/{repo}/issues"
+    },
+    {
+      "tool": "list_label",
+      "digest": "aa97bcf6a6267fbdfdc3b893730f7a21eead8999e860e31e9289cccac11d57aa",
+      "operation": "label.list",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/repo/{owner}/{repo}/issues"
+    },
+    {
+      "tool": "list_notifications",
+      "digest": "c9f4420262983fa6ee133e6e8b1bcb8ffcd760a28fa5da3104dfe7ccb70252cf",
+      "operation": "notification.list",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/notification"
+    },
+    {
+      "tool": "list_org_repository_security_advisories",
+      "digest": "fed529cc795c1533d5dd7bd114b95ae5676612b6c23431f63cf2866885a7b027",
+      "operation": "advisory.org.list",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/org/{org}"
+    },
+    {
+      "tool": "list_pull_requests",
+      "digest": "1885848e09e40871bc785a168877600c0fa1ea3fdeaa9c1984e4e0d227bb7dd2",
+      "operation": "pull.list",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/repo/{owner}/{repo}/pulls"
+    },
+    {
+      "tool": "list_releases",
+      "digest": "a607e521d44d1d3382ec572d0c6d9b3edc462a6ccf2dbbd7d4c1034ea9fd6cf8",
+      "operation": "release.list",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/repo/{owner}/{repo}/code"
+    },
+    {
+      "tool": "list_repository_collaborators",
+      "digest": "47b83b5ad310f5cd2ef20b4068db64cca9ea13a8337549090e981b6d7ac15bfc",
+      "operation": "collaborator.list",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/repo/{owner}/{repo}/settings"
+    },
+    {
+      "tool": "list_repository_security_advisories",
+      "digest": "e63882f3d738fbe3922bdb62a204b660290931889a5466d9869b8941b3729d0a",
+      "operation": "advisory.repo.list",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/repo/{owner}/{repo}/security"
+    },
+    {
+      "tool": "list_secret_scanning_alerts",
+      "digest": "f08ef2e3ece7a04d1e8a909937e89e0530be1f0a348787106fa4fe619e5745db",
+      "operation": "secret-scanning.alert.list",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/repo/{owner}/{repo}/security"
+    },
+    {
+      "tool": "list_starred_repositories",
+      "digest": "8a77b5fe5d621bcfbc7988dce9a2121fe3a60d231a2bd1ffd1758cc926a876a7",
+      "operation": "star.list",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/user"
+    },
+    {
+      "tool": "list_tags",
+      "digest": "ad8423da8112568698e2161fac1094e7f66d234969b84cadb6d8ff9746063283",
+      "operation": "tag.list",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/repo/{owner}/{repo}/code"
+    },
+    {
+      "tool": "manage_notification_subscription",
+      "digest": "bee22306d13b32e554e39d5475d67d25fdfac50496c9a8fd809e0d4314ece3a9",
+      "operation": "notification.subscription.write",
+      "kind": "write",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/notification"
+    },
+    {
+      "tool": "manage_repository_notification_subscription",
+      "digest": "121f36b1f56def4f32c173b4ea9ba1b90777655d74e59bf1eac07eab6f0f8b7f",
+      "operation": "repo.subscription.write",
+      "kind": "write",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/repo/{owner}/{repo}/settings"
+    },
+    {
+      "tool": "mark_all_notifications_read",
+      "digest": "7f93cf627128db65d40ed5f0f83af8a58486ef8a117140d9f45d326429ec8fe7",
+      "operation": "notification.mark-all-read",
+      "kind": "write",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/notification"
+    },
+    {
+      "tool": "merge_pull_request",
+      "digest": "4964b3c51273bf049560cb679ab70d4cf4f74aa4d95ad99d78c2ab9c8e41b9c9",
+      "operation": "pull.merge",
+      "kind": "write",
+      "reversal": "none",
+      "outward": true,
+      "resource": "github/repo/{owner}/{repo}/pulls"
+    },
+    {
+      "tool": "projects_get",
+      "digest": "c20d61d505aa8c5946269d8bda2d4412af4bc311e7025dfca7e6c957acddca20",
+      "operation": "project.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/project"
+    },
+    {
+      "tool": "projects_list",
+      "digest": "de7f983df295908580ac2c44f2b94d26852f3eb9e05eb561ed4b942c6a5d086a",
+      "operation": "project.list",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/owner/{owner}"
+    },
+    {
+      "tool": "projects_write",
+      "digest": "0dd5510f179f8de56ddb5721730522a80c71f9b133b0baa59936737ad8ca44cf",
+      "operation": "project.write",
+      "kind": "destructive",
+      "reversal": "none",
+      "outward": true,
+      "resource": "github/owner/{owner}"
+    },
+    {
+      "tool": "pull_request_read",
+      "digest": "beec66473c4945defec1a338828e0652f17f5d42c3ce6bb849b5b8019493662f",
+      "operation": "pull.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/repo/{owner}/{repo}/pulls"
+    },
+    {
+      "tool": "pull_request_review_write",
+      "digest": "5d4895da8468e2c4b7c855228534d4090d4ff6d784b3cfed9401e3aaf4ec9f8a",
+      "operation": "pull.review.write",
+      "kind": "destructive",
+      "reversal": "none",
+      "outward": true,
+      "resource": "github/repo/{owner}/{repo}/pulls"
+    },
+    {
+      "tool": "push_files",
+      "digest": "bfee95b988686357446d149b4fe5f0f1b08d98b76adbbd9702cc18f6af5ebe95",
+      "operation": "file.push",
+      "kind": "write",
+      "reversal": "restore",
+      "outward": true,
+      "resource": "github/repo/{owner}/{repo}/code"
+    },
+    {
+      "tool": "repository_ruleset_read",
+      "digest": "208c6e5412c2b88afaf4980239ba8e22165af2f0501563b033941c3c29646815",
+      "operation": "ruleset.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/admin"
+    },
+    {
+      "tool": "request_copilot_review",
+      "digest": "98abbb7c8c5c9d143719bf4c2b0c8e8ccdf5bc1de0c4e69fe10526555660cdf6",
+      "operation": "pull.review.request-automated",
+      "kind": "write",
+      "reversal": "none",
+      "outward": true,
+      "resource": "github/repo/{owner}/{repo}/pulls"
+    },
+    {
+      "tool": "search_code",
+      "digest": "6bcf98461fb252d30cadb1681d985595f4e12d9647908ce68939e5663318310f",
+      "operation": "search.code",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/search"
+    },
+    {
+      "tool": "search_commits",
+      "digest": "e3e18edcba5b8b35d5eededcd6e655cb15e473a69e0fc10ee6fb94d2fd093d80",
+      "operation": "search.commits",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/search"
+    },
+    {
+      "tool": "search_issues",
+      "digest": "10722f593194b02f1b7144786a198aa6fe0ffaca6dda7dbca724cb44e5837c4f",
+      "operation": "search.issues",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/search"
+    },
+    {
+      "tool": "search_orgs",
+      "digest": "7daf573568be85fe14c913dbe371d1e00853a54e014ed412bc8107c82ba7385e",
+      "operation": "search.orgs",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/search"
+    },
+    {
+      "tool": "search_pull_requests",
+      "digest": "f7880714d1466c2e8e6e3d14b5a1ed5c39c9cf671cce0ca2bfe07b668d46d38d",
+      "operation": "search.pulls",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/search"
+    },
+    {
+      "tool": "search_repositories",
+      "digest": "af5ea40adbfe401006cac860cc8dfd7d5063c296e33f97a6e8bba6278a9a5edb",
+      "operation": "search.repositories",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/search"
+    },
+    {
+      "tool": "search_users",
+      "digest": "e1b676727d07e1992a7b5622b9f372c26d4f7ceae3a72cab30e33c348ceec6f9",
+      "operation": "search.users",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/search"
+    },
+    {
+      "tool": "star_repository",
+      "digest": "d409bde0f7780d123ad04a5a766ee3b72b926f90f9d40a7a2ac6418d53b02d2e",
+      "operation": "star.add",
+      "kind": "write",
+      "reversal": "inverse",
+      "outward": true,
+      "resource": "github/repo/{owner}/{repo}/settings"
+    },
+    {
+      "tool": "sub_issue_write",
+      "digest": "1d8827ac6a70a4e22a716238937f6840d6722f73b3a18d64508a90e57ff86b98",
+      "operation": "issue.sub-issue.write",
+      "kind": "write",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/repo/{owner}/{repo}/issues"
+    },
+    {
+      "tool": "ui_get",
+      "digest": "a291bef61624a50b6e16b91a7b8bcb82801ba3ddf2eeeff2af3c5bb439a8a838",
+      "operation": "ui.read",
+      "kind": "read",
+      "reversal": "none",
+      "outward": false,
+      "resource": "github/owner/{owner}"
+    },
+    {
+      "tool": "unstar_repository",
+      "digest": "3a69b4bea79ded4c940222aa9995206270c6fa396434a93f5248203bd2cba412",
+      "operation": "star.remove",
+      "kind": "write",
+      "reversal": "inverse",
+      "outward": false,
+      "resource": "github/repo/{owner}/{repo}/settings"
+    },
+    {
+      "tool": "update_gist",
+      "digest": "6f61eb2a5dba347c029b1854a183da81866ef25e56eee31208e4641ca697b2ad",
+      "operation": "gist.update",
+      "kind": "write",
+      "reversal": "restore",
+      "outward": true,
+      "resource": "github/gist/{gist_id}"
+    },
+    {
+      "tool": "update_issue_comment",
+      "digest": "e2158aaeb4133c7cba13c7125c0122767bf96be598033b93a2a6ac7b22f813ea",
+      "operation": "issue.comment.update",
+      "kind": "write",
+      "reversal": "none",
+      "outward": true,
+      "resource": "github/repo/{owner}/{repo}/issues"
+    },
+    {
+      "tool": "update_pull_request",
+      "digest": "d3f97918c0cd5f5cd90839d47b9d38646ccf9fb5ca6933068ce310269ec133f3",
+      "operation": "pull.update",
+      "kind": "write",
+      "reversal": "none",
+      "outward": true,
+      "resource": "github/repo/{owner}/{repo}/pulls"
+    },
+    {
+      "tool": "update_pull_request_branch",
+      "digest": "656cd82cb69762112863d289e0132e139305480ea73028dc8e7bd6a20a0bf52b",
+      "operation": "pull.branch.update",
+      "kind": "write",
+      "reversal": "none",
+      "outward": true,
+      "resource": "github/repo/{owner}/{repo}/pulls"
+    }
+  ]
+}

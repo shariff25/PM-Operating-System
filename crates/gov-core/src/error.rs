@@ -55,12 +55,22 @@ pub enum Error {
     LeaseIncomplete,
     #[error("a number cannot be written in canonical form")]
     Number,
-    #[error("the lease is not the answer to this gate's request, or is older than the one held")]
+    #[error("the lease is not the answer to this gate's request")]
     LeaseReplayed,
+    #[error("the lease's time or revocation number is below the one held")]
+    AuthorityBehind,
     #[error("the public key is one anyone can forge for")]
     WeakKey,
     #[error("the approver is the person who issued the mandate")]
     ApproverIsIssuer,
+    #[error("the mandate's template is not in the policy bundle held")]
+    UnknownTemplate,
+    #[error("a mandate is wider than its template: {0}")]
+    WiderThanTemplate(&'static str),
+    #[error("the policy bundle is older than the one held")]
+    BundleOlder,
+    #[error("another policy bundle is held under the same number")]
+    BundleForked,
 }
 
 impl Error {
@@ -94,8 +104,13 @@ impl Error {
             Error::LeaseIncomplete => "lease_incomplete",
             Error::Number => "number",
             Error::LeaseReplayed => "lease_replayed",
+            Error::AuthorityBehind => "authority_behind",
             Error::WeakKey => "weak_key",
             Error::ApproverIsIssuer => "approver_is_issuer",
+            Error::UnknownTemplate => "unknown_template",
+            Error::WiderThanTemplate(_) => "wider_than_template",
+            Error::BundleOlder => "bundle_older",
+            Error::BundleForked => "bundle_forked",
         }
     }
 }
