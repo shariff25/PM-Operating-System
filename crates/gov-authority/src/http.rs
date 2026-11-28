@@ -51,7 +51,30 @@ pub struct Listener<S> {
     pub clock: fn() -> i64,
     pub limit: SourceLimit,
     pub counters: Counters,
-    seen: Mutex<(i64, HashMap<IpAddr, u32>)>,
+    seen: Mutex<Seen>,
+}
+
+#[derive(Default)]
+struct Seen {
+    second: i64,
+    by_source: HashMap<[u8; 16], u32>,
+    /// Requests this second from sources that came after the table was full.
+    late: u32,
+}
+
+/// An IPv6 source is its /64: one host is given that many addresses.
+fn source_of(ip: IpAddr) -> [u8; 16] {
+    match ip {
+        IpAddr::V4(v4) => v4.to_ipv6_mapped().octets(),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_ipv6_mapped().octets(),
+            None => {
+                let mut net = v6.octets();
+                net[8..].fill(0);
+                net
+            }
+        },
+    }
 }
 
 impl<S> Listener<S> {
@@ -65,21 +88,29 @@ impl<S> Listener<S> {
         }
     }
 
-    fn within_limit(&self, source: IpAddr, now: i64) -> bool {
+    pub fn within_limit(&self, source: IpAddr, now: i64) -> bool {
         let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
-        if seen.0 != now {
-            *seen = (now, HashMap::new());
+        if seen.second != now {
+            *seen = Seen {
+                second: now,
+                ..Seen::default()
+            };
         }
-        let sources = seen.1.len();
-        match seen.1.get_mut(&source) {
+        let sources = seen.by_source.len();
+        match seen.by_source.get_mut(&source_of(source)) {
             Some(count) if *count >= self.limit.per_second => false,
             Some(count) => {
                 *count += 1;
                 true
             }
-            None if sources >= self.limit.sources => false,
+            // A full table must not shut out every gate not yet in it: late sources
+            // share one source's allowance (review finding GR-190).
+            None if sources >= self.limit.sources => {
+                seen.late += 1;
+                seen.late <= self.limit.per_second
+            }
             None => {
-                seen.1.insert(source, 1);
+                seen.by_source.insert(source_of(source), 1);
                 true
             }
         }

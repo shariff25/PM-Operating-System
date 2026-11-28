@@ -1208,6 +1208,44 @@ order of steps (point 3: enrol the new key, ship everything under the old one, r
 it, delete its private half), and `--earlier-key` must be given oldest first; the
 program does not enforce the order or delete the key.
 
+### Thirtieth read, 2026-11-28: G4d-5 and the fixes, at `fadab56`
+
+**Verdict: no High or Critical; the gate passes for G4d-5.** GR-169, GR-174 and GR-189
+are closed. The reviewer ran the tests of the six `gov-*` crates with a Postgres of its
+own (217 passed, the four-program run among them), not the lint or format check. Fixed
+on `build/gov-review-30`, not yet read again.
+
+| Finding | Severity | What was wrong | What was done |
+|---|---|---|---|
+| GR-190 | Low | The table of sources could be filled each second (one IPv6 /64 is enough), and every gate not yet in it was then refused a renewal | Fixed: an IPv6 source is its /64, and once the table is full late sources share one source's allowance instead of being refused |
+| GR-191 | Low | `gov-ledger enrol-authority` could give an Authority a second admin key beside the first | Fixed: refused when the chain holds an admin key; a later one comes only by a replacement record |
+| GR-192 | Low | The Authority read the Ledger's answer to a shipment without a size limit | Fixed: read in pieces, 64 KiB at most. No test of its own |
+| (note) | | The count of an unwitnessed chain kept the time of the first uncovered head, so a chain that keeps moving would alarm with the witness one interval behind | Fixed: it watches one head until the witness reaches it; tested |
+
+Accepted as stated, with conditions now in §7.6.4: admin actions as library calls until
+G4e; a gate's change of key as an operator's order of steps, for fake data; the chain
+sent again after a restart, while nothing can re-enable a gate; no TLS, for fake data on
+loopback. Still open: GR-77.
+
+### Thirty-first read, 2026-11-28: the design of G4e (§7.6.4) at `3266c52`
+
+**Verdict: no High or Critical; the design passes and may be built,** with three Medium
+points to be in the text before the step that builds them. All seven findings are
+answered in §7.6.4 on `build/gov-review-30`; the reviewer has not read the changed text.
+
+| Finding | Severity | What was wrong | Where it is answered |
+|---|---|---|---|
+| GR-193 | Medium, before G4e-4 | An enrolment code would travel beside the request, and on a plain link someone on the path could enrol their own key with it | Point 6: the code never travels; the request carries a MAC under a key derived from it |
+| GR-194 | Medium, before G4e-5 | After the admin-record key is replaced, a serving program still holding the old one would write records the Ledger refuses | Point 9: the library signs only with the key the last replacement names; the command runs only with the program stopped, under a lock |
+| GR-195 | Medium, before G4e-2 | Whoever can link an account to a person can act as that person, and nothing guarded the link | Points 3 and 4: written once, one to one, and a recent sign-in for linking, a change of role, and a gate's enrolment code |
+| GR-196 | Low | Behind the proxy every caller has one address, so one stranger uses up the sign-in limit | Point 8 |
+| GR-197 | Low | A `Strict` cookie does not come back from Microsoft | Points 2 and 4 |
+| GR-198 | Low | A session reference had no end in the auditor's check | Point 4 |
+| GR-199 | Low | Five wrong codes would cancel an enrolment from anywhere | Point 6 |
+
+The reviewer's conditions on the new verifier, and its notes on what a sign-in record
+does and does not show, are in points 1 and 4.
+
 ## 1. What is being built
 
 Agent Governance is a second product, separate from PM OS. It has three parts.
@@ -2459,7 +2497,7 @@ program and the gate's renewal loop (point 11), run as four programs with fake d
 the Authority at the moment of an outward call (access governance spec §11; the owner's
 decision).
 
-#### 7.6.4 G4e, people and sign-in (design of 2026-11-28; not built; for the reviewer)
+#### 7.6.4 G4e, people and sign-in (design of 2026-11-28; read by the reviewer, who cleared it to be built; not built)
 
 Ends the last stand-in of G4: admin actions made by whoever can run a command. Written
 before any code. Fake data only, as everywhere before the gate passes for a pilot; the
@@ -2475,24 +2513,37 @@ provider and **nothing here will have been run against Microsoft** when it is fi
    `exp`, `nbf`, `iat`, `nonce` and `tid` all checked; `oid` a GUID; guests refused
    (`acct` must say member, so the registration needs that optional claim). A person is
    `(tid, oid)` and nothing else: `email` and `preferred_username` never decide who
-   someone is.
+   someone is. Conditions from the reviewer: every attack test of `crates/entra` is
+   ported; the endpoints the discovery document names must be HTTPS on the configured
+   authority's host, and no redirect is followed; only `openid` is asked for, and the
+   tokens are discarded once checked.
 2. **The flow.** Authorization code with PKCE, as a confidential client of one tenant;
    the ID token comes from the code exchange, never the front channel. `state`, `nonce`
    and the PKCE verifier are random, kept at the Authority under a digest of a
    pre-sign-in cookie, used once, and gone after ten minutes. The return address after
-   sign-in is fixed, not taken from the request. The client secret is read from a file
+   sign-in is fixed, not taken from the request. The code comes back in the query, not a
+   form post, and the pre-sign-in cookie is `SameSite=Lax`, since a `Strict` cookie is
+   not sent on the navigation back from Microsoft; `SameSite=None` is never used
+   (GR-197). The client secret is read from a file
    under the key-file rule (owner only; fake data only until a key service exists) and
    is never logged or put in an error.
 3. **Who a person is in Governance.** Governance's own people table, as built: a name and
    a role (admin, owner, approver, auditor). An admin links a person to an Entra account
    by giving the account's object id; the link is an admin record (`PersonLinked`, naming
    the person and a digest of `(tid, oid)`; the object id itself is not in the chain).
-   There is no linking by name or email at first sign-in. A person with no link cannot
+   There is no linking by name or email at first sign-in. **The link is the grant, and
+   is guarded as one** (GR-195): it is written once, and changing it means offboarding
+   the person and adding a new one; one account links to one person and one person to
+   one account; and linking, like any change of role, needs a recent sign-in (point 4).
+   The digest hides the object id from outsiders, not from anyone in the tenant, who can
+   list object ids and test them. A person with no link cannot
    sign in; an account linked to nobody is refused with the same bare answer as any other
    failure. The first admin is made on the Authority's machine by a command, with their
    object id, and that record says its actor is unverified, as now.
-4. **Sessions.** An opaque 256-bit random value in a cookie (`HttpOnly`, `Secure`,
-   `SameSite=Strict`, host-only, path `/`); the Authority stores only its digest, with
+4. **Sessions.** An opaque 256-bit random value in a cookie named with the `__Host-`
+   prefix (`HttpOnly`, `Secure`, `SameSite=Strict`, host-only, path `/`). The first page
+   after sign-in is served directly by the callback, not by a redirect that would need
+   the new cookie (GR-197). The Authority stores only the value's digest, with
    the person, the time of sign-in and the time last used. Idle limit 15 minutes,
    absolute limit 8 hours; both set by the operator, neither unlimited. Every request
    re-reads the person: offboarded or with a changed role, the session ends or acts with
@@ -2508,18 +2559,32 @@ provider and **nothing here will have been run against Microsoft** when it is fi
      reports a verified record, or a mandate with a session, whose reference no earlier
      `SignedIn` record of the same person in the same chain bears out. This is what the
      condition on G6 (§7.6.2, point 3) rests on.
+   - **A session reference has an end** (GR-198). The record carries the absolute limit
+     then in force; sign-out and offboarding are records too. `gov verify` also reports
+     an act later than its session's limit, or after that person's sign-out of it or
+     offboarding. The session's start is the token's `auth_time`, not the moment the
+     code came back; signing in again makes a new session and a new record; and the
+     record and the session row are written in one transaction.
+   - The chain then holds when each person signed in, for as long as it is kept. It does
+     not show that a second factor was used: that is the tenant's policy and is not in
+     the token.
    - **What "verified" proves.** That the Authority, holding its admin-record key, says
      this person was signed in. Whoever takes that key or the Authority's database can
      write the same records. It is evidence of who acted while the Authority is honest,
      and no more; said in the product wherever "verified" is shown.
    - **Recent sign-in for the acts that change who is trusted:** adding or offboarding
-     an admin, publishing a bundle, revoking a key, disabling a gate. These need a
-     sign-in no older than five minutes (`max_age` asked for, `auth_time` checked);
-     otherwise the answer says to sign in again.
+     an admin, linking a person or changing a role, publishing a bundle, revoking a key,
+     disabling a gate, and offering an enrolment code for a gate (it makes a new trusted
+     signer). These need a sign-in no older than five minutes (`max_age` asked for,
+     `auth_time` checked); otherwise the answer says to sign in again. A token without
+     `auth_time`, like one without `acct`, is refused, so the app registration needs
+     both optional claims.
 5. **Requests that change something.** `SameSite=Strict` is not relied on alone: every
    request that is not a read must carry an `Origin` equal to the configured admin
    origin, a JSON content type, and a header whose value is a second random value given
-   to the page at sign-in and kept with the session. A read changes nothing.
+   to the page at sign-in and kept with the session. A read changes nothing. Every
+   request's `Host` must be the configured origin's, and every answer says
+   `Cache-Control: no-store`.
 6. **Two listeners, two purposes.**
    - **The admin listener** (new): sign-in, sign-out, and people's calls. It is told its
      own public origin (`https://…`) and refuses to start with any other scheme unless
@@ -2527,11 +2592,20 @@ provider and **nothing here will have been run against Microsoft** when it is fi
      not speak TLS: it listens on loopback behind a proxy that does, which is the only
      supported way to serve it. `--plain-http-on-network` does not apply to it.
    - **The machines' listener** (as built for renewals) gains two routes, each a signed
-     document and no session: `POST /v1/enrol` (a one-time code and the signed request,
-     so a gate or agent on another machine can enrol) and `POST /v1/delegate` (a parent
-     agent's signed request). The per-source limit applies before any work, and wrong
-     codes are also limited per source (GR-117), beside the count per name that cancels
-     a code.
+     document and no session: `POST /v1/enrol` (so a gate or agent on another machine
+     can enrol) and `POST /v1/delegate` (a parent agent's signed request). The
+     per-source limit applies before any work.
+   - **An enrolment code never travels** (GR-193). When a code is offered, the Authority
+     keeps, beside the digest it keeps now, a key derived from the code under another
+     label. A request over the network carries a MAC under that key over the signed
+     request, and no code; someone on the path who reads it has nothing to enrol their
+     own key with. A code is at least 128 random bits, so neither value can be guessed
+     from what travels (to be checked against `new_code` when this is built). The
+     library call that takes the code itself stays, for the Authority's own machine.
+   - **Wrong attempts over the network do not cancel a code** (GR-199): with a code
+     that long, guessing is not the risk, and a stranger who knows a name could
+     otherwise cancel its enrolment from anywhere. The limits answer a flood. The
+     count that cancels stays on the library call.
 7. **Routes on the admin listener, first cut.** JSON only; the console's screens are a
    later slice and will use these.
 
@@ -2546,8 +2620,11 @@ provider and **nothing here will have been run against Microsoft** when it is fi
    actor; the library's own checks (role, ownership, last admin) stay the authority, and
    the listener adds none of its own that the library lacks.
 8. **Bare answers and limits.** Sign-in failures all answer alike and say nothing of
-   why; the reason is counted for the operator. A per-source limit applies to the
-   sign-in routes before any work. No token, code, secret, cookie or object id is
+   why; the reason is counted for the operator. Behind the proxy every caller is
+   loopback, so the limit on the sign-in routes is not by address (GR-196): there is
+   one overall limit, one for each pre-sign-in cookie, and, where the operator names the
+   header their proxy sets, one for each client address in it. That header is read on
+   the admin listener only. No token, code, secret, cookie or object id is
    logged.
 9. **The Authority's own key, in the program** (the reviewer's points from the
    twenty-ninth read). Replacing the admin-record key stays an operator's command on
@@ -2555,7 +2632,15 @@ provider and **nothing here will have been run against Microsoft** when it is fi
    until the Ledger has taken the new key: it writes the record; ships under the old key
    until the Ledger accepts the new one; then moves the old file aside and deletes it.
    Stopped at any point and run again, it goes on from where it was: if the Ledger
-   already holds the new key (a lost acknowledgement), it asks under the new key.
+   already holds the new key (a lost acknowledgement), it asks under the new key. There
+   is a test for a stop between each two steps.
+   - **The serving program must not go on signing with the old key** (GR-194), which it
+     would, all day, once sign-ins are records. Two rules. The library refuses to sign
+     a record with any key but the one its chain's last replacement names, so an
+     instance left holding the old key stops writing instead of writing records the
+     Ledger refuses. And the command runs only with the program stopped: the program
+     holds a lock in the Authority's database while it serves, the command refuses
+     while that lock is held, and the program is then started with the new key's file.
 
 **Threats this adds, and the answer to each.** A stolen session cookie: short limits,
 `HttpOnly`, recent sign-in for the acts that matter, and offboarding ends it. A forged
@@ -2572,6 +2657,14 @@ auditor's check of session references. G4e-3: the admin listener and its routes.
 G4e-4: enrolment and delegation on the machines' listener. G4e-5: the commands (the
 first admin; replacing the admin-record key), and the run as programs, with fake data
 and a fake identity provider.
+
+**Conditions carried into G4e from earlier reads.** A gate's change of key (enrol the new
+key, ship everything under the old one, revoke it, delete its private half) is written
+into the run notes now and is enforced or checked before real data. The Authority's
+acknowledged position at the Ledger must be kept across a restart before anything can
+re-enable a disabled gate: until then a record sent again is harmless. TLS is required
+before real data or any use beyond loopback, and GR-77 (limits on connections and slow
+requests on every listener) before any network exposure.
 
 **Not in G4e:** the console's screens; groups from the token; approvals and the page
 the gate serves for them (G6); any sign-in other than Entra; a run against Microsoft,

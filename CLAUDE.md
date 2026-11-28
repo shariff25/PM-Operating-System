@@ -578,6 +578,13 @@ follow-up tracking.
   sign-in is a record, so a "verified" act can be checked against one. It will be tested
   against a fake identity provider only: a run against Microsoft waits on the owner's
   app registration.
+- **Thirtieth and thirty-first reads (2026-11-28), at `fadab56` and `3266c52`:** no High
+  or Critical. G4d-5 passes; three Low (GR-190 to GR-192) and a fault in the
+  unwitnessed-chain count are fixed on `build/gov-review-30`. **The design of G4e passes
+  and may be built**; three Medium points (GR-193: an enrolment code must never travel;
+  GR-194: the serving program after the admin-record key is replaced; GR-195: guarding
+  the link between a person and an account) and four Low are answered in §7.6.4, not yet
+  read again. The app registration now needs `auth_time` as well as `acct`.
 
 ## Where the build stands (2026-11-23)
 
@@ -601,7 +608,7 @@ follow-up tracking.
 For real data on a hosted model (`docs/openshell-any-host-spec.md` §3.9 and slice H13): the
 owner's recorded approval of the provider and confirmation of its data-processing and retention
 terms; the first host (an Ubuntu 24.04 x86 virtual machine); an Entra app registration, with
-`acct` as an optional claim; human labels for the eval judges
+`acct` as an optional claim (and, for Agent Governance's own registration, `auth_time` too); human labels for the eval judges
 (`evals/judges/LABELLING.md`); pilot PM names; edits to the nudge wording; a GitHub App
 with pull-request permission and branch protection on the content branch; approval of the three
 plans (MCP servers and which ones for the pilot, the OpenShell prover, sandbox decisions in the
