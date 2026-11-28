@@ -568,6 +568,10 @@ follow-up tracking.
   a revoked mandate recorded as a failed proof, a key change across a restart, and the
   auditor's check passing over both chains. Admin actions are still library calls on the
   Authority's database until G4e. With it G4d is built; not yet read by the reviewer.
+- **Twenty-ninth read (2026-11-28), at `e4dd4d7`:** no High or Critical; the gate passes
+  for all of G4d-4. One Low (GR-189), fixed on `build/gov-review-29` with two of the
+  reviewer's points for the programs (a bundle kept before use; a refused gate says so
+  and backs off) and the owed test of a revoked key in `gov verify`. Not read again yet.
 
 ## Where the build stands (2026-11-23)
 

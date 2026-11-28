@@ -1184,6 +1184,30 @@ Not done: refusing `revoke_key` until the Ledger has acknowledged that key's las
 disabled gate, in `gov verify`; the reviewer did not verify that issuing to a revoked
 agent key is refused by the chain check.
 
+### Twenty-ninth read, 2026-11-28: G4d-4's last part and the fixes, at `e4dd4d7`
+
+**Verdict: no High or Critical; the gate passes for all of G4d-4.** GR-126, GR-130, GR-166
+and GR-186 to GR-188 are closed. The reviewer ran the tests of the six `gov-*` crates
+without Postgres (214 passed), not the lint or format check, and did not repeat the
+control removals. Vouching (GR-187) is accepted for a gate disabled and later given a new
+key; the sentence it asked for is in §7.6.3 point 8. Fixed on `build/gov-review-29`,
+not yet read again.
+
+| Finding | Severity | What was wrong | What was done |
+|---|---|---|---|
+| GR-189 | Low | A replacement admin key whose id was already enrolled for a gate was not noted at the Ledger, yet the old key was retired: the Authority's chain would stop there | Fixed on both sides: the Authority refuses a new key whose id or bytes are enrolled; the Ledger retires the signer only when the successor's note holds the digest the record names |
+
+Also done from this read: the `gov verify` test of a revoked key, as distinct from a
+disabled gate; and, of the reviewer's seven points for the programs, the two that apply
+to what G4d-5 serves: the gate keeps a bundle it takes before any call is read under it
+(counted when it cannot), and a gate refused outright by its Authority says so on its
+operator's address and waits longer each time, up to a minute. Not applicable until
+G4e, since the program takes no admin action: the Authority's own key across a crash
+and a lost acknowledgement (points 1 and 2). A gate's change of key is an operator's
+order of steps (point 3: enrol the new key, ship everything under the old one, revoke
+it, delete its private half), and `--earlier-key` must be given oldest first; the
+program does not enforce the order or delete the key.
+
 ## 1. What is being built
 
 Agent Governance is a second product, separate from PM OS. It has three parts.
@@ -2386,7 +2410,10 @@ check exist in `gov-core` since G1 (§4.6); nothing has used them yet.
      a shipment asked for under a key of that gate still in use; sent any other way it
      is refused as before. `gov verify` reports each such receipt that no checkpoint
      shows to be earlier than the revocation (point 10): the record is kept, and marked.
-     A disabled gate has no key in use, so nothing more of its is taken. In a planned
+     A disabled gate has no key in use, so nothing more of its is taken. If such a gate
+     is later given a new key, a shipment under it says only "these are my chain's
+     receipts"; it cannot settle when the old key's receipts were written, and the
+     auditor reports any the witness does not show to be earlier than the disabling. In a planned
      change the gate ships what the old key signed before the admin revokes it; the
      Authority cannot check that, since it does not see the Ledger's answers to a gate.
    - In a spool, a key does not come back once a later one has signed (GR-188).

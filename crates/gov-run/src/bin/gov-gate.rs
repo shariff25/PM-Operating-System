@@ -21,7 +21,7 @@ use gov_core::policy::open_bundle;
 use gov_core::renew::Standing;
 use gov_core::{Id, KeySet, PublicKey, Scope};
 use gov_gate::forward::{Forwarder, ForwarderConfig, FromAuthority};
-use gov_gate::link::{HttpAuthorityLink, HttpLedgerLink};
+use gov_gate::link::{HttpAuthorityLink, HttpLedgerLink, RenewFailed};
 use gov_gate::sessions::SessionsConfig;
 use gov_gate::{DirWitnessReader, FileSpool, Gate, GateConfig, Shipped, WitnessReader};
 use gov_run::{
@@ -169,7 +169,18 @@ async fn serve(s: Serve) -> anyhow::Result<()> {
             )
             .map_err(|e| anyhow::anyhow!("the policy bundle is not this Authority's: {e}"))?;
             let link = HttpAuthorityLink::new(url).map_err(|e| anyhow::anyhow!("{e}"))?;
-            Some((standing, link, signed, read_key(&s.key_file)?))
+            // File first and then the note of it, as the shim does (GR-181).
+            let keep_scope = scope.clone();
+            let keep: gov_gate::forward::Keep = Box::new(move |bundle| {
+                let kept = || {
+                    let held = open_bundle(bundle, &signed.root, &keep_scope).ok()?.held();
+                    let bytes = serde_json::to_vec(bundle).ok()?;
+                    gov_run::policy_source::replace(&signed.file, &bytes).ok()?;
+                    gov_run::policy_source::note(&signed.state, &held).ok()
+                };
+                kept().is_some()
+            });
+            Some((standing, link, keep, read_key(&s.key_file)?))
         }
         _ => None,
     };
@@ -189,7 +200,7 @@ async fn serve(s: Serve) -> anyhow::Result<()> {
         config
     });
     let operator_secret = new_secret(&s.operator_secret_file)?;
-    let (scope_kept, ledger_base) = (scope.clone(), s.ledger.clone());
+    let ledger_base = s.ledger.clone();
     let config = GateConfig {
         scope,
         gate,
@@ -203,15 +214,16 @@ async fn serve(s: Serve) -> anyhow::Result<()> {
     let gate = Gate::open_after(config, key, &earlier, spool, now())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let (standing, renewing) = match authority {
-        Some((standing, link, signed, key)) => (Some(standing), Some((link, signed, key))),
+        Some((standing, link, keep, key)) => (Some((standing, keep)), Some((link, key))),
         None => (None, None),
     };
     let forwarder = Forwarder::new(
         gate,
         ForwarderConfig {
-            authority: standing.map(|standing| FromAuthority {
+            authority: standing.map(|(standing, keep)| FromAuthority {
                 standing,
                 mono: mono_millis,
+                keep: Some(keep),
             }),
             upstream: s.upstream,
             map: policy.map,
@@ -227,43 +239,43 @@ async fn serve(s: Serve) -> anyhow::Result<()> {
     // Renew on a timer. An answer is taken whole or not at all; a bundle that changed is
     // kept, file first and then the note of it, so the next start begins from it.
     let renew_failed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let renew_refused_by_authority = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let offers_key = renewing.is_some();
-    if let Some((authority, signed, key)) = renewing {
-        let (renewer, failed, scope) = (forwarder.clone(), renew_failed.clone(), scope_kept);
+    if let Some((authority, key)) = renewing {
+        let (renewer, failed, refused) = (
+            forwarder.clone(),
+            renew_failed.clone(),
+            renew_refused_by_authority.clone(),
+        );
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(s.renew_interval));
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let every = Duration::from_secs(s.renew_interval);
+            let mut wait = every;
             loop {
-                tick.tick().await;
+                tokio::time::sleep(wait).await;
+                wait = every;
                 let Some(Ok((request, asked))) = renewer.renewal(&key) else {
                     failed.fetch_add(1, Ordering::Relaxed);
                     continue;
                 };
                 let answer = match authority.renew(&request).await {
                     Ok(answer) => answer,
-                    Err(e) => {
+                    Err(RenewFailed::Refused) => {
+                        // Refused outright: asking every second changes nothing.
+                        let times = refused.fetch_add(1, Ordering::Relaxed) + 1;
+                        wait = (every * 2u32.saturating_pow(times.min(6) as u32))
+                            .min(Duration::from_secs(60));
+                        eprintln!("renewing: the Authority refuses this gate");
+                        continue;
+                    }
+                    Err(RenewFailed::Other(e)) => {
                         failed.fetch_add(1, Ordering::Relaxed);
                         eprintln!("renewing: {e}");
                         continue;
                     }
                 };
-                match renewer.renewed(&answer, asked).await {
-                    Some(Ok(taken)) if taken.bundle_changed => {
-                        let kept = renewer.signed_bundle().and_then(|bundle| {
-                            let held = open_bundle(&bundle, &signed.root, &scope).ok()?.held();
-                            let bytes = serde_json::to_vec(&bundle).ok()?;
-                            gov_run::policy_source::replace(&signed.file, &bytes).ok()?;
-                            gov_run::policy_source::note(&signed.state, &held).ok()
-                        });
-                        if kept.is_none() {
-                            eprintln!("the new policy bundle could not be kept: a restart begins from the old one");
-                        }
-                    }
-                    Some(Ok(_)) => {}
-                    Some(Err(why)) => {
-                        eprintln!("renewing: the answer was refused ({})", why.code())
-                    }
-                    None => {}
+                refused.store(0, Ordering::Relaxed);
+                if let Some(Err(why)) = renewer.renewed(&answer, asked).await {
+                    eprintln!("renewing: the answer was refused ({})", why.code());
                 }
             }
         });
@@ -350,6 +362,10 @@ async fn serve(s: Serve) -> anyhow::Result<()> {
                 "proven": c.counters.proven.load(Ordering::Relaxed),
                 "proof_failed": c.counters.proof_failed.load(Ordering::Relaxed),
                 "renew_failed": renew_failed.load(Ordering::Relaxed),
+                // In a row; above zero, the Authority does not take this gate for one of
+                // its own: its key is revoked or it is disabled.
+                "renew_refused_by_authority": renew_refused_by_authority.load(Ordering::Relaxed),
+                "bundle_not_kept": c.counters.bundle_not_kept.load(Ordering::Relaxed),
                 "renew_refused": c.counters.renew_refused.counts(),
                 "policy_version": c.policy().version,
             }))

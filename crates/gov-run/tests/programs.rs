@@ -751,6 +751,16 @@ async fn four_programs_a_gate_renews_from_its_authority() {
     assert_eq!(health["chain_not_witnessed"], json!(0), "{health}");
     assert!(health["shipped_through"].as_u64().unwrap() >= 9, "{health}");
 
+    // Its key revoked, the gate is refused outright; it says so to its operator.
+    admin.revoke_key(&ana, &id("gate-1:k2"), now).await.unwrap();
+    until("the gate reports that it is refused", || async {
+        gate_health(operator.clone()).await["renew_refused_by_authority"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    })
+    .await;
+
     drop((gate, shim, authority, ledger));
     authority_db.drop_schema().await;
     site.db.drop_schema().await;

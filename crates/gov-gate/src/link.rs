@@ -68,6 +68,14 @@ impl LedgerLink for HttpLedgerLink {
 /// The largest answer to a renewal: a whole bundle and the revocation feed.
 const MAX_RENEWED: usize = 8 * 1024 * 1024;
 
+#[derive(Debug)]
+pub enum RenewFailed {
+    /// The Authority's bare refusal: this gate's key is not enrolled, is revoked, or the
+    /// gate is disabled. Asking again at once changes nothing.
+    Refused,
+    Other(String),
+}
+
 /// Carries a gate's request to renew to its Authority's listener for gates.
 pub struct HttpAuthorityLink {
     url: String,
@@ -86,25 +94,33 @@ impl HttpAuthorityLink {
         })
     }
 
-    pub async fn renew(&self, request: &Envelope) -> Result<gov_core::renew::Renewed, String> {
+    pub async fn renew(&self, request: &Envelope) -> Result<gov_core::renew::Renewed, RenewFailed> {
+        let other = |e: reqwest::Error| RenewFailed::Other(e.to_string());
         let mut response = self
             .http
             .post(&self.url)
             .json(request)
             .send()
             .await
-            .map_err(|e| e.to_string())?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(format!("the Authority answered {}", status.as_u16()));
+            .map_err(other)?;
+        match response.status().as_u16() {
+            200 => {}
+            403 => return Err(RenewFailed::Refused),
+            status => {
+                return Err(RenewFailed::Other(format!(
+                    "the Authority answered {status}"
+                )))
+            }
         }
         let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+        while let Some(chunk) = response.chunk().await.map_err(other)? {
             if bytes.len() + chunk.len() > MAX_RENEWED {
-                return Err("the Authority's answer is larger than an answer can be".into());
+                return Err(RenewFailed::Other(
+                    "the Authority's answer is larger than an answer can be".into(),
+                ));
             }
             bytes.extend_from_slice(&chunk);
         }
-        serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+        serde_json::from_slice(&bytes).map_err(|e| RenewFailed::Other(e.to_string()))
     }
 }

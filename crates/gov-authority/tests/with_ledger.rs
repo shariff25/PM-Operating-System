@@ -752,6 +752,16 @@ async fn the_authoritys_own_key_is_replaced_by_a_record_in_its_chain() {
         Err(AuthorityError::NotAllowed)
     ));
     assert!(a.replace_admin_key(&ana, admin_key(), NOW).await.is_err());
+    // Nor a key, or a key id, that a gate or an agent holds (GR-189).
+    let g1 = key("gate-1:k1", 20);
+    enrol_gate(&a, "gate-1", &g1).await;
+    for taken in [key("gate-1:k1", 62), key("authority-admin-2", 20)] {
+        assert!(matches!(
+            a.replace_admin_key(&ana, taken, NOW).await,
+            Err(AuthorityError::Exists("key"))
+        ));
+    }
+    let acked = ship(&a, &ledger, acked).await;
     let at = a
         .replace_admin_key(&ana, key("authority-admin-2", 62), NOW)
         .await
@@ -857,6 +867,104 @@ async fn the_authoritys_own_key_is_replaced_by_a_record_in_its_chain() {
     );
     ledger.ingest(&named, NOW).await.unwrap();
     refused(ledger.supply_key(&stray.public()).await);
+}
+
+/// A replacement that names a key id the Ledger already holds a note for cannot be
+/// followed, so the key that signed it stays in use: the chain is not left with no key
+/// (GR-189). The record is made by hand; the Authority refuses to write it.
+#[tokio::test]
+async fn a_replacement_the_ledger_cannot_follow_retires_nothing() {
+    use gov_core::admin::{AdminRecord, SubjectKind};
+    use gov_core::enrol::key_digest;
+    let (a, ledger) = installed().await;
+    enrol_gate(&a, "gate-1", &key("gate-1:k1", 20)).await;
+    let acked = ship(&a, &ledger, 0).await;
+    let batch = a.shipment(0, 100).await.unwrap().unwrap().batch;
+    let admin_keys = KeySet::new([a.admin_public()]);
+    let last = gov_core::open::<AdminRecord>(batch.last().unwrap(), &admin_keys, &scope()).unwrap();
+    let colliding = by_hand(
+        acked + 1,
+        last.hash,
+        AdminAction::AdminKeyReplaced,
+        (SubjectKind::Key, "gate-1:k1"),
+        None,
+        Some(key_digest(&key("gate-1:k1", 62).public()).unwrap()),
+        &admin_key(),
+    );
+    ledger.ingest(&colliding, NOW).await.unwrap();
+    assert!(!ledger
+        .store()
+        .key_retired(&scope(), &a.admin_public().kid)
+        .await
+        .unwrap());
+}
+
+/// A receipt under a revoked key, as distinct from a disabled gate's: earlier than the
+/// revocation only where the witness shows it. The late one is put into the Ledger's
+/// store directly, as a Ledger at fault would hold it.
+#[tokio::test]
+async fn a_receipt_under_a_revoked_key_is_judged_by_the_witness() {
+    let (a, ledger) = installed().await;
+    let (g1, g2) = (key("gate-1:k1", 20), key("gate-1:k2", 21));
+    enrol_gate(&a, "gate-1", &g1).await;
+    enrol_gate(&a, "gate-1", &g2).await;
+    let acked = ship(&a, &ledger, 0).await;
+    ledger.supply_key(&g1.public()).await.unwrap();
+    ledger.supply_key(&g2.public()).await.unwrap();
+    let mut prev = None;
+    let mut receipts = Vec::new();
+    for seq in 1..=3u64 {
+        let r = common::receipt("gate-1", seq, prev.clone(), NOW + seq as i64);
+        let env = seal(&r, &g1).unwrap();
+        prev = Some(common::hash_of(&env, &g1));
+        receipts.push((env, prev.clone().unwrap()));
+    }
+    for (env, _) in &receipts[..2] {
+        ledger.ingest(env, NOW).await.unwrap();
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let witness = DirWitness::new(dir.path());
+    let (lk, issuer) = (ledger_key(), id("ledger"));
+    let checkpoint = |at: i64| ledger.checkpoint(&lk, &issuer, at, &witness);
+    checkpoint(NOW + 30).await.unwrap();
+    a.revoke_key(&id("ana"), &id("gate-1:k1"), NOW)
+        .await
+        .unwrap();
+    ship(&a, &ledger, acked).await;
+    checkpoint(NOW + 60).await.unwrap();
+    let after_retirement = |found: Vec<(Problem, Option<Id>, Option<u64>)>| {
+        found
+            .into_iter()
+            .filter(|(p, _, _)| *p == Problem::ReceiptAfterRetirement)
+            .map(|(_, gate, seq)| (gate, seq))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        after_retirement(findings_of(&ledger, &witness, NOW + 61).await),
+        vec![]
+    );
+    let (late, hash) = receipts[2].clone();
+    ledger
+        .store()
+        .append(
+            &scope(),
+            &id("gate-1"),
+            2,
+            &gov_ledger::store::StoredReceipt {
+                seq: 3,
+                hash,
+                at: NOW + 3,
+                received_at: NOW,
+                envelope: late,
+            },
+        )
+        .await
+        .unwrap();
+    checkpoint(NOW + 90).await.unwrap();
+    assert_eq!(
+        after_retirement(findings_of(&ledger, &witness, NOW + 91).await),
+        vec![(Some(id("gate-1")), Some(3))]
+    );
 }
 
 /// The auditor's check holds a proven receipt to a mandate the Authority recorded issuing

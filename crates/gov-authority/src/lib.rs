@@ -1010,6 +1010,15 @@ impl<S: Store> Authority<S> {
         let digest = gov_core::enrol::key_digest(&public)?;
         let seq = on_head!(self, head, {
             self.admin(actor).await?;
+            // An id or a key some gate or agent holds would not be taken by the Ledger,
+            // and the chain would stop there (review finding GR-189).
+            let enrolled = self.store.keys(&self.scope).await?;
+            if enrolled
+                .iter()
+                .any(|e| e.key.kid == public.kid || e.key.same_key(&public))
+            {
+                return Err(AuthorityError::Exists("key"));
+            }
             let did = Did {
                 value: Some(digest.clone()),
                 ..Did::to(AdminAction::AdminKeyReplaced, SubjectKind::Key, &public.kid)

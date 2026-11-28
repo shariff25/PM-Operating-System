@@ -308,9 +308,18 @@ impl<S: Store> Ledger<S> {
             self.store
                 .note_enrolment(&self.scope, &record.subject.id, &successor)
                 .await?;
-            self.store
-                .retire_keys(&self.scope, authority, Some(signer))
+            // Only when the next key can be supplied: a note is written once, and one
+            // already there under this id for another key would leave the chain with no
+            // key at all (review finding GR-189).
+            let noted = self
+                .store
+                .enrolment(&self.scope, &record.subject.id)
                 .await?;
+            if noted.is_some_and(|e| &e.gate == authority && &e.digest == digest && !e.ended) {
+                self.store
+                    .retire_keys(&self.scope, authority, Some(signer))
+                    .await?;
+            }
         }
         if let (AdminAction::KeyEnrolled, Some(about), Some(digest)) =
             (&record.action, &record.about, &record.value)
