@@ -223,6 +223,14 @@ async fn the_authoritys_chain_is_witnessed_and_a_gates_key_follows_from_it() {
     let acked = ship(&a, &ledger, acked).await;
     refused(ledger.supply_key(&g2.public()).await);
 
+    // The witness sees gate-1's receipts before anything is said of disabling it.
+    let dir = tempfile::tempdir().unwrap();
+    let witness = DirWitness::new(dir.path());
+    ledger
+        .checkpoint(&ledger_key(), &id("ledger"), NOW + 30, &witness)
+        .await
+        .unwrap();
+
     // A gate disabled while in use: when the Ledger takes in that record, the gate's key is
     // retired. What it sent before stays and still verifies; nothing more is taken, and it
     // gets no answer to a shipment (review finding GR-20).
@@ -249,8 +257,6 @@ async fn the_authoritys_chain_is_witnessed_and_a_gates_key_follows_from_it() {
 
     // The Authority's chain is under the same witness as the gates', and an auditor's check
     // of the export covers both, the retired gate's receipts included.
-    let dir = tempfile::tempdir().unwrap();
-    let witness = DirWitness::new(dir.path());
     ledger
         .checkpoint(&ledger_key(), &id("ledger"), NOW + 60, &witness)
         .await
@@ -344,12 +350,14 @@ async fn the_authoritys_chain_is_witnessed_and_a_gates_key_follows_from_it() {
     assert!(found
         .iter()
         .all(|(p, gate)| *p != Problem::KeyNotEnrolled && *gate == Some(id("authority"))));
-    // A receipt dated after its gate was disabled, by more than the clocks may differ:
-    // gate-1's second receipt is one second later than the record that disabled it.
-    assert_eq!(
-        problems(&keys, &checkpoints, 0),
-        vec![(Problem::ReceiptAfterRetirement, Some(id("gate-1")))]
-    );
+    // The witness's order decides whether a receipt is earlier than its gate's disabling,
+    // whatever dates either carries (GR-130). Above, a checkpoint covered gate-1's receipts
+    // before the one that covered the record. Without that earlier checkpoint nothing
+    // shows them to be earlier, and the last of them is reported.
+    assert!(problems(&keys, &checkpoints, 0).is_empty());
+    let late_only = &checkpoints[1..];
+    assert!(problems(&keys, late_only, 60)
+        .contains(&(Problem::ReceiptAfterRetirement, Some(id("gate-1")))));
     // What was witnessed says which key was enrolled for which gate or agent, in order.
     let enrolled: Vec<Id> = a
         .records()

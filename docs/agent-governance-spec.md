@@ -599,6 +599,14 @@ reviewer.
     half once the Ledger has acknowledged its last receipt (the program, G4d-5); the
     Authority's own admin-record key (point 9) and the witness's order in `gov verify`
     (point 10), which are the second part.
+- **G4d-4, the auditor's order, built (2026-11-28), from §7.6.3 point 10; not yet read by
+  the reviewer.** On `build/gov-g4d4b`. `gov verify` no longer compares the gate's date on
+  a receipt with the Authority's date on the record that retired its key. A receipt under
+  a retired key counts as earlier only if a checkpoint before the first one covering the
+  retirement already covered it; otherwise it is reported, as "not shown to be earlier"
+  (GR-130). Tested for a disabled gate, with and without the earlier checkpoint; the same
+  code serves a revoked key, which has no test of its own yet. `clock_skew_secs` no longer
+  bears on this finding. Not built: replacing the Authority's admin-record key (point 9).
 
 ## Security review of 2026-11-26 (first read; the gate did not pass)
 
@@ -956,7 +964,7 @@ Postgres was again read, not run, by the reviewer.
 |---|---|---|---|
 | GR-128 | Medium, before G4b | Keeping the root key off the Authority's machine only helps if what it signs does not come from that machine, and the text did not say where the signer's input comes from or what the signer sees | §7.6.1, point 4: the input is the reviewed repository; `sign` runs the check itself, shows what changed since the previous signed bundle, and prints the digest it signed |
 | GR-129 | Low | A receipt carried the bundle's number only, so two bundles under one number could not be told apart | §7.6.1, point 5: the policy version is the number and the digest |
-| GR-130 | Low | "A receipt after its gate was disabled" compares the gate's own date with the Authority's, so it catches only a gate that dates honestly | Open; to use the witness's order (the first checkpoint that covered each), with G4d |
+| GR-130 | Low | "A receipt after its gate was disabled" compares the gate's own date with the Authority's, so it catches only a gate that dates honestly | Fixed on `build/gov-g4d4b` (2026-11-28): the witness's order decides |
 | GR-131 | Low | On a Ledger restored from an older copy, the notes of enrolments can disagree with the chain | Fixed on `build/gov-review-16`: the Ledger writes its notes again from the Authorities' chains before it serves, and a chain it cannot open stops the start. Tested as a library call; that the program makes the call is read, not tested |
 | GR-132 | Low | A gate or shim with no saved state accepts any validly signed bundle, an old one included | Stated in §7.6.1, point 3, as a limit until the lease names the bundle (G4d) |
 | GR-133 | Low | A gate and its shim started on different bundles fail proofs for every tool whose map differs | Stated in §7.6.1, point 7 |
@@ -1110,6 +1118,16 @@ its findings are from reading. **GR-181 and GR-182 are to be fixed before G4d-5.
 | GR-183 | Low | Two overlapping calls could put an older bundle back in the shim's state | Fixed: one follow at a time, each reading what is held after it has the lock. No test removes this one: it needs two bundle changes inside one call |
 | GR-184 | Low | The bundle is handed to anyone who knows an open session's id, which is on every receipt | Accepted for this release on a condition now stated here: **a bundle never holds a secret, and every agent of the tenant may read all of it.** With more than one tenant, or a rule an agent should not learn, the request must carry a proof under the session's key |
 | GR-185 | Info | The call that crosses a bundle change fails its proof; an operator cannot tell a publish from an attack without reading receipts | Open: before enforce mode the shim retries once after it follows, or the call gets a reason of its own |
+
+### Twenty-seventh read, 2026-11-28: the fixes at `f0bcd06`
+
+**Verdict: no High or Critical, and no new findings.** GR-177, GR-178, GR-180, GR-181 and
+GR-182 are closed; GR-183 is closed from reading only; GR-184 is accepted on its stated
+condition; GR-185 stays open before enforce mode. The reviewer ran the tests of four crates
+without Postgres, and did not run the lint or the format check. Two notes for G4d-5: a
+shim needs write access to its bundle file, or it follows nothing; and the bundle file and
+the state file must not share a name stem in one directory, since both write through a
+temporary file named from it.
 
 ## 1. What is being built
 
