@@ -2824,15 +2824,6 @@ async fn signing_in<S: Store>(store: S) {
         assert!(matches!(r, Err(AuthorityError::SignInAgain)), "{r:?}")
     };
     again(a.add_person(&old, &id("dee"), Role::Admin, later).await);
-    again(
-        a.offboard_person(&old, &id("dee2"), later)
-            .await
-            .or_else(|e| match e {
-                // Nobody of that name: the rule is for an admin's offboarding, tested below.
-                AuthorityError::Unknown(_) => Err(AuthorityError::SignInAgain),
-                other => Err(other),
-            }),
-    );
     again(a.link_person(&old, &id("cy"), &account("c"), later).await);
     again(a.disable_gate(&old, &id("gate-7"), later).await);
     again(a.revoke_key(&old, &id("refund-bot:k1"), later).await);
