@@ -623,6 +623,27 @@ reviewer.
   steps as one); the Authority must be given its earlier public keys to read its own
   chain. Not built, and moved to G4d-5: the Authority checking that the witness covers
   its own chain. With this G4d-4 is built as libraries.
+- **G4d-5 built (2026-11-28), from §7.6.3 point 11; not yet read by the reviewer.** On
+  `build/gov-g4d5`. A fourth program, `gov-authority`, with one listener, for gates only
+  (`POST /v1/renew`): a request of at most 64 KiB, a limit for each source address applied
+  before anything is parsed or looked up (GR-169, GR-174), and a bare refusal whatever is
+  wrong. It ships its own records to the Ledger and counts, for its operator, a head no
+  witnessed checkpoint covers in time. The gate program, given `--authority`, renews on a
+  timer, counts time on the clock that goes on through suspension (`CLOCK_BOOTTIME`;
+  elsewhere it starts only with fake data), keeps a bundle it takes (file, then note),
+  opens its spool under its earlier keys (`--earlier-key`), and offers its key to the
+  Ledger, which takes it on the Authority's record. `gov-ledger enrol-authority` gives the
+  Ledger the Authority's key at installation. **Run as four programs with fake data:** a
+  call proven under a lease; the next bundle published and taken without a restart, by
+  gate and shim; the mandate revoked and the next call recorded as a failed proof with
+  that reason; the gate started again under a new key; the auditor's check passing over
+  both chains. Limits and what is not tested: admin actions are still library calls on
+  the Authority's database (G4e), so the run's set-up is a library beside the program;
+  the count of an unwitnessed chain is only seen at zero; the refusal to start without a
+  suspension-counting clock cannot be run here; the old private key is not deleted by
+  the program; nothing speaks TLS; the Authority's acknowledged position is not kept
+  across a restart, so it sends its chain again from the start (the Ledger holds it
+  already). With this G4d is built.
 
 ## Security review of 2026-11-26 (first read; the gate did not pass)
 

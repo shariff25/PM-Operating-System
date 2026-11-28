@@ -64,3 +64,47 @@ impl LedgerLink for HttpLedgerLink {
         })
     }
 }
+
+/// The largest answer to a renewal: a whole bundle and the revocation feed.
+const MAX_RENEWED: usize = 8 * 1024 * 1024;
+
+/// Carries a gate's request to renew to its Authority's listener for gates.
+pub struct HttpAuthorityLink {
+    url: String,
+    http: reqwest::Client,
+}
+
+impl HttpAuthorityLink {
+    pub fn new(base: &str) -> Result<Self, String> {
+        Ok(HttpAuthorityLink {
+            url: format!("{}/v1/renew", base.trim_end_matches('/')),
+            http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .map_err(|e| e.to_string())?,
+        })
+    }
+
+    pub async fn renew(&self, request: &Envelope) -> Result<gov_core::renew::Renewed, String> {
+        let mut response = self
+            .http
+            .post(&self.url)
+            .json(request)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!("the Authority answered {}", status.as_u16()));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+            if bytes.len() + chunk.len() > MAX_RENEWED {
+                return Err("the Authority's answer is larger than an answer can be".into());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+    }
+}

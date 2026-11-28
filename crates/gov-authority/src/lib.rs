@@ -11,6 +11,7 @@
 //! refuses the commit if the head has moved, and the action starts again. Nothing changes
 //! the registry without moving the head, so no check can be overtaken.
 
+pub mod http;
 pub mod pg;
 pub mod store;
 

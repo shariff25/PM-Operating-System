@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+axum.workspace = true
 base64.workspace = true
 gov-core = { path = "../gov-core" }
 serde.workspace = true

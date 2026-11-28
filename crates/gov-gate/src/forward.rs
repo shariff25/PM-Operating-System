@@ -505,6 +505,16 @@ impl<S: Spool + 'static> Forwarder<S> {
         Some(taken)
     }
 
+    /// The bundle held from the Authority, as signed, for whoever keeps it across a restart.
+    pub fn signed_bundle(&self) -> Option<Envelope> {
+        let a = self.authority.as_ref()?;
+        let standing = a
+            .standing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        standing.signed_bundle().cloned()
+    }
+
     /// Whether a tool listing is held for an MCP session.
     pub fn holds_listing(&self, session: &str) -> bool {
         self.listed
