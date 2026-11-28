@@ -1193,6 +1193,13 @@ async fn two_kinds<S: Store>(store: S) {
         .await
         .unwrap();
 
+    // An Authority is given one key at installation; a second comes only by its chain.
+    assert!(matches!(
+        ledger
+            .enrol_admin_key(&id("authority"), &key("authority-admin-2", 63).public())
+            .await,
+        Err(LedgerError::Refused("authority_has_a_key"))
+    ));
     // A chain is of one kind: a gate's chain takes no admin key, an Authority's no gate key.
     assert!(ledger
         .enrol_admin_key(&id("gate-1"), &key("sneak-1", 61).public())

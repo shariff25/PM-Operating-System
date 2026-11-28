@@ -191,6 +191,39 @@ pub async fn bind(addr: SocketAddr) -> anyhow::Result<tokio::net::TcpListener> {
     Ok(listener)
 }
 
+/// Whether a chain's head has gone unwitnessed too long. It watches one head at a time:
+/// the first seen that the witness did not cover, until the witness reaches it. On a
+/// chain that keeps moving, a witness one interval behind is not an alarm.
+#[derive(Debug, Default)]
+pub struct Cover {
+    waiting: Option<(u64, i64)>,
+}
+
+impl Cover {
+    pub fn overdue(&mut self, head: u64, witnessed: u64, now: i64, within_secs: i64) -> bool {
+        if self.waiting.is_some_and(|(seen, _)| witnessed >= seen) {
+            self.waiting = None;
+        }
+        if witnessed >= head {
+            return false;
+        }
+        let (_, since) = *self.waiting.get_or_insert((head, now));
+        now.saturating_sub(since) > within_secs
+    }
+}
+
+/// Read a response's body, up to `max` bytes.
+pub async fn body_up_to(mut response: reqwest::Response, max: usize) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if bytes.len() + chunk.len() > max {
+            return None;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Some(bytes)
+}
+
 /// Milliseconds on a clock that goes on while the machine is suspended (spec §7.6.3,
 /// point 4). `None` where this program knows no such clock.
 #[cfg(target_os = "linux")]

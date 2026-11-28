@@ -192,8 +192,7 @@ async fn serve(s: Serve) -> anyhow::Result<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(s.ship_interval));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // The first head seen that the witness did not cover, and when.
-        let mut waiting: Option<(u64, i64)> = None;
+        let mut cover = gov_run::Cover::default();
         loop {
             tick.tick().await;
             loop {
@@ -212,10 +211,9 @@ async fn serve(s: Serve) -> anyhow::Result<()> {
                     .send()
                     .await;
                 let ack = match sent {
-                    Ok(r) if r.status().is_success() => r
-                        .json::<serde_json::Value>()
+                    Ok(r) if r.status().is_success() => gov_run::body_up_to(r, 64 * 1024)
                         .await
-                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
                         .and_then(|v| serde_json::from_value::<Envelope>(v["ack"].clone()).ok()),
                     Ok(r) => {
                         eprintln!("shipping: the Ledger answered {}", r.status().as_u16());
@@ -244,12 +242,8 @@ async fn serve(s: Serve) -> anyhow::Result<()> {
             }
             let Some(witness) = &witness else { continue };
             let acked = shipped.acked.load(Ordering::Relaxed);
-            if witnessed_head(witness, &ledger_keys, &scope, &name) >= acked {
-                waiting = None;
-                continue;
-            }
-            let (_, since) = *waiting.get_or_insert((acked, now()));
-            if now().saturating_sub(since) > cover_within {
+            let witnessed = witnessed_head(witness, &ledger_keys, &scope, &name);
+            if cover.overdue(acked, witnessed, now(), cover_within) {
                 shipped.uncovered.fetch_add(1, Ordering::Relaxed);
                 eprintln!("no witnessed checkpoint covers this Authority's chain through {acked}");
             }

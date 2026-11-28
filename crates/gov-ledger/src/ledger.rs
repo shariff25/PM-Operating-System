@@ -66,6 +66,15 @@ impl<S: Store> Ledger<S> {
         authority: &Id,
         key: &PublicKey,
     ) -> Result<(), LedgerError> {
+        // At installation only: a later key comes through a replacement record in the
+        // chain, never beside the first (review finding GR-191).
+        if self.store.chain_kind(&self.scope, authority).await? == Some(ChainKind::Admin) {
+            return Err(LedgerError::Refused("authority_has_a_key"));
+        }
+        self.add_admin_key(authority, key).await
+    }
+
+    async fn add_admin_key(&self, authority: &Id, key: &PublicKey) -> Result<(), LedgerError> {
         key.enrolable()?;
         self.store
             .add_key(&self.scope, authority, ChainKind::Admin, key)
@@ -256,7 +265,7 @@ impl<S: Store> Ledger<S> {
         }
         // An Authority's own next key, named by a record in its chain.
         if self.store.chain_kind(&self.scope, &gate).await? == Some(ChainKind::Admin) {
-            return self.enrol_admin_key(&gate, key).await;
+            return self.add_admin_key(&gate, key).await;
         }
         self.enrol_gate_key(&gate, key).await
     }
