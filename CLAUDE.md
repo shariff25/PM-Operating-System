@@ -611,6 +611,11 @@ follow-up tracking.
 - **A lint failure the check script caught (2026-11-28):** G4e-3's first full run failed
   the lint (an error type too large) with every test passing. Nothing was merged; fixed
   before the merge.
+- **G4e-4 built (2026-11-28), on `build/gov-g4e4`:** a gate or agent on another machine
+  can enrol over the network without its one-time code ever being sent (the request
+  carries a tag made with the code), and an agent can ask for a delegated mandate. Both
+  are on the listener the Authority program already serves. Not yet read by the reviewer;
+  no client command uses them yet.
 
 ## Where the build stands (2026-11-23)
 

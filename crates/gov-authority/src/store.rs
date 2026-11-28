@@ -99,6 +99,10 @@ pub struct PendingCode {
     pub kind: EnrolKind,
     pub name: Id,
     pub digest: Digest,
+    /// What a request sent over the network is authenticated with. Absent on a code made
+    /// before there was one: such a code enrols on the Authority's machine only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac_key: Option<Digest>,
     pub expires_at: i64,
     /// The admin who made it.
     pub by: Id,

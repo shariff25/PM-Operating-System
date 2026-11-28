@@ -703,6 +703,21 @@ reviewer.
   of starts can hold up new sign-ins for up to ten minutes within the overall limit.
   Every changing route is walked by a test that holds its record to "verified" and the
   session (GR-204).
+- **G4e-4 built (2026-11-28), from §7.6.4 point 6; not yet read by the reviewer.** On
+  `build/gov-g4e4`. Two more routes on the machines' listener, each a signed document and
+  no session, behind the limit for each source. `POST /v1/enrol`: a gate or agent on
+  another machine sends its signed request and a tag over it (HMAC-SHA-256 under a key
+  derived from the one-time code under a label of its own); **the code is never sent**
+  (GR-193), and a body that carries one is refused. The tag is checked before the code is
+  touched, so someone on the path can neither enrol their own key nor use the code up;
+  a code is still used once; wrong attempts from afar do not cancel it (GR-199). A code is
+  16 random bytes, checked by a test. `POST /v1/delegate`: a parent agent's signed
+  request, answered with the narrower mandate; every refusal is a bare 403. Seven
+  controls removed on purpose, each caught. Limits: a code offered before this change
+  has no such key and enrols on the Authority's machine only (not tested); no client
+  command sends these requests yet (the shim and gate programs still enrol by library in
+  the tests); the routes are in the `gov-authority` program through the listener it
+  already serves.
 
 ## Security review of 2026-11-26 (first read; the gate did not pass)
 

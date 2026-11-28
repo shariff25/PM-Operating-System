@@ -45,6 +45,8 @@ impl Default for SourceLimit {
 #[derive(Debug, Default)]
 pub struct Counters {
     pub renewed: AtomicU64,
+    pub enrolled: AtomicU64,
+    pub delegated: AtomicU64,
     pub refused: AtomicU64,
     pub limited: AtomicU64,
     pub failed: AtomicU64,
@@ -125,8 +127,87 @@ impl<S> Listener<S> {
 pub fn router<S: Store + 'static>(listener: Arc<Listener<S>>) -> Router {
     Router::new()
         .route("/v1/renew", post(renew::<S>))
+        .route("/v1/enrol", post(enrol::<S>))
+        .route("/v1/delegate", post(delegate::<S>))
         .layer(DefaultBodyLimit::max(MAX_REQUEST))
         .with_state(listener)
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Enrol {
+    request: Envelope,
+    /// A tag over the request under a key derived from the one-time code. The code
+    /// itself is never sent (review finding GR-193).
+    mac: String,
+}
+
+/// A gate or an agent on another machine enrols its key. The answer is the root key,
+/// which the caller pins only if its code names it.
+async fn enrol<S: Store + 'static>(
+    State(l): State<Arc<Listener<S>>>,
+    ConnectInfo(from): ConnectInfo<SocketAddr>,
+    body: Bytes,
+) -> Response {
+    let now = (l.clock)();
+    if !l.within_limit(from.ip(), now) {
+        l.counters.limited.fetch_add(1, Ordering::Relaxed);
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
+    let Ok(asked) = serde_json::from_slice::<Enrol>(&body) else {
+        l.counters.refused.fetch_add(1, Ordering::Relaxed);
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    match l
+        .authority
+        .enrol_remote(&asked.request, &asked.mac, now)
+        .await
+    {
+        Ok(root) => {
+            l.counters.enrolled.fetch_add(1, Ordering::Relaxed);
+            axum::Json(serde_json::json!({"root": root})).into_response()
+        }
+        Err(AuthorityError::Refused) => {
+            l.counters.refused.fetch_add(1, Ordering::Relaxed);
+            StatusCode::FORBIDDEN.into_response()
+        }
+        Err(_) => {
+            l.counters.failed.fetch_add(1, Ordering::Relaxed);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// A parent agent's signed request for a narrower mandate for another agent.
+async fn delegate<S: Store + 'static>(
+    State(l): State<Arc<Listener<S>>>,
+    ConnectInfo(from): ConnectInfo<SocketAddr>,
+    body: Bytes,
+) -> Response {
+    let now = (l.clock)();
+    if !l.within_limit(from.ip(), now) {
+        l.counters.limited.fetch_add(1, Ordering::Relaxed);
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
+    let delegated = match serde_json::from_slice::<Envelope>(&body) {
+        Ok(request) => l.authority.delegate(&request, now).await,
+        Err(_) => Err(AuthorityError::Refused),
+    };
+    match delegated {
+        Ok(mandate) => {
+            l.counters.delegated.fetch_add(1, Ordering::Relaxed);
+            axum::Json(mandate).into_response()
+        }
+        Err(AuthorityError::Store(_)) => {
+            l.counters.failed.fetch_add(1, Ordering::Relaxed);
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+        // Whatever the reason, a caller that may be anyone is told only that.
+        Err(_) => {
+            l.counters.refused.fetch_add(1, Ordering::Relaxed);
+            StatusCode::FORBIDDEN.into_response()
+        }
+    }
 }
 
 /// Whatever is wrong with a request, its sender learns only that it was refused.

@@ -574,12 +574,22 @@ async fn four_programs_a_gate_renews_from_its_authority() {
         limited += u32::from(answer.status().as_u16() == 429);
     }
     assert!(limited >= 1);
-    for path in ["/healthz", "/v1/enrol", "/v1/mandates"] {
+    // Nothing for people is on this listener: no sign-in, no admin action.
+    for path in ["/healthz", "/v1/mandates", "/v1/people", "/v1/signin/start"] {
         let other = reqwest::get(format!("{authority_url}{path}"))
             .await
             .unwrap();
         assert_eq!(other.status().as_u16(), 404);
     }
+    // Enrolment is: a signed request and a tag, and anything else is refused bare.
+    let stranger = reqwest::Client::new()
+        .post(format!("{authority_url}/v1/enrol"))
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert!(matches!(stranger.status().as_u16(), 403 | 429));
+    assert!(stranger.text().await.unwrap().is_empty());
 
     let with_authority = |listen: &str| {
         let mut c = site.gate_on(&ledger_url, listen);

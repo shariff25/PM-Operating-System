@@ -539,6 +539,7 @@ async fn enrolment_attacks<S: Store>(store: S) {
         kind: EnrolKind::Gate,
         name: id("gate-3"),
         digest: code_digest(&code3),
+        mac_key: None,
         expires_at: NOW + CODE_SECS,
         by: ana.clone(),
         wrong: 0,
@@ -2880,3 +2881,174 @@ async fn signing_in<S: Store>(store: S) {
     refused(a.sign_in(&bens, NOW + 6, NOW + 6).await);
 }
 both_stores!(people_sign_in_and_their_acts_say_so, signing_in);
+
+/// A gate on another machine enrols (spec §7.6.4, point 6): the code never travels, and
+/// what does travel enrols nobody but the key it was made for.
+async fn enrolling_from_afar<S: Store + 'static>(store: S) {
+    use base64::Engine;
+    use gov_core::enrol::{mac_key, request_mac};
+    let a = std::sync::Arc::new(installed(store).await);
+    let ana = id("ana");
+    let code = a
+        .offer_enrolment(&ana, EnrolKind::Gate, &id("gate-1"), NOW)
+        .await
+        .unwrap();
+    // A code is 128 random bits: what travels gives no way to guess it.
+    let random = code.split('.').next().unwrap();
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(random)
+        .unwrap();
+    assert_eq!(bytes.len(), 16);
+
+    let gate = key("gate-1:k1", 20);
+    let asked = request(&gate, EnrolKind::Gate, "gate-1", gate.public(), &code);
+    let tag = request_mac(&mac_key(&code), &asked);
+    assert!(!tag.contains(random) && !serde_json::to_string(&asked).unwrap().contains(random));
+
+    // Someone on the path holds the request and its tag, and wants their own key in.
+    let theirs = key("gate-1:k9", 99);
+    let mut forged = asked.clone();
+    forged.sig = request(&theirs, EnrolKind::Gate, "gate-1", theirs.public(), &code).sig;
+    let own: EnrolRequest = {
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&asked.payload)
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    let swapped = seal(
+        &EnrolRequest {
+            key: theirs.public(),
+            ..own
+        },
+        &theirs,
+    )
+    .unwrap();
+    // The rightful signature and tag over another payload: refused before the code is
+    // touched, or whoever is on the path could use the code up.
+    let mut other_payload = asked.clone();
+    other_payload.payload = swapped.payload.clone();
+    let before = chain(&a).await.len();
+    for (attempt, with) in [
+        (&other_payload, tag.as_str()),
+        (&swapped, tag.as_str()),
+        (&forged, tag.as_str()),
+        (&asked, "AAAA"),
+        (&asked, ""),
+        (
+            &swapped,
+            request_mac(&mac_key("a-guess"), &swapped).as_str(),
+        ),
+    ] {
+        assert!(matches!(
+            a.enrol_remote(attempt, with, NOW).await,
+            Err(AuthorityError::Refused)
+        ));
+    }
+    // Wrong attempts from afar, however many, do not cancel the code (GR-199).
+    for _ in 0..WRONG_CODES + 2 {
+        assert!(a.enrol_remote(&asked, "AAAA", NOW).await.is_err());
+    }
+    assert_eq!(chain(&a).await.len(), before);
+
+    // Over the listener: the request and its tag, and never the code.
+    let listener = std::sync::Arc::new(gov_authority::http::Listener::new(
+        a.clone(),
+        || NOW,
+        Default::default(),
+    ));
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", socket.local_addr().unwrap());
+    let app = gov_authority::http::router(listener.clone())
+        .into_make_service_with_connect_info::<std::net::SocketAddr>();
+    tokio::spawn(async move { axum::serve(socket, app).await.unwrap() });
+    let http = reqwest::Client::new();
+    let post = |path: &str, body: serde_json::Value| {
+        let request = http.post(format!("{base}{path}")).json(&body);
+        async move {
+            let answer = request.send().await.unwrap();
+            (answer.status().as_u16(), answer.text().await.unwrap())
+        }
+    };
+    let refused = (403, String::new());
+    let wrong = serde_json::json!({"request": swapped, "mac": tag});
+    assert_eq!(post("/v1/enrol", wrong).await, refused);
+    assert_eq!(post("/v1/enrol", serde_json::json!({})).await, refused);
+    let with_the_code = serde_json::json!({"request": asked, "mac": tag, "code": code});
+    assert_eq!(post("/v1/enrol", with_the_code).await, refused);
+    let (status, body) = post(
+        "/v1/enrol",
+        serde_json::json!({"request": asked, "mac": tag}),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let answered: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let pinned: PublicKey = serde_json::from_value(answered["root"].clone()).unwrap();
+    assert!(code_names_root(&code, &pinned));
+    assert_eq!(a.gate_keys().await.unwrap(), vec![gate.public()]);
+    // A code is used once, from afar as well: not again for the same key, and not by its
+    // holder for a second one.
+    let again = serde_json::json!({"request": asked, "mac": tag});
+    assert_eq!(post("/v1/enrol", again).await, refused);
+    let second = key("gate-1:k2", 21);
+    let more = request(&second, EnrolKind::Gate, "gate-1", second.public(), &code);
+    let more = serde_json::json!({"request": more, "mac": request_mac(&mac_key(&code), &more)});
+    assert_eq!(post("/v1/enrol", more).await, refused);
+    // Delegation on the same listener: anything but a parent agent's signed request is
+    // refused without a word.
+    assert_eq!(
+        post("/v1/delegate", serde_json::json!(asked)).await,
+        refused
+    );
+    assert_eq!(post("/v1/delegate", serde_json::json!({})).await, refused);
+}
+both_stores!(
+    a_gate_enrols_from_another_machine_without_its_code_travelling,
+    enrolling_from_afar
+);
+
+/// A parent agent's signed request reaches the Authority over the machines' listener and
+/// is answered with the narrower mandate.
+#[tokio::test]
+async fn an_agent_delegates_over_the_listener() {
+    let (a, refund, _, _) = ready(MemoryStore::default()).await;
+    let (ana, ben) = (id("ana"), id("ben"));
+    a.publish_bundle(&ana, &policy(1, vec![mandates_key().public()]), NOW)
+        .await
+        .unwrap();
+    a.issue_mandate(&ben, &ask("refund-bot", "refund-bot:k1", "triage"), NOW)
+        .await
+        .unwrap();
+    let parent = a.list_mandates(&ben).await.unwrap()[0].id.clone();
+    let asked = delegate_request(&refund, &parent, ("helper-bot", "helper-bot:k1"), &|_| {});
+    let listener = std::sync::Arc::new(gov_authority::http::Listener::new(
+        std::sync::Arc::new(a),
+        || NOW,
+        Default::default(),
+    ));
+    let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", socket.local_addr().unwrap());
+    let app = gov_authority::http::router(listener.clone())
+        .into_make_service_with_connect_info::<std::net::SocketAddr>();
+    tokio::spawn(async move { axum::serve(socket, app).await.unwrap() });
+    let answer = reqwest::Client::new()
+        .post(format!("{base}/v1/delegate"))
+        .json(&asked)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(answer.status(), 200);
+    let mandate: Envelope = answer.json().await.unwrap();
+    let links = as_a_gate(&mandate, &RevocationSet::default()).unwrap();
+    assert_eq!(links[0].agent.id, id("helper-bot"));
+    // The same request again is a replay, and is refused like anything else.
+    let again = reqwest::Client::new()
+        .post(format!("{base}/v1/delegate"))
+        .json(&asked)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        (again.status().as_u16(), again.text().await.unwrap()),
+        (403, String::new())
+    );
+}
