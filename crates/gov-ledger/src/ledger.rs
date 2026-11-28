@@ -103,6 +103,19 @@ impl<S: Store> Ledger<S> {
     /// receipt that does not is refused and the refusal recorded; one whose signature held is
     /// kept whole, because a gate that signs a fork or a gap has left evidence.
     pub async fn ingest(&self, envelope: &Envelope, now: i64) -> Result<Ingested, LedgerError> {
+        self.ingest_as(envelope, false, now).await
+    }
+
+    /// `vouched`: the receipt came in a shipment asked for under a key of its gate that is
+    /// still in use. Then a receipt under a revoked key of that gate is taken, so a gate
+    /// whose key was replaced can ship what it signed before (review finding GR-187); the
+    /// auditor reports any that no checkpoint shows to be earlier than the revocation.
+    async fn ingest_as(
+        &self,
+        envelope: &Envelope,
+        vouched: bool,
+        now: i64,
+    ) -> Result<Ingested, LedgerError> {
         let Some((gate, key)) = self.store.gate_key(&self.scope, &envelope.kid).await? else {
             return self.refuse(envelope, "unknown_key", false, now).await;
         };
@@ -113,7 +126,7 @@ impl<S: Store> Ledger<S> {
         if self.store.chain_kind(&self.scope, &gate).await? == Some(ChainKind::Admin) {
             return self.ingest_admin(envelope, &gate, &keys, now).await;
         }
-        if self.store.key_retired(&self.scope, &envelope.kid).await? {
+        if !vouched && self.store.key_retired(&self.scope, &envelope.kid).await? {
             return self.refuse(envelope, "retired_key", false, now).await;
         }
         let opened = match open::<Receipt>(envelope, &keys, &self.scope) {
@@ -144,7 +157,10 @@ impl<S: Store> Ledger<S> {
             // GR-46). The intent may have been pruned; then there is nothing to compare with.
             if let Some(intent_seq) = opened.doc.intent {
                 if let Some(held) = self.store.receipt(&self.scope, &gate, intent_seq).await? {
-                    let intent = open::<Receipt>(&held.envelope, &keys, &self.scope)?.doc;
+                    // The intent may be under a key this gate has since replaced.
+                    let signer = self.store.gate_key(&self.scope, &held.envelope.kid).await?;
+                    let signer = KeySet::new(signer.map(|(_, key)| key));
+                    let intent = open::<Receipt>(&held.envelope, &signer, &self.scope)?.doc;
                     if intent.phase != Phase::Intent
                         || intent.action.digest != opened.doc.action.digest
                     {
@@ -238,6 +254,10 @@ impl<S: Store> Ledger<S> {
                 Err(refused())
             };
         }
+        // An Authority's own next key, named by a record in its chain.
+        if self.store.chain_kind(&self.scope, &gate).await? == Some(ChainKind::Admin) {
+            return self.enrol_admin_key(&gate, key).await;
+        }
         self.enrol_gate_key(&gate, key).await
     }
 
@@ -257,7 +277,8 @@ impl<S: Store> Ledger<S> {
             let keys = KeySet::new(held.iter().cloned());
             for stored in self.store.receipts(&self.scope, &authority).await? {
                 let record = open::<AdminRecord>(&stored.envelope, &keys, &self.scope)?.doc;
-                self.grant_trust(&authority, &record).await?;
+                self.grant_trust(&authority, &record, &stored.envelope.kid)
+                    .await?;
                 self.end_trust(&authority, &record).await?;
                 read += 1;
             }
@@ -269,11 +290,33 @@ impl<S: Store> Ledger<S> {
     /// that the key it names can be supplied. Done only for a record the chain holds, and
     /// again when the record comes again, in case the Ledger stopped between keeping it and
     /// noting it. Safe to do twice.
-    async fn grant_trust(&self, authority: &Id, record: &AdminRecord) -> Result<(), LedgerError> {
+    async fn grant_trust(
+        &self,
+        authority: &Id,
+        record: &AdminRecord,
+        signer: &Id,
+    ) -> Result<(), LedgerError> {
+        // The Authority's own key replaced: the new key may be supplied, and the key that
+        // signed this record signs nothing after it (review finding GR-166).
+        if let (AdminAction::AdminKeyReplaced, Some(digest)) = (&record.action, &record.value) {
+            let successor = Enrolment {
+                authority: authority.clone(),
+                gate: authority.clone(),
+                digest: digest.clone(),
+                ended: false,
+            };
+            self.store
+                .note_enrolment(&self.scope, &record.subject.id, &successor)
+                .await?;
+            self.store
+                .retire_keys(&self.scope, authority, Some(signer))
+                .await?;
+        }
         if let (AdminAction::KeyEnrolled, Some(about), Some(digest)) =
             (&record.action, &record.about, &record.value)
         {
-            if about.kind == SubjectKind::Gate {
+            // Never under the Authority's own name: only a replacement names its next key.
+            if about.kind == SubjectKind::Gate && &about.id != authority {
                 let enrolment = Enrolment {
                     authority: authority.clone(),
                     gate: about.id.clone(),
@@ -356,13 +399,18 @@ impl<S: Store> Ledger<S> {
                             // Sent again, perhaps because the Ledger stopped before it
                             // had acted on it: act on it again (GR-123).
                             self.end_trust(authority, &opened.doc).await?;
-                            self.grant_trust(authority, &opened.doc).await?;
+                            self.grant_trust(authority, &opened.doc, &envelope.kid)
+                                .await?;
                             Ok(Ingested::AlreadyHeld)
                         }
                         Some(_) => self.refuse(envelope, "fork", true, now).await,
                         None => self.refuse(envelope, "already_pruned", true, now).await,
                     };
                 }
+            }
+            // A key the Authority has replaced signs no further record.
+            if self.store.key_retired(&self.scope, &envelope.kid).await? {
+                return self.refuse(envelope, "retired_key", true, now).await;
             }
             let new_head = match gov_core::admin::follow(head.as_ref(), &opened) {
                 Ok(h) => h,
@@ -382,7 +430,8 @@ impl<S: Store> Ledger<S> {
                 .await
             {
                 Ok(()) => {
-                    self.grant_trust(authority, &opened.doc).await?;
+                    self.grant_trust(authority, &opened.doc, &envelope.kid)
+                        .await?;
                     return Ok(Ingested::Added);
                 }
                 Err(StoreError::HeadMoved) => continue,
@@ -432,7 +481,7 @@ impl<S: Store> Ledger<S> {
             }
         }
         let (results, ack) = self
-            .ingest_batch(batch, &asked.nonce, key, issuer, now)
+            .ingest_batch_as(batch, true, &asked.nonce, key, issuer, now)
             .await?;
         Ok((ack, results.into_iter().find_map(|r| r.err())))
     }
@@ -449,6 +498,19 @@ impl<S: Store> Ledger<S> {
         issuer: &Id,
         now: i64,
     ) -> Result<(Vec<Result<Ingested, &'static str>>, Envelope), LedgerError> {
+        self.ingest_batch_as(batch, false, nonce, key, issuer, now)
+            .await
+    }
+
+    async fn ingest_batch_as(
+        &self,
+        batch: &[Envelope],
+        vouched: bool,
+        nonce: &Id,
+        key: &SigningKey,
+        issuer: &Id,
+        now: i64,
+    ) -> Result<(Vec<Result<Ingested, &'static str>>, Envelope), LedgerError> {
         let Some(first) = batch.first() else {
             return Err(LedgerError::Refused("empty_batch"));
         };
@@ -457,7 +519,7 @@ impl<S: Store> Ledger<S> {
         };
         let mut results = Vec::with_capacity(batch.len());
         for envelope in batch {
-            results.push(match self.ingest(envelope, now).await {
+            results.push(match self.ingest_as(envelope, vouched, now).await {
                 Ok(done) => Ok(done),
                 Err(LedgerError::Refused(code)) => Err(code),
                 Err(other) => return Err(other),

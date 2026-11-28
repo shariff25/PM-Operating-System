@@ -193,7 +193,10 @@ fn describe(problem: &Problem) -> String {
             "a proven receipt names a mandate no witnessed record says was issued".into()
         }
         Problem::ReceiptAfterRetirement => {
-            "a receipt is dated after its gate was disabled or its key revoked".into()
+            "a receipt under a disabled gate's or revoked key is not shown to be earlier than that: no checkpoint covered it before one covered the retirement".into()
+        }
+        Problem::RecordUnderReplacedKey => {
+            "an Authority's record is signed with a key its chain says was replaced".into()
         }
     }
 }

@@ -549,6 +549,19 @@ follow-up tracking.
   whether a receipt is earlier than its key's retirement by the witness's checkpoints, not
   by dates (GR-130). Not yet read by the reviewer. Still to build in G4d-4: replacing the
   Authority's admin-record key.
+- **The Authority's own key replaced, built (2026-11-28), on `build/gov-g4d4c`:** a record
+  in the Authority's chain, signed with the old key, names the new one; the Ledger and
+  `gov verify` take nothing under the old key after it. A planned change only: it does not
+  help once a key is taken. With it G4d-4 is built as libraries; not yet read by the
+  reviewer. Next: G4d-5, the programs.
+- **Twenty-eighth read (2026-11-28), at `afd7f78`:** no High or Critical; the gate passes
+  for G4d-4's first part and the auditor's order. Two Medium (GR-186: the auditor's order
+  compared positions in two different lists; GR-187: revoking a gate's key stranded the
+  receipts it had not shipped) and one Low, fixed on `build/gov-review-28`; the test for
+  GR-187 found a further fault in the Ledger, fixed with it. Not yet read again.
+- **A failure the check script caught (2026-11-28):** the key-replacement commit did not
+  compile in the CLI (a new finding had no wording). Nothing was merged or pushed; fixed
+  on `build/gov-review-28` before the merge.
 
 ## Where the build stands (2026-11-23)
 

@@ -358,6 +358,29 @@ async fn the_authoritys_chain_is_witnessed_and_a_gates_key_follows_from_it() {
     let late_only = &checkpoints[1..];
     assert!(problems(&keys, late_only, 60)
         .contains(&(Problem::ReceiptAfterRetirement, Some(id("gate-1")))));
+    // The order is by the checkpoints' own numbers, not by where each stands among those
+    // that name a chain (GR-186): the Authority's chain is witnessed first, alone, and then
+    // one checkpoint covers the receipts and the disabling together.
+    let open_cp = |bytes: &[u8]| {
+        let envelope: Envelope = serde_json::from_slice(bytes).unwrap();
+        gov_core::open::<gov_core::lease::Checkpoint>(&envelope, &ledger_keys(), &scope())
+            .unwrap()
+            .doc
+    };
+    let sealed = |cp: &gov_core::lease::Checkpoint| {
+        (
+            cp.seq,
+            serde_json::to_vec(&seal(cp, &ledger_key()).unwrap()).unwrap(),
+        )
+    };
+    let mut alone_first = open_cp(&checkpoints[0].1);
+    alone_first.heads.retain(|h| h.gate == id("authority"));
+    let mut together = open_cp(&checkpoints[1].1);
+    together.seq = 2;
+    assert!(
+        problems(&keys, &[sealed(&alone_first), sealed(&together)], 60)
+            .contains(&(Problem::ReceiptAfterRetirement, Some(id("gate-1"))))
+    );
     // What was witnessed says which key was enrolled for which gate or agent, in order.
     let enrolled: Vec<Id> = a
         .records()
@@ -675,6 +698,165 @@ async fn a_record_about_a_gate_never_retires_the_authoritys_own_key() {
         .key_retired(&scope(), &a.admin_public().kid)
         .await
         .unwrap());
+}
+
+/// A record made by hand under `signer`, following `prev`: what a taken key would write.
+fn by_hand(
+    seq: u64,
+    prev: Digest,
+    action: AdminAction,
+    subject: (gov_core::admin::SubjectKind, &str),
+    about: Option<(gov_core::admin::SubjectKind, &str)>,
+    value: Option<Digest>,
+    signer: &SigningKey,
+) -> Envelope {
+    use gov_core::admin::{Actor, AdminRecord, Subject};
+    let record = AdminRecord {
+        v: 1,
+        tenant: id("acme"),
+        env: id("prod"),
+        authority: id("authority"),
+        seq,
+        prev: Some(prev),
+        at: NOW,
+        actor: Actor {
+            id: id("ana"),
+            kind: Default::default(),
+            verified: false,
+        },
+        action,
+        subject: Subject {
+            kind: subject.0,
+            id: id(subject.1),
+        },
+        about: about.map(|(kind, name)| Subject { kind, id: id(name) }),
+        value,
+    };
+    seal(&record, signer).unwrap()
+}
+
+/// The Authority's admin-record key is replaced (spec §7.6.3, point 9; GR-166): the old key
+/// signs the record of it and nothing after, at the Ledger and in the auditor's check.
+#[tokio::test]
+async fn the_authoritys_own_key_is_replaced_by_a_record_in_its_chain() {
+    use gov_core::admin::SubjectKind;
+    use gov_core::enrol::key_digest;
+    let (mut a, ledger) = installed().await;
+    let (ana, ben) = (id("ana"), id("ben"));
+    let (old, next) = (admin_key(), key("authority-admin-2", 62));
+    let acked = ship(&a, &ledger, 0).await;
+
+    assert!(matches!(
+        a.replace_admin_key(&ben, key("authority-admin-2", 62), NOW)
+            .await,
+        Err(AuthorityError::NotAllowed)
+    ));
+    assert!(a.replace_admin_key(&ana, admin_key(), NOW).await.is_err());
+    let at = a
+        .replace_admin_key(&ana, key("authority-admin-2", 62), NOW)
+        .await
+        .unwrap();
+    assert_eq!(a.admin_public(), next.public());
+    a.register_gate(&ana, &id("gate-3"), NOW).await.unwrap();
+    let records = a.records().await.unwrap();
+    let replaced = &records[at as usize - 1];
+    assert_eq!(replaced.action, AdminAction::AdminKeyReplaced);
+    assert_eq!(replaced.subject.id, next.public().kid);
+    assert_eq!(replaced.value, Some(key_digest(&next.public()).unwrap()));
+
+    // The Ledger knows the new key only from the record, so it is not taken before.
+    refused(ledger.supply_key(&next.public()).await);
+    let sent = a.shipment(acked, 100).await.unwrap().unwrap();
+    assert_eq!(sent.request.kid, old.public().kid);
+    assert_eq!(sent.batch.len() as u64, at - acked);
+    assert_eq!(sent.batch.last().unwrap().kid, old.public().kid);
+    assert_eq!(ship(&a, &ledger, acked).await, at);
+    // Another key under the new key's id is not the one the record named.
+    refused(
+        ledger
+            .supply_key(&key("authority-admin-2", 63).public())
+            .await,
+    );
+    ledger.supply_key(&next.public()).await.unwrap();
+    let after = a.shipment(at, 100).await.unwrap().unwrap();
+    assert_eq!(after.request.kid, next.public().kid);
+    assert_eq!(ship(&a, &ledger, at).await, at + 1);
+
+    // The old key is answered nothing and signs nothing more; what it signed comes again.
+    let all = a.shipment(0, 100).await.unwrap().unwrap();
+    assert!(matches!(
+        ledger
+            .take_shipment(&all.request, &all.batch, &ledger_key(), &id("ledger"), NOW)
+            .await,
+        Err(LedgerError::Refused("unknown_sender"))
+    ));
+    a.settle_admin_key();
+    assert_eq!(ship(&a, &ledger, 0).await, at + 1);
+    let both = KeySet::new([old.public(), next.public()]);
+    let last = a.shipment(at, 100).await.unwrap().unwrap().batch;
+    let last = gov_core::open::<gov_core::admin::AdminRecord>(&last[0], &both, &scope()).unwrap();
+    let taken = by_hand(
+        at + 2,
+        last.hash.clone(),
+        AdminAction::GateDisabled,
+        (SubjectKind::Gate, "gate-2"),
+        None,
+        None,
+        &old,
+    );
+    assert!(matches!(
+        ledger.ingest(&taken, NOW).await,
+        Err(LedgerError::Refused("retired_key"))
+    ));
+
+    let dir = tempfile::tempdir().unwrap();
+    let witness = DirWitness::new(dir.path());
+    ledger
+        .checkpoint(&ledger_key(), &id("ledger"), NOW + 60, &witness)
+        .await
+        .unwrap();
+    assert_eq!(findings_of(&ledger, &witness, NOW + 61).await, vec![]);
+
+    // An export in which the old key went on signing is reported, at that record.
+    let mut export = ledger.export().await.unwrap();
+    let chain = export
+        .gates
+        .iter_mut()
+        .find(|g| g.gate == id("authority"))
+        .unwrap();
+    chain.receipts.push(taken);
+    let keys = ledger.keys(&ledger_key()).await.unwrap();
+    let report = verify(&Check {
+        scope: &scope(),
+        keys: &keys,
+        export: &export,
+        checkpoints: &witness.all().unwrap(),
+        interval_secs: 60,
+        now: Some(NOW + 61),
+        gate_quiet_secs: None,
+        clock_skew_secs: 60,
+        retention_secs: None,
+    });
+    assert!(report.findings.iter().any(|f| {
+        f.problem == Problem::RecordUnderReplacedKey
+            && f.gate == Some(id("authority"))
+            && f.seq == Some(at + 2)
+    }));
+
+    // A key enrolled for a gate that bears the Authority's name is no key of the
+    // Authority's: only a replacement names one.
+    let stray = key("authority:k9", 64);
+    let named = by_hand(
+        at + 2,
+        last.hash,
+        AdminAction::KeyEnrolled,
+        (SubjectKind::Key, "authority:k9"),
+        Some((SubjectKind::Gate, "authority")),
+        Some(key_digest(&stray.public()).unwrap()),
+        &next,
+    );
+    ledger.ingest(&named, NOW).await.unwrap();
+    refused(ledger.supply_key(&stray.public()).await);
 }
 
 /// The auditor's check holds a proven receipt to a mandate the Authority recorded issuing

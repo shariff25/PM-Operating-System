@@ -126,6 +126,9 @@ pub enum Problem {
     /// before the first one that covered the retirement. A receipt written honestly before
     /// and shipped late is reported too.
     ReceiptAfterRetirement,
+    /// An Authority's record is signed with a key other than the one its chain's last
+    /// replacement names: the key was replaced, and went on signing (finding GR-166).
+    RecordUnderReplacedKey,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -273,6 +276,7 @@ pub fn verify(check: &Check<'_>) -> Report {
             prune_tied: false,
         };
         let mut head: Option<ChainHead> = None;
+        let mut successor: Option<Digest> = None;
         if let Some(record) = &gate.pruned {
             match open::<Pruned>(record, &ledger_keys, check.scope) {
                 Ok(p) if p.doc.gate == gate.gate && p.doc.through_seq >= 1 => {
@@ -364,6 +368,24 @@ pub fn verify(check: &Check<'_>) -> Report {
                         }
                         Link::Admin(opened) => {
                             let record = &opened.doc;
+                            if let Some(named) = &successor {
+                                let signer = gate_keys
+                                    .iter()
+                                    .find(|k| k.kid == envelope.kid)
+                                    .and_then(|k| key_digest(k).ok());
+                                if signer.as_ref() != Some(named) {
+                                    find(
+                                        Problem::RecordUnderReplacedKey,
+                                        Some(&gate.gate),
+                                        Some(h.seq),
+                                    );
+                                }
+                            }
+                            if let (AdminAction::AdminKeyReplaced, Some(next)) =
+                                (&record.action, &record.value)
+                            {
+                                successor = Some(next.clone());
+                            }
                             if record.action == AdminAction::MandateIssued {
                                 issued
                                     .entry(record.subject.id.clone())
@@ -434,6 +456,9 @@ pub fn verify(check: &Check<'_>) -> Report {
     let mut last_moved: BTreeMap<Id, i64> = BTreeMap::new();
     // For each gate, every (head number, hash, checkpoint time) the witness holds.
     let mut witnessed: BTreeMap<Id, Vec<(u64, Digest, i64)>> = BTreeMap::new();
+    // For each chain, (head number, the checkpoint's own number): positions in `witnessed`
+    // are per chain and cannot be compared across chains (review finding GR-186).
+    let mut covered_in: BTreeMap<Id, Vec<(u64, u64)>> = BTreeMap::new();
     let mut checkpoints_verified = 0;
     let silence = i64::from(check.interval_secs) * 2;
     if check.checkpoints.is_empty() {
@@ -486,6 +511,10 @@ pub fn verify(check: &Check<'_>) -> Report {
         let mut seen: BTreeMap<Id, u64> = BTreeMap::new();
         for h in &cp.heads {
             seen.insert(h.gate.clone(), h.seq);
+            covered_in
+                .entry(h.gate.clone())
+                .or_default()
+                .push((h.seq, cp.seq));
             witnessed
                 .entry(h.gate.clone())
                 .or_default()
@@ -667,9 +696,12 @@ pub fn verify(check: &Check<'_>) -> Report {
         // a receipt counts as earlier than a retirement only if a checkpoint before the
         // first one covering the retirement already covered the receipt.
         let first_cover = |chain: &Id, seq: u64| {
-            witnessed
-                .get(chain)
-                .and_then(|heads| heads.iter().position(|(head, _, _)| *head >= seq))
+            covered_in.get(chain).and_then(|heads| {
+                heads
+                    .iter()
+                    .find(|(head, _)| *head >= seq)
+                    .map(|(_, checkpoint)| *checkpoint)
+            })
         };
         for (kid, (gate, seq)) in &signed_last {
             let Some((authority, record)) = enrolments
